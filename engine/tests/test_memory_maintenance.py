@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from engine.execution.memory.memory_maintenance import (
@@ -220,7 +221,7 @@ def test_memory_compilation_reports_partial_progress(
     memory_dir.mkdir()
     (memory_dir / "recent.jsonl").write_text(
         '{"task":"keep recent activity","summary":"recent evidence",'
-        '"timestamp":"2026-07-11T00:00:00+00:00"}\n',
+        '"timestamp":"' + datetime.now(timezone.utc).isoformat() + '"}\n',
         encoding="utf-8",
     )
 
