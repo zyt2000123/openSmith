@@ -27,7 +27,7 @@ from .pipeline_context import (
     CTX_WORKING_DIR,
     output_key,
 )
-from .react_loop import react_event_loop
+from engine.execution.react.react_loop import react_event_loop
 
 if TYPE_CHECKING:
     from engine.llm.port import LLMPort

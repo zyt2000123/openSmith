@@ -6,9 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from common.config import AGENT_DIR, BUILTIN_IDENTITIES_DIR, BUILTIN_SKILLS_DIR, PATHS, SAFETY_RULES_PATH
-from engine.execution.skill_chain import SkillChain, load_gate_content
+from engine.execution.pipeline.skill_chain import SkillChain, load_gate_content
 from engine.identity_catalog import IdentityCatalog, load_identity_catalog
-from engine.execution.runtime import RuntimeContext, RuntimeServices
+from engine.execution.orchestration.runtime import RuntimeContext, RuntimeServices
 from engine.llm.model_config import LLMUsage, build_llm_client, resolve_llm_config
 from engine.llm.contracts import GEMINI_OPENAI_BASE_URL
 from engine.llm.factory import normalize_provider_name

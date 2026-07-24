@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from engine.execution import agent_loop as agent_loop_module
-from engine.execution.agent_loop import run_agent_stream
-from engine.execution.backtrack import FailureLoopGuard
-from engine.execution.events import EventType, ExecutionEvent
-from engine.execution.gate import GateResult, LLMGate
-from engine.execution.skill_chain import (
+from engine.execution.orchestration import agent_loop as agent_loop_module
+from engine.execution.orchestration.agent_loop import run_agent_stream
+from engine.execution.pipeline.backtrack import FailureLoopGuard
+from engine.observability.events import EventType, ExecutionEvent
+from engine.execution.pipeline.gate import GateResult, LLMGate
+from engine.execution.pipeline.skill_chain import (
     GATE_REGISTRY,
     SkillChain,
     SkillNode,
@@ -546,7 +546,7 @@ def _seed_checkpoint(
     agent_id: str = "smith-id",
     identity_id: str = "smith",
 ) -> None:
-    from engine.execution.checkpoint import SessionCheckpoint, SessionStateManager
+    from engine.execution.pipeline.checkpoint import SessionCheckpoint, SessionStateManager
 
     SessionStateManager(tmp_path).save(SessionCheckpoint(
         agent_id=agent_id,

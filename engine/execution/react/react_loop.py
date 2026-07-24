@@ -29,7 +29,7 @@ from engine.react_budget import (
     budget_exhausted_message,
     looks_like_incomplete_final_after_tool,
 )
-from .runtime_control import tool_blocked_prompt
+from engine.execution.runtime_control import tool_blocked_prompt
 from engine.safety.approval import (
     ApprovalRequest,
     ApprovalTimeoutError,

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 
-from engine.execution.react_loop import (
+from engine.execution.react.react_loop import (
     react_event_loop as _react_event_loop,
     react_loop as _react_loop,
     react_stream_loop as _react_stream_loop,
 )
-from engine.execution.events import EventType
-from engine.execution.react_loop import FailedAgentRunError, IncompleteAgentRunError
+from engine.observability.events import EventType
+from engine.execution.react.react_loop import FailedAgentRunError, IncompleteAgentRunError
 from engine.llm.client import ChatResponse, ToolCallData
 from engine.llm.contracts import LLMResponseError
 from engine.llm.events import ProviderEvent, ProviderEventType

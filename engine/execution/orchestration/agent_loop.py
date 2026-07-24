@@ -39,9 +39,9 @@ from engine.sandbox import MacOSSeatbeltEnvironment
 from engine.skill.executor import execute_skill_events
 from engine.skill.registry import SkillRegistry
 from engine.tool.registry import ToolRegistry
-from .backtrack import FailureLoopGuard
-from .pipeline import run_pipeline
-from .pipeline_context import (
+from engine.execution.pipeline.backtrack import FailureLoopGuard
+from engine.execution.pipeline.pipeline import run_pipeline
+from engine.execution.pipeline.pipeline_context import (
     CTX_AGENT_ID,
     CTX_FORCED_SKILL,
     CTX_IDENTITY_ID,
@@ -52,19 +52,19 @@ from .pipeline_context import (
     CTX_USER_MESSAGE,
     CTX_WORKING_DIR,
 )
-from .react_loop import (
+from engine.execution.react.react_loop import (
     IncompleteAgentRunError,
     react_event_loop,
 )
 from .run_state import RunStateError, RunStateStore, RunStatus, project_execution_event
 from .run_stream import AgentRunStream
 from .runtime import EngineRequest, EngineResult, RuntimeContext, RuntimeServices
-from .runtime_control import initial_runtime_control_prompt
-from .skill_chain import SkillChain, load_gate_content
-from .tool_ledger import ToolExecutionLedger
+from engine.execution.runtime_control import initial_runtime_control_prompt
+from engine.execution.pipeline.skill_chain import SkillChain, load_gate_content
+from engine.execution.tool_execution.tool_ledger import ToolExecutionLedger
 from engine.safety.eval_guard import EVAL_SENSITIVE_GUIDANCE, detect_eval_sensitive
 from engine.safety.approval import APPROVAL_BROKER, use_approval_context
-from .task_router import route_task
+from engine.execution.routing.task_router import route_task
 
 # ReAct loop implementations belong to react_loop.py and are intentionally
 # not re-exported from this orchestration module.
@@ -195,7 +195,7 @@ def _apply_crash_checkpoint(
     expected_identity_id = str(context.get(CTX_IDENTITY_ID) or "")
     expected_working_dir = str(context.get(CTX_WORKING_DIR) or "")
     try:
-        from .checkpoint import SessionStateManager
+        from engine.execution.pipeline.checkpoint import SessionStateManager
 
         manager = SessionStateManager(Path(state_dir))
         checkpoint = manager.restore(session_id)
@@ -747,7 +747,7 @@ def _ensure_memory_lifecycle_hooks(services: RuntimeServices) -> None:
         and services.hooks.is_registered(services._memory_lifecycle_hook)
     ):
         return
-    from engine.execution.memory_maintenance import (
+    from engine.execution.memory.memory_maintenance import (
         MemoryLifecycleHooks,
         MemoryMaintenanceService,
     )

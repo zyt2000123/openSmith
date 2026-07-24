@@ -9,16 +9,16 @@ from typing import AsyncGenerator
 
 from fastapi import HTTPException
 
-from engine.execution.agent_loop import (
+from engine.execution.orchestration.agent_loop import (
     run_stream_with_runtime as engine_run_stream_with_runtime,
     resume_stream_with_runtime as engine_resume_stream_with_runtime,
     reply_with_runtime as engine_reply_with_runtime,
 )
 from engine.observability import raw_text_delta
-from engine.execution.smith_ui import smith_ui_fallback, validate_smith_ui_call
+from engine.execution.react.smith_ui import smith_ui_fallback, validate_smith_ui_call
 from engine.context import CONTEXT_DISPLAY_WINDOW, compact_history
-from engine.execution.run_state import RunStateError, RunStateStore, RunStatus
-from engine.execution.runtime import EngineRequest
+from engine.execution.orchestration.run_state import RunStateError, RunStateStore, RunStatus
+from engine.execution.orchestration.runtime import EngineRequest
 from engine.identity_catalog import IdentityCatalog, IdentityCatalogError
 from engine.llm.model_config import resolve_llm_config
 from common.yaml_utils import YamlConfigError

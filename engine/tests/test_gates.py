@@ -3,8 +3,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-from engine.execution.gate import GateResult, LLMGate
-from engine.execution.skill_chain import GATE_REGISTRY, load_gate_content
+from engine.execution.pipeline.gate import GateResult, LLMGate
+from engine.execution.pipeline.skill_chain import GATE_REGISTRY, load_gate_content
 
 
 ROOT = Path(__file__).resolve().parents[2]

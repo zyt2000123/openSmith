@@ -6,7 +6,7 @@ semantic verification over a cheap heuristic pre-filter.
 
 Concrete gate implementations are content, not engine code.  They live
 under ``agents/gates/<domain>/`` and are registered at startup by
-``engine.execution.skill_chain.load_gate_content``.
+``engine.execution.pipeline.skill_chain.load_gate_content``.
 """
 
 from __future__ import annotations

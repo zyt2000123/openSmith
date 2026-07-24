@@ -347,7 +347,7 @@ async def test_resume_run_reuses_session_scope_and_discards_partial_reply(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from engine.execution.run_state import RunStateStore
+    from engine.execution.orchestration.run_state import RunStateStore
 
     captured: dict[str, object] = {}
     repo = FakeSessionRepo()
@@ -425,7 +425,7 @@ async def test_resume_run_rejects_an_older_run_without_deleting_later_turns(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from engine.execution.run_state import RunStateStore
+    from engine.execution.orchestration.run_state import RunStateStore
 
     repo = FakeSessionRepo()
     repo.messages = [
@@ -463,7 +463,7 @@ async def test_prepare_resume_rejects_a_retired_identity_without_discarding_part
     tmp_path: Path,
 ) -> None:
     """Resume preflight must be read-only until the identity is known to be valid."""
-    from engine.execution.run_state import RunStateStore
+    from engine.execution.orchestration.run_state import RunStateStore
 
     repo = FakeSessionRepo()
     repo.identity_id = "smith"

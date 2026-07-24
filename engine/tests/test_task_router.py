@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-from engine.execution.task_router import detect_eval_sensitive, route_task
+from engine.execution.routing.task_router import detect_eval_sensitive, route_task
 from engine.identity_catalog import IdentityCatalog
 
 

@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.services.run_state_service import RunStateService
-from engine.execution.run_state import RunStateStore
+from engine.execution.orchestration.run_state import RunStateStore
 from engine.safety.approval import APPROVAL_BROKER, ApprovalRequest
 
 

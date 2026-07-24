@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from engine.execution.agent_loop import _MemoryToolApi, _enabled_tools_from_config
+from engine.execution.orchestration.agent_loop import _MemoryToolApi, _enabled_tools_from_config
 from engine.identity_catalog import IdentitySpec
 from engine.sandbox import MacOSSeatbeltEnvironment
 from engine.tool.interface import ToolCall

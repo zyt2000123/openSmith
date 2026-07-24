@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from engine.execution import agent_loop as agent_loop_module
-from engine.execution.agent_loop import (
+from engine.execution.orchestration import agent_loop as agent_loop_module
+from engine.execution.orchestration.agent_loop import (
     _bind_working_directory_tools,
     prepare_runtime,
     reply_events_with_runtime,
@@ -17,9 +17,9 @@ from engine.execution.agent_loop import (
     run_stream_with_runtime,
     run_agent_stream,
 )
-from engine.execution.backtrack import FailureLoopGuard
-from engine.execution.run_state import RunStateStore, RunStatus, project_execution_event
-from engine.execution.runtime import EngineRequest, RuntimeContext, RuntimeServices
+from engine.execution.pipeline.backtrack import FailureLoopGuard
+from engine.execution.orchestration.run_state import RunStateStore, RunStatus, project_execution_event
+from engine.execution.orchestration.runtime import EngineRequest, RuntimeContext, RuntimeServices
 from engine.identity_catalog import IdentityCatalog
 from engine.llm.client import ChatResponse, ToolCallData
 from engine.observability import EventType, ExecutionEvent, RunSummaryStore, TraceStore, raw_text_delta
@@ -932,7 +932,7 @@ steps:
         gates_dir.mkdir()
         (gates_dir / "planning.py").write_text(
             """
-from engine.execution.gate import Gate, GateResult
+from engine.execution.pipeline.gate import Gate, GateResult
 
 class AlwaysPassGate(Gate):
     async def check(self, output, context):

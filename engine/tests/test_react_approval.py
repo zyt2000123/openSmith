@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from engine.execution.events import EventType
-from engine.execution.react_loop import react_event_loop
+from engine.observability.events import EventType
+from engine.execution.react.react_loop import react_event_loop
 from engine.llm.client import ChatResponse
 from engine.llm.contracts import ToolCallData
 from engine.safety.approval import (

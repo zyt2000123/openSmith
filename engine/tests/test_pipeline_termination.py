@@ -10,12 +10,12 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from engine.execution.agent_loop import run_agent_stream
-from engine.execution.backtrack import FailureLoopGuard, FailureSignature
-from engine.execution.events import EventType
-from engine.execution.gate import GateResult
-from engine.execution.react_loop import react_event_loop
-from engine.execution.skill_chain import SkillChain, SkillNode
+from engine.execution.orchestration.agent_loop import run_agent_stream
+from engine.execution.pipeline.backtrack import FailureLoopGuard, FailureSignature
+from engine.observability.events import EventType
+from engine.execution.pipeline.gate import GateResult
+from engine.execution.react.react_loop import react_event_loop
+from engine.execution.pipeline.skill_chain import SkillChain, SkillNode
 from engine.identity_catalog import IdentitySpec, RouteDecision
 from engine.llm.client import ChatResponse
 from engine.skill.loader import SkillBody, SkillMeta
