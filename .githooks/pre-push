@@ -1,0 +1,23 @@
+#!/bin/sh
+# 推送前跑 Python 两层测试（engine + server，合计约 8 秒）。
+#
+# 本项目不引入 CI，这个钩子就是唯一的自动触发点。
+# 启用：git config core.hooksPath .githooks
+#
+# ponytail: shell 层未纳入 —— npm run build 慢到会逼人习惯性 --no-verify，
+# 那样连 Python 层也一起跳过了。shell 改动请手动 cd shell && npm test。
+# 等 trace replay 建好后在下面的循环里加一行即可。
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+
+for pkg in engine server; do
+	printf '── %s\n' "$pkg"
+	if ! (cd "$root/$pkg" && uv run --with pytest --with pytest-asyncio pytest -q); then
+		printf '\n✗ %s 测试失败，推送已拦下。确认要跳过：git push --no-verify\n' "$pkg" >&2
+		exit 1
+	fi
+done
+
+printf '\n✓ engine + server 全绿\n'
