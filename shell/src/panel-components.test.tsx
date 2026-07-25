@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { renderToString, Text } from "ink";
-
+import type { TokenDay } from "./api.js";
 import { MultiSelectList } from "./multi-select-list.js";
 import { PanelContainer } from "./panel-container.js";
 import { RunExplorerPanel } from "./run-panel.js";
 import { TabbedPanel } from "./tabbed-panel.js";
-import { TokenStatsPanel } from "./token-panel.js";
+import { planRollingBarChart, TokenStatsPanel } from "./token-panel.js";
 
 function stripAnsi(text: string): string {
   const ansiEscape = String.fromCharCode(27);
@@ -87,4 +87,61 @@ test("RunExplorerPanel keeps the panel boundary when no run data exists yet", ()
   assert.match(output, /Observability/);
   assert.match(output, /No completed or interrupted runs recorded yet/);
   assert.match(output, /Esc back/);
+});
+
+function usageDay(date: string, total: number): TokenDay {
+  return { date, sessions: 1, input_tokens: total, output_tokens: 0, total_tokens: total };
+}
+
+/** The shape of the PTY capture that exposed the defect: a quiet week, two heavy days. */
+const ROLLING_WEEK: TokenDay[] = [
+  usageDay("2026-07-19", 0),
+  usageDay("2026-07-20", 0),
+  usageDay("2026-07-21", 0),
+  usageDay("2026-07-22", 136_900),
+  usageDay("2026-07-23", 0),
+  usageDay("2026-07-24", 0),
+  usageDay("2026-07-25", 317_500),
+];
+
+test("a wide terminal keeps full weekday labels and one-decimal counts", () => {
+  const plan = planRollingBarChart(ROLLING_WEEK, 100);
+
+  assert.ok(plan);
+  assert.equal(plan.width, 10);
+  assert.equal(plan.labels[3], "Wed 22");
+  assert.equal(plan.values[3], "136.9k");
+});
+
+test("a 40-column terminal falls back to day numbers and whole-unit counts", () => {
+  const plan = planRollingBarChart(ROLLING_WEEK, 40);
+
+  assert.ok(plan);
+  assert.deepEqual(plan.labels, ["19", "20", "21", "22", "23", "24", "25"]);
+  assert.equal(plan.values[3], "137k");
+  assert.equal(plan.values[6], "318k");
+});
+
+test("no bar chart column is ever narrower than the text it holds", () => {
+  // Ink wraps instead of clipping, so a column narrower than its own text used to
+  // fold `136.9k` into `136.9` plus an orphan `k` on the next row at 40 columns.
+  for (let columns = 8; columns <= 140; columns++) {
+    const plan = planRollingBarChart(ROLLING_WEEK, columns);
+    if (!plan) continue;
+
+    for (const text of [...plan.labels, ...plan.values]) {
+      assert.ok(
+        text.length <= plan.width,
+        `${columns} columns: ${JSON.stringify(text)} is ${text.length} wide, column is ${plan.width}`,
+      );
+    }
+    assert.ok(
+      plan.width * ROLLING_WEEK.length <= columns,
+      `${columns} columns: chart spans ${plan.width * ROLLING_WEEK.length}`,
+    );
+  }
+});
+
+test("a terminal too narrow for even the short form drops the chart", () => {
+  assert.equal(planRollingBarChart(ROLLING_WEEK, 12), null);
 });
