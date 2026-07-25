@@ -99,17 +99,25 @@ function requiredGridWidth(columnWidths: readonly number[], padding: number): nu
 }
 
 /** A cell cannot be narrower than one complete terminal grapheme. */
+// Both fold instead of spreading: one argument per grapheme (or per line) overflows
+// the call stack past ~100k arguments, and table content is model-generated.
 function minimumColumnWidths(table: MarkdownTable): number[] {
   return table.headers.map((header, index) => {
     const values = [header, ...table.rows.map((row) => row[index] ?? "")];
-    return Math.max(1, ...values.flatMap((value) => graphemes(value).map(displayWidth)));
+    return values.reduce(
+      (widest, value) => graphemes(value).reduce((cell, grapheme) => Math.max(cell, displayWidth(grapheme)), widest),
+      1,
+    );
   });
 }
 
 function desiredColumnWidths(table: MarkdownTable): number[] {
   return table.headers.map((header, index) => {
     const values = [header, ...table.rows.map((row) => row[index] ?? "")];
-    return Math.max(1, ...values.flatMap((value) => value.split("\n").map(displayWidth)));
+    return values.reduce(
+      (widest, value) => value.split("\n").reduce((cell, line) => Math.max(cell, displayWidth(line)), widest),
+      1,
+    );
   });
 }
 

@@ -49,6 +49,32 @@ test("transcript turns frame user messages while aligning their content with rep
   assert.equal(userMessageBoxProps(2).width, 1);
 });
 
+test("an over-long tool hint is truncated on grapheme boundaries", () => {
+  const toolBlock = (hint: string) => ({
+    id: "tool-1",
+    type: "tool" as const,
+    toolCallId: "call-1",
+    name: "read",
+    hint,
+    state: "success" as const,
+    summary: "",
+  });
+  const renderHint = (hint: string) =>
+    stripAnsi(
+      renderToString(
+        <TranscriptEntryView
+          entry={{ ...completedTurn("check config"), blocks: [toolBlock(hint)] }}
+          viewMode="transcript"
+        />,
+      ),
+    );
+
+  // A 40-emoji hint is 80 UTF-16 units, so slicing at 55 lands mid-surrogate and
+  // emits a lone half. Measuring cells instead cuts on a grapheme boundary.
+  const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.equal(loneSurrogate.test(renderHint("🎉".repeat(40))), false);
+});
+
 test("transcript keeps the assistant marker on the first Markdown heading line", () => {
   const entry = { ...completedTurn("Explain memory"), assistantText: "## Agent 记忆系统的核心关注点" };
   const output = stripAnsi(renderToString(<TranscriptEntryView entry={entry} viewMode="compact" />));

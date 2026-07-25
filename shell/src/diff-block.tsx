@@ -147,15 +147,13 @@ function parseContentLine(sourceLine: string, cursor: DiffCursor): UnifiedDiffLi
   }
 }
 
+// Folds rather than spreading two arguments per numbered line: a machine-sized
+// diff would otherwise overflow the call stack instead of rendering.
 function numberedLineWidth(lines: UnifiedDiffLine[]): number {
-  return Math.max(
-    1,
-    ...lines
-      .filter((line) => line.oldLine !== null || line.newLine !== null)
-      .flatMap((line) => [line.oldLine ?? 0, line.newLine ?? 0])
-      .map(String)
-      .map((value) => value.length),
-  );
+  return lines.reduce((widest, line) => {
+    if (line.oldLine === null && line.newLine === null) return widest;
+    return Math.max(widest, String(line.oldLine ?? 0).length, String(line.newLine ?? 0).length);
+  }, 1);
 }
 
 function withWordChanges(lines: UnifiedDiffLine[]): UnifiedDiffLine[] {

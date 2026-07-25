@@ -15,6 +15,7 @@ import { stripEmojiIcons } from "./output.js";
 import { skillPresentation } from "./skill-presentation.js";
 import { SmithUiBlock as SmithUiView } from "./smith-ui.js";
 import { splitStreamingMarkdown } from "./streaming-markdown.js";
+import { truncateDisplay } from "./text-layout.js";
 import { ACCENT, ASSISTANT, BORDER, ERROR, INFO, MUTED, SKILL, SUCCESS, WARNING } from "./theme.js";
 import type {
   SkillBlock,
@@ -223,10 +224,9 @@ type RenderBlock =
   | ToolSummaryBlock;
 
 function truncate(text: string, max = 80): string {
-  if (text.length <= max) {
-    return text;
-  }
-  return `${text.slice(0, max - 1)}…`;
+  // `max` is a column budget, so it has to be measured in terminal cells: UTF-16
+  // length counts a CJK glyph as 1 (it occupies 2) and splits emoji surrogate pairs.
+  return truncateDisplay(text, max);
 }
 
 function truncateLines(text: string, max = 4): { text: string; hidden: number } {

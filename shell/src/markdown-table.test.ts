@@ -4,6 +4,16 @@ import test from "node:test";
 import { layoutMarkdownTable, parseMarkdownTable, renderMarkdownTableLines } from "./markdown-table.js";
 import { displayWidth } from "./text-layout.js";
 
+test("a table with more graphemes than the argument limit still lays out", () => {
+  // Column sizing must fold over the cells; spreading one argument per grapheme
+  // into Math.max blows the stack somewhere past ~100k and takes the shell down.
+  const rows = Array.from({ length: 500 }, () => `| ${"x".repeat(400)} |`).join("\n");
+  const table = parseMarkdownTable(`| head |\n| --- |\n${rows}`);
+
+  assert.ok(table);
+  assert.doesNotThrow(() => layoutMarkdownTable(table, 80));
+});
+
 const LONG_CHECKSUM = `sha256:${"a".repeat(72)}`;
 
 test("parses GFM tables through the parser instead of splitting escaped pipes", () => {
