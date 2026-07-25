@@ -139,7 +139,9 @@ export function setSetupField(draft: SetupDraft, field: EditableSetupField, valu
 
 export function setProvider(draft: SetupDraft, value: string): SetupDraft | null {
   const provider = value.trim().toLowerCase();
-  if (!(provider in PROVIDER_PRESETS)) return null;
+  // hasOwn, not `in`: `in` walks the prototype, so "constructor"/"toString" would pass
+  // the check and then read an undefined base_url off Object.prototype.
+  if (!Object.hasOwn(PROVIDER_PRESETS, provider)) return null;
 
   const preset = PROVIDER_PRESETS[provider as keyof typeof PROVIDER_PRESETS];
   return {
@@ -322,9 +324,17 @@ export function buildLlmConfigInput(draft: SetupDraft): LlmConfigInput {
   const models = parseModels(draft.models);
   const maxOutputTokens = parseMaxOutputTokens(draft.max_output_tokens);
 
+  // setProvider() only guards the Enter path; arrow/Tab navigation writes the field
+  // verbatim. Validate at the single exit instead, so no navigation order can slip
+  // an unsupported protocol through to the server.
+  const provider = draft.provider.trim().toLowerCase();
+  if (!Object.hasOwn(PROVIDER_PRESETS, provider)) {
+    throw new Error("Compatible protocol must be openai, anthropic, or gemini.");
+  }
+
   const input: LlmConfigInput = {
     vendor: draft.vendor.trim(),
-    provider: draft.provider.trim(),
+    provider,
     base_url: draft.base_url.trim(),
     model: draft.model.trim(),
   };

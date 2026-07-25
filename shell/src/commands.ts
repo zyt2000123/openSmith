@@ -7,12 +7,10 @@ import type { AppStore, Panel } from "./store.js";
 
 export type SlashItem = {
   id: string;
-  kind: "command" | "skill";
   title: string;
   command: string;
   description: string;
   category: string;
-  skill?: SkillSummary;
 };
 
 type CommandContext = {
@@ -25,6 +23,7 @@ type CommandContext = {
 type CommandHandler = (args: string[], context: CommandContext) => Promise<void> | void;
 
 const HELP_TEXT = [
+  "- `/help` — show this list",
   "- `/new` — start a fresh session and keep the current session in history",
   "- `/reload` — start fresh after changing SMITH.md or other context files",
   "- `/init` — create a project .smith/SMITH.md instruction template",
@@ -37,27 +36,29 @@ const HELP_TEXT = [
   "- `/runs` — recent Agent runs and outcome metrics",
   "- `/trace [run-id]` — diagnose the latest run or a specific Run",
   "- `/skills` — inspect or run a standard SKILL.md skill",
+  "- `/skill <name> [prompt]` — arm a skill, or run it straight away with a prompt",
+  "- `/approve`, `/deny` — answer a pending approval without leaving the composer",
   "- `/hooks` — inspect runtime lifecycle hooks",
   "- `/mcp` — inspect configured MCP servers and tools",
   "- `/resume [session-id]` — recover the latest interrupted run, or open a session; use `/resume run <run-id>` for a specific run",
   "- `/compact` — switch to compact view; Ctrl+O toggles compact/transcript",
+  "- `/reconnect` — retry the local server connection after a failed boot",
   "- `/exit` — quit",
 ].join("\n");
 
-export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
+/** Skills are reached through `@name` and `/skill`, never through this palette. */
+export function buildSlashItems(): SlashItem[] {
   const commands: SlashItem[] = [
     {
       id: "help",
-      kind: "command",
       title: "/help",
       command: "/help",
       description: "Show commands.",
       category: "Commands",
     },
-    { id: "exit", kind: "command", title: "/exit", command: "/exit", description: "Quit Smith.", category: "Commands" },
+    { id: "exit", title: "/exit", command: "/exit", description: "Quit Smith.", category: "Commands" },
     {
       id: "new",
-      kind: "command",
       title: "/new",
       command: "/new",
       description: "New session; keep history.",
@@ -65,7 +66,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "reload",
-      kind: "command",
       title: "/reload",
       command: "/reload",
       description: "Start fresh with current context files.",
@@ -73,7 +73,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "init",
-      kind: "command",
       title: "/init",
       command: "/init",
       description: "Create a project instruction template.",
@@ -81,7 +80,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "compress",
-      kind: "command",
       title: "/compress",
       command: "/compress",
       description: "Persist a context summary for this session.",
@@ -89,7 +87,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "model",
-      kind: "command",
       title: "/model",
       command: "/model",
       description: "Select or add a model profile.",
@@ -97,7 +94,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "config",
-      kind: "command",
       title: "/config",
       command: "/config",
       description: "Edit LLM config.",
@@ -105,7 +101,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "sessions",
-      kind: "command",
       title: "/sessions",
       command: "/sessions",
       description: "Recent sessions.",
@@ -113,7 +108,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "resume",
-      kind: "command",
       title: "/resume",
       command: "/resume",
       description: "Resume an interrupted run or a recent session.",
@@ -121,7 +115,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "token",
-      kind: "command",
       title: "/token",
       command: "/token",
       description: "Local token usage dashboard.",
@@ -129,7 +122,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "runs",
-      kind: "command",
       title: "/runs",
       command: "/runs",
       description: "Recent Agent run history.",
@@ -137,7 +129,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "trace",
-      kind: "command",
       title: "/trace",
       command: "/trace",
       description: "Diagnose the latest Agent run.",
@@ -145,7 +136,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "skills",
-      kind: "command",
       title: "/skills",
       command: "/skills",
       description: "Inspect skills.",
@@ -153,7 +143,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "mcp",
-      kind: "command",
       title: "/mcp",
       command: "/mcp",
       description: "Inspect MCP servers and tools.",
@@ -161,7 +150,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "hooks",
-      kind: "command",
       title: "/hooks",
       command: "/hooks",
       description: "View runtime lifecycle hooks.",
@@ -169,7 +157,6 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "clear",
-      kind: "command",
       title: "/clear",
       command: "/clear",
       description: "Delete current session.",
@@ -177,10 +164,16 @@ export function buildSlashItems(_skills: SkillSummary[]): SlashItem[] {
     },
     {
       id: "compact",
-      kind: "command",
       title: "/compact",
       command: "/compact",
       description: "Compact view.",
+      category: "Commands",
+    },
+    {
+      id: "reconnect",
+      title: "/reconnect",
+      command: "/reconnect",
+      description: "Retry the local server connection.",
       category: "Commands",
     },
   ];
@@ -388,6 +381,10 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
   },
   "/compact": (_args, context) =>
     context.getState().set({ viewMode: "compact", panel: "chat", statusLine: "Compact view." }),
+  "/reconnect": async (_args, context) => {
+    context.getState().set({ statusLine: "Reconnecting…", welcomeNotice: null });
+    await context.bridge.boot();
+  },
   "/clear": async (_args, context) => {
     await context.bridge.clearCurrentSession();
   },

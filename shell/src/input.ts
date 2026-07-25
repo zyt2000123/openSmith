@@ -382,7 +382,20 @@ function cyclePanel(key: Key, options: ShellInputOptions): void {
 
   const panels: Panel[] = ["welcome", "sessions", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"];
   const index = panels.indexOf(options.panel);
-  options.getState().set({ panel: panels[(index + 1) % panels.length] });
+  const next = panels[(index + 1) % panels.length];
+
+  // The data-backed panels load through the bridge; setting `panel` alone would
+  // strand them on their loading placeholder with no request behind it.
+  if (next === "tokens") {
+    void options.bridge.openTokenStats();
+    return;
+  }
+  if (next === "runs") {
+    void options.bridge.openRunExplorer();
+    return;
+  }
+  options.getState().set({ panel: next });
+  if (next === "mcp") void options.bridge.refreshMcpServers();
 }
 
 function handlePickerInput(key: Key, options: ShellInputOptions): boolean {

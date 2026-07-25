@@ -184,6 +184,7 @@ export class NodeBridge {
   private activeRequest: AbortController | null = null;
   private tokenStatsRequestId = 0;
   private observabilityRequestId = 0;
+  private booting = false;
 
   constructor(private store: StoreApi<AppStore>) {}
 
@@ -276,6 +277,10 @@ export class NodeBridge {
   }
 
   async boot(): Promise<void> {
+    // /reconnect can be pressed repeatedly; without this each press would spawn
+    // another uvicorn, and only the last one stays tracked for cleanup.
+    if (this.booting) return;
+    this.booting = true;
     try {
       const server = await ensureLocalServer();
       this.s.set({
@@ -305,8 +310,11 @@ export class NodeBridge {
         mode: "chat",
         panel: "welcome",
         statusLine: `Boot failed: ${message}`,
-        welcomeNotice: { text: message, tone: "error" },
+        // Without a baseUrl every other command dead-ends, so name the way back out.
+        welcomeNotice: { text: `${message}\nFix the problem, then run /reconnect to retry.`, tone: "error" },
       });
+    } finally {
+      this.booting = false;
     }
   }
 
@@ -408,7 +416,9 @@ export class NodeBridge {
   async openTokenStats(): Promise<void> {
     const { baseUrl } = this.s;
     if (!baseUrl) {
-      this.s.set({ statusLine: "Shell is not ready yet." });
+      // Land on chat rather than the caller's panel: Tab cycles through here, and
+      // staying put would make the key look dead.
+      this.s.set({ panel: "chat", statusLine: "Shell is not ready yet." });
       return;
     }
     const requestId = ++this.tokenStatsRequestId;
@@ -426,7 +436,10 @@ export class NodeBridge {
 
   async openRunExplorer(): Promise<void> {
     const { baseUrl } = this.s;
-    if (!baseUrl) return;
+    if (!baseUrl) {
+      this.s.set({ panel: "chat", statusLine: "Shell is not ready yet." });
+      return;
+    }
     const requestId = ++this.observabilityRequestId;
     this.s.set({
       panel: "runs",
@@ -863,10 +876,18 @@ export class NodeBridge {
     if (next) {
       this.s.set({ pendingApproval: null, approvalResolving: false });
       void this.sendMessage(next.text, next.skillName).then((accepted) => {
-        if (!accepted) this.enqueueMessage(next.text, next.skillName);
+        if (accepted) return;
+        // The handoff was refused (a shell operation locked the input as the run ended).
+        // Requeue and go idle, otherwise the spinner would run forever with no request behind it.
+        this.enqueueMessage(next.text, next.skillName);
+        if (!this.activeRequest) this.goIdle();
       });
       return;
     }
+    this.goIdle();
+  }
+
+  private goIdle(): void {
     this.s.set({
       pendingApproval: null,
       approvalResolving: false,
@@ -939,9 +960,15 @@ export class NodeBridge {
     let reset = false;
     for await (const event of events) {
       if (!reset && event.type === "run_started") {
+        // Resuming into the current session skips loadSession, so this is the only
+        // place that rewinds the turn. Replayed events re-add every tool call and
+        // token, so the counters have to start from zero alongside the transcript.
+        clearTerminal();
         this.s.set({
           transcript: restartLatestTurn(this.s.transcript),
           transcriptEpoch: this.s.transcriptEpoch + 1,
+          toolActivity: createToolActivity(),
+          turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
           recoverableRunId: runId,
         });
         reset = true;

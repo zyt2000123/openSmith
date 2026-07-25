@@ -80,3 +80,9 @@ test("setup clears the review route when no review model is configured", () => {
   assert.deepEqual(result.routes, {});
   assert.deepEqual(result.timeout_profiles, {});
 });
+
+test("setup rejects a provider that only exists on Object.prototype", () => {
+  for (const provider of ["constructor", "toString", "valueOf"]) {
+    assert.throws(() => buildLlmConfigInput(draft({ provider })), /Compatible protocol/);
+  }
+});

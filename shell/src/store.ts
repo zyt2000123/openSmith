@@ -25,6 +25,7 @@ import { createEmptyConversation } from "./conversation.js";
 import { HISTORY_LIMIT } from "./history.js";
 import type { ModelPickerState } from "./model-picker.js";
 import type { QueuedMessage } from "./queue.js";
+import { clearTerminal } from "./term.js";
 import type { TokenTab } from "./token-stats.js";
 import {
   applyStreamEvent,
@@ -145,6 +146,8 @@ export type AppActions = {
 export type AppStore = AppState & AppActions;
 
 export const TRANSCRIPT_LIMIT = 200;
+/** How far a trim cuts back, so repaints are occasional instead of per-message. */
+export const TRANSCRIPT_TRIM_TARGET = 150;
 
 type HydrateOptions = {
   agent: AgentProfile;
@@ -172,6 +175,28 @@ function hydrateShellState(state: AppState, options: HydrateOptions): Partial<Ap
       ? "Ready, with warnings. Type / for commands."
       : "Ready. Type / for commands or @ for skills.",
   };
+}
+
+/**
+ * Ink's <Static> assumes its item list only ever grows: it prints `items.slice(index)`
+ * and never lowers `index`. Dropping the oldest entries therefore strands every later
+ * append — the terminal would silently stop showing new output. A truncating write has
+ * to wipe the screen and bump the epoch that remounts <Static>, exactly like /clear.
+ */
+function boundedTranscript(state: AppState, transcript: TranscriptEntry[]): Partial<AppState> {
+  if (transcript.length <= TRANSCRIPT_LIMIT) return { transcript };
+
+  // Trim in batches, not one-in-one-out: each trim costs a full repaint, so
+  // shedding a quarter buys TRANSCRIPT_LIMIT/4 quiet appends before the next one.
+  clearTerminal();
+  return {
+    transcript: limitTranscript(transcript, TRANSCRIPT_TRIM_TARGET),
+    transcriptEpoch: state.transcriptEpoch + 1,
+  };
+}
+
+function appendTranscript(state: AppState, entry: TranscriptEntry): Partial<AppState> {
+  return boundedTranscript(state, [...state.transcript, entry]);
 }
 
 function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState> {
@@ -235,7 +260,9 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
       approvalResolving: false,
       statusLine: "Approval required. Review the request and choose Allow or Deny.",
       toolActivity: applyToolActivity(state.toolActivity, event),
-      transcript: applyStreamEvent(state.transcript, event),
+      // The only stream event that appends an entry, so it needs the same bound
+      // as pushTurn/pushSystemLine — every other event edits the turn in place.
+      ...boundedTranscript(state, applyStreamEvent(state.transcript, event)),
     };
   }
 
@@ -324,11 +351,10 @@ export function createAppStore(initialHistory: string[] = []) {
             : [...s.inputHistory, text].slice(-HISTORY_LIMIT),
         historyIndex: -1,
       })),
-    pushSystemLine: (text, tone = "info") =>
-      set((s) => ({ transcript: limitTranscript([...s.transcript, createSystemEntry(text, tone)], TRANSCRIPT_LIMIT) })),
+    pushSystemLine: (text, tone = "info") => set((s) => appendTranscript(s, createSystemEntry(text, tone))),
     pushTurn: (userText) =>
       set((s) => ({
-        transcript: limitTranscript([...s.transcript, createTurnEntry(userText)], TRANSCRIPT_LIMIT),
+        ...appendTranscript(s, createTurnEntry(userText)),
         turnCount: s.turnCount + 1,
         turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
       })),

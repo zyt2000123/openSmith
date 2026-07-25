@@ -305,17 +305,13 @@ function HooksPanel() {
         <Box width={35}>
           <Text color={INFO}>Event</Text>
         </Box>
-        <Box width={11}>
-          <Text color={INFO}>Installed</Text>
-        </Box>
-        <Box width={9}>
-          <Text color={INFO}>Active</Text>
+        <Box width={24}>
+          <Text color={INFO}>Handler</Text>
         </Box>
         <Text color={INFO}>Description</Text>
       </Box>
       {LIFECYCLE_HOOKS.map((hook, index) => {
         const selected = index === selectedIndex;
-        const registrations = hook.handler ? 1 : 0;
         return (
           <Box key={hook.event} width="100%" backgroundColor={selected ? SELECTED_BACKGROUND : undefined}>
             <Box width={35}>
@@ -324,19 +320,14 @@ function HooksPanel() {
                 {hook.event}
               </Text>
             </Box>
-            <Box width={11}>
-              <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{registrations}</Text>
-            </Box>
-            <Box width={9}>
-              <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{registrations}</Text>
+            <Box width={24}>
+              <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{hook.handler}</Text>
             </Box>
             <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{hook.description}</Text>
           </Box>
         );
       })}
-      <Text color={MUTED}>
-        Counts describe built-in registrations; configurable or plugin hooks are not loaded yet.
-      </Text>
+      <Text color={MUTED}>Built-in dispatch points; configurable or plugin hooks are not loaded yet.</Text>
       <Text color={MUTED}>↑/↓ select · Enter view details · Esc close</Text>
     </Box>
   );
@@ -763,11 +754,7 @@ function completeSlashSelection(input: string, slashMenuOpen: boolean, items: Sl
   const selected = selectedSlashItem(input, slashMenuOpen, items, index);
   if (!selected) return false;
 
-  if (selected.kind === "skill" && selected.skill) {
-    armSkill(selected.skill);
-  } else {
-    getState().set({ inputValue: selected.command, statusLine: `Ready: ${selected.command}` });
-  }
+  getState().set({ inputValue: selected.command, statusLine: `Ready: ${selected.command}` });
   return true;
 }
 
@@ -822,7 +809,9 @@ async function submitWhileBusy(
       rememberSubmittedInput(input);
       return;
     }
-    completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex);
+    if (!completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
+      getState().set({ statusLine: `${input} is unavailable while Smith is working. Press Esc to cancel the run.` });
+    }
     return;
   }
   if (!bridge.enqueueMessage(payload, skill?.name)) return;
@@ -841,19 +830,10 @@ async function submitSlashCommand(
 ): Promise<boolean> {
   if (!input.startsWith("/") || hasExplicitSkill) return false;
 
+  // A highlighted palette entry wins over the raw text so a partial command still runs.
   const selected = selectedSlashItem(input, slashMenuOpen, slashItems, slashIndex);
-  if (selected?.kind === "command") {
-    rememberSubmittedInput(input);
-    await runShellCommand(selected.command, { bridge, exit, getState, workingDir: PROJECT_CWD });
-    return true;
-  }
-  if (completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
-    rememberSubmittedInput(input);
-    return true;
-  }
-
   rememberSubmittedInput(input);
-  await runShellCommand(input, { bridge, exit, getState, workingDir: PROJECT_CWD });
+  await runShellCommand(selected?.command ?? input, { bridge, exit, getState, workingDir: PROJECT_CWD });
   return true;
 }
 
@@ -991,7 +971,7 @@ function SmithApp() {
   const skillMentionIndex = useS((state) => state.skillMentionIndex);
 
   const activeSetupField = setupFieldAt(setupIndex, setupFlow);
-  const slashItems = useMemo(() => filterSlash(buildSlashItems(skills), inputValue), [inputValue, skills]);
+  const slashItems = useMemo(() => filterSlash(buildSlashItems(), inputValue), [inputValue]);
   const slashMenuOpen = mode === "chat" && inputValue.startsWith("/");
   const skillMentionMenuOpen = mode === "chat" && isSkillMentionQuery(inputValue);
   const skillMentions = useMemo(() => filterSkillMentions(skills, inputValue), [inputValue, skills]);

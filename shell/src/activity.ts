@@ -63,6 +63,12 @@ function changeStateCount(activity: ToolActivity, state: ToolState, name: string
   }
 }
 
+/**
+ * Bounded at TOOL_ACTIVITY_CALL_LIMIT by dropping settled calls; running ones stay so
+ * they can still be settled. Ceiling: past that many calls the dedupe key for a settled
+ * id is gone, so a re-sent tool_result for it would count twice. Nothing re-sends one
+ * today — a resumed run resets this map wholesale. Add an id->state ledger if that changes.
+ */
 function pruneCalls(calls: Record<string, ToolCall>): Record<string, ToolCall> {
   if (Object.keys(calls).length <= TOOL_ACTIVITY_CALL_LIMIT) return calls;
 
