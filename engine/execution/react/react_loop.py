@@ -317,13 +317,36 @@ def _should_repair_incomplete_final(
     )
 
 
-def _append_incomplete_final_repair(conversation: list[dict], text: str) -> None:
-    conversation.append({"role": "assistant", "content": text})
+def _assistant_turn(text: str, reasoning: str = "") -> dict[str, object]:
+    """构造一条 assistant 消息，按需带上 reasoning。
+
+    推理模型（thinking 模式）要求本轮 reasoning_content 原样回传，否则**下一次**请求会被
+    provider 整个以 400 拒收（实测 deepseek-v4-pro："The `reasoning_content` in the
+    thinking mode must be passed back to the API"）。非推理模型 reasoning 为空 → 字段
+    不出现，同一条路径同时支持两类模型，无需探测模型能力。
+
+    每一条"追加 assistant 消息后还会再发请求"的路径都必须走这里。收敛在一处是因为
+    第一次修复只补了工具调用那条，漏掉了长度续写与残句修复 —— 加第四条路径时别再漏。
+    conversation 本身是 OpenAI wire format（K6 记录的既有边界），故用 provider 字段名；
+    anthropic adapter 的翻译循环按 role 挑字段，会忽略它。
+    """
+    message: dict[str, object] = {"role": "assistant", "content": text}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return message
+
+
+def _append_incomplete_final_repair(
+    conversation: list[dict], text: str, reasoning: str = ""
+) -> None:
+    conversation.append(_assistant_turn(text, reasoning))
     conversation.append({"role": "system", "content": INCOMPLETE_FINAL_AFTER_TOOL_HINT})
 
 
-def _append_length_continuation(conversation: list[dict], text: str) -> None:
-    conversation.append({"role": "assistant", "content": text})
+def _append_length_continuation(
+    conversation: list[dict], text: str, reasoning: str = ""
+) -> None:
+    conversation.append(_assistant_turn(text, reasoning))
     conversation.append({"role": "system", "content": CONTINUE_AFTER_LENGTH_HINT})
 
 
@@ -623,7 +646,9 @@ async def react_event_loop(
             if response.finish_reason == "length":
                 if length_continuations < MAX_LENGTH_CONTINUATIONS:
                     length_continuations += 1
-                    _append_length_continuation(conversation, response.text)
+                    _append_length_continuation(
+                        conversation, response.text, response.reasoning
+                    )
                     continue
                 if final_text:
                     for provision_id in active_provision_ids:
@@ -675,7 +700,9 @@ async def react_event_loop(
                     yield _provisional_retract_event(provision_id, "incomplete_final_repair")
                 active_provision_ids.clear()
                 incomplete_final_repairs += 1
-                _append_incomplete_final_repair(conversation, final_text)
+                _append_incomplete_final_repair(
+                    conversation, final_text, response.reasoning
+                )
                 final_text_parts.clear()
                 final_text_was_streamed = False
                 continue
@@ -692,18 +719,16 @@ async def react_event_loop(
             return
 
         policy.begin_round()
-        conversation.append({
-            "role": "assistant",
-            "content": response.text,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
-                }
-                for tc in response.tool_calls
-            ],
-        })
+        assistant_message = _assistant_turn(response.text, response.reasoning)
+        assistant_message["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
+            }
+            for tc in response.tool_calls
+        ]
+        conversation.append(assistant_message)
 
         round_had_success = False
         round_had_failure = False

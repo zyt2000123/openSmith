@@ -129,6 +129,17 @@ class HTTPAdapterMixin:
                 f"{self._error_label} request failed after {MAX_RETRIES} attempts: {exc}"
             ) from exc
 
+    async def _error_detail(self, response: httpx.Response, *, limit: int = 500) -> str:
+        """Read a bounded slice of an error body so a 4xx says what was wrong."""
+        try:
+            raw = await response.aread()
+        except Exception:
+            return "<error body unavailable>"
+        compact = " ".join(raw.decode("utf-8", errors="replace").split())
+        if not compact:
+            return "<empty error body>"
+        return compact[:limit] + ("…" if len(compact) > limit else "")
+
     async def _read_bounded(
         self,
         method: str,
@@ -141,6 +152,17 @@ class HTTPAdapterMixin:
         response = await self._http.send(req, stream=True)
         try:
             if not response.is_success:
+                # stream=True 意味着响应体还没被读过，而 4xx 的排查成本几乎全在
+                # provider 那段"哪个字段非法"里。但它不能进异常消息 —— 异常会外泄
+                # 到日志与前端，而错误体常回显请求内容（含 prompt）。见
+                # test_request_failure_does_not_surface_provider_error_body。
+                # 折中：只落 debug 日志，排查时开 debug，默认零暴露。
+                logger.debug(
+                    "%s error body (HTTP %d): %s",
+                    self._error_label,
+                    response.status_code,
+                    await self._error_detail(response),
+                )
                 response.raise_for_status()
             chunks: list[bytes] = []
             total = 0
