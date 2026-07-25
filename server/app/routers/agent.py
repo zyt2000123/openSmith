@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from ..schemas.agent_profile import AgentProfileOut, AgentProfileUpdate
+from ..schemas.agent_profile import AgentProfileOut
 from ..schemas.auto_task import (
     AutoTaskCreate,
     AutoTaskOut,
@@ -22,15 +22,10 @@ from ..schemas.run import ApprovalDecision, RunStateOut
 from ..schemas.skill import SkillEnabledUpdate, SkillSummaryOut
 from ..schemas.mcp import McpServerOut
 from ..schemas.observability import AgentHealthOut, RunDiagnosisOut, RunImprovementProposalOut, RunIncidentOut, RunSummaryOut, RunTraceEventOut
-from ..schemas.task import TaskCreate, TaskOut
 from ..schemas.token_stats import TokenStatsOut
 from ..services.agent_service import AgentService
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
-
-
-class FileContent(BaseModel):
-    content: str
 
 
 def get_agent_service() -> AgentService:
@@ -45,14 +40,6 @@ async def get_profile(svc: AgentService = Depends(get_agent_service)):
 @router.post("/ensure", response_model=AgentProfileOut, status_code=201)
 async def ensure_profile(svc: AgentService = Depends(get_agent_service)):
     return await svc.ensure_profile()
-
-
-@router.put("", response_model=AgentProfileOut)
-async def update_profile(
-    body: AgentProfileUpdate,
-    svc: AgentService = Depends(get_agent_service),
-):
-    return await svc.update_profile(body)
 
 
 @router.get("/sessions", response_model=list[SessionOut])
@@ -93,12 +80,6 @@ async def delete_session(
     await svc.delete_session(session_id)
 
 
-@router.get("/identities")
-async def list_identities(svc: AgentService = Depends(get_agent_service)):
-    """Expose the startup-scanned identity catalog for clients and CLI users."""
-    return await svc.list_identities()
-
-
 @router.get("/sessions/{session_id}/messages", response_model=list[MessageOut])
 async def list_messages(
     session_id: str,
@@ -107,22 +88,6 @@ async def list_messages(
     svc: AgentService = Depends(get_agent_service),
 ):
     return await svc.list_messages(session_id, limit=limit, offset=offset)
-
-
-@router.post("/sessions/{session_id}/messages", response_model=MessageOut, status_code=201)
-async def send_message(
-    session_id: str,
-    body: MessageCreate,
-    svc: AgentService = Depends(get_agent_service),
-):
-    return await svc.send_message(
-        session_id,
-        body.content,
-        context=body.context,
-        skill_name=body.skill_name,
-        identity_id=body.identity_id,
-        working_dir=body.working_dir,
-    )
 
 
 @router.post("/sessions/{session_id}/messages/stream")
@@ -161,39 +126,12 @@ async def list_mcp_servers(svc: AgentService = Depends(get_agent_service)):
     return await svc.list_mcp_servers()
 
 
-@router.get("/files")
-async def list_files(svc: AgentService = Depends(get_agent_service)):
-    return await svc.list_files()
-
-
-@router.get("/files/{filename}")
-async def get_file(
-    filename: str,
-    svc: AgentService = Depends(get_agent_service),
-):
-    return await svc.get_file(filename)
-
-
-@router.put("/files/{filename}")
-async def update_file(
-    filename: str,
-    body: FileContent,
-    svc: AgentService = Depends(get_agent_service),
-):
-    return await svc.update_file(filename, body.content)
-
-
 @router.put("/project-instructions", response_model=ProjectInstructionOut)
 async def initialize_project_instructions(
     body: ProjectInstructionInit,
     svc: AgentService = Depends(get_agent_service),
 ):
     return await svc.initialize_project_instructions(body.working_dir)
-
-
-@router.get("/stats")
-async def get_stats(svc: AgentService = Depends(get_agent_service)):
-    return await svc.get_stats()
 
 
 @router.get("/token-stats", response_model=TokenStatsOut)
@@ -285,19 +223,6 @@ async def resolve_run_approval(
     svc: AgentService = Depends(get_agent_service),
 ):
     return await svc.resolve_run_approval(run_id, body)
-
-
-@router.get("/tasks", response_model=list[TaskOut])
-async def list_tasks(svc: AgentService = Depends(get_agent_service)):
-    return await svc.list_tasks()
-
-
-@router.post("/tasks", response_model=TaskOut, status_code=201)
-async def create_task(
-    body: TaskCreate,
-    svc: AgentService = Depends(get_agent_service),
-):
-    return await svc.create_task(body)
 
 
 @router.get("/auto-tasks", response_model=list[AutoTaskOut])

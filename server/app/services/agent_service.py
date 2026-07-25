@@ -10,24 +10,19 @@ from engine.llm.model_config import SMITH_TEMPLATE_ID
 from ..infrastructure.repositories.auto_task_repo import AutoTaskRepo
 from ..infrastructure.repositories.agent_profile_repo import AgentProfileRepo
 from ..infrastructure.repositories.session_repo import SessionRepo
-from ..infrastructure.repositories.task_repo import TaskRepo
-from ..schemas.agent_profile import AgentProfileOut, AgentProfileUpdate
+from ..schemas.agent_profile import AgentProfileOut
 from ..schemas.auto_task import AutoTaskCreate, AutoTaskRunOut, AutoTaskUpdate
 from ..schemas.session import ContextCompressionOut, MessageOut, SessionOut
 from ..schemas.run import ApprovalDecision
-from ..schemas.task import TaskCreate, TaskOut
 from ..schemas.mcp import McpServerOut
 from .auto_task_service import AutoTaskService
 from .agent_profile_service import AgentProfileService
-from .profile_file_service import ProfileFileService
 from .project_instruction_service import ProjectInstructionService
 from .run_state_service import RunStateService
 from .session_service import SessionService
 from .skill_service import SkillService
 from .mcp_service import McpService
 from .observability_service import ObservabilityService
-from .stats_service import StatsService
-from .task_service import TaskService
 from .token_stats_service import TokenStatsService
 
 SMITH_NAME = "Smith"
@@ -45,11 +40,8 @@ class AgentService:
         *,
         agent_profile_service: AgentProfileService | Any | None = None,
         session_service: SessionService | Any | None = None,
-        task_service: TaskService | Any | None = None,
         auto_task_service: AutoTaskService | Any | None = None,
-        profile_file_service: ProfileFileService | Any | None = None,
         skill_service: SkillService | Any | None = None,
-        stats_service: StatsService | Any | None = None,
         run_state_service: RunStateService | Any | None = None,
         mcp_service: McpService | Any | None = None,
         token_stats_service: TokenStatsService | Any | None = None,
@@ -72,15 +64,12 @@ class AgentService:
             token_stats_service=self.token_stats_service,
             run_state_store=run_state_store,
         )
-        self.task_service = task_service or TaskService(TaskRepo(), agent_profile_repo)
         self.auto_task_service = auto_task_service or AutoTaskService(
             auto_task_repo,
             agent_profile_repo,
             session_repo,
         )
-        self.profile_file_service = profile_file_service or ProfileFileService()
         self.skill_service = skill_service or SkillService(agent_profile_repo)
-        self.stats_service = stats_service or StatsService()
         self.run_state_service = run_state_service or RunStateService(run_state_store or RunStateStore(AGENT_DIR))
         self.observability_service = observability_service or ObservabilityService(
             ObservabilityReader(AGENT_DIR)
@@ -106,11 +95,6 @@ class AgentService:
 
     async def get_profile(self) -> AgentProfileOut:
         return await self.ensure_profile()
-
-    async def update_profile(self, body: AgentProfileUpdate) -> AgentProfileOut:
-        profile = await self.ensure_profile()
-        updated = await self.agent_profile_service.update_profile(profile.id, body)
-        return AgentProfileOut(**updated.model_dump())
 
     async def _profile_id(self) -> str:
         return (await self.ensure_profile()).id
@@ -142,19 +126,6 @@ class AgentService:
     async def delete_session(self, session_id: str) -> None:
         await self.session_service.delete_session(await self._profile_id(), session_id)
 
-    async def list_identities(self) -> list[dict]:
-        from .engine_runtime import load_runtime_identity_catalog
-
-        return [
-            {
-                "id": identity.id,
-                "name": identity.name,
-                "description": identity.description,
-                "default": identity.is_default,
-            }
-            for identity in load_runtime_identity_catalog().identities
-        ]
-
     async def list_messages(
         self,
         session_id: str,
@@ -167,26 +138,6 @@ class AgentService:
             session_id,
             limit=limit,
             offset=offset,
-        )
-
-    async def send_message(
-        self,
-        session_id: str,
-        content: str,
-        *,
-        context: str | None = None,
-        skill_name: str | None = None,
-        identity_id: str | None = None,
-        working_dir: str | None = None,
-    ) -> MessageOut:
-        return await self.session_service.send_message(
-            await self._profile_id(),
-            session_id,
-            content,
-            context=context,
-            skill_name=skill_name,
-            identity_id=identity_id,
-            working_dir=working_dir,
         )
 
     async def stream_message(
@@ -251,24 +202,9 @@ class AgentService:
         await self._profile_id()
         return await self.mcp_service.list_servers()
 
-    async def list_files(self) -> list[dict]:
-        await self._profile_id()
-        return await self.profile_file_service.list_files()
-
-    async def get_file(self, filename: str) -> dict:
-        await self._profile_id()
-        return await self.profile_file_service.get_file(filename)
-
-    async def update_file(self, filename: str, content: str) -> dict:
-        await self._profile_id()
-        return await self.profile_file_service.update_file(filename, content)
-
     async def initialize_project_instructions(self, working_dir: str) -> dict:
         result = await self.project_instruction_service.initialize(working_dir)
         return result.model_dump()
-
-    async def get_stats(self) -> dict:
-        return await self.stats_service.get_agent_stats(await self._profile_id())
 
     async def get_token_stats(self, year: int | None = None) -> dict:
         await self.token_stats_service.sync_from_traces()
@@ -305,12 +241,6 @@ class AgentService:
             decision.approval_id,
             approved=decision.approved,
         )
-
-    async def list_tasks(self) -> list[TaskOut]:
-        return await self.task_service.list_tasks(await self._profile_id())
-
-    async def create_task(self, body: TaskCreate) -> TaskOut:
-        return await self.task_service.create_task(await self._profile_id(), body)
 
     async def list_auto_tasks(self):
         return await self.auto_task_service.list_auto_tasks(await self._profile_id())

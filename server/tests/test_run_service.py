@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -58,3 +59,23 @@ def test_run_state_service_resolves_live_approval_for_current_agent(tmp_path: Pa
 
     assert resolved.status == "running"
     assert resolved.reason == "approval_granted"
+
+
+def test_approval_resolution_stays_synchronous_end_to_end() -> None:
+    """审批批复先落库、后唤醒 broker，这个顺序只在整条链全同步时才安全。
+
+    单线程事件循环下 is_pending 检查到 resolve() 之间没有其他协程能插进来，所以
+    当前顺序没有竞态。一旦其中任何一环变成 async（例如把 RunStateStore 换成
+    aiosqlite），落库成功而唤醒失败就会让等待审批的引擎协程永远挂住。把"全同步"
+    钉成不变量，改造存储的人会先撞到这条测试而不是线上挂死。
+    """
+    for func in (
+        RunStateService.resolve_approval,
+        RunStateStore.resolve_approval,
+        APPROVAL_BROKER.is_pending,
+        APPROVAL_BROKER.resolve,
+    ):
+        assert not inspect.iscoroutinefunction(func), (
+            f"{func.__qualname__} 变成 async 会让审批唤醒出现真实竞态；"
+            "改造前请重新审视 RunStateService.resolve_approval 的落库/唤醒顺序"
+        )

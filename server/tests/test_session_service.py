@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -1006,3 +1007,108 @@ async def test_stream_message_marks_unhandled_engine_error_as_failed(monkeypatch
     assert any(event["event"] == "message" for event in events)
     done = json.loads(events[-1]["data"])
     assert done == {"id": None, "status": "failed", "reason": "server_execution_error"}
+
+
+@pytest.mark.asyncio
+async def test_stream_message_persists_visible_reply_when_the_consumer_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 SSE 断连是消费方协程被取消，不是 aclose()。
+
+    sse_starlette 在未配置 send_timeout 时不会显式 aclose body_iterator，断连由
+    task group 的 cancel scope 注入 CancelledError。上面那条 aclose() 测试走的是
+    GeneratorExit 路径；这条复现取消路径，锁定 finally + asyncio.shield 在取消下
+    同样保住已经发给客户端的回复。
+    """
+
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
+
+    streaming = asyncio.Event()
+
+    async def fake_engine_reply_events(request, runtime, services):
+        yield SimpleNamespace(type=SimpleNamespace(value="text_delta"), data={"text": "visible so far"})
+        streaming.set()
+        await asyncio.sleep(3600)  # 停在引擎等待点，等取消到达
+        yield SimpleNamespace(type=SimpleNamespace(value="text_delta"), data={"text": " never sent"})
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_run_stream_with_runtime",
+        _fake_run(fake_engine_reply_events),
+    )
+
+    # 落库要挂起并让测试知道自己进来了，才能在 cleanup 期间投第二次取消 ——
+    # Task.cancel() 只递送一次，单次取消下 finally 里的 await 本来就跑得完，
+    # asyncio.shield 真正防的是 cleanup 还在 await 时再次被取消。
+    persisting = asyncio.Event()
+
+    class SuspendingSessionRepo(FakeSessionRepo):
+        async def add_message(self, session_id: str, role: str, content: str) -> dict:
+            if role == "assistant":
+                persisting.set()
+                await asyncio.sleep(0.05)
+            return await super().add_message(session_id, role, content)
+
+    repo = SuspendingSessionRepo()
+    service = SessionService(repo, FakeAgentProfileRepo())
+
+    async def consume() -> None:
+        async for _ in service.stream_message("smith-id", "sess-1", "hello"):
+            pass
+
+    task = asyncio.create_task(consume())
+    await streaming.wait()
+    task.cancel()  # 断连：中断事件流，进入 finally
+    await persisting.wait()
+    task.cancel()  # cleanup 期间再次施压：没有 shield 就会丢掉这条回复
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # shield 让 inner 协程在 task 已经抛出之后继续跑完，所以要等它落完库再断言。
+    await asyncio.sleep(0.1)
+    assert ("sess-1", "assistant", "visible so far") in repo.saved_messages
+
+
+@pytest.mark.asyncio
+async def test_stream_message_reports_failed_status_when_persisting_the_reply_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """落库失败必须走成终态 failed + reply_persistence_failed，而不是静默完成。"""
+
+    class FailingSessionRepo(FakeSessionRepo):
+        async def add_message(self, session_id: str, role: str, content: str) -> dict:
+            if role == "assistant":
+                raise RuntimeError("database is locked")
+            return await super().add_message(session_id, role, content)
+
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
+
+    async def fake_engine_reply_events(request, runtime, services):
+        yield SimpleNamespace(type=SimpleNamespace(value="text_delta"), data={"text": "an answer"})
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_run_stream_with_runtime",
+        _fake_run(fake_engine_reply_events),
+    )
+
+    events = [
+        event
+        async for event in SessionService(FailingSessionRepo(), FakeAgentProfileRepo()).stream_message(
+            "smith-id",
+            "sess-1",
+            "hello",
+        )
+    ]
+
+    notices = [json.loads(event["data"])["text"] for event in events if event["event"] == "message"]
+    assert any("回复保存失败" in notice for notice in notices)
+    assert json.loads(events[-1]["data"]) == {
+        "id": None,
+        "status": "failed",
+        "reason": "reply_persistence_failed",
+    }

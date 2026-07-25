@@ -12,7 +12,6 @@ from fastapi import HTTPException
 from engine.execution.orchestration.agent_loop import (
     run_stream_with_runtime as engine_run_stream_with_runtime,
     resume_stream_with_runtime as engine_resume_stream_with_runtime,
-    reply_with_runtime as engine_reply_with_runtime,
 )
 from engine.observability import raw_text_delta
 from engine.execution.react.smith_ui import smith_ui_fallback, validate_smith_ui_call
@@ -281,55 +280,6 @@ class SessionService:
             raise HTTPException(404, "Session not found")
         rows = await self.session_repo.get_messages(session_id, limit=limit, offset=offset)
         return [MessageOut(**r) for r in rows]
-
-    async def send_message(
-        self,
-        agent_id: str,
-        session_id: str,
-        content: str,
-        context: str | None = None,
-        skill_name: str | None = None,
-        identity_id: str | None = None,
-        working_dir: str | None = None,
-    ) -> MessageOut:
-        selected_identity_id = await self._resolve_session_identity(
-            agent_id,
-            session_id,
-            content,
-            identity_id,
-        )
-
-        profile = await self.agent_profile_repo.get(agent_id)
-        profile_name = profile["name"] if profile else "Agent"
-
-        # Fetch recent history BEFORE saving the new message (avoids duplication)
-        history = await self._recent_history(session_id)
-
-        # Save user message
-        user_message = await self.session_repo.add_message(session_id, "user", content)
-
-        try:
-            runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
-            result = await engine_reply_with_runtime(
-                EngineRequest(
-                    message=content,
-                    history=history,
-                    context=context,
-                    forced_skill=skill_name,
-                    identity_id=selected_identity_id,
-                    working_dir=working_dir,
-                    message_id=user_message["id"],
-                ),
-                runtime,
-                services,
-            )
-            reply_text = result.text
-        except Exception:
-            logger.exception("send_message engine call failed (session=%s)", session_id)
-            reply_text = "执行失败（详情见服务端日志）"
-
-        msg = await self.session_repo.add_message(session_id, "assistant", reply_text)
-        return MessageOut(**msg)
 
     async def resume_run(
         self,

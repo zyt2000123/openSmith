@@ -83,7 +83,7 @@ Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 | Infrastructure | `common/` | 269 | Paths, SQLite connection, YAML read/write. Zero business logic. |
 | Execution | `engine/` | 16.5k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
 | Content | `agents/` | 4.0k | Smith identity seed, pipelines, gates, tools, skills, safety rules. Pure content. |
-| Platform | `server/` | 5.9k | FastAPI. Orchestration, session/agent lifecycle, 40 HTTP endpoints. |
+| Platform | `server/` | 5.9k | FastAPI. Orchestration, session/agent lifecycle, 34 HTTP endpoints. |
 | Terminal UI | `shell/` | 9.3k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
 
 Rules:
@@ -144,6 +144,20 @@ declaration stays in sync.
 - Safety changes: `tool_guard.py` is the non-bypassable boundary, `fact_gate.py`
   only challenges and can be retried. Keep the guard first — a test enforces it.
 
+### Working Rhythm
+
+Skills are matched passively; nothing chains them. Name the step you want:
+
+| Intent | Command |
+|---|---|
+| Turn a vague ask into a decided plan | `grill me` |
+| Execute a defined task | `/ecc:orch-fix-defect`, `/ecc:orch-add-feature`, `/ecc:orch-refine-code` |
+| Check a diff before it lands | `/ecc:code-review` |
+
+`grill me` stops at shared understanding — it does not hand off. The `orch-*`
+skills delegate to `ecc:orch-pipeline` (Research → Plan → TDD → Review → Commit,
+two human gates); invoke an operation skill, never the engine directly.
+
 ## 9. Testing And Verification
 
 ```bash
@@ -153,7 +167,7 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 523 passed, server 113 passed.
+Current baseline: engine 523 passed, server 116 passed.
 
 ## 10. Not Implemented Yet
 
