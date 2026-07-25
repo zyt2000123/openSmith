@@ -245,6 +245,109 @@ def test_the_probe_runs_once_across_two_requests(tmp_path):
     assert len(llm.calls) == 1
 
 
+# --- the messages actually reach the model --------------------------------
+#
+# 上面的测试证明 resolve_image_messages 造出了对的消息；这两条证明它们真的进了
+# 发给模型的请求。两条分发路径各走一次 —— 只测一条就会漏掉另一条，而"每个零件
+# 都对、接线断了"正是这类改动最容易犯的错。
+
+
+class _RecordingLLM:
+    provider = "openai"
+    model = "recorder"
+
+    def __init__(self) -> None:
+        self.seen: list[list[dict]] = []
+
+    async def chat(self, messages, tools=None, prefix_cache_key=None):
+        self.seen.append(messages)
+        return ChatResponse(text="Done. Evidence is in engine/llm/image_input.py for review.")
+
+
+def _image_block_reached(llm: _RecordingLLM) -> bool:
+    return any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for messages in llm.seen
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    )
+
+
+def _drive(route, chain, vision_messages) -> _RecordingLLM:
+    from engine.execution.orchestration.agent_loop import run_agent_stream
+    from engine.execution.pipeline.backtrack import FailureLoopGuard
+    from engine.skill.loader import SkillBody, SkillMeta
+
+    class _Tools:
+        def get_schemas(self):
+            return []
+
+    class _Skills:
+        def get(self, name):
+            return SkillBody(meta=SkillMeta(name=name), content="Do the work.")
+
+        def list_summaries(self):
+            return [{"name": "planning"}]
+
+    llm = _RecordingLLM()
+
+    async def run():
+        async for _ in run_agent_stream(
+            llm, "system prompt", "看这张图 shot.png",
+            _Tools(), _Skills(), route, chain, FailureLoopGuard(),
+            vision_messages=vision_messages,
+        ):
+            pass
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    return llm
+
+
+IMAGE_MESSAGE = [{
+    "role": "user",
+    "content": [
+        {"type": "text", "text": "[Attached image(s): shot.png]"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+    ],
+}]
+
+
+def test_the_direct_react_path_sends_the_image():
+    from engine.identity_catalog import IdentitySpec, RouteDecision
+
+    smith = IdentitySpec(
+        id="smith", name="Smith", description="", prompt="",
+        enabled_tools=None, enabled_skills=None, routes=(), is_default=True,
+    )
+    llm = _drive(RouteDecision(smith, "git", None, score=1), None, IMAGE_MESSAGE)
+
+    assert _image_block_reached(llm), "直接 ReAct 路径没把图片送出去"
+
+
+def test_the_pipeline_skill_path_sends_the_image():
+    """截图 + '修一下这个 bug' 会命中 coding 管线的 skill 节点，它自建消息列表。"""
+    from engine.execution.pipeline.gate import GateResult
+    from engine.execution.pipeline.skill_chain import SkillChain, SkillNode
+    from engine.identity_catalog import IdentitySpec, RouteDecision
+
+    class _PassingGate:
+        async def check(self, output, context):
+            return GateResult("pass", "")
+
+    smith = IdentitySpec(
+        id="smith", name="Smith", description="", prompt="",
+        enabled_tools=None, enabled_skills=None, routes=(), is_default=True,
+    )
+    llm = _drive(
+        RouteDecision(smith, "bugfix", "coding", score=1),
+        SkillChain([SkillNode("planning", _PassingGate())]),
+        IMAGE_MESSAGE,
+    )
+
+    assert _image_block_reached(llm), "管线 skill 路径没把图片送出去"
+
+
 # --- anthropic wire format ------------------------------------------------
 
 
