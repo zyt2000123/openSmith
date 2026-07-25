@@ -61,6 +61,8 @@ export type SetupDraft = {
   api_key: string;
   model: string;
   review_model: string;
+  /** Blank is a real choice: no vision route means images depend on the main model. */
+  image_model: string;
   max_output_tokens: string;
   routes: string;
   models: string;
@@ -324,6 +326,7 @@ export function createAppStore(initialHistory: string[] = []) {
       api_key: "",
       model: "gpt-4.1-mini",
       review_model: "",
+      image_model: "",
       max_output_tokens: "",
       routes: "",
       models: "",

@@ -29,6 +29,8 @@ class LLMUsage(str, Enum):
     INTERACTIVE = "interactive"
     GATE = "gate"
     BACKGROUND = "background"
+    # 图片解析路由。可以不配 —— 不配时能否处理图片完全取决于主模型。
+    VISION = "vision"
 
 
 _TIMEOUT_FIELDS = frozenset({"connect", "read", "stream_read", "write", "pool"})
@@ -38,6 +40,14 @@ _TIMEOUT_DEFAULTS: dict[LLMUsage, dict[str, float]] = {
         "read": 90.0,
         "stream_read": 120.0,
         "write": 30.0,
+        "pool": 10.0,
+    },
+    LLMUsage.VISION: {
+        # 比 interactive 宽松：图片要先编码上传，模型也要先看完图才吐第一个 token。
+        "connect": 10.0,
+        "read": 120.0,
+        "stream_read": 150.0,
+        "write": 60.0,
         "pool": 10.0,
     },
     LLMUsage.GATE: {

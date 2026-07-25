@@ -3,7 +3,7 @@ import { parseSmithUiPayload, type SmithUiPayload } from "./smith-ui-schema.js";
 
 export const CONTEXT_DISPLAY_WINDOW = 256_000;
 
-export type LlmUsage = "interactive" | "gate" | "background";
+export type LlmUsage = "interactive" | "gate" | "background" | "vision";
 export type LlmTimeoutField = "connect" | "read" | "stream_read" | "write" | "pool";
 
 export type LlmRoute = {
