@@ -53,6 +53,9 @@ class RuntimeServices:
     skill_registry: SkillRegistry
     gate_llm: LLMPort | None = None
     background_llm: LLMPort | None = None
+    # Only set when a distinct image model is configured. ``None`` means image
+    # support rests entirely on whether ``llm`` itself accepts images.
+    vision_llm: LLMPort | None = None
     tool_guard: ToolGuard | None = None
     mcp_clients: list[Any] = field(default_factory=list)
     mcp_session_pool: Any | None = None
@@ -83,7 +86,7 @@ class RuntimeServices:
 
         if self.owns_llm_clients:
             closed_llms: set[int] = set()
-            for llm in (self.background_llm, self.gate_llm, self.llm):
+            for llm in (self.background_llm, self.vision_llm, self.gate_llm, self.llm):
                 if llm is None or id(llm) in closed_llms:
                     continue
                 closed_llms.add(id(llm))

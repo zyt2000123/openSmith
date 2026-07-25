@@ -1,4 +1,4 @@
-"""One minimal probe to learn whether a model accepts images.
+"""One small probe to learn whether a model accepts images.
 
 Neither of the usual answers holds up: a config flag puts the burden on the
 user and goes stale, and a model-name table misses every model released after
@@ -22,10 +22,17 @@ from engine.llm.observability import llm_purpose
 
 logger = logging.getLogger(__name__)
 
-# 1x1 transparent PNG — the smallest legal image, 67 bytes decoded.
-_PIXEL_PNG = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/"
-    "q842iQAAAABJRU5ErkJggg=="
+# 64x64 PNG, 154 bytes: a black square on white.
+#
+# Deliberately not a 1x1 pixel. A relay answered that one with
+# HTTP 400 "You uploaded an unsupported image" — a verdict on the *image*,
+# which _classify cannot tell apart from a verdict on image support, so a
+# vision-capable model came back "unsupported". 64x64 clears every minimum
+# dimension in the wild while staying one image tile.
+_PROBE_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAYUlEQVR42u3asQkAIAxFQb+4"
+    "/8pxhhQi4r0+4EGagKmq8XJzPB4AAAAAAAAAAADAvVZ3IMnRB3XvEysEAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAA0C7+CwEAAAAAAAAAAAB8C9iYUQl7FJC2bQAAAABJRU5ErkJggg=="
 )
 
 _PROBE_PROMPT = "Reply with: ok"
@@ -64,7 +71,7 @@ def _probe_messages() -> list[dict[str, Any]]:
                 {"type": "text", "text": _PROBE_PROMPT},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{_PIXEL_PNG}"},
+                    "image_url": {"url": f"data:image/png;base64,{_PROBE_PNG}"},
                 },
             ],
         }

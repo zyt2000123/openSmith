@@ -45,6 +45,21 @@ def test_the_probe_actually_sends_an_image():
     assert any(part.get("type") == "image_url" for part in content)
 
 
+def test_the_probe_image_is_large_enough_to_be_accepted():
+    """真调发现的假阴性：1x1 像素被 provider 以 400 "unsupported image" 拒收，
+    而 _classify 无法把"这张图不合法"和"不支持图片"区分开，于是能读图的
+    gpt-5.2 被判成 unsupported。探测图必须在各家最小尺寸之上。"""
+    import base64
+    import struct
+
+    from engine.llm.vision_probe import _PROBE_PNG
+
+    raw = base64.b64decode(_PROBE_PNG)
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n", "探测载荷必须是真 PNG"
+    width, height = struct.unpack(">II", raw[16:24])
+    assert width >= 32 and height >= 32, f"{width}x{height} 太小，会被当成非法图片"
+
+
 def test_a_4xx_rejection_means_unsupported():
     llm = _Provider(LLMResponseError("LLM request failed (HTTP 400) after 1 attempt(s)."))
 

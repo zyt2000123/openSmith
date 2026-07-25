@@ -278,11 +278,42 @@ def test_build_engine_runtime_selects_interactive_gate_and_background_clients(mo
         model_config.LLMUsage.INTERACTIVE,
         model_config.LLMUsage.GATE,
         model_config.LLMUsage.BACKGROUND,
+        model_config.LLMUsage.VISION,
     ]
     assert services.llm is clients[0]
     assert services.gate_llm is clients[1]
     assert services.background_llm is clients[2]
+    # 这里的 fake 给每个 usage 不同的 model，等价于"配了独立图片模型"。
+    assert services.vision_llm is clients[3]
     assert services.owns_llm_clients is False
+
+
+def test_build_engine_runtime_skips_the_image_client_when_no_image_model_is_set(monkeypatch) -> None:
+    """未配 image model 时 vision 路由继承主模型（resolve_llm_config 的既有行为）。
+
+    此时必须是 None：白建一个客户端只会多占一条 httpx 连接，更糟的是
+    engine 会以为存在一个可回落的图片模型，而它其实和读不了图的主模型是同一个。
+    """
+    clients: list[object] = []
+
+    def fake_resolve(*, usage: model_config.LLMUsage) -> dict:
+        return {
+            "usage": usage.value,
+            "provider": "openai",
+            "model": "one-model-for-everything",
+            "base_url": "https://provider.example/v1",
+        }
+
+    monkeypatch.setattr(engine_runtime, "resolve_llm_config", fake_resolve)
+    monkeypatch.setattr(engine_runtime, "build_llm_client", lambda config: clients.append(config) or object())
+    monkeypatch.setattr(engine_runtime, "load_runtime_identity_catalog", lambda: object())
+    monkeypatch.setattr(engine_runtime, "ToolRegistry", lambda: object())
+    monkeypatch.setattr(engine_runtime, "SkillRegistry", lambda: object())
+    monkeypatch.setattr(engine_runtime, "ToolGuard", lambda _path: object())
+
+    _, services = engine_runtime.build_engine_runtime("smith-id", "Smith")
+
+    assert services.vision_llm is None
 
 
 def test_llm_client_manager_reuses_clients_for_identical_config(monkeypatch) -> None:

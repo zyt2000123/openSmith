@@ -148,6 +148,12 @@ def build_engine_runtime(
     interactive_config = resolve_llm_config(**interactive_kwargs)
     gate_config = resolve_llm_config(usage=LLMUsage.GATE)
     background_config = resolve_llm_config(usage=LLMUsage.BACKGROUND)
+    # An omitted route inherits the base model, so an unset image model looks
+    # exactly like the interactive one here. Same model means there is nothing
+    # to fall back to: probing the main model already decides the outcome.
+    vision_config: dict[str, Any] | None = resolve_llm_config(usage=LLMUsage.VISION)
+    if vision_config and vision_config.get("model") == interactive_config.get("model"):
+        vision_config = None
     runtime = RuntimeContext(
         agent_id=agent_id,
         agent_name=agent_name,
@@ -161,6 +167,7 @@ def build_engine_runtime(
         llm=manager.get_for_config(interactive_config),
         gate_llm=manager.get_for_config(gate_config),
         background_llm=manager.get_for_config(background_config),
+        vision_llm=manager.get_for_config(vision_config) if vision_config else None,
         tool_registry=ToolRegistry(),
         skill_registry=SkillRegistry(),
         tool_guard=ToolGuard(SAFETY_RULES_PATH),
