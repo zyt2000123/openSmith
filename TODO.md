@@ -40,14 +40,73 @@
 
 ## 未闭环
 
+### 已修 · 真实运行暴露的故障（保留全过程，因为它是 e2e 层价值的唯一实证）
+
+- [x] **工具结果回灌后偶发 HTTP 400** —— 2026-07-25 由 e2e 冒烟抓到并当天闭环。
+      修复：`react_loop` 回灌 assistant 消息时，`response.reasoning` 非空则附加
+      `reasoning_content`。非推理模型 reasoning 为空 → 字段不出现，同一条路径同时支持两类
+      模型，无需探测模型能力。回归：`engine/tests/test_reasoning_roundtrip.py`（3 条，含
+      多轮各自回传与非推理模型不多字段）。验证：e2e append 连续 5/5 通过（修前约 50% 失败）。
+      现象：`server/tests/test_e2e_smoke.py::test_e2e_smoke[append]` 轨迹为 `read_file` →
+      **下一次 LLM 请求 400**，流式（`adapters/openai.py:196`）与非流式回退
+      （`adapters/_http.py:117`）双双 400，端点 `/v1/chat/completions`。
+      **间歇**：同一条 case 在前一轮全跑里 PASSED，只调 `read_file` 的 `read` case 也稳定通过。
+      **根因已确认**（2026-07-25，循环跑 append 第 2 次复现，provider 错误原文）：
+      `OpenAI bad request: The 'reasoning_content' in the thinking mode must be passed back
+      to the API.`（`type: invalid_request_error`）
+
+      推理模型（当前 `deepseek-v4-pro`）返回 `reasoning` + `tool_calls` 后，engine 把 assistant
+      消息回灌进下一轮 conversation 时丢掉了 reasoning，provider 因此拒收整个请求。
+      间歇性来源：只有该轮真的产生了 reasoning、且后面还有请求（工具调用后继续）时才触发。
+      **修复要点（涉及抽象边界，别图快）**：`ChatResponse.reasoning` 是 engine 的中立字段，
+      `reasoning_content` 是 wire format。正确分工是 conversation 存中立的 reasoning，由 adapter
+      在构造请求体时翻译（OpenAI 兼容/deepseek → `reasoning_content`，Anthropic → `thinking`）。
+      **不要**在 `react_loop` 里直接写 provider 字段名。
+      落点：`react_loop.py` 追加 assistant 消息处（`"tool_calls": [` 一带）+ `adapters/openai.py`
+      的消息翻译处。
+      **留给后来人的教训**：636 条 mock 测试全绿却漏掉它 —— 因为 mock 的 LLM 从不校验请求体
+      合法性，而这个 bug 的全部内容就是"请求体不合法"。这不是测试写得不够多，是 mock 层的
+      结构性盲区，再加 600 条也一样漏。这也是 e2e 那 5 条存在的全部理由。
+
 ### P1 · harness 完整性
 
 - [ ] **工具调用串行执行**
       `react_loop` 拿到多个 tool_call 后是 `for tc in response.tool_calls:` 逐个 await。
       模型一次返回 3 个独立读取，要串 3 轮 I/O。
       **难点**：并行会破坏审批语义 —— 两个工具并发跑，一个触发审批阻塞时另一个可能已经写了文件。
-      **验收**：`side_effect: none` 的工具并行、其余串行（Rich Tool Contract 的并发属性已声明
-      `safe`/`serial`，目前无人消费）；补"并行读 + 串行写混合调用"与"并行中途触发审批"两个测试。
+      **已量，结论：暂不做**（2026-07-25 录制 e2e 五条，11 个模型回合）：
+
+      | 一次返回的 tool_call 数 | 回合数 | 占比 |
+      |---|---|---|
+      | 0 | 3 | 27% |
+      | 1 | 8 | 73% |
+      | **>1** | **0** | **0%** |
+
+      `deepseek-v4-pro` 从不一次返回多个 tool_call → **并行执行的收益为零，没有可并行的对象**。
+      Claude Code 做这个优化是因为 Claude 经常一次返回多个 tool_use，那是模型行为不是通用事实。
+      顺带测到：11/11 回合都带 reasoning（100%），印证上面 reasoning_content 那条修复的必要性。
+      **重测触发条件**：换成 Claude/GPT 一类模型，或换 provider 后。样本仅 11 回合且任务简单，
+      复杂任务可能不同；重测用 `AGENT_SMITH_RECORD_LLM` 录真实会话即可。
+      **原局限已消除**（同日）：测量时录制强制非流式，同批 e2e 流式 5/5、录制模式 2/5。
+      改成流式保真录制后录制模式回到 5/5 —— 差异确实来自强制非流式，不是模型随机。
+      上面 11 回合的样本是非流式录的，占比结论仍成立但样本偏小；换模型后按流式重录即可
+      （流式录的是事件序列，统计多工具需从 `response.function_call_arguments.delta` 解析）。
+
+      **参考实现**（claude-code 快照 `src/services/tools/toolOrchestration.ts`，188 行）：
+      1. `partitionToolCalls` 把一批 tool_use 分成 batch：要么「1 个非并发安全工具」，
+         要么「多个**连续**的并发安全工具」。**保序，不重排** —— 「读 a、写 b、读 c」不会把
+         a 和 c 并到一起跨过 b。这是最容易做错的一点。
+      2. `isConcurrencySafe(parsedInput)` **接收参数**，按实际调用判定而非按工具类型
+         （同一 shell 工具 `ls` 安全、`rm` 不安全）。Agent-Smith 已有更细的等价物：
+         `fact_gate._is_read_only_shell/_is_read_only_git/_is_read_only_sed`，一份判定两个用途。
+      3. **三重保守**：参数解析失败→不安全、判定抛异常→不安全、未声明→默认不安全。
+      4. 并发跑法 `all(generators, getMaxToolUseConcurrency())` —— 有并发上限，不是无限 fan-out。
+      5. 并发批内的 context 修改**排队到批结束后统一应用**，避免并发写竞争。
+      **审批不必并行**：`ApprovalBroker._pending` 本就支持多 pending（每个独立 Event），但
+      `RunState` 只有单个 `approval_id`。不用改 —— Claude Code 靠「需要审批的工具天然不进并发批」
+      消解问题，而非并行审批。并行审批还会引入"拒绝其一时另一个已落盘"的无回滚状态。
+      **验收**：`side_effect: none` 的工具并行、其余串行（Rich Tool Contract 的 `safe`/`serial`
+      已声明无人消费）；测试覆盖"读写混合保序分批"、"判定抛异常时退化为串行"、"并发上限生效"。
 
 - [ ] **回归 Eval Harness**（原 P1 条目重定义）
       现状：完全没有。`safety/eval_guard.py` 只是 30 行敏感词检测，与 eval 无关（名字撞车）。
