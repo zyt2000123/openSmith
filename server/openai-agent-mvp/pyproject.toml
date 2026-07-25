@@ -1,9 +1,0 @@
-[project]
-name = "openai-agent-mvp"
-version = "0.1.0"
-description = "OpenAI Agent SDK 最小 MVP 实战 - 本地文件助手"
-requires-python = ">=3.10"
-dependencies = [
-    "openai-agents>=0.0.7",
-    "python-dotenv>=1.0.0",
-]
