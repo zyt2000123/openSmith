@@ -1,133 +1,160 @@
 # Agent-Smith TODO
 
 > 维护规则：完成一项立即勾选；范围、依赖或验收标准变化时同步更新。
-> 当前目标：深化单常驻 Agent 运行时，不恢复 `employees` 多角色产品模型。
+> **以代码为准**：任何条目与代码冲突时，先核实代码再改本文件。行号会随重构失效，
+> 引用优先写符号名（`react_loop._will_compact`）而非行号。
+> 当前目标：把单常驻 Agent 运行时补成一个完整 harness，不恢复多角色产品模型。
+>
+> 基线（2026-07-25 实测）：engine 523 passed / server 113 passed / shell 198 passed。
+> engine 16.5k 行源码 + 13.4k 行测试，依赖方向 `server → engine → common` 已由 import
+> graph 验证（`tool→execution`、`mcp→execution` 两处反向引用仅在 `TYPE_CHECKING` 内）。
 
-## 状态
+---
 
-- [x] 完成主流 Agent 设计调研
-- [x] 审计当前 Runtime、Tool、Checkpoint、Memory、Event 主路径
-- [x] 运行相关基线测试：21 passed
-- [x] 完成 engine 宏观设计评审（R1–R8）与内核深查（K1–K6），见下方"设计评审发现"
-- [ ] 确认分批交付范围与 Sandbox/UI 边界
-- [ ] 完成架构设计并取得确认
-- [ ] 编写实施计划
+## 已闭环
 
-## 可靠性内核首批进展（2026-07-14）
+2026-07-10 的宏观评审（R1–R8）与内核深查（K1–K6）已收口，逐条状态见文末《评审条目归档》。
+三批 P0 全部完成：
 
-- [x] Rich Tool Contract 基础字段、结构化工具错误、超时与旧 `TOOL_META` 兼容
-- [x] RunState 恢复入口与副作用工具 SQLite 幂等账本
-- [x] 本地 JSONL Trace Store，支持脱敏、截断且写入失败不阻断主任务
-- [x] 自动任务租约、并发 claim、指数退避重试与重试计数迁移
-- [x] ExecutionEnvironment 协议 + LocalExecutionEnvironment，shell/git 进程执行收口到环境层，registry 按签名注入（`engine/tool/environment.py`，2026-07-15）
-- [ ] 完整审批恢复协议、取消语义、Eval Harness 与 Context/Session/Memory 完整分离
+- **Rich Tool Contract** —— `engine/tool/interface.py` ToolDefinition：side_effect / 并发属性 /
+  审批策略 / 执行环境 / timeout / idempotency，registry、policy、trace、审批 SSE 共用同一份元数据
+- **Run State 状态机与 Checkpoint** —— `engine/execution/orchestration/run_state.py`：显式
+  `RunStatus` + 合法转换表 + 原子保存；`tool_ledger` SQLite 幂等账本 + `_apply_crash_checkpoint`
+  消费崩溃遗留 checkpoint 续跑
+- **Permission / Approval / ExecutionEnvironment 分层** —— `safety/tool_policy.py` PolicyChecker 链
+  （硬 guard 先于软挑战）、`sandbox/host.py` ExecutionEnvironment 协议、shell/git 进程执行收口到环境层
+- **持久化 Trace** —— `observability/trace_store.py` 本地 JSONL，敏感键脱敏 + 深度/长度截断 +
+  写入失败不阻断主任务；`recorder → projections → incidents → diagnosis → proposals` 归因链已通
+- **取消与重启恢复** —— 两条路径都已接线并有测试：
+  - *重启*：`RunStateStore.recover_interrupted()` 由 `server/app/main.py` 在启动时调用，把
+    QUEUED / RUNNING / WAITING_APPROVAL 的遗留 run 清掉审批字段并转 `CANCELLED("server_restarted")`；
+    `CANCELLED` 是可 resume 状态，配合 `tool_ledger` 幂等账本避免副作用重放。测试 `test_run_state.py`。
+  - *消费者断连*：`_run_events_with_runtime` 的 `finally` 检查 `drained`，未跑完则写
+    `CANCELLED("consumer_disconnected")` + `services.close()` + `APPROVAL_BROKER.cancel_run(run_id)`；
+    首个事件前就断连走 `_cancel_unstarted_run`。测试 `test_runtime_contract.py`（4 处断言）。
+  - **注意别误判**：`ApprovalBroker._pending` 是内存态属**有意设计** —— 挂起的 ReAct 帧本来就活不过
+    进程重启，所以重启后转 CANCELLED 让用户重试是正确行为，不是缺陷。同理，取消不经
+    `CancelledError` 而经 async generator 的 `finally`/`aclose()`，`grep CancelledError` 不是判据。
 
-## 设计评审发现（2026-07-10 · engine 宏观 + 内核深查）
+---
 
-> 图解与证据：https://claude.ai/code/artifact/e1368e55-bf8d-4f39-a805-0a72434e2865 （R1–R8 对应评审页 P1–P8）。
-> 行号以 2026-07-10 工作区为准。各条标注了与下方 P0/P1 计划的归属关系；标"未覆盖"的是现有计划缺口。
+## 未闭环
 
-### 高
+### P1 · harness 完整性
 
-- [x] R1 `run_agent` 与 `run_agent_stream` 双实现已漂移 —— 已收敛：sync 版删除，只剩 `run_agent_stream` 单一实现（2026-07-15 验证）
-- [ ] R2 `execute_skill` 用 SKILL.md 替换整个 system prompt，身份/记忆/历史全丢，前序输出以 dict repr 无预算灌入（`skill/executor.py:28`、`agent_loop.py:130`；归属：Context/Session 分离，需补"技能节点上下文交接"验收项）
-- [ ] R3 关键词路由独自决定是否进重型链；`route_task_with_llm`（LLM 兜底 + `[direct]` 覆写）全仓库无调用方（`execution/task_router.py:89`、`agent_loop.py:503`；未覆盖）
+- [ ] **工具调用串行执行**
+      `react_loop` 拿到多个 tool_call 后是 `for tc in response.tool_calls:` 逐个 await。
+      模型一次返回 3 个独立读取，要串 3 轮 I/O。
+      **难点**：并行会破坏审批语义 —— 两个工具并发跑，一个触发审批阻塞时另一个可能已经写了文件。
+      **验收**：`side_effect: none` 的工具并行、其余串行（Rich Tool Contract 的并发属性已声明
+      `safe`/`serial`，目前无人消费）；补"并行读 + 串行写混合调用"与"并行中途触发审批"两个测试。
 
-### 中
+- [ ] **回归 Eval Harness**（原 P1 条目重定义）
+      现状：完全没有。`safety/eval_guard.py` 只是 30 行敏感词检测，与 eval 无关（名字撞车）。
+      13.4k 行测试测的是"代码没坏"，测不出"改了 prompt 层次或循环判定后 agent 变笨了"。
+      **不采用公开 benchmark**：Terminal-Bench 2.0 / τ²-bench / SWE-bench 测的是解题排名，
+      要 Docker + 每轮几小时几十美元，且与单常驻 Agent + 记忆 + 技能链的形态不匹配。
+      **分两层做，不要混**：
+      1. *任务式 e2e 冒烟*（参考 neovate-code `e2e/fixtures/`）：`{cliArgs: 自然语言, test: 断言}`
+         配隔离工作区，真调 LLM，**断言世界状态而非模型文本**（文件真的被写了）+ 轮次上限。
+         5–10 条，捕"harness 接线断了"。engine 现有 523 个测试全部 mock LLM，这一层是零。
+      2. *trace replay 回归*：`observability/trace_store.py` 已经在落 JSONL，把真实运行的 trace
+         固化成 golden case，重放时 LLM 走录制回放（不真调），断言决策序列不漂移。快、免费。
+      **边界（别误用）**：trace replay 只在模型响应不变时有效 —— 改截断算法、压缩时机、门禁判据、
+      路由规则、状态转换时管用；**改 prompt 内容或换模型时失效**，因为录制的响应由旧 prompt 产生，
+      新 prompt 配旧响应这个组合从未真实发生过。它捕的是 harness 逻辑漂移，不是 prompt 质量。
+      **验收**：第 1 层 5–10 条 e2e，真调 LLM，手动触发；第 2 层 30 条 golden trace
+      （覆盖 outcome / trajectory / safety / recovery 四类），命令行入口，全量 <5 分钟。
+      本项目不引 CI，第 2 层挂 `.git/hooks/pre-push`（非 pre-commit，太吵）；检索质量与
+      过期记忆各占至少 3 条。
 
-- [ ] R4 13 个门禁 11 个纯正则，只读模型自述、不接工具执行事实；rubric 错误词检查惩罚诚实汇报；LLMGate 复核异常静默通过（`execution/gate.py`；可并入回归 Eval 思路）
-- [ ] R5 运行时按每条消息重建：MCP stdio 子进程每次 spawn/断开，`RuntimeServices` 生命周期归属需明确决策（`agent_loop.py:466/:679`；归属：ExecutionEnvironment）
-- [x] R6 checkpoint 只写不读 —— 已接线：`agent_loop._apply_crash_checkpoint` 消费崩溃遗留 checkpoint（同 route + 同消息则跳过已完成节点续跑，否则清除陈旧文件）；`run_pipeline` 支持 `start_node_idx`。测试：`test_agent_stream_checkpoint.py`（2026-07-15）
+- [ ] **Hook 只有合并模式，没有生命周期切点**
+      `HookType` 的五个值是 first / series / series_merge / series_last / parallel ——
+      描述的是"多个 handler 的返回值怎么合并"，不是"在哪个时刻切入"。真正的切点硬编码在
+      `agent_loop._ensure_memory_lifecycle_hooks` 里。
+      **验收**：定义 PreToolUse / PostToolUse / SessionStart 一类生命周期点并对外可注册；
+      memory 生命周期改为通过该机制注册，`agent_loop` 不再硬编码。
 
-### 低
+- [ ] **技能节点上下文交接**（原 R2，确认仍在）
+      `skill/executor.py:_skill_conversation` 用 SKILL.md 顶替整个 system prompt，身份、记忆、
+      工具策略、已装技能清单全部丢失；前序节点输出以 `Context: {context}` 的 dict repr 无预算灌入。
+      **验收**：技能节点复用 `context/assembler.py` 的层叠结果（SKILL.md 作为 Workflow 层叠加，
+      不是替换）；前序输出走预算裁剪；补"技能节点仍能看到身份与记忆"的断言。
 
-- [ ] R7 engine 硬编码 agents 层技能名；技能缺失静默降级为伪技能提示，且两分支上下文构造不一致（`execution/skill_chain.py:70`、`agent_loop.py:117`）
-- [x] R8 硬截断切断 tool_use/tool_result 配对 → API 400 —— 已修：截断切点回退到轮次边界（`react_loop.py` CONVERSATION_HARD_LIMIT 分支）；2026-07-15 补齐回归测试（切点落 tool 串中间、巨型 tool 轮保留完整对话，`test_react_budget.py::test_hard_limit_*`）。三套机制（prune/compact/硬截断）已在 `react_event_loop` 单点顺序编排
+- [ ] **Gate 判据不接执行事实**（原 R4 残余）
+      LLMGate 的异常静默通过与 retry_hint 丢弃都已修（异常现在 fail，retry_hint 经
+      `CTX_RETRY_HINT` 回流）。剩下的真问题是：门禁只读节点的 **output 文本**，读不到
+      `tool_ledger` / trace 里的真实执行事实，所以模型自述"我已经跑过测试"就能过门。
+      **验收**：gate 的 `context` 里带上本节点的工具调用事实（哪些工具、成功与否）；
+      至少一个门禁改为以执行事实而非文本为判据。
 
-### 内核深查（压缩子系统应算进内核验收范围）
+### P2 · 结构债
 
-> 第一批（内核）已修复并通过测试：engine 全量 53 passed。新增 `test_llm_client.py`，
-> 扩充 `test_compression.py`（中文密度、工具证据入摘要）。修复前先写会失败的测试验证。
+- [ ] **`agent_loop.py` 1305 行 / 37 个顶层函数**
+      8 个 `_bind_*_tool` 把内置工具接线硬编码进编排层 —— 加一个工具就要改 harness 里最该稳定的文件。
+      **验收**：工具绑定改为声明式注册，`agent_loop` 只负责调度；文件降到 600 行以下且测试不变。
 
-- [x] 循环骨架判定健康：`react_event_loop` 单一实现 + 三个收集器（`react_loop`/`react_stream_loop`），预算与修复设计无需重构
-- [x] K1 token 估算改为 CJK 感知（汉字 1 字符/token，其余 //3），compact 不再在爆窗口后才触发（`execution/compression.py:42`）
-- [x] K2 compact 摘要输入纳入工具结果与工具调用意图，压缩不再抹掉任务证据（`compression.py:118-142`）
-- [~] K3 prune 单任务内不生效 —— **待决策，暂保持现状**：改动会让模型在任务中途丢失早期工具结果，风险高于收益；K1 修好后 compact 已能在正确时机兜底（`compression.py:62-76`）
-- [x] K4 `react_event_loop` 逐条 `dict(m)` 浅拷贝，prune/compress 不再污染调用方 history（`execution/react_loop.py:115`）
-- [x] K4.1 流式暂态文本在“长度截断 → 后续工具调用”时会撤回全部未提交 draft 并清空累计文本，避免旧片段被提交或持久化；已补回归测试（`execution/react_loop.py`、`tests/test_react_budget.py`）
-- [x] K5 `_request` 4xx（除 429）不再重试，仅 429 与 5xx 重试到上限（`llm/client.py:113-120`）
-- [ ] K6 对话中途插入 system 消息 + 裸透传，引擎锁定 OpenAI 兼容协议；换 Anthropic 原生需 client 层适配（记录边界，暂不动）（`react_loop.py:183`、`react_budget.py:84`）
+- [ ] **turn 级 ID 与 checkpoint 版本号**（原两处 `[~]`）
+      run_id 与 tool call_id 有，turn 级 ID 没有（trace 靠 per-run 序列号兜底）；checkpoint
+      原子保存有（临时文件 + 替换），显式版本号字段没有，坏格式只能靠解析失败识别。
+      **验收**：Trace 支持 run → turn → tool call 三层查询；checkpoint 带版本号，
+      跨版本读到旧格式显式拒绝而非猜测。
 
-## P0：Rich Tool Contract（回填 2026-07-15：实现于 `engine/tool/interface.py` ToolDefinition）
+- [ ] **上下文压缩只有单一策略**
+      `compress` / `compact_history` 是整段 LLM 摘要，没有"保留最近 N 轮 + 摘要更早"的分段策略，
+      也不度量压缩造成的信息损失。无子代理意味着长任务只能靠压缩撑，这里是单点。
+      **验收**：分段策略可配置；压缩前后对关键事实（文件路径、错误信息、决策）的保留率有度量并进 Eval。
 
-- [x] 为工具定义风险属性：`side_effect: none/write/external/destructive`
-- [x] 为工具定义并发属性：`safe`、`serial`
-- [x] 为工具定义审批策略：`never`、`policy`、`always`
-- [x] 为工具定义执行环境：`host`、`sandbox`、`either`（由 registry 环境匹配检查消费）
-- [x] 为工具定义 timeout、cancel、idempotency 和结果处理策略（`timeout_seconds`/`retryable`/`idempotent` + ToolResult `error_kind`/`timed_out`/`side_effect_status`）
-- [x] 保持现有 `TOOL_META + execute` 工具兼容（tool_guard 硬编码表作 fallback）
-- [x] 让 Registry、Policy、执行器、Trace 和 UI 消费同一份工具元数据（UI 经审批 SSE 事件间接消费）
-- [x] 补齐正常、非法配置、兼容和异常路径测试（`test_runtime_contract.py`、`test_tool_design_fixes.py`）
+- [ ] **四类数据的保留与删除规则**
+      `PromptAssembler`（本轮 Context）/ Session Store（server 层对话历史）/ `RunStateStore`
+      （执行与审批状态）/ `memory/`（跨会话事实）四者职责已分离，`memory/policy.py` 管视图策略。
+      缺的是统一的 ID、生命周期、保留期与删除规则说明。
+      **验收**：四类数据各写明 ID 来源、保留期、删除触发；有一条测试验证删除会话不留孤儿 run state。
 
-## P0：Agent Loop 状态机与可靠 Checkpoint（回填 2026-07-15：实现于 `engine/execution/run_state.py`）
+---
 
-- [x] 定义显式 `RunStatus` 与合法状态转换（`_ALLOWED_TRANSITIONS` + `RunStateTransitionError`）
-- [x] 分离 `RunState`、会话历史和 Durable Memory（RunState 不持久化 messages/工具参数）
-- [~] 为每次 run、turn、tool call 分配稳定 ID —— run_id 与 tool call_id 有；turn 级 ID 未做（trace 有 per-run 序列号兜底）
-- [~] 在关键状态转换后原子保存 versioned checkpoint —— 原子保存有（临时文件+替换）；显式版本号字段未做
-- [x] 支持完成、失败、取消、阻塞、预算耗尽和等待审批终态（阻塞/预算耗尽映射 `INCOMPLETE`）
-- [x] 恢复时避免重复执行已经完成的副作用（`tool_ledger.py` SQLite 幂等账本 + `_apply_crash_checkpoint`）
-- [x] 保持现有 SSE 事件和 SkillChain 行为兼容
-- [x] 补齐状态转换、崩溃恢复、坏 checkpoint 和重复恢复测试（`test_run_state.py`、`test_agent_stream_checkpoint.py`）
+## 已决策不做
 
-## P0：Permission / Approval / ExecutionEnvironment 分层（回填 2026-07-15）
+- **K3 prune 单任务内不生效** —— 保持现状。让 prune 在任务中途生效会让模型丢失早期工具结果，
+  风险高于收益；K1 修好 CJK token 估算后 compact 已能在正确时机兜底。
+- **Sandbox Adapter** —— 不实现。工具声明 `sandbox` 而环境不匹配时 registry 显式拒绝
+  （`error_kind=environment_unavailable`），不静默降级。
+- **子代理 / 多 Agent 路由** —— 产品决策（见 CLAUDE.md）。代价：长任务只能靠压缩不能靠委派隔离。
+- **工具结果缓存** —— 不做。`tool_ledger` 已负责重复调用决策，缓存属推测性优化。
+- **External Agent Adapter、常驻多 Agent** —— 没有真实需求前不加。
 
-- [x] `ToolPolicy` 只负责 allow、deny、require approval 决策（`engine/safety/tool_policy.py` PolicyChecker 链）
-- [~] 定义结构化 `ApprovalRequest`、`ApprovalDecision` 和恢复协议 —— ApprovalRequest/Broker + run_state `request_approval`/`resolve_approval` 已有；跨进程完整恢复协议见上方首批进展未完成项
-- [x] 定义小而深的 `ExecutionEnvironment` 接口（`engine/tool/environment.py` Protocol：`name` + `run_command`，shell/argv 双模式）
-- [x] 实现 `LocalExecutionEnvironment`（进程组终止、输出限流、取消与超时语义自 shell 工具收口）
-- [x] 确认并实现 Sandbox Adapter 的首期边界 —— 决策：不实现 adapter；工具声明 `sandbox` 而环境不匹配时 registry 显式拒绝（`error_kind=environment_unavailable`），不静默降级
-- [x] 确认 Shell 审批 UI 的首期边界 —— 决策：现有 ApprovalBroker + SSE 审批流即首期边界，UI 不变
-- [x] 将 shell/git 等副作用工具接入执行环境，不在工具内自行创建进程（registry 按 execute 签名注入 `environment`，agents 层零 engine import）
-- [x] 补齐拒绝、审批、取消、超时和环境失败测试（`test_execution_environment.py`、`test_approval.py`、`test_react_approval.py`）
-
-## P1：持久化 Trace 与回归 Eval
-
-- [ ] 定义 run → turn → tool call 层级 Trace Schema
-- [ ] 记录耗时、usage、权限、审批、错误、重试和 checkpoint
-- [ ] 实现本地 JSONL Trace Store
-- [ ] 对敏感参数和输出执行脱敏/截断
-- [ ] 建立固定 Eval 数据集和命令行运行入口
-- [ ] 覆盖 outcome、trajectory、safety、efficiency、recovery 指标
-- [ ] 为 Trace 写入失败设计不阻断主任务的降级行为
-
-## P1：Context / Session / Run State / Memory 分离
-
-- [ ] `PromptAssembler` 只负责本轮模型 Context
-- [ ] Session Store 只负责对话历史
-- [ ] Run State Store 只负责执行、审批和恢复状态
-- [ ] Durable Memory 只保存跨会话事实、偏好和经验
-- [ ] 明确四类数据的 ID、生命周期、保留和删除规则
-- [ ] 保留当前 project/agent memory scope 与 evidence
-- [ ] 增加 Context 预算、渐进加载和 compaction 验收案例
-- [ ] 增加错误记忆、过期记忆和检索质量 Eval
-
-## 推荐实施顺序
-
-1. [x] Rich Tool Contract
-2. [x] Run State 状态机与 Checkpoint（turn 级 ID、checkpoint 版本号两处小缺口见上）
-3. [~] Permission / Approval / ExecutionEnvironment（余：完整审批恢复协议与取消语义）
-4. [ ] 持久化 Trace
-5. [ ] 回归 Eval Harness
-6. [ ] Context / Session / Run State / Memory 完整分离
-7. [ ] Sandbox 与 Shell 审批体验增强
+---
 
 ## 全局约束
 
-- [ ] 保持依赖方向 `server → engine → common`
+- [x] 保持依赖方向 `server → engine → common`（import graph 已验证，仅 TYPE_CHECKING 反向）
+- [x] Engine 不依赖 FastAPI、HTTP 或产品实例管理概念
+- [x] `agents/` 不 import 任何其他层（registry 经 `exec_module` 加载，契约是 `TOOL_META` + `execute`）
 - [ ] Router 只做请求解析、调用和响应转换
-- [ ] Engine 不依赖 FastAPI、HTTP 或产品实例管理概念
 - [ ] 不覆盖或清理当前工作树中的用户改动
 - [ ] 所有行为变更遵循测试先行
 - [ ] 每个阶段必须通过相关单测、全量测试和运行时验证
-- [ ] 没有真实需求前不增加 External Agent Adapter 或常驻多 Agent
+
+---
+
+## 评审条目归档
+
+2026-07-10 评审的图解与证据：https://claude.ai/code/artifact/e1368e55-bf8d-4f39-a805-0a72434e2865
+
+| 编号 | 问题 | 状态 |
+|---|---|---|
+| R1 | `run_agent` / `run_agent_stream` 双实现漂移 | 已收敛，sync 版删除 |
+| R2 | `execute_skill` 顶替整个 system prompt | **仍在** → 见 P1「技能节点上下文交接」 |
+| R3 | `route_task_with_llm` 全仓库零调用方 | **仍在**（死代码，接线或删除二选一） |
+| R4 | 门禁纯正则 / LLMGate 异常静默通过 / retry_hint 丢弃 | 后两项已修；判据不接执行事实 → 见 P1 |
+| R5 | MCP stdio 每条消息 spawn/断开 | 已修，`mcp/session_pool.py` 按 session 复用 |
+| R6 | checkpoint 只写不读 | 已接线，`_apply_crash_checkpoint` + `run_pipeline(start_node_idx)` |
+| R7 | engine 硬编码 agents 层技能名 | 已修，pipeline 与 gate 均从 `agents/` 动态加载 |
+| R8 | 硬截断切断 tool_use/tool_result 配对 → API 400 | 已修，切点回退到轮次边界 + 回归测试 |
+| K1 | token 估算未考虑 CJK | 已修，汉字 1 字符/token |
+| K2 | compact 摘要抹掉工具证据 | 已修，工具结果与调用意图纳入摘要输入 |
+| K3 | prune 单任务内不生效 | 已决策保持现状 |
+| K4 | prune/compress 污染调用方 history | 已修，逐条浅拷贝 |
+| K4.1 | 长度截断后工具调用会提交陈旧 draft | 已修，撤回全部未提交 draft |
+| K5 | 4xx 也重试 | 已修，仅 429 与 5xx 重试 |
+| K6 | 锁定 OpenAI 兼容协议 | 已修，`AnthropicAdapter` 原生 `/v1/messages` + Gemini adapter |
