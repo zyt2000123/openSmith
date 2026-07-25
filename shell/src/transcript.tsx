@@ -7,10 +7,9 @@ import { useEffect, useState } from "react";
 import type { ToolState } from "./activity.js";
 import { CodeBlock, type CodeHighlighter } from "./code-block.js";
 import { DiffBlock } from "./diff-block.js";
-import { DisplayText } from "./display-text.js";
 import { splitMarkdownLayoutBlocks } from "./markdown-layout.js";
+import { type MarkdownSegment, splitMarkdownBlocks } from "./markdown-segments.js";
 import { MarkdownTableBlock } from "./markdown-table.js";
-import { type MarkdownSegment, renderMermaidDiagram, renderSimpleTextDiagram, splitMarkdownBlocks } from "./mermaid.js";
 import { stripEmojiIcons } from "./output.js";
 import { skillPresentation } from "./skill-presentation.js";
 import { SmithUiBlock as SmithUiView } from "./smith-ui.js";
@@ -68,16 +67,6 @@ export function userMessageBoxProps(columns: number) {
   } as const;
 }
 
-/** `color` is left unset for output that already carries its own ANSI colours —
- *  wrapping those in a Text colour breaks at their first reset sequence. */
-function DiagramBlock({ color, diagram, width }: { color?: string; diagram: string; width: number }) {
-  return (
-    <Box flexDirection="column" marginTop={1} marginBottom={1}>
-      <DisplayText text={diagram} width={width} color={color} breakLongTokens preserveWhitespace />
-    </Box>
-  );
-}
-
 function MarkdownContent({ text, width }: { text: string; width: number }) {
   const layoutBlocks = splitMarkdownLayoutBlocks(text);
   const blockKeyCounts = new Map<string, number>();
@@ -106,34 +95,6 @@ function startsWithMarkdownHeading(text: string): boolean {
   return /^(?:[ \t]*\r?\n)*[ \t]{0,3}#{1,6}(?:\s|$)/u.test(text);
 }
 
-function CodeSegment({
-  segment,
-  highlighter,
-  width,
-}: {
-  segment: Extract<MarkdownSegment, { type: "code" }>;
-  highlighter?: CodeHighlighter;
-  width: number;
-}) {
-  const diagram =
-    segment.language === "text" || segment.language === "diagram" ? renderSimpleTextDiagram(segment.text) : null;
-
-  return diagram ? (
-    <DiagramBlock color={ASSISTANT} diagram={diagram} width={width} />
-  ) : (
-    <CodeBlock code={segment.text} language={segment.language} highlighter={highlighter} />
-  );
-}
-
-function MermaidSegment({ source, width }: { source: string; width: number }) {
-  const diagram = renderMermaidDiagram(source);
-  return diagram ? (
-    <DiagramBlock diagram={diagram} width={width} />
-  ) : (
-    <MarkdownText text={`\`\`\`mermaid\n${source}\n\`\`\``} width={width} {...MARKDOWN_OPTIONS} />
-  );
-}
-
 function DiffSegment({
   segment,
   highlighter,
@@ -157,8 +118,7 @@ function MarkdownSegmentView({
 }) {
   if (segment.type === "markdown") return segment.text ? <MarkdownContent text={segment.text} width={width} /> : null;
   if (segment.type === "diff") return <DiffSegment segment={segment} highlighter={highlighter} width={width} />;
-  if (segment.type === "code") return <CodeSegment segment={segment} highlighter={highlighter} width={width} />;
-  return <MermaidSegment source={segment.text} width={width} />;
+  return <CodeBlock code={segment.text} language={segment.language} highlighter={highlighter} />;
 }
 
 function MarkdownDocument({

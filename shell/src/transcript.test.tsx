@@ -104,23 +104,6 @@ test("processing placeholder sweeps its bright character from left to right", ()
   );
 });
 
-test("transcript renders simple unlabelled relationship diagrams outside generic code blocks", () => {
-  const entry = {
-    ...completedTurn("Explain outgoing webhooks"),
-    assistantText: `\`\`\`
-用户系统  <——HTTP POST——  云平台
-                      (事件发生时)
-\`\`\``,
-  };
-  const output = stripAnsi(renderToString(<TranscriptEntryView entry={entry} viewMode="compact" />));
-
-  assert.match(output, /用户系统/);
-  assert.match(output, /云平台/);
-  assert.match(output, /HTTP.*POST/);
-  assert.match(output, /事件发生时/);
-  assert.doesNotMatch(output, /\[text\] · 2 行/);
-});
-
 test("transcript keeps JSON payloads in the code renderer", () => {
   const entry = {
     ...completedTurn("Show an event"),

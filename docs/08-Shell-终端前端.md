@@ -133,7 +133,7 @@ SSE event
   → TranscriptEntryView
       → MarkdownMessage
           → splitStreamingMarkdown
-          → 代码 / Mermaid / diff / 表格 / 常规 Markdown
+          → 代码 / diff / 表格 / 常规 Markdown
 ```
 
 ### Markdown、表格、diff
