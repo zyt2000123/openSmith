@@ -61,13 +61,11 @@ llm:
 ### Run
 
 ```bash
-# Ink terminal shell (auto-starts backend)
-cd server && uv run smith
+# Build and link the Ink terminal shell (one-time)
+cd shell && npm install && npm run build && npm link
 
-# Or use CLI directly
-uv run smith chat -m "analyze this project"
-uv run smith agent ensure
-uv run smith sessions list
+# Then run it from any project directory — it auto-starts the backend
+smith
 ```
 
 ### Context files

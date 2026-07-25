@@ -79,7 +79,7 @@ Rules:
 
 | Area | Key Files |
 |---|---|
-| CLI entry | `server/app/cli.py` |
+| Terminal entry | `shell/bin/smith.js` → `shell/src/index.tsx` |
 | Agent lifecycle | `server/app/services/agent_profile_service.py` |
 | Chat + execution | `server/app/services/session_service.py` |
 | ReAct loop | `engine/execution/agent_loop.py` |
@@ -104,11 +104,10 @@ Only one built-in Smith identity exists. Its source files live in `agents/smith/
 ## 9. Testing And Verification
 
 ```bash
-cd server && uv run --with pytest --with pytest-asyncio pytest tests/test_cli.py
-cd server && uv run python -m app.cli --help
-cd server && uv run python -m app.cli agent ensure
-cd server && uv run python -m app.cli sessions list
-cd server && uv run python -m app.cli chat --help
+cd server && uv run --with pytest --with pytest-asyncio pytest
+cd engine && uv run --with pytest --with pytest-asyncio pytest
+cd shell && npm run build && npm test
+cd server && uv run uvicorn app.main:app --port 8000
 ```
 
 ## 10. Default Decision Rule
