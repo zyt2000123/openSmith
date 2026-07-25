@@ -114,6 +114,38 @@ test("a rejected queue handoff releases the busy state instead of stalling the s
   assert.equal(state.runStartedAt, null);
 });
 
+test("a refused handoff returns the message to the head of the queue instead of dropping it", async () => {
+  const store = createAppStore();
+  const bridge = new NodeBridge(store);
+  bridge.enqueueMessage("first");
+  bridge.enqueueMessage("second");
+
+  const activeController = new AbortController();
+  const internal = bridge as unknown as {
+    activeRequest: AbortController | null;
+    finishRequest: (controller: AbortController) => void;
+    sendMessage: (text: string, skillName?: string) => Promise<boolean>;
+  };
+  internal.activeRequest = activeController;
+  // The user types while the handoff is still in flight, filling the queue to its cap.
+  // Re-entering through enqueueMessage would be refused here, losing "first" outright.
+  internal.sendMessage = async () => {
+    bridge.enqueueMessage("typed-during-handoff");
+    bridge.enqueueMessage("typed-after-that");
+    assert.equal(store.getState().queuedMessages.length, MAX_QUEUED_MESSAGES);
+    return false;
+  };
+
+  internal.finishRequest(activeController);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(
+    store.getState().queuedMessages.map((item) => item.text),
+    ["first", "second", "typed-during-handoff", "typed-after-that"],
+  );
+});
+
 test("starting a new session keeps the existing session in history", () => {
   const store = createAppStore();
   const session = {
