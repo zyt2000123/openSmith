@@ -2,104 +2,147 @@
 
 This file is the working brief for Claude or any coding agent operating in this repository.
 
+**Trust code over docs.** `docs/` has not been kept in sync with refactors. When
+this file and the code disagree, the code wins — and fix this file. Count things
+by the consumer's criterion, never by directory listing: `engine/tool/registry.py`
+accepts a tool only if it defines `TOOL_META` + `execute`; a skill counts only if
+its directory holds a top-level `SKILL.md`.
+
 ## 1. What This Project Is
 
 Agent-Smith is a local-first personal assistant Agent workbench that runs in the terminal.
 
 - Smith is the single, always-on Agent
-- Smith uses the skill system to switch workflows per task type (debug, planning, review, etc.)
-- Smith uses knowledge injection to gain domain expertise when needed (frontend patterns, backend patterns, etc.)
+- Smith uses the skill system to switch workflows per task type
 - No sub-agents, no multi-agent routing — one Agent, one conversation, accumulating memory over time
 
 One-line:
 
-> Agent-Smith is a local-first Agent workbench. Smith is your single resident assistant — it keeps context, accumulates memory, switches workflows via skills, and injects domain knowledge when a task demands it.
+> Agent-Smith is a local-first Agent workbench. Smith is your single resident
+> assistant — it keeps context, accumulates memory, and switches workflows via skills.
 
 ## 2. Current Priority
 
 The current priority is the terminal workbench experience:
 
-1. Smith CLI (chat, sessions, agent management) works end-to-end
-2. Ink shell (`shell/`) provides the rich terminal UI
-3. Skill-based workflow switching works for different task types
-4. Memory accumulation across sessions
+1. Ink shell (`shell/`) is the sole entry point and provides the rich terminal UI
+2. Skill-based workflow switching works for different task types
+3. Memory accumulation across sessions
 
 ## 3. Agent Architecture
 
 ```
-User ←→ Smith (single Agent, always-on)
-           │
-           ├── skill system (workflow per task type)
-           │    ├── sde-debug → planning → testing → validation → review
-           │    ├── planning → architecture → testing → validation → review
-           │    └── direct reply (simple questions)
-           │
-           └── knowledge injection (domain expertise on demand)
-                ├── frontend knowledge (React, CSS, build tools, browser)
-                └── backend knowledge (API, DB, infra, performance)
+User ──▶ Ink shell ──HTTP + SSE──▶ server ──▶ engine
+                                                │
+              identity_catalog (agents/identities/smith.yaml)
+              keyword + priority match ──▶ RouteSpec
+                                                │
+                        ┌───────────────────────┴──────────────────┐
+                        ▼                                          ▼
+                 pipeline: null                            pipeline: coding
+                 direct ReAct loop                  (agents/pipelines/coding.yaml)
+                                                                   │
+    understanding ─▶ planning ─▶ architecture* ─▶ implementation ─▶ validation
+        gate:          gate:        gate:            gate:             gate:
+    understanding    planning      design     contract_alignment  validation_llm
+                                                                   │
+                          gate fails ──▶ backtrack to an earlier node
+    * runs only when `needs_architecture` holds (agents/conditions/coding.py)
 ```
 
-Smith decides everything. Skills switch the workflow. Knowledge injection provides domain context. No agent routing needed.
+Declared routes in `agents/identities/smith.yaml` (priority order): `git` (no
+pipeline), `bugfix`, `refactor`, `feature` (all → `coding`). A pipeline node
+falls back to generic ReAct when no matching `SKILL.md` is installed; the gate
+still runs, so the intermediate contract stays observable.
+
+Prompt assembly (`engine/context/assembler.py`) stacks 12 trust-tagged layers:
+Agent Role / Style / Workflow, Tool Usage Policy, Available Tools, Available
+Skills, Learned User Context, Global Instructions, Project Instructions,
+Identity Guidance, Evaluation Safety Guidance (conditional), Output Style.
 
 ## 4. Product Language
 
-Use: "Smith", "Agent", "skill", "knowledge", "session", "memory", "tool", "template"
+Use: "Smith", "Agent", "skill", "session", "memory", "tool", "template"
 
 Avoid: "sub-agent", "employee", "digital employee", "hire"
 
 ## 5. Architecture Boundaries
 
-Four layers, one-way dependencies:
+Four layers, one-way dependencies (verified by import graph, not by convention):
 
 ```
 server/ → engine/ → common/
           ↑
-        agents/
+        agents/   (loaded at runtime, never imported)
 ```
 
-Plus `shell/` as the terminal frontend (Ink/React, calls server via HTTP).
+Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 
-| Layer | Directory | Responsibility |
-|---|---|---|
-| Infrastructure | `common/` | Config, SQLite, filesystem, logging. Zero business logic. |
-| Execution | `engine/` | Agent framework: LLM, DAG+ReAct, memory, skills, tools, safety. Zero platform knowledge. |
-| Content | `agents/` | Template, built-in skills, built-in tools, safety rules. Pure content. |
-| Platform | `server/` | FastAPI + CLI. Orchestration, session/agent lifecycle, API. |
-| Terminal UI | `shell/` | Ink shell. Calls server HTTP. Auto-starts backend. |
+| Layer | Directory | Source lines | Responsibility |
+|---|---|---|---|
+| Infrastructure | `common/` | 269 | Paths, SQLite connection, YAML read/write. Zero business logic. |
+| Execution | `engine/` | 16.5k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
+| Content | `agents/` | 4.0k | Smith identity seed, pipelines, gates, tools, skills, safety rules. Pure content. |
+| Platform | `server/` | 5.9k | FastAPI. Orchestration, session/agent lifecycle, 40 HTTP endpoints. |
+| Terminal UI | `shell/` | 9.3k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
 
 Rules:
 
 - `engine/` must not know FastAPI, HTTP, or agent instance management
+- `agents/` imports nothing from other layers — the tool registry loads its `.py`
+  files via `exec_module`, so the contract is `TOOL_META` + `execute`, not types.
+  A path constant cannot be shared into it; expect duplicated path derivation.
 - `server/app/routers/` stays thin — extract params, call service, return result
 - `server/app/` is the FastAPI application package; keep this conventional layout
 - `agents/smith/` is where Smith's built-in identity seed lives
-- New capabilities → add skills or knowledge docs, not new agents
+- New capabilities → add skills, not new agents
+
+`common/paths.py` is the single source of truth for the runtime data root
+(`~/.agent-smith`, enforced `0o700`/`0o600`). `engine/safety/tool_guard.py`
+anchors its non-bypassable platform-write protection on it.
 
 ## 6. Files That Matter
 
 | Area | Key Files |
 |---|---|
 | Terminal entry | `shell/bin/smith.js` → `shell/src/index.tsx` |
+| Backend spawn | `shell/src/dev-server.ts` (runs `uv run uvicorn app.main:app`) |
+| Engine assembly | `server/app/services/engine_runtime.py` |
 | Agent lifecycle | `server/app/services/agent_profile_service.py` |
 | Chat + execution | `server/app/services/session_service.py` |
-| ReAct loop | `engine/execution/agent_loop.py` |
-| Task routing | `engine/execution/task_router.py` |
-| Skill chain | `engine/execution/skill_chain.py` |
-| Prompt assembly | `engine/prompt/assembler.py` |
+| Run lifecycle | `engine/execution/orchestration/agent_loop.py` |
+| ReAct loop | `engine/execution/react/react_loop.py` |
+| Task routing | `engine/execution/routing/task_router.py`, `engine/identity_catalog.py` |
+| Pipeline + skill chain | `engine/execution/pipeline/pipeline.py`, `.../skill_chain.py` |
+| Prompt assembly | `engine/context/assembler.py` |
+| Tool policy | `engine/safety/tool_policy.py` (hard guard before soft challenge) |
+| Data root | `common/paths.py` |
 | Smith profile seed | `agents/smith/` |
-| Terminal shell | `shell/src/index.tsx` |
 
 ## 7. Smith Profile System
 
-Only one built-in Smith identity exists. Its source files live in `agents/smith/`; the legacy `personal-assistant` id remains only as a compatibility role/template id for existing API and data paths. Legacy multi-agent templates and bundled skills have been removed; optional skills can still be installed into Smith's runtime profile.
+Only one built-in Smith identity exists. Its source files live in `agents/smith/`
+(`role.md`, `style.md`, `workflow.md`, `context.md`, `toolbox.md`, `config.yaml`).
+The legacy `personal-assistant` id remains only as a compatibility role/template
+id (`SMITH_TEMPLATE_ID` in `engine/llm/model_config.py`, `role:` in
+`agents/smith/config.yaml`) for existing API and data paths. Legacy multi-agent
+templates have been removed; optional skills can still be installed into Smith's
+runtime profile.
+
+Skills that ship with Smith are mirrored into `~/.agent-smith/builtin/skills/`,
+discovered by scanning `agents/skills/` for directories holding a `SKILL.md`.
+A wheel install ships them through `[tool.setuptools.data-files]` in
+`common/pyproject.toml`, which needs one entry per skill — a test asserts that
+declaration stays in sync.
 
 ## 8. Implementation Guidance
 
 - Inspect current code first; prefer existing patterns
 - Keep changes local; preserve compatibility unless asked to break it
-- New domain expertise → knowledge docs injected via assembler, not new templates
-- New task workflows → SKILL.md files, not new agents
+- New task workflows → `SKILL.md` files, not new agents
 - Smith identity changes belong in `agents/smith/`; capabilities belong in skills
+- Safety changes: `tool_guard.py` is the non-bypassable boundary, `fact_gate.py`
+  only challenges and can be retried. Keep the guard first — a test enforces it.
 
 ## 9. Testing And Verification
 
@@ -110,11 +153,22 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-## 10. Default Decision Rule
+Current baseline: engine 523 passed, server 113 passed.
+
+## 10. Not Implemented Yet
+
+Product intent recorded here so it is not mistaken for existing behavior:
+
+- **Knowledge injection.** Earlier drafts of this file described injecting
+  domain expertise (frontend/backend knowledge docs) on demand. No such
+  mechanism exists. `agent_profiles.knowledge` is a `list[str]` column that the
+  prompt assembler does not read.
+
+## 11. Default Decision Rule
 
 If a choice is unclear, prefer the option that:
 
 - makes the single-Agent terminal experience more usable
-- reuses existing skill/knowledge infrastructure
+- reuses existing skill infrastructure
 - avoids introducing multi-agent complexity
 - keeps changes minimal and reversible
