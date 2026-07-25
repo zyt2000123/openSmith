@@ -10,13 +10,6 @@ import sysconfig
 PROJECT_ROOT_ENV = "AGENT_SMITH_PROJECT_ROOT"
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
-BUILTIN_SKILL_NAMES = (
-    "edit-article",
-    "grill-me",
-    "research",
-    "teach",
-    "writing-great-skills",
-)
 
 
 def _default_project_root() -> Path:
@@ -106,6 +99,9 @@ class AppPaths:
         ``agent/skills`` remains reserved for user-installed skills.  Keeping
         shipped skills under ``builtin/skills`` lets an installed Smith retain
         its default capabilities without treating them as user customizations.
+
+        The shipped set is discovered from the bundled directory, so adding a
+        skill there needs no second declaration in this layer.
         """
         source = self.bundled_skills_dir
         if not source.is_dir():
@@ -116,13 +112,14 @@ class AppPaths:
         _ensure_private_dir(target)
         manifest = target / ".manifest.json"
 
-        for name in BUILTIN_SKILL_NAMES:
-            skill_file = source / name / "SKILL.md"
-            if skill_file.is_file():
-                shutil.copytree(skill_file.parent, target / name, dirs_exist_ok=True)
+        shipped = sorted(
+            child.name for child in source.iterdir() if (child / "SKILL.md").is_file()
+        )
+        for name in shipped:
+            shutil.copytree(source / name, target / name, dirs_exist_ok=True)
 
         for child in target.iterdir():
-            if child.is_dir() and child.name not in BUILTIN_SKILL_NAMES:
+            if child.is_dir() and child.name not in shipped:
                 shutil.rmtree(child)
-        manifest.write_text(json.dumps({"skills": BUILTIN_SKILL_NAMES}), encoding="utf-8")
+        manifest.write_text(json.dumps({"skills": shipped}), encoding="utf-8")
         manifest.chmod(PRIVATE_FILE_MODE)
