@@ -4,6 +4,17 @@ import stringWidth from "string-width";
 
 import { renderMermaidDiagram, renderSimpleTextDiagram, splitMarkdownBlocks } from "./mermaid.js";
 
+/** Diagram output carries ANSI colour; these assertions are about layout and text. */
+function stripAnsi(value: string | null): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: matching the ANSI escape is the point
+  return (value ?? "").replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+/** Layout/text assertions run against the uncoloured grid. */
+function renderPlain(source: string): string {
+  return stripAnsi(renderMermaidDiagram(source));
+}
+
 test("splits ordinary fenced code into a code segment", () => {
   assert.deepEqual(splitMarkdownBlocks("Before\n\n```python\nprint('hi')\n```\n\nAfter"), [
     { type: "markdown", text: "Before\n" },
@@ -52,12 +63,12 @@ test("keeps the language when a fence info string has extra words", () => {
 });
 
 test("renders a basic Mermaid flowchart as terminal Unicode", () => {
-  const rendered = renderMermaidDiagram("flowchart TD\n  A[Start] --> B[End]");
+  const rendered = renderPlain("flowchart TD\n  A[Start] --> B[End]");
 
-  assert.match(rendered ?? "", /Start/);
-  assert.match(rendered ?? "", /End/);
-  assert.match(rendered ?? "", /[┌┐└┘]/);
-  assert.doesNotMatch(rendered ?? "", /A\[Start\]/);
+  assert.match(rendered, /Start/);
+  assert.match(rendered, /End/);
+  assert.match(rendered, /[┌┐└┘]/);
+  assert.doesNotMatch(rendered, /A\[Start\]/);
   assert.equal(
     rendered?.split("\n").some((line) => line.endsWith(" ")),
     false,
@@ -65,12 +76,12 @@ test("renders a basic Mermaid flowchart as terminal Unicode", () => {
 });
 
 test("renders Mermaid sequence diagrams as terminal Unicode", () => {
-  const rendered = renderMermaidDiagram("sequenceDiagram\n  云平台->>用户系统: HTTP POST");
+  const rendered = renderPlain("sequenceDiagram\n  云平台->>用户系统: HTTP POST");
 
-  assert.match(rendered ?? "", /云平台/);
-  assert.match(rendered ?? "", /用户系统/);
-  assert.match(rendered ?? "", /HTTP POST/);
-  assert.match(rendered ?? "", /[┌┐└┘]/);
+  assert.match(rendered, /云平台/);
+  assert.match(rendered, /用户系统/);
+  assert.match(rendered, /HTTP POST/);
+  assert.match(rendered, /[┌┐└┘]/);
 });
 
 test("turns an unlabelled two-endpoint arrow into a diagram", () => {
@@ -89,7 +100,7 @@ test("keeps ordinary text outside the simple-diagram grammar", () => {
 });
 
 test("turns HTML line breaks in node labels into readable terminal text", () => {
-  const rendered = renderMermaidDiagram('flowchart TD\n  A["save_conversation_memory()<br/>提取证据 → recent.jsonl"]');
+  const rendered = renderPlain('flowchart TD\n  A["save_conversation_memory()<br/>提取证据 → recent.jsonl"]');
 
   assert.ok(rendered);
   assert.doesNotMatch(rendered, /<br\s*\/?\s*>/i);
@@ -98,7 +109,7 @@ test("turns HTML line breaks in node labels into readable terminal text", () => 
 });
 
 test("keeps CJK node labels inside their terminal box", () => {
-  const rendered = renderMermaidDiagram("flowchart TD\n  A[完整生命周期] --> B[对话结束]");
+  const rendered = renderPlain("flowchart TD\n  A[完整生命周期] --> B[对话结束]");
 
   assert.ok(rendered);
   const lines = rendered.split("\n");
@@ -111,14 +122,14 @@ test("keeps CJK node labels inside their terminal box", () => {
 });
 
 test("preserves node identity when a CJK label is referenced more than once", () => {
-  const rendered = renderMermaidDiagram("flowchart TD\n  A[开始] --> B[中间]\n  B --> C[结束]");
+  const rendered = renderPlain("flowchart TD\n  A[开始] --> B[中间]\n  B --> C[结束]");
 
   assert.ok(rendered);
   assert.equal(rendered.match(/中间/g)?.length, 1);
 });
 
 test("keeps CJK edge labels aligned with a horizontal branch", () => {
-  const rendered = renderMermaidDiagram("flowchart LR\n  A[开始] -->|是| B[结束]");
+  const rendered = renderPlain("flowchart LR\n  A[开始] -->|是| B[结束]");
 
   assert.ok(rendered);
   const lines = rendered.split("\n");
@@ -133,7 +144,7 @@ test("keeps CJK edge labels aligned with a horizontal branch", () => {
 test("moves long edge labels below the diagram and wraps them", () => {
   const label =
     "关键设计决策： Markdown 是唯一事实源， SQLite 索引是可丢弃的派生物。索引损坏时自动重建，不影响记忆本身。";
-  const rendered = renderMermaidDiagram(`flowchart LR
+  const rendered = renderPlain(`flowchart LR
   A[recent.jsonl] -->|${label}| B[agent/*.md]
   B --> C[project/*.md]
   C --> D[search.sqlite]`);
@@ -152,7 +163,7 @@ test("moves long edge labels below the diagram and wraps them", () => {
 });
 
 test("keeps the full memory lifecycle diagram readable", () => {
-  const rendered = renderMermaidDiagram(`flowchart TD
+  const rendered = renderPlain(`flowchart TD
   A[完整生命周期] --> B[对话结束]
   B --> C[save_conversation_memory()<br/>提取证据 → recent.jsonl]
   C --> D{有学习信号或<br/>累计5个有效turn?}
@@ -175,4 +186,17 @@ test("keeps the full memory lifecycle diagram readable", () => {
 
 test("returns null for an unsupported or invalid diagram", () => {
   assert.equal(renderMermaidDiagram("not valid Mermaid"), null);
+});
+
+test("colours the diagram frame, labels and arrows from the shell palette", () => {
+  const rendered = renderMermaidDiagram("flowchart TD\n  A[Start] --> B[End]");
+
+  assert.ok(rendered);
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: matching the ANSI escape is the point
+  assert.match(rendered, /\u001b\[38;2;92;92;99m/); // BORDER on the frame
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: matching the ANSI escape is the point
+  assert.match(rendered, /\u001b\[38;2;233;233;234m/); // INFO on the labels
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: matching the ANSI escape is the point
+  assert.match(rendered, /\u001b\[38;2;97;175;239m/); // ASSISTANT on the arrowheads
+  assert.equal(stripAnsi(rendered).includes("\u001b"), false);
 });

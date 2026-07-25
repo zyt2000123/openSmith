@@ -68,10 +68,12 @@ export function userMessageBoxProps(columns: number) {
   } as const;
 }
 
-function DiagramBlock({ diagram, width }: { diagram: string; width: number }) {
+/** `color` is left unset for output that already carries its own ANSI colours —
+ *  wrapping those in a Text colour breaks at their first reset sequence. */
+function DiagramBlock({ color, diagram, width }: { color?: string; diagram: string; width: number }) {
   return (
     <Box flexDirection="column" marginTop={1} marginBottom={1}>
-      <DisplayText text={diagram} width={width} color={ASSISTANT} breakLongTokens preserveWhitespace />
+      <DisplayText text={diagram} width={width} color={color} breakLongTokens preserveWhitespace />
     </Box>
   );
 }
@@ -117,9 +119,9 @@ function CodeSegment({
     segment.language === "text" || segment.language === "diagram" ? renderSimpleTextDiagram(segment.text) : null;
 
   return diagram ? (
-    <DiagramBlock diagram={diagram} width={width} />
+    <DiagramBlock color={ASSISTANT} diagram={diagram} width={width} />
   ) : (
-    <CodeBlock code={segment.text} language={segment.language} highlighter={highlighter} width={width} />
+    <CodeBlock code={segment.text} language={segment.language} highlighter={highlighter} />
   );
 }
 

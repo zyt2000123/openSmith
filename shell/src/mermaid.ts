@@ -1,6 +1,8 @@
 import { renderMermaidASCII } from "beautiful-mermaid";
 import stringWidth from "string-width";
 
+import { ASSISTANT, BORDER, INFO } from "./theme.js";
+
 export type MarkdownSegment =
   | { type: "markdown"; text: string }
   | { type: "mermaid"; text: string }
@@ -235,7 +237,11 @@ export function renderMermaidDiagram(source: string): string | null {
   try {
     const output = renderMermaidASCII(encoded.text, {
       useAscii: process.env.SMITH_ASCII_DIAGRAMS === "1",
-      colorMode: "none",
+      colorMode: "truecolor",
+      // Match the markdown table: grey frame, near-white labels, accent arrows.
+      // corner/junction default to a lighter grey than `border`; pin them too so
+      // the whole frame reads as one colour.
+      theme: { arrow: ASSISTANT, border: BORDER, corner: BORDER, fg: INFO, junction: BORDER, line: BORDER },
     });
     const compact = output
       .trimEnd()

@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { layoutMarkdownTable, parseMarkdownTable, renderMarkdownTableLines } from "./markdown-table.js";
+import {
+  buildMarkdownTableGrid,
+  layoutMarkdownTable,
+  parseMarkdownTable,
+  renderMarkdownTableLines,
+} from "./markdown-table.js";
 import { displayWidth } from "./text-layout.js";
 
 test("a table with more graphemes than the argument limit still lays out", () => {
@@ -67,4 +72,16 @@ test("marks a CJK grid as overflowed when a complete wide grapheme cannot fit in
   assert.equal(layout.overflowed, true);
   assert.ok(lines.every((line) => displayWidth(line) <= layout.width));
   assert.match(lines.join(""), /甲.*乙.*丙.*丁.*戊/);
+});
+
+test("keeps a box-drawing rule inside a cell out of the column split", () => {
+  const table = parseMarkdownTable("| a | b |\n|---|---|\n| x \u2502 y | z |");
+
+  assert.ok(table);
+  const body = buildMarkdownTableGrid(layoutMarkdownTable(table, 40)).filter((line) => line.kind === "cells");
+  const lastRow = body.at(-1);
+
+  assert.equal(lastRow?.kind, "cells");
+  assert.equal(lastRow?.cells.length, 2, "a rule inside a cell must not add a column");
+  assert.match(lastRow?.cells[0] ?? "", /x \u2502 y/);
 });

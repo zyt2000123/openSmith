@@ -77,7 +77,8 @@ const SMITH_LOGO = [
   "██╔════╝████╗ ████║██║╚══██╔══╝██║  ██║",
   "███████╗██╔████╔██║██║   ██║   ███████║",
   "╚════██║██║╚██╔╝██║██║   ██║   ██╔══██║",
-  "███████╗██║ ╚═╝ ██║██║   ██║   ██║  ██║",
+  "███████║██║ ╚═╝ ██║██║   ██║   ██║  ██║",
+  "╚══════╝╚═╝     ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝",
 ];
 const GHOST_BUDDY = ["  ─╥╥─  ", "▄██████▄", "██ ██ ██", " ██████ ", "╰╯╰╮╭╯╰╯"];
 
@@ -100,31 +101,71 @@ function armSkill(skill: SkillSummary): void {
   getState().set({ pendingSkill: skill, panel: "chat", statusLine: "" });
 }
 
+const HERO_HINTS = ["`/` for commands", "`@` for skills", "Enter confirms", "Esc goes back", "`/help` for all"];
+
+/** border(2) + paddingX(6) + logo(39) + gap(3) + buddy(8) — below this the art itself will not fit. */
+const HERO_MIN_COLUMNS = 58;
+/** The above + gap(5) + widest tip(18): only then do the two columns sit side by side. */
+const HERO_WIDE_COLUMNS = 82;
+
 function HeroPanel() {
   const { columns } = useWindowSize();
-  const compact = columns < 60;
+  const compact = columns < HERO_MIN_COLUMNS;
+  const wide = columns >= HERO_WIDE_COLUMNS;
+
+  if (compact) {
+    return (
+      <Box flexDirection="column" marginBottom={1} paddingTop={1}>
+        <Box gap={1} marginBottom={1}>
+          <Text color={ACCENT}>Agent-Smith</Text>
+          <Text color={MUTED}>v{SHELL_VERSION}</Text>
+        </Box>
+        <Text color={INFO}>Terminal view is compact. Type `/help` for commands.</Text>
+      </Box>
+    );
+  }
 
   return (
-    <Box flexDirection="column" marginBottom={1} paddingTop={1}>
-      <Box gap={1} marginBottom={1}>
-        <Text color={ACCENT}>Agent-Smith</Text>
-        <Text color={MUTED}>v{SHELL_VERSION}</Text>
-      </Box>
-      {compact ? (
-        <Text color={INFO}>Terminal view is compact. Type `/help` for commands.</Text>
-      ) : (
-        SMITH_LOGO.map((line, index) => (
-          <Box key={line}>
-            <Text color={ACCENT}>{line}</Text>
-            <Text>{"   "}</Text>
-            <Text color={ACCENT}>{GHOST_BUDDY[index]}</Text>
+    <Box borderColor={ACCENT} borderStyle="round" flexDirection="column" marginBottom={1} paddingX={3} paddingY={1}>
+      {/* Two columns, each headed by its own title row, so "Tips:" lands on the
+          same line as the version without either side needing a fixed width. */}
+      <Box flexDirection={wide ? "row" : "column"} gap={wide ? 5 : 1}>
+        <Box flexDirection="column">
+          <Box gap={1}>
+            <Text color={ACCENT}>Agent-Smith</Text>
+            <Text color={MUTED}>v{SHELL_VERSION}</Text>
           </Box>
-        ))
-      )}
-      <Text> </Text>
-      <Text color={INFO}>
-        Type `/` for commands · `@` for skills · Enter confirms · Esc goes back · `/help` for all
-      </Text>
+          <Box gap={3} marginTop={1}>
+            <Box flexDirection="column">
+              {SMITH_LOGO.map((line) => (
+                <Text color={ACCENT} key={line}>
+                  {line}
+                </Text>
+              ))}
+            </Box>
+            <Box flexDirection="column" justifyContent="center">
+              {GHOST_BUDDY.map((line) => (
+                <Text color={ACCENT} key={line}>
+                  {line}
+                </Text>
+              ))}
+            </Box>
+          </Box>
+        </Box>
+        <Box flexDirection="column">
+          <Text bold color={ACCENT}>
+            Tips:
+          </Text>
+          <Box flexDirection="column" marginTop={1}>
+            {HERO_HINTS.map((hint) => (
+              <Text color={INFO} key={hint}>
+                {"· "}
+                {hint}
+              </Text>
+            ))}
+          </Box>
+        </Box>
+      </Box>
     </Box>
   );
 }
