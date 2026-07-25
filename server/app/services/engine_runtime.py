@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from common.config import AGENT_DIR, BUILTIN_IDENTITIES_DIR, BUILTIN_SKILLS_DIR, PATHS, SAFETY_RULES_PATH
@@ -36,6 +38,25 @@ def _normalize_llm_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _maybe_record(client: LLMPort) -> LLMPort:
+    """Wrap the client so real runs land in a JSONL recording (opt-in).
+
+    Set ``AGENT_SMITH_RECORD_LLM=/path/to/case.jsonl`` and every model turn of
+    every subsequent run appends there, ready to replay via ``engine.replay``.
+    Only the *responses* are written, never the prompt — so a recording cannot
+    leak conversation content, and replay does not need it (turns are served in
+    recorded order rather than matched against messages).
+    """
+    target = os.environ.get("AGENT_SMITH_RECORD_LLM", "").strip()
+    if not target:
+        return client
+    from engine.replay import RecordingLLM
+
+    path = Path(target).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return RecordingLLM(client, path)
+
+
 @dataclass
 class LLMClientManager:
     """Factory/cache for process-scoped LLM clients."""
@@ -52,7 +73,7 @@ class LLMClientManager:
         with self._lock:
             client = self._clients.get(fingerprint)
             if client is None:
-                client = build_llm_client(config)
+                client = _maybe_record(build_llm_client(config))
                 self._clients[fingerprint] = client
             return client
 
