@@ -33,8 +33,24 @@ Smith is a single, always-on agent that runs locally. It keeps conversation cont
 # Backend
 cd server && uv sync
 
-# Terminal shell (optional — CLI works without it)
-cd ../shell && npm ci && npm run build
+# Terminal shell — build, then link `smith` onto your PATH
+cd ../shell && npm ci && npm run build && npm link
+```
+
+If an older release left a `smith` from `uv tool install`, remove it first — it
+points at the deleted Python CLI and shadows the shell entry point:
+
+```bash
+uv tool uninstall agent-smith-server
+```
+
+`npm link` symlinks the global `smith` to this working copy rather than copying
+it, so `smith` works from any directory and finds `server/` through its own
+install path — but it breaks if the repository moves, and picks up source edits
+only after `npm run build`. Verify with:
+
+```bash
+ls -l "$(which smith)"   # → .../lib/node_modules/smith-shell/bin/smith.js
 ```
 
 ### Configure
@@ -61,10 +77,7 @@ llm:
 ### Run
 
 ```bash
-# Build and link the Ink terminal shell (one-time)
-cd shell && npm install && npm run build && npm link
-
-# Then run it from any project directory — it auto-starts the backend
+# Run it from any project directory — it auto-starts the backend
 smith
 ```
 
