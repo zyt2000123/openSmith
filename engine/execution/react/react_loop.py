@@ -789,6 +789,7 @@ async def react_event_loop(
                 identical_error_count = 0
                 continue
 
+            granted_approval_id: str | None = None
             yield ExecutionEvent(EventType.TOOL_CALL_START, {"name": tc.name, "id": tc.id, "arguments": call.arguments})
 
             decision = policy.evaluate(call)
@@ -855,7 +856,7 @@ async def react_event_loop(
                             # The hard guard already passed. Continue with the
                             # exact suspended call instead of asking the model
                             # to recreate it and risking a duplicate side effect.
-                            pass
+                            granted_approval_id = approval_request.approval_id
                         else:
                             conversation.append({
                                 "role": "tool",
@@ -913,7 +914,7 @@ async def react_event_loop(
 
             result = await tool_registry.execute(call)
             conversation.append({"role": "tool", "tool_call_id": result.call_id, "content": result.content})
-            yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+            result_event = {
                 "id": tc.id,
                 "error": result.is_error,
                 "blocked": False,
@@ -924,7 +925,11 @@ async def react_event_loop(
                 "timed_out": result.timed_out,
                 "side_effect_status": result.side_effect_status,
                 "metadata": result.metadata,
-            })
+            }
+            if granted_approval_id is not None:
+                result_event["approval_outcome"] = "granted"
+                result_event["approval_id"] = granted_approval_id
+            yield ExecutionEvent(EventType.TOOL_CALL_RESULT, result_event)
             if result.is_error:
                 round_had_failure = True
                 consecutive_errors += 1

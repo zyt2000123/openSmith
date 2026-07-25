@@ -173,10 +173,15 @@ def _total_lines(memory_dir: Path) -> int:
 
 
 def _parse_ts(ts: str) -> datetime | None:
+    if not isinstance(ts, str):
+        return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _filter_by_time(entries: list[dict], after: datetime) -> list[dict]:

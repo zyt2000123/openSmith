@@ -3,6 +3,7 @@ from __future__ import annotations
 from engine.safety.fact_gate import (
     FactGate,
     FactGateContext,
+    _is_read_only_sed,
     current_fact_gate,
     use_fact_gate,
 )
@@ -110,6 +111,19 @@ def test_first_state_changing_shell_is_challenged_once_per_turn() -> None:
     assert "rollback" in first.reason
     assert same_round.challenged
     assert not retry.challenged
+
+
+def test_is_read_only_sed_handles_e_flag_and_write_commands() -> None:
+    # Plain print is read-only
+    assert _is_read_only_sed(["-n", "1p", "file"])
+    # -e flag is filtered, not mistaken for the script
+    assert _is_read_only_sed(["-n", "-e", "1p", "file"])
+    # ;-separated print sub-commands remain read-only
+    assert _is_read_only_sed(["-n", "1p;2p", "file"])
+    # A write sub-command hidden after a print is not read-only
+    assert not _is_read_only_sed(["-n", "1p;w /tmp/evil", "file"])
+    # A direct write command is not read-only
+    assert not _is_read_only_sed(["-n", "w report.txt", "input.txt"])
 
 
 def test_gate_can_be_disabled() -> None:

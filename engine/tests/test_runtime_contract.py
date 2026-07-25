@@ -584,6 +584,62 @@ def test_timeout_settles_waiting_approval_before_terminal_run_state(tmp_path: Pa
     assert terminal is not None and terminal.status is RunStatus.COMPLETED
 
 
+def test_granted_approval_resolves_waiting_approval_to_running(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith")
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-1"}),
+    )
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(
+            EventType.TOOL_CALL_RESULT,
+            {
+                "approval_required": True,
+                "approval_id": "approval-1",
+                "tool": "shell",
+                "level": "execute",
+                "reason": "Approval required for shell",
+            },
+        ),
+    )
+    waiting = store.get("run-1")
+    assert waiting is not None and waiting.status is RunStatus.WAITING_APPROVAL
+
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(
+            EventType.TOOL_CALL_RESULT,
+            {
+                "approval_id": "approval-1",
+                "approval_outcome": "granted",
+                "blocked": False,
+            },
+        ),
+    )
+
+    resolved = store.get("run-1")
+    assert resolved is not None
+    assert resolved.status is RunStatus.RUNNING
+    assert resolved.approval_id is None
+    assert resolved.reason == "approval_granted"
+
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(
+            EventType.RUN_FINISHED,
+            {"run_id": "run-1", "status": "completed"},
+        ),
+    )
+    terminal = store.get("run-1")
+    assert terminal is not None and terminal.status is RunStatus.COMPLETED
+
+
 def test_resume_setup_failure_is_exposed_as_terminal_stream(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

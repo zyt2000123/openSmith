@@ -490,7 +490,17 @@ def project_execution_event(
                 )
                 return
             approval_outcome = str(event.data.get("approval_outcome") or "")
-            if approval_outcome in {"denied", "timed_out"}:
+            if approval_outcome == "granted":
+                state = store.get(run_id)
+                if state is not None and state.status is RunStatus.WAITING_APPROVAL:
+                    store.resolve_approval(
+                        run_id,
+                        str(event.data.get("approval_id") or ""),
+                        approved=True,
+                        reason="approval_granted",
+                    )
+                # Fall through to clear_tool: the tool has executed and completed.
+            elif approval_outcome in {"denied", "timed_out"}:
                 state = store.get(run_id)
                 if state is not None and state.status is RunStatus.WAITING_APPROVAL:
                     approval_id = str(event.data.get("approval_id") or "")
