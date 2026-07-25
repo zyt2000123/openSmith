@@ -15,12 +15,6 @@ from engine.context.assembler import (
 )
 
 
-def test_legacy_prompt_import_reexports_context_assembler() -> None:
-    from engine.prompt.assembler import PromptAssembler as legacy_prompt_assembler
-
-    assert legacy_prompt_assembler is PromptAssembler
-
-
 class FakeToolRegistry:
     def list_tools(self) -> list:
         return []

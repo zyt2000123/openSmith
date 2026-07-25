@@ -353,8 +353,13 @@ class MCPClient:
             params = {"cursor": cursor} if cursor else {}
             result = await self._send("tools/list", params)
             for t in result.get("tools", []):
+                if not isinstance(t, dict):
+                    continue
+                name = t.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
                 tools.append(MCPTool(
-                    name=t["name"],
+                    name=name,
                     description=t.get("description", ""),
                     input_schema=t.get("inputSchema", {}),
                 ))

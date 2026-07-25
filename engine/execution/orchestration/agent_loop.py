@@ -18,7 +18,7 @@ import inspect
 import logging
 import sys
 from hashlib import sha256
-from typing import AsyncGenerator, NamedTuple
+from typing import AsyncGenerator, NamedTuple, Sequence
 from uuid import uuid4
 
 from engine.identity_catalog import IdentityCatalog, IdentitySpec, RouteDecision
@@ -39,9 +39,9 @@ from engine.sandbox import MacOSSeatbeltEnvironment
 from engine.skill.executor import execute_skill_events
 from engine.skill.registry import SkillRegistry
 from engine.tool.registry import ToolRegistry
-from .backtrack import FailureLoopGuard
-from .pipeline import run_pipeline
-from .pipeline_context import (
+from engine.execution.pipeline.backtrack import FailureLoopGuard
+from engine.execution.pipeline.pipeline import run_pipeline
+from engine.execution.pipeline.pipeline_context import (
     CTX_AGENT_ID,
     CTX_FORCED_SKILL,
     CTX_IDENTITY_ID,
@@ -52,19 +52,19 @@ from .pipeline_context import (
     CTX_USER_MESSAGE,
     CTX_WORKING_DIR,
 )
-from .react_loop import (
+from engine.execution.react.react_loop import (
     IncompleteAgentRunError,
     react_event_loop,
 )
 from .run_state import RunStateError, RunStateStore, RunStatus, project_execution_event
 from .run_stream import AgentRunStream
 from .runtime import EngineRequest, EngineResult, RuntimeContext, RuntimeServices
-from .runtime_control import initial_runtime_control_prompt
-from .skill_chain import SkillChain, load_gate_content
-from .tool_ledger import ToolExecutionLedger
+from engine.execution.runtime_control import initial_runtime_control_prompt
+from engine.execution.pipeline.skill_chain import SkillChain, load_gate_content
+from engine.execution.tool_execution.tool_ledger import ToolExecutionLedger
 from engine.safety.eval_guard import EVAL_SENSITIVE_GUIDANCE, detect_eval_sensitive
 from engine.safety.approval import APPROVAL_BROKER, use_approval_context
-from .task_router import route_task
+from engine.execution.routing.task_router import route_task
 
 # ReAct loop implementations belong to react_loop.py and are intentionally
 # not re-exported from this orchestration module.
@@ -104,6 +104,7 @@ async def run_agent_stream(
     execution_context: dict | None = None,
     gate_llm: LLMPort | None = None,
     disabled_skill_names: frozenset[str] = frozenset(),
+    vision_messages: Sequence[dict] = (),
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """Route to the right execution path and yield events."""
     if forced_skill:
@@ -111,13 +112,19 @@ async def run_agent_stream(
             llm, system_prompt, tool_registry, skill_registry,
             user_message, forced_skill, tool_guard, max_react_iters,
             history=history, execution_context=execution_context,
+            vision_messages=vision_messages,
         ):
             yield event
         return
 
+    # Images sit in their own message just before the user turn. OpenAI accepts
+    # consecutive user messages, and Anthropic's adapter merges same-role
+    # neighbours into one turn — so both providers end up with image-then-text
+    # without the engine ever turning ``user_message`` into a content list.
     base_messages = [
         {"role": "system", "content": system_prompt},
         *(history or []),
+        *vision_messages,
         {"role": "user", "content": user_message},
     ]
 
@@ -169,6 +176,7 @@ async def run_agent_stream(
         max_react_iters, context, gate_llm=gate_llm,
         start_node_idx=start_node_idx,
         disabled_skill_names=disabled_skill_names,
+        vision_messages=vision_messages,
     ):
         yield event
 
@@ -195,7 +203,7 @@ def _apply_crash_checkpoint(
     expected_identity_id = str(context.get(CTX_IDENTITY_ID) or "")
     expected_working_dir = str(context.get(CTX_WORKING_DIR) or "")
     try:
-        from .checkpoint import SessionStateManager
+        from engine.execution.pipeline.checkpoint import SessionStateManager
 
         manager = SessionStateManager(Path(state_dir))
         checkpoint = manager.restore(session_id)
@@ -239,6 +247,7 @@ async def _run_forced_skill_stream(
     max_react_iters: int,
     history: list[dict] | None = None,
     execution_context: dict | None = None,
+    vision_messages: Sequence[dict] = (),
 ) -> AsyncGenerator[ExecutionEvent, None]:
     yield ExecutionEvent(EventType.ROUTE_DECIDED, {"type": "skill", "skill": forced_skill})
 
@@ -254,6 +263,7 @@ async def _run_forced_skill_stream(
     messages = [
         {"role": "system", "content": system_prompt},
         *(history or []),
+        *vision_messages,
         {"role": "user", "content": user_message},
     ]
     context: dict = {CTX_USER_MESSAGE: user_message, CTX_TASK_TYPE: "skill", CTX_FORCED_SKILL: forced_skill}
@@ -308,6 +318,10 @@ class _AgentSetup(NamedTuple):
     state_dir: Path
     working_dir: Path
     disabled_skill_names: frozenset[str]
+    # Messages carrying (or explaining) images the user referenced by path.
+    # Empty for every request that mentions none, which is nearly all of them.
+    # A tuple, so the default cannot be a shared mutable list.
+    vision_messages: Sequence[dict] = ()
 
 
 def _merge_context(user_message: str, context: str | None) -> str:
@@ -506,6 +520,14 @@ async def prepare_runtime(
 
     chain = _resolve_pipeline(route, runtime)
 
+    # Only ``request.message`` is scanned. Resolving paths out of model output
+    # would let it read any file without passing the tool guard.
+    from engine.llm.image_input import resolve_image_messages
+
+    vision_messages = await resolve_image_messages(
+        request.message, wd, services.llm, services.vision_llm,
+    )
+
     return _AgentSetup(
         prompt_assembly.text,
         prompt_assembly.manifest.to_trace_data(),
@@ -515,6 +537,7 @@ async def prepare_runtime(
         state_dir,
         wd,
         frozenset(disabled_skills),
+        vision_messages,
     )
 
 
@@ -747,7 +770,7 @@ def _ensure_memory_lifecycle_hooks(services: RuntimeServices) -> None:
         and services.hooks.is_registered(services._memory_lifecycle_hook)
     ):
         return
-    from engine.execution.memory_maintenance import (
+    from engine.execution.memory.memory_maintenance import (
         MemoryLifecycleHooks,
         MemoryMaintenanceService,
     )
@@ -1133,6 +1156,7 @@ async def _run_events_with_runtime(
                 ),
                 gate_llm=services.gate_llm,
                 disabled_skill_names=getattr(s, "disabled_skill_names", frozenset()),
+                vision_messages=getattr(s, "vision_messages", ()),
             ):
                 if event.type == EventType.TEXT_DELTA:
                     full_text.append(str(event.data.get("text", "")))

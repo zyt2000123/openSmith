@@ -10,7 +10,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from engine.execution.runtime import RuntimeContext, RuntimeServices
+    from engine.execution.orchestration.runtime import RuntimeContext, RuntimeServices
 
 logger = logging.getLogger(__name__)
 

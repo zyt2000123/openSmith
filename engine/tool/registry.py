@@ -13,7 +13,7 @@ from .interface import ToolCall, ToolDefinition, ToolResult
 from .truncation import truncate_output
 
 if TYPE_CHECKING:
-    from engine.execution.tool_ledger import ToolExecutionLedger
+    from engine.execution.tool_execution.tool_ledger import ToolExecutionLedger
 
 _TOOL_ALIASES = {
     "websearch": "web_search",

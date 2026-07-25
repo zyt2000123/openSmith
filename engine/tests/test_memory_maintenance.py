@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from engine.execution.memory_maintenance import (
+from engine.execution.memory.memory_maintenance import (
     MemoryLifecycleHooks,
     MemoryMaintenanceService,
 )
-from engine.execution.agent_loop import _ensure_memory_lifecycle_hooks, run_memory_idle_tick
-from engine.execution.runtime import RuntimeServices
+from engine.execution.orchestration.agent_loop import _ensure_memory_lifecycle_hooks, run_memory_idle_tick
+from engine.execution.orchestration.runtime import RuntimeServices
 from engine.hook import HookManager, HookType
 from engine.llm.client import ChatResponse
 from engine.skill.registry import SkillRegistry
@@ -197,7 +198,7 @@ def test_idle_maintenance_skips_work_that_is_not_pending(
 
 
 def test_memory_compilation_timeout_does_not_block_lifecycle(tmp_path: Path, monkeypatch) -> None:
-    import engine.execution.memory_maintenance as memory_maintenance
+    import engine.execution.memory.memory_maintenance as memory_maintenance
 
     async def slow_compilation(*_args, **_kwargs):
         await asyncio.sleep(1)
@@ -220,7 +221,7 @@ def test_memory_compilation_reports_partial_progress(
     memory_dir.mkdir()
     (memory_dir / "recent.jsonl").write_text(
         '{"task":"keep recent activity","summary":"recent evidence",'
-        '"timestamp":"2026-07-11T00:00:00+00:00"}\n',
+        '"timestamp":"' + datetime.now(timezone.utc).isoformat() + '"}\n',
         encoding="utf-8",
     )
 

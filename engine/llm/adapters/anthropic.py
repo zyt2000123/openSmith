@@ -411,9 +411,36 @@ class AnthropicAdapter(HTTPAdapterMixin):
             for block in content:
                 if not isinstance(block, dict):
                     raise LLMResponseError("Message content blocks must be objects.")
-                copied.append(dict(block))
+                copied.append(AnthropicAdapter._translate_block(block))
             return copied
         return [{"type": "text", "text": str(content)}]
+
+    @staticmethod
+    def _translate_block(block: dict[str, Any]) -> dict[str, Any]:
+        """Rewrite an OpenAI image part into Anthropic's base64 source form.
+
+        Every other block type passes through unchanged: the engine's
+        conversation is OpenAI-shaped by design, and Anthropic accepts the same
+        text/tool_use/tool_result shapes. Images are the one divergence.
+        """
+        if block.get("type") != "image_url":
+            return dict(block)
+        source = block.get("image_url")
+        url = source.get("url") if isinstance(source, dict) else None
+        header, _, data = url.partition(",") if isinstance(url, str) else ("", "", "")
+        if not header.startswith("data:") or not header.endswith(";base64") or not data:
+            # Anthropic also has a url source type, but the engine only ever
+            # produces data URLs (engine/llm/image_input.py). Anything else is a
+            # bug worth naming here instead of forwarding as an opaque 400.
+            raise LLMResponseError("Anthropic image blocks require a base64 data: URL.")
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": header[len("data:"):].removesuffix(";base64"),
+                "data": data,
+            },
+        }
 
     @staticmethod
     def _text_content(content: object) -> str:

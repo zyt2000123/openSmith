@@ -38,17 +38,6 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,
-    type TEXT NOT NULL CHECK (type IN ('conversation', 'automation')),
-    title TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
-    session_id TEXT REFERENCES sessions(id),
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
 CREATE TABLE IF NOT EXISTS auto_tasks (
     id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,

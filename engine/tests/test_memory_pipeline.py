@@ -1430,6 +1430,37 @@ def test_compile_recent_skips_non_dict_json_lines(tmp_path: Path) -> None:
     assert "valid task" in (memory_dir / "recent.md").read_text(encoding="utf-8")
 
 
+def test_compile_recent_handles_null_timestamp(tmp_path: Path) -> None:
+    """An entry whose ``timestamp`` is ``null`` must not crash compilation."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    null_event = {"task": "null-ts task", "summary": "ok", "timestamp": None}
+    valid_event = {"task": "valid task", "summary": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(null_event) + "\n" + json.dumps(valid_event) + "\n", encoding="utf-8"
+    )
+
+    assert asyncio.run(
+        compile_recent(memory_dir, StaticLLM(), PassReviewer())
+    ) is True
+
+
+def test_compile_recent_handles_naive_timestamp(tmp_path: Path) -> None:
+    """A naive (no tzinfo) timestamp must not raise TypeError in time filtering."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    # Naive timestamp near now; interpreted as UTC and stays inside the window.
+    naive_now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    event = {"task": "naive-ts task", "summary": "ok", "timestamp": naive_now}
+    (memory_dir / "recent.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    assert asyncio.run(
+        compile_recent(memory_dir, StaticLLM(), PassReviewer())
+    ) is True
+    assert "naive-ts task" in (memory_dir / "recent.md").read_text(encoding="utf-8")
+
+
+
 def test_save_conversation_memory_retries_dream_after_insufficient_output(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()

@@ -24,6 +24,7 @@ export const REQUIRED_API_OPERATIONS = [
   { method: "POST", path: "/api/agent/sessions/{session_id}/compress" },
   { method: "DELETE", path: "/api/agent/sessions/{session_id}" },
   { method: "GET", path: "/api/agent/skills" },
+  { method: "PUT", path: "/api/agent/skills/{skill_name}" },
   { method: "GET", path: "/api/agent/mcp" },
   { method: "GET", path: "/api/agent/token-stats" },
   { method: "GET", path: "/api/agent/observability/runs" },

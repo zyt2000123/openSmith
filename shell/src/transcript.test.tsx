@@ -49,6 +49,32 @@ test("transcript turns frame user messages while aligning their content with rep
   assert.equal(userMessageBoxProps(2).width, 1);
 });
 
+test("an over-long tool hint is truncated on grapheme boundaries", () => {
+  const toolBlock = (hint: string) => ({
+    id: "tool-1",
+    type: "tool" as const,
+    toolCallId: "call-1",
+    name: "read",
+    hint,
+    state: "success" as const,
+    summary: "",
+  });
+  const renderHint = (hint: string) =>
+    stripAnsi(
+      renderToString(
+        <TranscriptEntryView
+          entry={{ ...completedTurn("check config"), blocks: [toolBlock(hint)] }}
+          viewMode="transcript"
+        />,
+      ),
+    );
+
+  // A 40-emoji hint is 80 UTF-16 units, so slicing at 55 lands mid-surrogate and
+  // emits a lone half. Measuring cells instead cuts on a grapheme boundary.
+  const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.equal(loneSurrogate.test(renderHint("🎉".repeat(40))), false);
+});
+
 test("transcript keeps the assistant marker on the first Markdown heading line", () => {
   const entry = { ...completedTurn("Explain memory"), assistantText: "## Agent 记忆系统的核心关注点" };
   const output = stripAnsi(renderToString(<TranscriptEntryView entry={entry} viewMode="compact" />));
@@ -76,23 +102,6 @@ test("processing placeholder sweeps its bright character from left to right", ()
     finalFrame.map((segment) => segment.active),
     [false, false, false, false, false, false, false, false, false, true],
   );
-});
-
-test("transcript renders simple unlabelled relationship diagrams outside generic code blocks", () => {
-  const entry = {
-    ...completedTurn("Explain outgoing webhooks"),
-    assistantText: `\`\`\`
-用户系统  <——HTTP POST——  云平台
-                      (事件发生时)
-\`\`\``,
-  };
-  const output = stripAnsi(renderToString(<TranscriptEntryView entry={entry} viewMode="compact" />));
-
-  assert.match(output, /用户系统/);
-  assert.match(output, /云平台/);
-  assert.match(output, /HTTP.*POST/);
-  assert.match(output, /事件发生时/);
-  assert.doesNotMatch(output, /\[text\] · 2 行/);
 });
 
 test("transcript keeps JSON payloads in the code renderer", () => {

@@ -245,7 +245,7 @@ class SessionWhitelist:
 
 # ── Shell path extraction (req #4: redirects + pipes) ───────
 
-_REDIRECT_RE = re.compile(r"(?:>>?|[12]>>?)\s*([^\s;|&]+)")
+_REDIRECT_RE = re.compile(r"(?:>>?|[12]>>?|&>>?)\s*([^\s;|&]+)")
 _ABS_PATH_RE = re.compile(r"(?<![\w:~])/(?!/)[^\s;|&'\"`$()<>]+")
 _SHELL_CD_RE = re.compile(
     r"(?:^|[;|&]\s*)cd\s+(?:--\s+)?(?P<path>'[^']*'|\"[^\"]*\"|[^\s;|&]+)"

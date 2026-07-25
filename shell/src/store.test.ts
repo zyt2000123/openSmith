@@ -1,7 +1,58 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createAppStore, TRANSCRIPT_LIMIT } from "./store.js";
+import { createAppStore, TRANSCRIPT_LIMIT, TRANSCRIPT_TRIM_TARGET } from "./store.js";
+import { splitTranscript } from "./transcript-state.js";
+
+/**
+ * Ink's <Static> renders `items.slice(index)` and only advances `index` from a
+ * layout effect keyed on `items.length`. Mirroring that here shows what the
+ * terminal actually receives across a sequence of store updates.
+ */
+function createStaticSpy() {
+  let index = 0;
+  let lastLength = -1;
+  const printed: string[] = [];
+  return {
+    printed,
+    /** `<Static key={transcriptEpoch}>` — a new key throws away the print cursor. */
+    remount(): void {
+      index = 0;
+      lastLength = -1;
+    },
+    render(items: string[]): void {
+      printed.push(...items.slice(index));
+      if (items.length !== lastLength) {
+        lastLength = items.length;
+        index = items.length;
+      }
+    },
+  };
+}
+
+test("system lines still reach the terminal after the transcript hits its limit", () => {
+  const store = createAppStore();
+  const staticSpy = createStaticSpy();
+  let epoch = store.getState().transcriptEpoch;
+  const renderStatic = () => {
+    const state = store.getState();
+    if (state.transcriptEpoch !== epoch) {
+      epoch = state.transcriptEpoch;
+      staticSpy.remount();
+    }
+    const { done } = splitTranscript(state.transcript);
+    staticSpy.render(["hero", ...done.map((entry) => (entry.kind === "system" ? entry.text : entry.id))]);
+  };
+
+  for (let index = 0; index < TRANSCRIPT_LIMIT; index += 1) {
+    store.getState().pushSystemLine(`line-${index}`);
+    renderStatic();
+  }
+  store.getState().pushSystemLine("overflow-marker");
+  renderStatic();
+
+  assert.equal(staticSpy.printed.includes("overflow-marker"), true);
+});
 
 test("transcript history is bounded for long-running shell sessions", () => {
   const store = createAppStore();
@@ -11,9 +62,16 @@ test("transcript history is bounded for long-running shell sessions", () => {
   }
 
   const transcript = store.getState().transcript;
-  assert.equal(transcript.length, TRANSCRIPT_LIMIT);
+  assert.equal(transcript.length <= TRANSCRIPT_LIMIT, true);
+  // A trim cuts back to TRANSCRIPT_TRIM_TARGET, so the survivors start that far
+  // back from the append that overflowed the limit.
   assert.equal(transcript[0]?.kind, "system");
-  assert.equal(transcript[0]?.kind === "system" ? transcript[0].text : "", "line-20");
+  assert.equal(
+    transcript[0]?.kind === "system" ? transcript[0].text : "",
+    `line-${TRANSCRIPT_LIMIT + 1 - TRANSCRIPT_TRIM_TARGET}`,
+  );
+  const last = transcript.at(-1);
+  assert.equal(last?.kind === "system" ? last.text : "", `line-${TRANSCRIPT_LIMIT + 19}`);
 });
 
 test("token usage tracks the current turn separately from the session total", () => {

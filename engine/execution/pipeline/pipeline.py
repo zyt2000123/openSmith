@@ -10,7 +10,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncGenerator
+from typing import TYPE_CHECKING, AsyncGenerator, Sequence
 from uuid import uuid4
 
 from .backtrack import FailureLoopGuard, FailureSignature
@@ -27,7 +27,7 @@ from .pipeline_context import (
     CTX_WORKING_DIR,
     output_key,
 )
-from .react_loop import react_event_loop
+from engine.execution.react.react_loop import react_event_loop
 
 if TYPE_CHECKING:
     from engine.llm.port import LLMPort
@@ -61,6 +61,7 @@ async def run_pipeline(
     gate_llm: "LLMPort | None" = None,
     start_node_idx: int = 0,
     disabled_skill_names: frozenset[str] = frozenset(),
+    vision_messages: Sequence[dict] = (),
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """Execute a pipeline: walk nodes sequentially, ReAct each, gate-check.
 
@@ -130,7 +131,10 @@ async def run_pipeline(
                         skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
                     elif attempt == 2:
                         skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
-                    messages = [{"role": "user", "content": user_message}]
+                    # 兜底路径（上面 116 行）用 base_messages，图片已在其中；
+                    # skill 路径自建消息列表，必须自己带上，否则截图在整个
+                    # coding 工作流里对模型不可见。
+                    messages = [*vision_messages, {"role": "user", "content": user_message}]
                     event_stream = execute_skill_events(
                         skill, llm, tool_registry, messages, skill_context,
                         max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,

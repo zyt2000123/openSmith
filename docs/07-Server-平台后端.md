@@ -33,16 +33,18 @@ uv run uvicorn app.main:app --port 8140
 
 ## 端点总览
 
-共 12 个路由模块，50+ 个 API 端点。`/api/auth` stub 已移除；当前本地产品主线不提供账号认证。
+共 2 个路由模块（`agent`、`config`）加健康检查，34 个 API 端点 —— 以 `app.openapi()` 为准。
+
+> 下文「模板 `/api/templates`」「插件 `/api/plugins`」两节描述的端点在当前代码中并不存在，
+> 属于早于单 Smith 重构的历史遗留，本次只清理了确实被删除的端点，未连带处理它们。
 
 当前主线 API 是单 Smith facade：`/api/agent/...`。
 
 | 模块 | 前缀 | 端点数 |
 |------|------|--------|
 | 健康检查 | `/api` | 1 |
-| Smith 主路径 | `/api/agent` | 20+ |
-| 配置 | `/api/config` | 2 |
-| 插件 | `/api/plugins` | 4 |
+| Smith 主路径 | `/api/agent` | 30 |
+| 配置 | `/api/config` | 3 |
 
 ---
 
@@ -98,28 +100,6 @@ uv run uvicorn app.main:app --port 8140
 3. 生成默认 `smith` 身份档案并返回
 
 **响应 201** `AgentProfileOut`
-
----
-
-### PUT /api/agent
-
-更新 Smith 档案字段，未提供字段保持不变。
-
-**请求体** `AgentProfileUpdate`（全部可选）：
-
-| 字段 | 类型 |
-|------|------|
-| `name` | `str \| None` |
-| `role` | `str \| None` |
-| `description` | `str \| None` |
-| `device` | `str \| None` |
-| `knowledge` | `list[str] \| None` |
-| `online` | `bool \| None` |
-| `accent` | `str \| None` |
-
----
-
-**响应 200** `AgentProfileOut`
 
 ---
 
@@ -192,26 +172,6 @@ uv run uvicorn app.main:app --port 8140
 
 ---
 
-### POST .../sessions/{session_id}/messages
-
-发送消息（同步模式）。
-
-**流程：**
-1. 保存用户消息到数据库（`role: "user"`）
-2. 调用 `engine.reply(agent_id, name, content)` 获取 AI 回复
-3. 保存助手消息到数据库（`role: "assistant"`）
-4. 返回助手消息
-
-**请求体** `MessageCreate`：
-
-| 字段 | 类型 | 必填 |
-|------|------|------|
-| `content` | `str` | 是 |
-
-**响应 201** `MessageOut`（助手回复消息）
-
----
-
 ### POST .../sessions/{session_id}/messages/stream
 
 发送消息（SSE 流式模式）。
@@ -239,48 +199,6 @@ data: {"id": "msg_a1b2c3d4e5f6"}
 | `done` | `{"id": "msg_id"}` | 流结束，返回完整消息 ID |
 
 > 内部调用 `engine.reply_stream()` 获取 `AsyncGenerator[str, None]`。对于技能链（非 DIRECT）任务，回退到非流式模式，完成后一次性返回完整结果。
-
----
-
-## 任务 `/api/agent/tasks`
-
-### GET .../tasks
-
-列出指定 Agent 的所有任务。
-
-**响应 200** `list[TaskOut]`：
-
-```json
-[
-  {
-    "id": "a1b2c3d4e5f6",
-    "agent_id": "a1b2c3d4",
-    "type": "conversation",
-    "title": "",
-    "status": "pending",
-    "session_id": null,
-    "created_at": "2025-01-01T00:00:00",
-    "updated_at": "2025-01-01T00:00:00"
-  }
-]
-```
-
----
-
-### POST .../tasks
-
-创建任务。
-
-**请求体** `TaskCreate`：
-
-| 字段 | 类型 | 必填 | 默认值 |
-|------|------|------|--------|
-| `type` | `str` | 否 | `"conversation"` |
-| `title` | `str` | 否 | `""` |
-
-> `type` 可选值：`conversation`、`automation`。初始状态为 `pending`。
-
-**响应 201** `TaskOut`
 
 ---
 
@@ -431,76 +349,6 @@ data: {"id": "msg_a1b2c3d4e5f6"}
 
 ---
 
-## 文件 `/api/agent/files`
-
-操作 Smith 唯一运行时目录（`~/.agent-smith/agent/`）下的配置文件。
-
-### 白名单
-
-仅允许操作以下文件：
-
-- `role.md`
-- `style.md`
-- `workflow.md`
-- `toolbox.md`
-- `context.md`
-- `config.yaml`
-
-访问白名单之外的文件返回 `400`。
-
----
-
-### GET .../files
-
-列出 Agent 目录下的所有文件。
-
-**响应 200**：
-
-```json
-["role.md", "style.md", "workflow.md", "config.yaml", "context.md"]
-```
-
----
-
-### GET .../files/{filename}
-
-读取指定文件内容。
-
-**路径参数：**
-- `filename` — 文件名（必须在白名单内）
-
-**响应 200：**
-
-```json
-{
-  "filename": "role.md",
-  "content": "# 角色定义\n\n你是一名全栈开发工程师..."
-}
-```
-
----
-
-### PUT .../files/{filename}
-
-更新指定文件内容。
-
-**请求体** `FileContent`：
-
-| 字段 | 类型 | 必填 |
-|------|------|------|
-| `content` | `str` | 是 |
-
-**响应 200：**
-
-```json
-{
-  "filename": "role.md",
-  "content": "# 角色定义\n\n更新后的内容..."
-}
-```
-
----
-
 ## 配置 `/api/config`
 
 ### GET /api/config/llm
@@ -541,58 +389,6 @@ data: {"id": "msg_a1b2c3d4e5f6"}
   "model": "gpt-4o-mini"
 }
 ```
-
----
-
-## 统计 `/api/agent/stats`
-
-### GET .../stats
-
-获取指定 Agent 的活动统计数据。
-
-**响应 200：**
-
-```json
-{
-  "agent_id": "a1b2c3d4",
-  "days_active": 30,
-  "total_sessions": 42,
-  "total_messages": 356,
-  "total_tasks": 18,
-  "completed_tasks": 15,
-  "auto_tasks": 3,
-  "recent_activity": [
-    {
-      "session_id": "a1b2c3d4e5f6",
-      "title": "代码审查",
-      "created_at": "2025-01-01T10:00:00",
-      "message_count": 12
-    }
-  ],
-  "activity_heatmap": {
-    "2025-01-01": 5,
-    "2025-01-02": 3,
-    "2024-12-31": 8
-  },
-  "tool_usage": {
-    "file_read": 45,
-    "web_search": 12,
-    "code_execute": 28
-  }
-}
-```
-
-| 字段 | 说明 |
-|------|------|
-| `days_active` | 有活动的天数 |
-| `total_sessions` | 会话总数 |
-| `total_messages` | 消息总数 |
-| `total_tasks` | 任务总数 |
-| `completed_tasks` | 已完成任务数 |
-| `auto_tasks` | 自动任务数 |
-| `recent_activity` | 最近 10 个会话 |
-| `activity_heatmap` | 近 30 天每日消息数 |
-| `tool_usage` | 从助手消息中解析的工具调用统计 |
 
 ---
 

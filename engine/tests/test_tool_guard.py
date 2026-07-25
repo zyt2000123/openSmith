@@ -115,6 +115,22 @@ def test_platform_writes_outside_memory_remain_blocked():
     ).allowed
 
 
+def test_combined_redirect_to_platform_data_blocked():
+    """``&>`` and ``&>>`` (stdout+stderr) redirects into platform data must be blocked."""
+    agent_dir = Path.home() / ".agent-smith" / "agent"
+    assert not _check(f"cmd &> {agent_dir / 'evil.log'}").allowed
+    assert not _check(f"cmd &>> {agent_dir / 'evil.log'}").allowed
+
+
+def test_extract_shell_paths_captures_combined_redirect():
+    from engine.safety.tool_guard import _extract_shell_paths
+
+    _, write_paths = _extract_shell_paths("cmd &> ~/.agent-smith/agent/x")
+    assert any(p.endswith("x") for p in write_paths)
+    _, write_paths = _extract_shell_paths("cmd &>> ~/.agent-smith/agent/x")
+    assert any(p.endswith("x") for p in write_paths)
+
+
 def test_file_tools_only_write_approved_memory_views_in_platform_data():
     agent_dir = Path.home() / ".agent-smith" / "agent"
     memory = agent_dir / "memory"

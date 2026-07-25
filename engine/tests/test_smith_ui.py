@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from engine.execution.events import EventType
-from engine.execution.react_loop import react_event_loop
-from engine.execution.smith_ui import validate_smith_ui_call
+from engine.observability.events import EventType
+from engine.execution.react.react_loop import react_event_loop
+from engine.execution.react.smith_ui import validate_smith_ui_call
 from engine.llm.client import ChatResponse, ToolCallData
 from engine.tool.registry import ToolRegistry
 

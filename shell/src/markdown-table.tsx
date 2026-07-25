@@ -1,9 +1,10 @@
 import { MarkdownText } from "@assistant-ui/react-ink-markdown";
 import { Box, Text } from "ink";
 import { marked, type Token, type Tokens } from "marked";
+import { Fragment } from "react";
 
 import { displayWidth, padDisplayText, type TextAlignment, wrapDisplayText } from "./text-layout.js";
-import { ASSISTANT, BORDER, WARNING } from "./theme.js";
+import { BORDER, INFO } from "./theme.js";
 
 export type MarkdownTable = {
   headers: string[];
@@ -99,17 +100,25 @@ function requiredGridWidth(columnWidths: readonly number[], padding: number): nu
 }
 
 /** A cell cannot be narrower than one complete terminal grapheme. */
+// Both fold instead of spreading: one argument per grapheme (or per line) overflows
+// the call stack past ~100k arguments, and table content is model-generated.
 function minimumColumnWidths(table: MarkdownTable): number[] {
   return table.headers.map((header, index) => {
     const values = [header, ...table.rows.map((row) => row[index] ?? "")];
-    return Math.max(1, ...values.flatMap((value) => graphemes(value).map(displayWidth)));
+    return values.reduce(
+      (widest, value) => graphemes(value).reduce((cell, grapheme) => Math.max(cell, displayWidth(grapheme)), widest),
+      1,
+    );
   });
 }
 
 function desiredColumnWidths(table: MarkdownTable): number[] {
   return table.headers.map((header, index) => {
     const values = [header, ...table.rows.map((row) => row[index] ?? "")];
-    return Math.max(1, ...values.flatMap((value) => value.split("\n").map(displayWidth)));
+    return values.reduce(
+      (widest, value) => value.split("\n").reduce((cell, line) => Math.max(cell, displayWidth(line)), widest),
+      1,
+    );
   });
 }
 
@@ -190,29 +199,49 @@ function borderLine(layout: MarkdownTableLayout, left: string, join: string, rig
   return `${left}${spans.join(join)}${right}`;
 }
 
-function rowLines(layout: MarkdownTableLayout, row: GridTableRow): string[] {
+/** Padded cell text for one visual line of a row; the column rules are excluded. */
+function rowCellLines(layout: MarkdownTableLayout, row: GridTableRow): string[][] {
   const height = Math.max(1, ...row.cells.map((cell) => cell.lines.length));
-  return Array.from({ length: height }, (_, lineIndex) => {
-    const cells = row.cells.map((cell, columnIndex) => {
+  return Array.from({ length: height }, (_, lineIndex) =>
+    row.cells.map((cell, columnIndex) => {
       const content = cell.lines[lineIndex] ?? "";
       const width = layout.columnWidths[columnIndex] ?? 1;
       return `${" ".repeat(layout.padding)}${padDisplayText(content, width, cell.alignment)}${" ".repeat(layout.padding)}`;
-    });
-    return `│${cells.join("│")}│`;
-  });
+    }),
+  );
+}
+
+export type MarkdownTableGridLine =
+  | { kind: "border"; text: string }
+  | { kind: "cells"; header: boolean; cells: string[] };
+
+/**
+ * The grid with cell text kept apart from the column rules. Colour-aware
+ * rendering must consume this instead of re-splitting the joined line: a cell
+ * may legitimately contain the rule character itself, and splitting on it would
+ * paint that character as a border and cut the cell in two.
+ */
+export function buildMarkdownTableGrid(layout: MarkdownTableLayout): MarkdownTableGridLine[] {
+  if (layout.rows.length === 0) return [];
+  const grid: MarkdownTableGridLine[] = [{ kind: "border", text: borderLine(layout, "┌", "┬", "┐") }];
+  for (const [index, row] of layout.rows.entries()) {
+    for (const cells of rowCellLines(layout, row)) {
+      grid.push({ kind: "cells", header: row.header, cells });
+    }
+    // A header-only table still gets its separator, matching the original grid.
+    if (index === 0 || index < layout.rows.length - 1) {
+      grid.push({ kind: "border", text: borderLine(layout, "├", "┼", "┤") });
+    }
+  }
+  grid.push({ kind: "border", text: borderLine(layout, "└", "┴", "┘") });
+  return grid;
 }
 
 /** Returns plain grid lines so terminal-width behavior is testable without Ink. */
 export function renderMarkdownTableLines(layout: MarkdownTableLayout): string[] {
-  if (layout.rows.length === 0) return [];
-  const lines: string[] = [borderLine(layout, "┌", "┬", "┐")];
-  for (const [index, row] of layout.rows.entries()) {
-    lines.push(...rowLines(layout, row));
-    if (index === 0) lines.push(borderLine(layout, "├", "┼", "┤"));
-    else if (index < layout.rows.length - 1) lines.push(borderLine(layout, "├", "┼", "┤"));
-  }
-  lines.push(borderLine(layout, "└", "┴", "┘"));
-  return lines;
+  return buildMarkdownTableGrid(layout).map((line) =>
+    line.kind === "border" ? line.text : `│${line.cells.join("│")}│`,
+  );
 }
 
 export function MarkdownTableBlock({ markdown, width }: { markdown: string; width: number }) {
@@ -221,23 +250,31 @@ export function MarkdownTableBlock({ markdown, width }: { markdown: string; widt
     return <MarkdownText text={markdown} width={width} />;
   }
 
-  const layout = layoutMarkdownTable(table, width);
-  const lines = renderMarkdownTableLines(layout);
-  const lineCounts = new Map<string, number>();
-  let sawHeader = false;
-  let headerOpen = true;
+  // Rules are emitted as their own <Text> so they keep the border colour while
+  // cell text keeps the content colour; cell strings are never re-parsed.
   return (
     <Box flexDirection="column">
-      {lines.map((line) => {
-        const isBorder = /^[┌├└]/u.test(line);
-        if (isBorder && sawHeader) headerOpen = false;
-        const isHeader = !isBorder && headerOpen;
-        if (isHeader) sawHeader = true;
-        const occurrence = lineCounts.get(line) ?? 0;
-        lineCounts.set(line, occurrence + 1);
+      {buildMarkdownTableGrid(layoutMarkdownTable(table, width)).map((line, lineIndex) => {
+        const key = `line-${lineIndex}`;
+        if (line.kind === "border") {
+          return (
+            <Text color={BORDER} key={key}>
+              {line.text}
+            </Text>
+          );
+        }
         return (
-          <Text key={`${line}\u0000${occurrence}`} color={isBorder ? BORDER : isHeader ? WARNING : ASSISTANT}>
-            {line}
+          <Text key={key}>
+            <Text color={BORDER}>│</Text>
+            {line.cells.map((cell, column) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: column position is fixed for the whole grid.
+              <Fragment key={`${key}-${column}`}>
+                <Text bold={line.header} color={INFO}>
+                  {cell}
+                </Text>
+                <Text color={BORDER}>│</Text>
+              </Fragment>
+            ))}
           </Text>
         );
       })}

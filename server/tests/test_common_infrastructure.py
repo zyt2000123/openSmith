@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import stat
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.services.config_service import ConfigService  # noqa: E402
 from common import database  # noqa: E402
-from common.paths import BUILTIN_SKILL_NAMES, AppPaths  # noqa: E402
+from common.paths import AppPaths  # noqa: E402
 from common.yaml_utils import YamlConfigError, load_yaml, save_yaml  # noqa: E402
 
 
@@ -48,9 +49,47 @@ def test_app_paths_installs_shipped_skills_separately_from_user_skills(tmp_path:
 
     paths.ensure_base_dirs()
 
+    shipped = sorted(
+        child.name
+        for child in paths.bundled_skills_dir.iterdir()
+        if (child / "SKILL.md").is_file()
+    )
+    installed = sorted(child.name for child in paths.builtin_skills_dir.iterdir() if child.is_dir())
+
     assert paths.builtin_skills_dir == paths.data_dir / "builtin" / "skills"
-    assert sorted(child.name for child in paths.builtin_skills_dir.iterdir() if child.is_dir()) == list(BUILTIN_SKILL_NAMES)
+    # Every shipped skill (a directory holding a SKILL.md entry file) is
+    # mirrored, and nothing else is left in the Smith-owned directory.
+    assert shipped, "no shipped skill was discovered"
+    assert installed == shipped
     assert not (paths.agent_dir / "skills").exists()
+
+
+def test_wheel_data_files_declare_every_bundled_skill() -> None:
+    """A non-editable install ships skills through ``data-files``.
+
+    ``bundled_skills_dir`` prefers that installed copy, so a skill missing from
+    the declaration is absent from a wheel install while still working from a
+    source checkout. setuptools needs one entry per skill (a glob would flatten
+    every ``SKILL.md`` into a single directory), so assert the two stay in sync.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    pyproject = tomllib.loads(
+        (repo_root / "common" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    prefix = "agent_smith_common/builtin_skills/"
+    declared = {
+        target[len(prefix) :]
+        for target in pyproject["tool"]["setuptools"]["data-files"]
+        if target.startswith(prefix)
+    }
+    shipped = {
+        child.name
+        for child in (repo_root / "agents" / "skills").iterdir()
+        if (child / "SKILL.md").is_file()
+    }
+
+    assert shipped, "no shipped skill was discovered"
+    assert declared == shipped
 
 
 def test_yaml_requires_a_mapping_and_preserves_private_atomic_file(tmp_path: Path) -> None:

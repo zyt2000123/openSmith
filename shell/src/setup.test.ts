@@ -12,6 +12,7 @@ function draft(overrides: Partial<SetupDraft> = {}): SetupDraft {
     base_url: "https://api.openai.com/v1",
     model: "gpt-4.1-mini",
     review_model: "",
+    image_model: "",
     max_output_tokens: "",
     api_key: "",
     routes: "",
@@ -27,7 +28,7 @@ function draft(overrides: Partial<SetupDraft> = {}): SetupDraft {
 test("initial setup separates the supplier name from the compatible protocol", () => {
   assert.deepEqual(
     [...INITIAL_SETUP_FIELDS],
-    ["vendor", "provider", "base_url", "api_key", "model", "review_model", "save"],
+    ["vendor", "provider", "base_url", "api_key", "model", "review_model", "image_model", "save"],
   );
 });
 
@@ -79,4 +80,10 @@ test("setup clears the review route when no review model is configured", () => {
 
   assert.deepEqual(result.routes, {});
   assert.deepEqual(result.timeout_profiles, {});
+});
+
+test("setup rejects a provider that only exists on Object.prototype", () => {
+  for (const provider of ["constructor", "toString", "valueOf"]) {
+    assert.throws(() => buildLlmConfigInput(draft({ provider })), /Compatible protocol/);
+  }
 });

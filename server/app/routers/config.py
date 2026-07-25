@@ -8,7 +8,7 @@ from ..services.config_service import ConfigService
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
-LLMUsageName = Literal["interactive", "gate", "background"]
+LLMUsageName = Literal["interactive", "gate", "background", "vision"]
 
 
 class LLMRoutePatch(BaseModel):

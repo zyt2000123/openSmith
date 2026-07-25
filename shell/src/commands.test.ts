@@ -23,12 +23,15 @@ function skill(name: string) {
 }
 
 test("slash filtering exposes one resume command", () => {
-  const skills = Array.from({ length: 8 }, (_, index) => skill(`skill-${index + 1}`));
-  const items = filterSlash(buildSlashItems(skills), "/");
+  const items = filterSlash(buildSlashItems(), "/");
 
-  assert.equal(items.length, 18);
+  assert.equal(items.length, 19);
   assert.equal(
     items.some((item) => item.command === "/init"),
+    true,
+  );
+  assert.equal(
+    items.some((item) => item.command === "/reconnect"),
     true,
   );
   assert.equal(
@@ -65,10 +68,6 @@ test("slash filtering exposes one resume command", () => {
   );
   assert.equal(
     items.some((item) => item.command === "/approve" || item.command === "/deny"),
-    false,
-  );
-  assert.equal(
-    items.some((item) => item.kind === "skill"),
     false,
   );
 });
@@ -123,7 +122,7 @@ test("welcome accepts the first command submitted from the composer", () => {
 });
 
 test("the highlighted hooks command is confirmed with one Enter", () => {
-  const items = filterSlash(buildSlashItems([]), "/");
+  const items = filterSlash(buildSlashItems(), "/");
   const hooksIndex = items.findIndex((item) => item.command === "/hooks");
 
   assert.equal(selectedSlashItem("/", true, items, hooksIndex)?.command, "/hooks");

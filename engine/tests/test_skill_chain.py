@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from engine.execution.skill_chain import (
+from engine.execution.pipeline.skill_chain import (
     GateContentError,
     SkillChain,
     load_gate_content,
@@ -183,7 +183,7 @@ def test_gate_content_registries_are_scoped_per_agents_directory(tmp_path: Path)
         gates_dir = root / "gates"
         gates_dir.mkdir(parents=True)
         (gates_dir / "gates.py").write_text(
-            "from engine.execution.gate import GateResult\n"
+            "from engine.execution.pipeline.gate import GateResult\n"
             f"class {class_name}:\n"
             "    async def check(self, output, context):\n"
             "        return GateResult('pass', 'ok')\n"
@@ -228,7 +228,7 @@ def test_duplicate_gate_key_across_files_raises(tmp_path: Path) -> None:
     gates_dir = tmp_path / "gates"
     gates_dir.mkdir()
     body = (
-        "from engine.execution.gate import GateResult\n"
+        "from engine.execution.pipeline.gate import GateResult\n"
         "class G:\n"
         "    async def check(self, output, context):\n"
         "        return GateResult('pass', 'ok')\n"

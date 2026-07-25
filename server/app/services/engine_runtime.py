@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from common.config import AGENT_DIR, BUILTIN_IDENTITIES_DIR, BUILTIN_SKILLS_DIR, PATHS, SAFETY_RULES_PATH
-from engine.execution.skill_chain import SkillChain, load_gate_content
+from engine.execution.pipeline.skill_chain import SkillChain, load_gate_content
 from engine.identity_catalog import IdentityCatalog, load_identity_catalog
-from engine.execution.runtime import RuntimeContext, RuntimeServices
+from engine.execution.orchestration.runtime import RuntimeContext, RuntimeServices
 from engine.llm.model_config import LLMUsage, build_llm_client, resolve_llm_config
 from engine.llm.contracts import GEMINI_OPENAI_BASE_URL
 from engine.llm.factory import normalize_provider_name
@@ -36,6 +38,25 @@ def _normalize_llm_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _maybe_record(client: LLMPort) -> LLMPort:
+    """Wrap the client so real runs land in a JSONL recording (opt-in).
+
+    Set ``AGENT_SMITH_RECORD_LLM=/path/to/case.jsonl`` and every model turn of
+    every subsequent run appends there, ready to replay via ``engine.replay``.
+    Only the *responses* are written, never the prompt — so a recording cannot
+    leak conversation content, and replay does not need it (turns are served in
+    recorded order rather than matched against messages).
+    """
+    target = os.environ.get("AGENT_SMITH_RECORD_LLM", "").strip()
+    if not target:
+        return client
+    from engine.replay import RecordingLLM
+
+    path = Path(target).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return RecordingLLM(client, path)
+
+
 @dataclass
 class LLMClientManager:
     """Factory/cache for process-scoped LLM clients."""
@@ -52,7 +73,7 @@ class LLMClientManager:
         with self._lock:
             client = self._clients.get(fingerprint)
             if client is None:
-                client = build_llm_client(config)
+                client = _maybe_record(build_llm_client(config))
                 self._clients[fingerprint] = client
             return client
 
@@ -127,6 +148,12 @@ def build_engine_runtime(
     interactive_config = resolve_llm_config(**interactive_kwargs)
     gate_config = resolve_llm_config(usage=LLMUsage.GATE)
     background_config = resolve_llm_config(usage=LLMUsage.BACKGROUND)
+    # An omitted route inherits the base model, so an unset image model looks
+    # exactly like the interactive one here. Same model means there is nothing
+    # to fall back to: probing the main model already decides the outcome.
+    vision_config: dict[str, Any] | None = resolve_llm_config(usage=LLMUsage.VISION)
+    if vision_config and vision_config.get("model") == interactive_config.get("model"):
+        vision_config = None
     runtime = RuntimeContext(
         agent_id=agent_id,
         agent_name=agent_name,
@@ -140,6 +167,7 @@ def build_engine_runtime(
         llm=manager.get_for_config(interactive_config),
         gate_llm=manager.get_for_config(gate_config),
         background_llm=manager.get_for_config(background_config),
+        vision_llm=manager.get_for_config(vision_config) if vision_config else None,
         tool_registry=ToolRegistry(),
         skill_registry=SkillRegistry(),
         tool_guard=ToolGuard(SAFETY_RULES_PATH),

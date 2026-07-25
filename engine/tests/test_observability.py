@@ -10,16 +10,6 @@ from engine.observability import (
 )
 
 
-def test_legacy_execution_imports_remain_compatible() -> None:
-    from engine.execution.events import EventType as LegacyEventType
-    from engine.execution.events import ExecutionEvent as LegacyExecutionEvent
-    from engine.execution.trace import TraceStore as LegacyTraceStore
-
-    assert LegacyEventType is EventType
-    assert LegacyExecutionEvent is ExecutionEvent
-    assert LegacyTraceStore is TraceStore
-
-
 def test_recorder_persists_events_and_exposes_a_compact_run_summary(tmp_path) -> None:
     projected: list[str] = []
     recorder = RunEventRecorder(

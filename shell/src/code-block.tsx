@@ -1,4 +1,4 @@
-import { Box, Text, useWindowSize } from "ink";
+import { Box, Text } from "ink";
 import { useMemo } from "react";
 
 import { BORDER, MUTED } from "./theme.js";
@@ -30,21 +30,21 @@ export function CodeBlock({
   code,
   language,
   highlighter,
-  width: requestedWidth,
 }: {
   code: string;
   language?: string;
   highlighter?: CodeHighlighter;
-  /** Total horizontal footprint available to the bordered block. */
-  width?: number;
 }) {
-  const { columns } = useWindowSize();
   const lines = useMemo(() => formatCodeLines(code, highlighter, language), [code, highlighter, language]);
   const displayLanguage = language || "text";
-  const width = Math.max(1, requestedWidth ?? columns - 4);
 
+  // No explicit width: a `columns - n` budget has to re-derive every ancestor's
+  // padding by hand, and when that sum is wrong Ink does not shrink the box — it
+  // folds the right border onto the next row. The frame fills its parent through
+  // the default `alignItems: stretch` instead. Do not add flexGrow here: the
+  // parent is a column, so it would grow the box vertically, not horizontally.
   return (
-    <Box flexDirection="column" width={width} borderStyle="single" borderColor={BORDER} paddingX={1} marginBottom={1}>
+    <Box flexDirection="column" borderStyle="single" borderColor={BORDER} paddingX={1} marginBottom={1}>
       <Text color={MUTED} dimColor>
         [{displayLanguage}] · {lines.length} 行
       </Text>

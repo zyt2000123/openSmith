@@ -440,7 +440,16 @@ def _is_read_only_git(args: list[str]) -> bool:
 def _is_read_only_sed(args: list[str]) -> bool:
     if any(arg.startswith("-i") or arg.startswith("--in-place") for arg in args):
         return False
-    scripts = [arg for arg in args if arg not in {"-n", "--quiet", "--silent"}]
+    scripts = [arg for arg in args if arg not in {"-n", "--quiet", "--silent", "-e", "--expression"}]
     if not scripts:
         return False
-    return bool(re.fullmatch(r"(?:\d+|\$)(?:,(?:\d+|\$))?p", scripts[0]))
+    # The first positional is the script (subsequent positionals are input
+    # files). A script may contain ``;``/newline-separated sub-commands; every
+    # one of them must be a read-only print command for the whole call to be
+    # treated as read-only, otherwise a hidden write command (e.g. ``w``)
+    # could slip through.
+    pattern = re.compile(r"(?:\d+|\$)(?:,(?:\d+|\$))?p")
+    sub_cmds = [part.strip() for part in re.split(r"[;\n]", scripts[0]) if part.strip()]
+    if not sub_cmds:
+        return False
+    return all(pattern.fullmatch(cmd) for cmd in sub_cmds)

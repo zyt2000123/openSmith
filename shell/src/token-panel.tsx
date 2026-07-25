@@ -47,6 +47,46 @@ function formatRecentDay(date: string): string {
   return `${WEEKDAY_LABELS[day.getUTCDay()]} ${date.slice(-2)}`;
 }
 
+/** Whole units, so a narrow column cannot fold a one-decimal count's unit onto its own row. */
+function formatCompactTokens(value: number): string {
+  if (value >= 1_000_000_000) return `${Math.round(value / 1_000_000_000)}B`;
+  if (value >= 1_000_000) return `${Math.round(value / 1_000_000)}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
+  return String(value);
+}
+
+export type RollingBarChartPlan = {
+  width: number;
+  labels: string[];
+  values: string[];
+};
+
+/**
+ * Chart geometry as plain data so narrow-terminal behavior is testable without Ink.
+ *
+ * Ink never clips a `<Box width={n}>` — it wraps. A column narrower than the text it
+ * holds folds `136.9k` into `136.9` plus an orphan `k` on the next row, which reads as
+ * a value belonging to no column at all. So the column budget is checked against the
+ * text that will actually be drawn: full labels first, then the short form, and no
+ * chart at all when even that will not fit. Measuring beats picking a constant —
+ * `formatTokenCount` reaches 7 columns at 999_999 ("1000.0k"), which a hand-set bound
+ * would miss.
+ */
+export function planRollingBarChart(days: TokenDay[], columns: number): RollingBarChartPlan | null {
+  if (days.length === 0) return null;
+
+  const width = Math.min(BAR_WIDTH, Math.floor((columns - 4) / days.length));
+  for (const compact of [false, true]) {
+    const labels = days.map((day) => (compact ? day.date.slice(-2) : formatRecentDay(day.date)));
+    const values = days.map((day) =>
+      compact ? formatCompactTokens(day.total_tokens) : formatTokenCount(day.total_tokens),
+    );
+    const needed = Math.max(...labels.map((text) => text.length), ...values.map((text) => text.length));
+    if (width >= needed) return { width, labels, values };
+  }
+  return null;
+}
+
 function barSegments(day: TokenDay, maxTokens: number): { filled: number; input: number } {
   if (day.total_tokens <= 0 || maxTokens <= 0) return { filled: 0, input: 0 };
 
@@ -59,8 +99,10 @@ function barSegments(day: TokenDay, maxTokens: number): { filled: number; input:
 
 function RollingBarChart({ days }: { days: TokenDay[] }) {
   const { columns } = useWindowSize();
+  const plan = planRollingBarChart(days, columns);
+  if (!plan) return null;
+
   const maxTokens = Math.max(1, ...days.map((day) => day.total_tokens));
-  const width = Math.max(2, Math.min(BAR_WIDTH, Math.floor((columns - 4) / days.length)));
   return (
     <Box flexDirection="column">
       <Box>
@@ -79,7 +121,7 @@ function RollingBarChart({ days }: { days: TokenDay[] }) {
                 const filled = level <= segments.filled;
                 const color = level <= segments.input ? ASSISTANT : WARNING;
                 return (
-                  <Box key={`${day.date}-${level}`} width={width} justifyContent="center">
+                  <Box key={`${day.date}-${level}`} width={plan.width} justifyContent="center">
                     <Text color={filled ? color : MUTED}>{filled ? "██" : "  "}</Text>
                   </Box>
                 );
@@ -89,16 +131,16 @@ function RollingBarChart({ days }: { days: TokenDay[] }) {
         })}
       </Box>
       <Box>
-        {days.map((day) => (
-          <Box key={day.date} width={width} justifyContent="center">
-            <Text color={MUTED}>{formatRecentDay(day.date)}</Text>
+        {days.map((day, index) => (
+          <Box key={day.date} width={plan.width} justifyContent="center">
+            <Text color={MUTED}>{plan.labels[index]}</Text>
           </Box>
         ))}
       </Box>
       <Box>
-        {days.map((day) => (
-          <Box key={day.date} width={width} justifyContent="center">
-            <Text color={day.total_tokens > 0 ? INFO : MUTED}>{formatTokenCount(day.total_tokens)}</Text>
+        {days.map((day, index) => (
+          <Box key={day.date} width={plan.width} justifyContent="center">
+            <Text color={day.total_tokens > 0 ? INFO : MUTED}>{plan.values[index]}</Text>
           </Box>
         ))}
       </Box>

@@ -70,7 +70,6 @@ test("slash and skills navigation scrolls through the full lists", () => {
   options.slashMenuOpen = true;
   options.slashItems = Array.from({ length: 10 }, (_, index) => ({
     id: `item-${index}`,
-    kind: "command" as const,
     title: `/item-${index}`,
     command: `/item-${index}`,
     description: "",

@@ -7,7 +7,7 @@ export const PROVIDER_PRESETS = {
   gemini: { base_url: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
 } as const;
 
-const LLM_USAGES = ["interactive", "gate", "background"] as const satisfies readonly LlmUsage[];
+const LLM_USAGES = ["interactive", "gate", "background", "vision"] as const satisfies readonly LlmUsage[];
 const TIMEOUT_FIELDS = ["connect", "read", "stream_read", "write", "pool"] as const;
 
 export const INITIAL_SETUP_FIELDS = [
@@ -17,6 +17,7 @@ export const INITIAL_SETUP_FIELDS = [
   "api_key",
   "model",
   "review_model",
+  "image_model",
   "save",
 ] as const;
 
@@ -27,6 +28,7 @@ export const SETUP_FIELDS = [
   "api_key",
   "model",
   "review_model",
+  "image_model",
   "max_output_tokens",
   "routes",
   "models",
@@ -47,6 +49,7 @@ const SETUP_FIELD_LABELS: Record<SetupField, string> = {
   base_url: "base URL",
   model: "model",
   review_model: "review model (optional)",
+  image_model: "image model (optional)",
   max_output_tokens: "max output tokens (blank=keep, -=provider default)",
   api_key: "API key",
   routes: "route overrides (JSON)",
@@ -118,6 +121,7 @@ export function createSetupDraft(config: LlmConfig | null): SetupDraft {
     base_url: config?.base_url || "",
     model: config?.model || "",
     review_model: config?.routes?.gate?.model || "",
+    image_model: config?.routes?.vision?.model || "",
     max_output_tokens: config?.max_output_tokens?.toString() ?? "",
     api_key: "",
     routes: jsonForRouteOverrides(config),
@@ -139,7 +143,9 @@ export function setSetupField(draft: SetupDraft, field: EditableSetupField, valu
 
 export function setProvider(draft: SetupDraft, value: string): SetupDraft | null {
   const provider = value.trim().toLowerCase();
-  if (!(provider in PROVIDER_PRESETS)) return null;
+  // hasOwn, not `in`: `in` walks the prototype, so "constructor"/"toString" would pass
+  // the check and then read an undefined base_url off Object.prototype.
+  if (!Object.hasOwn(PROVIDER_PRESETS, provider)) return null;
 
   const preset = PROVIDER_PRESETS[provider as keyof typeof PROVIDER_PRESETS];
   return {
@@ -317,18 +323,29 @@ function routeForUsage(routes: Partial<Record<LlmUsage, LlmRouteInput | null>>, 
 /** Build the API patch while keeping all secret fields out of the JSON editor. */
 export function buildLlmConfigInput(draft: SetupDraft): LlmConfigInput {
   const reviewModel = draft.review_model.trim();
+  const imageModel = draft.image_model.trim();
   const routes = parseRoutes(draft.routes) ?? {};
   const timeoutProfiles = parseTimeoutProfiles(draft.timeout_profiles);
   const models = parseModels(draft.models);
   const maxOutputTokens = parseMaxOutputTokens(draft.max_output_tokens);
 
+  // setProvider() only guards the Enter path; arrow/Tab navigation writes the field
+  // verbatim. Validate at the single exit instead, so no navigation order can slip
+  // an unsupported protocol through to the server.
+  const provider = draft.provider.trim().toLowerCase();
+  if (!Object.hasOwn(PROVIDER_PRESETS, provider)) {
+    throw new Error("Compatible protocol must be openai, anthropic, or gemini.");
+  }
+
   const input: LlmConfigInput = {
     vendor: draft.vendor.trim(),
-    provider: draft.provider.trim(),
+    provider,
     base_url: draft.base_url.trim(),
     model: draft.model.trim(),
   };
   if (reviewModel) routeForUsage(routes, "gate").model = reviewModel;
+  // 留空是有意义的选项，不是缺省值：没有 vision 路由时，能否读图完全取决于主模型。
+  if (imageModel) routeForUsage(routes, "vision").model = imageModel;
   input.routes = routes;
   input.timeout_profiles = timeoutProfiles ?? {};
   if (models !== undefined) input.models = models;

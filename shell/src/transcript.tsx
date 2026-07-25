@@ -7,14 +7,14 @@ import { useEffect, useState } from "react";
 import type { ToolState } from "./activity.js";
 import { CodeBlock, type CodeHighlighter } from "./code-block.js";
 import { DiffBlock } from "./diff-block.js";
-import { DisplayText } from "./display-text.js";
 import { splitMarkdownLayoutBlocks } from "./markdown-layout.js";
+import { type MarkdownSegment, splitMarkdownBlocks } from "./markdown-segments.js";
 import { MarkdownTableBlock } from "./markdown-table.js";
-import { type MarkdownSegment, renderMermaidDiagram, renderSimpleTextDiagram, splitMarkdownBlocks } from "./mermaid.js";
 import { stripEmojiIcons } from "./output.js";
 import { skillPresentation } from "./skill-presentation.js";
 import { SmithUiBlock as SmithUiView } from "./smith-ui.js";
 import { splitStreamingMarkdown } from "./streaming-markdown.js";
+import { truncateDisplay } from "./text-layout.js";
 import { ACCENT, ASSISTANT, BORDER, ERROR, INFO, MUTED, SKILL, SUCCESS, WARNING } from "./theme.js";
 import type {
   SkillBlock,
@@ -67,14 +67,6 @@ export function userMessageBoxProps(columns: number) {
   } as const;
 }
 
-function DiagramBlock({ diagram, width }: { diagram: string; width: number }) {
-  return (
-    <Box flexDirection="column" marginTop={1} marginBottom={1}>
-      <DisplayText text={diagram} width={width} color={ASSISTANT} breakLongTokens preserveWhitespace />
-    </Box>
-  );
-}
-
 function MarkdownContent({ text, width }: { text: string; width: number }) {
   const layoutBlocks = splitMarkdownLayoutBlocks(text);
   const blockKeyCounts = new Map<string, number>();
@@ -103,34 +95,6 @@ function startsWithMarkdownHeading(text: string): boolean {
   return /^(?:[ \t]*\r?\n)*[ \t]{0,3}#{1,6}(?:\s|$)/u.test(text);
 }
 
-function CodeSegment({
-  segment,
-  highlighter,
-  width,
-}: {
-  segment: Extract<MarkdownSegment, { type: "code" }>;
-  highlighter?: CodeHighlighter;
-  width: number;
-}) {
-  const diagram =
-    segment.language === "text" || segment.language === "diagram" ? renderSimpleTextDiagram(segment.text) : null;
-
-  return diagram ? (
-    <DiagramBlock diagram={diagram} width={width} />
-  ) : (
-    <CodeBlock code={segment.text} language={segment.language} highlighter={highlighter} width={width} />
-  );
-}
-
-function MermaidSegment({ source, width }: { source: string; width: number }) {
-  const diagram = renderMermaidDiagram(source);
-  return diagram ? (
-    <DiagramBlock diagram={diagram} width={width} />
-  ) : (
-    <MarkdownText text={`\`\`\`mermaid\n${source}\n\`\`\``} width={width} {...MARKDOWN_OPTIONS} />
-  );
-}
-
 function DiffSegment({
   segment,
   highlighter,
@@ -154,8 +118,7 @@ function MarkdownSegmentView({
 }) {
   if (segment.type === "markdown") return segment.text ? <MarkdownContent text={segment.text} width={width} /> : null;
   if (segment.type === "diff") return <DiffSegment segment={segment} highlighter={highlighter} width={width} />;
-  if (segment.type === "code") return <CodeSegment segment={segment} highlighter={highlighter} width={width} />;
-  return <MermaidSegment source={segment.text} width={width} />;
+  return <CodeBlock code={segment.text} language={segment.language} highlighter={highlighter} />;
 }
 
 function MarkdownDocument({
@@ -223,10 +186,9 @@ type RenderBlock =
   | ToolSummaryBlock;
 
 function truncate(text: string, max = 80): string {
-  if (text.length <= max) {
-    return text;
-  }
-  return `${text.slice(0, max - 1)}…`;
+  // `max` is a column budget, so it has to be measured in terminal cells: UTF-16
+  // length counts a CJK glyph as 1 (it occupies 2) and splits emoji surrogate pairs.
+  return truncateDisplay(text, max);
 }
 
 function truncateLines(text: string, max = 4): { text: string; hidden: number } {

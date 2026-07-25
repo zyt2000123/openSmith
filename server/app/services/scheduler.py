@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 from common.config import AGENT_DIR
-from engine.execution.agent_loop import run_memory_idle_tick
+from engine.execution.orchestration.agent_loop import run_memory_idle_tick
 
 from .auto_task_service import AutoTaskService
 from .engine_runtime import build_memory_maintenance_services

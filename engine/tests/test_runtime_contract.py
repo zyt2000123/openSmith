@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from engine.execution import agent_loop as agent_loop_module
-from engine.execution.agent_loop import (
+from engine.execution.orchestration import agent_loop as agent_loop_module
+from engine.execution.orchestration.agent_loop import (
     _bind_working_directory_tools,
     prepare_runtime,
     reply_events_with_runtime,
@@ -17,9 +17,9 @@ from engine.execution.agent_loop import (
     run_stream_with_runtime,
     run_agent_stream,
 )
-from engine.execution.backtrack import FailureLoopGuard
-from engine.execution.run_state import RunStateStore, RunStatus, project_execution_event
-from engine.execution.runtime import EngineRequest, RuntimeContext, RuntimeServices
+from engine.execution.pipeline.backtrack import FailureLoopGuard
+from engine.execution.orchestration.run_state import RunStateStore, RunStatus, project_execution_event
+from engine.execution.orchestration.runtime import EngineRequest, RuntimeContext, RuntimeServices
 from engine.identity_catalog import IdentityCatalog
 from engine.llm.client import ChatResponse, ToolCallData
 from engine.observability import EventType, ExecutionEvent, RunSummaryStore, TraceStore, raw_text_delta
@@ -584,6 +584,62 @@ def test_timeout_settles_waiting_approval_before_terminal_run_state(tmp_path: Pa
     assert terminal is not None and terminal.status is RunStatus.COMPLETED
 
 
+def test_granted_approval_resolves_waiting_approval_to_running(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith")
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-1"}),
+    )
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(
+            EventType.TOOL_CALL_RESULT,
+            {
+                "approval_required": True,
+                "approval_id": "approval-1",
+                "tool": "shell",
+                "level": "execute",
+                "reason": "Approval required for shell",
+            },
+        ),
+    )
+    waiting = store.get("run-1")
+    assert waiting is not None and waiting.status is RunStatus.WAITING_APPROVAL
+
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(
+            EventType.TOOL_CALL_RESULT,
+            {
+                "approval_id": "approval-1",
+                "approval_outcome": "granted",
+                "blocked": False,
+            },
+        ),
+    )
+
+    resolved = store.get("run-1")
+    assert resolved is not None
+    assert resolved.status is RunStatus.RUNNING
+    assert resolved.approval_id is None
+    assert resolved.reason == "approval_granted"
+
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(
+            EventType.RUN_FINISHED,
+            {"run_id": "run-1", "status": "completed"},
+        ),
+    )
+    terminal = store.get("run-1")
+    assert terminal is not None and terminal.status is RunStatus.COMPLETED
+
+
 def test_resume_setup_failure_is_exposed_as_terminal_stream(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -932,7 +988,7 @@ steps:
         gates_dir.mkdir()
         (gates_dir / "planning.py").write_text(
             """
-from engine.execution.gate import Gate, GateResult
+from engine.execution.pipeline.gate import Gate, GateResult
 
 class AlwaysPassGate(Gate):
     async def check(self, output, context):

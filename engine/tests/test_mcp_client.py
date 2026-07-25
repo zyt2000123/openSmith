@@ -173,6 +173,42 @@ def test_mcp_client_rejects_repeated_tool_list_cursor():
     assert asyncio.run(run()) == 2
 
 
+def test_mcp_client_list_tools_skips_malformed_entries():
+    """Tools missing a valid string ``name`` must be skipped, not crash list_tools."""
+    class MixedToolsTransport:
+        label = "mixed-tools"
+
+        async def connect(self):
+            pass
+
+        async def send_request(self, method, params):
+            assert method == "tools/list"
+            return {"tools": [
+                {"name": "valid", "description": "ok", "inputSchema": {}},
+                {"description": "no name key"},
+                {"name": None, "description": "null name"},
+                {"name": 123, "description": "non-string name"},
+                {"name": "", "description": "empty name"},
+                "not-a-dict",
+                None,
+            ]}
+
+        async def send_notification(self, method, params):
+            pass
+
+        async def close(self):
+            pass
+
+    async def run():
+        transport = MixedToolsTransport()
+        client = MCPClient(transport=transport)
+        tools = await client.list_tools()
+        await client.close()
+        return [tool.name for tool in tools]
+
+    assert asyncio.run(run()) == ["valid"]
+
+
 def test_mcp_client_limits_tool_list_pages(monkeypatch):
     monkeypatch.setattr(mcp_client, "MAX_MCP_TOOL_LIST_PAGES", 2)
 

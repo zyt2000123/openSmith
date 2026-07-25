@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
-from engine.execution.agent_loop import reply_with_runtime as engine_reply_with_runtime
-from engine.execution.runtime import EngineRequest
+from engine.execution.orchestration.agent_loop import reply_with_runtime as engine_reply_with_runtime
+from engine.execution.orchestration.runtime import EngineRequest
 
 from ..schemas.auto_task import AutoTaskCreate, AutoTaskUpdate, AutoTaskOut, AutoTaskRunOut
 from ..infrastructure.repositories.auto_task_repo import AutoTaskRepo

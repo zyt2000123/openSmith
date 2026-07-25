@@ -85,6 +85,67 @@ test("finishing a request starts the next queued message in FIFO order", async (
   );
 });
 
+test("a rejected queue handoff releases the busy state instead of stalling the shell", async () => {
+  const store = createAppStore();
+  const bridge = new NodeBridge(store);
+  bridge.enqueueMessage("second");
+  store.getState().set({ busy: true, runStartedAt: 1, inputLocked: true });
+
+  const activeController = new AbortController();
+  const internal = bridge as unknown as {
+    activeRequest: AbortController | null;
+    finishRequest: (controller: AbortController) => void;
+    sendMessage: (text: string, skillName?: string) => Promise<boolean>;
+  };
+  internal.activeRequest = activeController;
+  // A shell operation (skill toggle, MCP refresh) locked the input while the run was ending.
+  internal.sendMessage = async () => false;
+
+  internal.finishRequest(activeController);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const state = store.getState();
+  assert.deepEqual(
+    state.queuedMessages.map((item) => item.text),
+    ["second"],
+  );
+  assert.equal(state.busy, false);
+  assert.equal(state.runStartedAt, null);
+});
+
+test("a refused handoff returns the message to the head of the queue instead of dropping it", async () => {
+  const store = createAppStore();
+  const bridge = new NodeBridge(store);
+  bridge.enqueueMessage("first");
+  bridge.enqueueMessage("second");
+
+  const activeController = new AbortController();
+  const internal = bridge as unknown as {
+    activeRequest: AbortController | null;
+    finishRequest: (controller: AbortController) => void;
+    sendMessage: (text: string, skillName?: string) => Promise<boolean>;
+  };
+  internal.activeRequest = activeController;
+  // The user types while the handoff is still in flight, filling the queue to its cap.
+  // Re-entering through enqueueMessage would be refused here, losing "first" outright.
+  internal.sendMessage = async () => {
+    bridge.enqueueMessage("typed-during-handoff");
+    bridge.enqueueMessage("typed-after-that");
+    assert.equal(store.getState().queuedMessages.length, MAX_QUEUED_MESSAGES);
+    return false;
+  };
+
+  internal.finishRequest(activeController);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(
+    store.getState().queuedMessages.map((item) => item.text),
+    ["first", "second", "typed-during-handoff", "typed-after-that"],
+  );
+});
+
 test("starting a new session keeps the existing session in history", () => {
   const store = createAppStore();
   const session = {
@@ -359,6 +420,68 @@ test("resuming a recoverable run replaces the partial reply instead of duplicati
     assert.equal(turn?.kind === "turn" ? turn.assistantText : "", "fresh");
     assert.equal(store.getState().recoverableRunId, null);
     assert.equal(calls.includes("POST http://127.0.0.1:8140/api/agent/runs/run-1/resume"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resuming a run in the current session restarts its counters instead of doubling them", async () => {
+  const session = { id: "session-1", agent_id: "agent-1", title: "work", created_at: "now", message_count: 1 };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api/agent/runs/run-1")) {
+      return new Response(
+        JSON.stringify({
+          run_id: "run-1",
+          agent_id: "agent-1",
+          session_id: "session-1",
+          status: "cancelled",
+          created_at: "now",
+          updated_at: "now",
+          event_seq: 1,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.endsWith("/api/agent/runs/run-1/resume")) {
+      return new Response(
+        'event: run_started\ndata: {"run_id":"run-1"}\n\nevent: token_usage\ndata: {"input_tokens":10,"output_tokens":5,"total_tokens":15}\n\nevent: done\ndata: {"run_id":"run-1","status":"completed"}\n\n',
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      );
+    }
+    if (url.endsWith("/api/agent/sessions")) {
+      return new Response(JSON.stringify([session]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    const store = createAppStore();
+    store.getState().set({
+      baseUrl: "http://127.0.0.1:8140",
+      agent: { id: "agent-1", name: "Smith", role: "agent" },
+      sessions: [session],
+      // Same session as the interrupted run, so the resume path skips loadSession —
+      // nothing else would clear the counters the replayed events add to.
+      currentSession: session,
+      recoverableRunId: "run-1",
+      turnTokenUsage: { input_tokens: 100, output_tokens: 100, total_tokens: 200 },
+    });
+    store.getState().pushTurn("fix it");
+    store.getState().applyEvent({ type: "tool_call", id: "t1", name: "shell", hint: "" });
+    store
+      .getState()
+      .applyEvent({ type: "tool_result", id: "t1", error: false, blocked: false, preflight: false, summary: "ok" });
+
+    await new NodeBridge(store).resumeRun();
+
+    const state = store.getState();
+    assert.equal(state.turnTokenUsage.total_tokens, 15);
+    assert.equal(state.toolActivity.successes.shell, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

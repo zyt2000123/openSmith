@@ -47,6 +47,9 @@ import { type AppStore, TRANSCRIPT_LIMIT } from "./store.js";
 import { clearTerminal } from "./term.js";
 import { limitTranscript, removeApprovalNotice, restartLatestTurn, restoreTranscript } from "./transcript-state.js";
 
+/** Shown wherever a missing baseUrl blocks the action — always with the way back out. */
+const NOT_READY_STATUS = "Shell is not ready yet. Run /reconnect to retry the local server.";
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -184,6 +187,7 @@ export class NodeBridge {
   private activeRequest: AbortController | null = null;
   private tokenStatsRequestId = 0;
   private observabilityRequestId = 0;
+  private booting = false;
 
   constructor(private store: StoreApi<AppStore>) {}
 
@@ -276,6 +280,14 @@ export class NodeBridge {
   }
 
   async boot(): Promise<void> {
+    // /reconnect can be pressed repeatedly; without this each press would spawn
+    // another uvicorn, and only the last one stays tracked for cleanup. Say so, or
+    // the caller's "Reconnecting…" would sit there for a boot it never started.
+    if (this.booting) {
+      this.s.set({ statusLine: "Already reconnecting; waiting for the local server." });
+      return;
+    }
+    this.booting = true;
     try {
       const server = await ensureLocalServer();
       this.s.set({
@@ -305,8 +317,11 @@ export class NodeBridge {
         mode: "chat",
         panel: "welcome",
         statusLine: `Boot failed: ${message}`,
-        welcomeNotice: { text: message, tone: "error" },
+        // Without a baseUrl every other command dead-ends, so name the way back out.
+        welcomeNotice: { text: `${message}\nFix the problem, then run /reconnect to retry.`, tone: "error" },
       });
+    } finally {
+      this.booting = false;
     }
   }
 
@@ -408,7 +423,10 @@ export class NodeBridge {
   async openTokenStats(): Promise<void> {
     const { baseUrl } = this.s;
     if (!baseUrl) {
-      this.s.set({ statusLine: "Shell is not ready yet." });
+      // Land on chat rather than the caller's panel: Tab cycles through here, and
+      // staying put would make the key look dead. Name the way out, or the panel
+      // just vanishes with no hint why.
+      this.s.set({ panel: "chat", statusLine: NOT_READY_STATUS });
       return;
     }
     const requestId = ++this.tokenStatsRequestId;
@@ -426,7 +444,10 @@ export class NodeBridge {
 
   async openRunExplorer(): Promise<void> {
     const { baseUrl } = this.s;
-    if (!baseUrl) return;
+    if (!baseUrl) {
+      this.s.set({ panel: "chat", statusLine: NOT_READY_STATUS });
+      return;
+    }
     const requestId = ++this.observabilityRequestId;
     this.s.set({
       panel: "runs",
@@ -469,7 +490,7 @@ export class NodeBridge {
   async showTrace(requestedRunId?: string): Promise<void> {
     const { baseUrl, currentSession } = this.s;
     if (!baseUrl) {
-      this.s.set({ statusLine: "Shell is not ready yet." });
+      this.s.set({ statusLine: NOT_READY_STATUS });
       return;
     }
     this.s.set({ statusLine: "Loading run trace…" });
@@ -844,7 +865,9 @@ export class NodeBridge {
     const { baseUrl, agent, currentSession } = this.s;
     if (baseUrl && agent) return { baseUrl, currentSession };
 
-    this.s.set({ statusLine: "Shell is not ready yet." });
+    // The only signal a user gets when a queued message cannot be handed off, so it
+    // has to name /reconnect: the message stays queued until something drives it.
+    this.s.set({ statusLine: NOT_READY_STATUS });
     return null;
   }
 
@@ -863,10 +886,22 @@ export class NodeBridge {
     if (next) {
       this.s.set({ pendingApproval: null, approvalResolving: false });
       void this.sendMessage(next.text, next.skillName).then((accepted) => {
-        if (!accepted) this.enqueueMessage(next.text, next.skillName);
+        if (accepted) return;
+        // The handoff was refused (a shell operation locked the input as the run ended).
+        // Requeue and go idle, otherwise the spinner would run forever with no request
+        // behind it. Push it back at the head, not through enqueueMessage: it already
+        // holds a queue slot, so re-entering the tail would reorder it behind whatever
+        // the user typed while the handoff was in flight — and if that filled the queue,
+        // the cap would drop it outright. Overshooting the cap by one beats losing it.
+        this.s.set({ queuedMessages: [next, ...this.s.queuedMessages] });
+        if (!this.activeRequest) this.goIdle();
       });
       return;
     }
+    this.goIdle();
+  }
+
+  private goIdle(): void {
     this.s.set({
       pendingApproval: null,
       approvalResolving: false,
@@ -939,9 +974,15 @@ export class NodeBridge {
     let reset = false;
     for await (const event of events) {
       if (!reset && event.type === "run_started") {
+        // Resuming into the current session skips loadSession, so this is the only
+        // place that rewinds the turn. Replayed events re-add every tool call and
+        // token, so the counters have to start from zero alongside the transcript.
+        clearTerminal();
         this.s.set({
           transcript: restartLatestTurn(this.s.transcript),
           transcriptEpoch: this.s.transcriptEpoch + 1,
+          toolActivity: createToolActivity(),
+          turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
           recoverableRunId: runId,
         });
         reset = true;

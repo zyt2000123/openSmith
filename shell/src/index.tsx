@@ -77,7 +77,8 @@ const SMITH_LOGO = [
   "██╔════╝████╗ ████║██║╚══██╔══╝██║  ██║",
   "███████╗██╔████╔██║██║   ██║   ███████║",
   "╚════██║██║╚██╔╝██║██║   ██║   ██╔══██║",
-  "███████╗██║ ╚═╝ ██║██║   ██║   ██║  ██║",
+  "███████║██║ ╚═╝ ██║██║   ██║   ██║  ██║",
+  "╚══════╝╚═╝     ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝",
 ];
 const GHOST_BUDDY = ["  ─╥╥─  ", "▄██████▄", "██ ██ ██", " ██████ ", "╰╯╰╮╭╯╰╯"];
 
@@ -100,31 +101,71 @@ function armSkill(skill: SkillSummary): void {
   getState().set({ pendingSkill: skill, panel: "chat", statusLine: "" });
 }
 
+const HERO_HINTS = ["`/` for commands", "`@` for skills", "Enter confirms", "Esc goes back", "`/help` for all"];
+
+/** border(2) + paddingX(6) + logo(39) + gap(3) + buddy(8) — below this the art itself will not fit. */
+const HERO_MIN_COLUMNS = 58;
+/** The above + gap(5) + widest tip(18): only then do the two columns sit side by side. */
+const HERO_WIDE_COLUMNS = 82;
+
 function HeroPanel() {
   const { columns } = useWindowSize();
-  const compact = columns < 60;
+  const compact = columns < HERO_MIN_COLUMNS;
+  const wide = columns >= HERO_WIDE_COLUMNS;
+
+  if (compact) {
+    return (
+      <Box flexDirection="column" marginBottom={1} paddingTop={1}>
+        <Box gap={1} marginBottom={1}>
+          <Text color={ACCENT}>Agent-Smith</Text>
+          <Text color={MUTED}>v{SHELL_VERSION}</Text>
+        </Box>
+        <Text color={INFO}>Terminal view is compact. Type `/help` for commands.</Text>
+      </Box>
+    );
+  }
 
   return (
-    <Box flexDirection="column" marginBottom={1} paddingTop={1}>
-      <Box gap={1} marginBottom={1}>
-        <Text color={ACCENT}>Agent-Smith</Text>
-        <Text color={MUTED}>v{SHELL_VERSION}</Text>
-      </Box>
-      {compact ? (
-        <Text color={INFO}>Terminal view is compact. Type `/help` for commands.</Text>
-      ) : (
-        SMITH_LOGO.map((line, index) => (
-          <Box key={line}>
-            <Text color={ACCENT}>{line}</Text>
-            <Text>{"   "}</Text>
-            <Text color={ACCENT}>{GHOST_BUDDY[index]}</Text>
+    <Box borderColor={ACCENT} borderStyle="round" flexDirection="column" marginBottom={1} paddingX={3} paddingY={1}>
+      {/* Two columns, each headed by its own title row, so "Tips:" lands on the
+          same line as the version without either side needing a fixed width. */}
+      <Box flexDirection={wide ? "row" : "column"} gap={wide ? 5 : 1}>
+        <Box flexDirection="column">
+          <Box gap={1}>
+            <Text color={ACCENT}>Agent-Smith</Text>
+            <Text color={MUTED}>v{SHELL_VERSION}</Text>
           </Box>
-        ))
-      )}
-      <Text> </Text>
-      <Text color={INFO}>
-        Type `/` for commands · `@` for skills · Enter confirms · Esc goes back · `/help` for all
-      </Text>
+          <Box gap={3} marginTop={1}>
+            <Box flexDirection="column">
+              {SMITH_LOGO.map((line) => (
+                <Text color={ACCENT} key={line}>
+                  {line}
+                </Text>
+              ))}
+            </Box>
+            <Box flexDirection="column" justifyContent="center">
+              {GHOST_BUDDY.map((line) => (
+                <Text color={ACCENT} key={line}>
+                  {line}
+                </Text>
+              ))}
+            </Box>
+          </Box>
+        </Box>
+        <Box flexDirection="column">
+          <Text bold color={ACCENT}>
+            Tips:
+          </Text>
+          <Box flexDirection="column" marginTop={1}>
+            {HERO_HINTS.map((hint) => (
+              <Text color={INFO} key={hint}>
+                {"· "}
+                {hint}
+              </Text>
+            ))}
+          </Box>
+        </Box>
+      </Box>
     </Box>
   );
 }
@@ -305,17 +346,13 @@ function HooksPanel() {
         <Box width={35}>
           <Text color={INFO}>Event</Text>
         </Box>
-        <Box width={11}>
-          <Text color={INFO}>Installed</Text>
-        </Box>
-        <Box width={9}>
-          <Text color={INFO}>Active</Text>
+        <Box width={24}>
+          <Text color={INFO}>Handler</Text>
         </Box>
         <Text color={INFO}>Description</Text>
       </Box>
       {LIFECYCLE_HOOKS.map((hook, index) => {
         const selected = index === selectedIndex;
-        const registrations = hook.handler ? 1 : 0;
         return (
           <Box key={hook.event} width="100%" backgroundColor={selected ? SELECTED_BACKGROUND : undefined}>
             <Box width={35}>
@@ -324,19 +361,14 @@ function HooksPanel() {
                 {hook.event}
               </Text>
             </Box>
-            <Box width={11}>
-              <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{registrations}</Text>
-            </Box>
-            <Box width={9}>
-              <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{registrations}</Text>
+            <Box width={24}>
+              <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{hook.handler}</Text>
             </Box>
             <Text color={selected ? SELECTED_FOREGROUND : MUTED}>{hook.description}</Text>
           </Box>
         );
       })}
-      <Text color={MUTED}>
-        Counts describe built-in registrations; configurable or plugin hooks are not loaded yet.
-      </Text>
+      <Text color={MUTED}>Built-in dispatch points; configurable or plugin hooks are not loaded yet.</Text>
       <Text color={MUTED}>↑/↓ select · Enter view details · Esc close</Text>
     </Box>
   );
@@ -763,11 +795,7 @@ function completeSlashSelection(input: string, slashMenuOpen: boolean, items: Sl
   const selected = selectedSlashItem(input, slashMenuOpen, items, index);
   if (!selected) return false;
 
-  if (selected.kind === "skill" && selected.skill) {
-    armSkill(selected.skill);
-  } else {
-    getState().set({ inputValue: selected.command, statusLine: `Ready: ${selected.command}` });
-  }
+  getState().set({ inputValue: selected.command, statusLine: `Ready: ${selected.command}` });
   return true;
 }
 
@@ -822,7 +850,9 @@ async function submitWhileBusy(
       rememberSubmittedInput(input);
       return;
     }
-    completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex);
+    if (!completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
+      getState().set({ statusLine: `${input} is unavailable while Smith is working. Press Esc to cancel the run.` });
+    }
     return;
   }
   if (!bridge.enqueueMessage(payload, skill?.name)) return;
@@ -841,19 +871,10 @@ async function submitSlashCommand(
 ): Promise<boolean> {
   if (!input.startsWith("/") || hasExplicitSkill) return false;
 
+  // A highlighted palette entry wins over the raw text so a partial command still runs.
   const selected = selectedSlashItem(input, slashMenuOpen, slashItems, slashIndex);
-  if (selected?.kind === "command") {
-    rememberSubmittedInput(input);
-    await runShellCommand(selected.command, { bridge, exit, getState, workingDir: PROJECT_CWD });
-    return true;
-  }
-  if (completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
-    rememberSubmittedInput(input);
-    return true;
-  }
-
   rememberSubmittedInput(input);
-  await runShellCommand(input, { bridge, exit, getState, workingDir: PROJECT_CWD });
+  await runShellCommand(selected?.command ?? input, { bridge, exit, getState, workingDir: PROJECT_CWD });
   return true;
 }
 
@@ -991,7 +1012,7 @@ function SmithApp() {
   const skillMentionIndex = useS((state) => state.skillMentionIndex);
 
   const activeSetupField = setupFieldAt(setupIndex, setupFlow);
-  const slashItems = useMemo(() => filterSlash(buildSlashItems(skills), inputValue), [inputValue, skills]);
+  const slashItems = useMemo(() => filterSlash(buildSlashItems(), inputValue), [inputValue]);
   const slashMenuOpen = mode === "chat" && inputValue.startsWith("/");
   const skillMentionMenuOpen = mode === "chat" && isSkillMentionQuery(inputValue);
   const skillMentions = useMemo(() => filterSkillMentions(skills, inputValue), [inputValue, skills]);
