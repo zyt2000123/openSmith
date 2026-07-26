@@ -166,11 +166,8 @@ class MacOSSeatbeltEnvironment:
                     not stat.S_ISLNK(metadata.st_mode)
                     and stat.S_ISREG(metadata.st_mode)
                     and metadata.st_nlink > 1
-                    and _is_hardlink_protected_path(relative)
                 ):
-                    return (
-                        f"sandbox refuses protected files with hard links: {relative}"
-                    )
+                    return f"sandbox refuses files with hard links: {relative}"
         if walk_errors:
             return "sandbox protected-path preflight could not inspect workspace"
         return None

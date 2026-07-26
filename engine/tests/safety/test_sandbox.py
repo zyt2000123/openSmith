@@ -361,6 +361,29 @@ def test_macos_seatbelt_fails_closed_on_a_hardlink_alias_to_a_secret(
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_macos_seatbelt_fails_closed_on_a_hardlink_from_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside_secret = tmp_path / "outside-secret.txt"
+    outside_secret.write_text("outside-hardlink-secret\n", encoding="utf-8")
+    os.link(outside_secret, workspace / "apparently-safe.txt")
+    environment = MacOSSeatbeltEnvironment(workspace=workspace)
+
+    result = asyncio.run(
+        environment.run_command(
+            argv=["/bin/cat", "apparently-safe.txt"],
+            cwd=str(workspace),
+        )
+    )
+
+    assert result.exit_code is None
+    assert result.error and "hard links" in result.error
+    assert "outside-hardlink-secret" not in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
 def test_macos_seatbelt_fails_closed_on_a_hardlink_alias_to_git_metadata(
     tmp_path: Path,
 ) -> None:
