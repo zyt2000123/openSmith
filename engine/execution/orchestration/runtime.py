@@ -6,14 +6,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
-from engine.identity_catalog import IdentityCatalog
+from engine.execution.events import RunObservationFactory
+from engine.identity import IdentityCatalog
 from engine.llm.port import LLMPort
 from engine.safety.tool_guard import ToolGuard
 from engine.skill.registry import SkillRegistry
 from engine.tool.registry import ToolRegistry
 
 if TYPE_CHECKING:
-    from engine.hook import HookManager
+    from engine.execution.hooks import HookManager
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +54,12 @@ class RuntimeServices:
     skill_registry: SkillRegistry
     gate_llm: LLMPort | None = None
     background_llm: LLMPort | None = None
-    # Only set when a distinct image model is configured. ``None`` means image
-    # support rests entirely on whether ``llm`` itself accepts images.
-    vision_llm: LLMPort | None = None
     tool_guard: ToolGuard | None = None
     mcp_clients: list[Any] = field(default_factory=list)
     mcp_session_pool: Any | None = None
     owns_mcp_clients: bool = True
     hooks: HookManager | None = None
+    observation_factory: RunObservationFactory | None = None
     owns_llm_clients: bool = True
     _memory_lifecycle_hook: Any | None = field(default=None, init=False, repr=False)
     _memory_lifecycle_hook_key: tuple[int, int, bool, int] | None = field(
@@ -86,7 +85,7 @@ class RuntimeServices:
 
         if self.owns_llm_clients:
             closed_llms: set[int] = set()
-            for llm in (self.background_llm, self.vision_llm, self.gate_llm, self.llm):
+            for llm in (self.background_llm, self.gate_llm, self.llm):
                 if llm is None or id(llm) in closed_llms:
                     continue
                 closed_llms.add(id(llm))

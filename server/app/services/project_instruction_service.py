@@ -74,7 +74,9 @@ class ProjectInstructionService:
             raise HTTPException(403, "Project instructions cannot be initialized at this path")
 
         try:
-            smith_dir.mkdir(mode=0o755)
+            # exist_ok: a .smith/ left by other tooling must not be mistaken for
+            # an existing SMITH.md — the FileExistsError below belongs to O_EXCL.
+            smith_dir.mkdir(mode=0o755, exist_ok=True)
             self._ensure_safe_target(smith_dir, target)
             no_follow = getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow, 0o644)

@@ -187,7 +187,7 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，只整理，不创造�
 | `memory/history.py` | 追加脱敏审计记录 |
 | `memory/dream.py` | 低频清洗、整理和日志回收 |
 | `memory/user_learner.py` | 只产出稳定偏好信号，不写 Markdown |
-| `execution/memory_maintenance.py` | 生命周期锁、超时和 RuntimeServices 依赖接线 |
+| `memory/maintenance.py` | 生命周期锁、超时，以及由执行层注入的 LLM 依赖 |
 | `prompt/assembler.py` | 组合已接受的记忆，不理解编译规则 |
 
 新增规则或模板优先修改 `MEMORY_POLICY.md`；外部调用方不需要了解具体模型提示词和文件写入细节。三份正式 Markdown 始终只有一个写入入口。
@@ -227,4 +227,4 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，只整理，不创造�
 - 事件分类使用小型确定性信号集；复杂隐含偏好只有在重复启发式命中或用户明确表达后才进入正式记忆。
 - `.bak` 只保存上一个版本；完整变更轨迹依赖 `memory_history.jsonl` 的哈希和原始证据日志。
 
-当前实现基线：2026-07-13。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/test_memory_policy.py` 与 `engine/tests/test_memory_pipeline.py` 为准。
+当前实现基线：2026-07-13。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/memory/test_memory_policy.py` 与 `engine/tests/memory/test_memory_pipeline.py` 为准。

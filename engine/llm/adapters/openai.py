@@ -12,6 +12,7 @@ import httpx
 from ..contracts import (
     ChatResponse,
     DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_MAX_OUTPUT_TOKENS,
     LLMProviderConfig,
     LLMRequest,
     LLMResponseError,
@@ -42,7 +43,10 @@ class OpenAIAdapter(HTTPAdapterMixin):
         self.base_url = config.base_url.rstrip("/")
         self.model = config.model
         self.timeouts = config.timeouts
-        self.max_output_tokens = config.max_output_tokens
+        self.max_output_tokens_declared = config.max_output_tokens is not None
+        self.max_output_tokens = (
+            config.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS
+        )
         self.context_window_declared = config.context_window is not None
         self.context_window = config.context_window or DEFAULT_CONTEXT_WINDOW
         self._http = httpx.AsyncClient(
@@ -92,18 +96,30 @@ class OpenAIAdapter(HTTPAdapterMixin):
             saw_done = False
             raw_finish_reason: str | None = None
             served_model: str | None = None
+            created_emitted = False
+            pending_events: list[ProviderEvent] = []
+
+            def commit_attempt() -> list[ProviderEvent]:
+                nonlocal created_emitted
+                if created_emitted:
+                    return []
+                created_emitted = True
+                committed = [
+                    ProviderEvent(
+                        ProviderEventType.RESPONSE_CREATED,
+                        {"model": self.model},
+                    ),
+                    *pending_events,
+                ]
+                pending_events.clear()
+                return committed
+
             try:
                 response = await self._http.send(http_request, stream=True)
-                response.raise_for_status()
-                yield ProviderEvent(ProviderEventType.RESPONSE_CREATED, {"model": self.model})
+                await self._raise_for_status(response)
                 limiter = SSEStreamLimiter()
-                async for line in response.aiter_lines():
-                    limiter.consume_line(line)
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].lstrip(" ")
+                async for payload in self._iter_sse_payloads(response, limiter):
                     if payload.strip() == "[DONE]":
-                        limiter.finish_event()
                         saw_done = True
                         break
 
@@ -120,7 +136,14 @@ class OpenAIAdapter(HTTPAdapterMixin):
 
                     usage = chunk.get("usage")
                     if isinstance(usage, dict):
-                        yield ProviderEvent(ProviderEventType.USAGE, {"usage": usage})
+                        usage_event = ProviderEvent(
+                            ProviderEventType.USAGE,
+                            {"usage": usage},
+                        )
+                        if created_emitted:
+                            yield usage_event
+                        else:
+                            pending_events.append(usage_event)
 
                     choices = chunk.get("choices", [])
                     if not isinstance(choices, list) or not choices:
@@ -136,11 +159,15 @@ class OpenAIAdapter(HTTPAdapterMixin):
 
                     text = delta.get("content")
                     if isinstance(text, str) and text:
+                        for committed_event in commit_attempt():
+                            yield committed_event
                         saw_content_event = True
                         yield ProviderEvent(ProviderEventType.OUTPUT_TEXT_DELTA, {"delta": text})
 
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                     if isinstance(reasoning, str) and reasoning:
+                        for committed_event in commit_attempt():
+                            yield committed_event
                         saw_content_event = True
                         yield ProviderEvent(ProviderEventType.REASONING_DELTA, {"delta": reasoning})
 
@@ -164,6 +191,8 @@ class OpenAIAdapter(HTTPAdapterMixin):
                         if isinstance(function.get("arguments"), str):
                             event_data["arguments_delta"] = function["arguments"]
                         if len(event_data) > 1:
+                            for committed_event in commit_attempt():
+                                yield committed_event
                             saw_content_event = True
                             yield ProviderEvent(
                                 ProviderEventType.FUNCTION_CALL_ARGUMENTS_DELTA,
@@ -173,11 +202,12 @@ class OpenAIAdapter(HTTPAdapterMixin):
                     finish_reason = choice.get("finish_reason")
                     if isinstance(finish_reason, str):
                         raw_finish_reason = finish_reason
-                    limiter.finish_event()
 
                 if not saw_done:
                     raise LLMResponseError("Provider stream ended before the [DONE] sentinel.")
 
+                for committed_event in commit_attempt():
+                    yield committed_event
                 yield ProviderEvent(
                     ProviderEventType.RESPONSE_COMPLETED,
                     {
@@ -217,6 +247,40 @@ class OpenAIAdapter(HTTPAdapterMixin):
 
             await self._wait_for_retry(attempt, retry_after)
 
+    @staticmethod
+    async def _iter_sse_payloads(
+        response: httpx.Response,
+        limiter: SSEStreamLimiter,
+    ) -> AsyncIterator[str]:
+        """Yield complete SSE ``data`` payloads and reset limits per event."""
+        data_lines: list[str] = []
+        has_event_fields = False
+
+        async for line in response.aiter_lines():
+            limiter.consume_line(line)
+            if line == "":
+                if not has_event_fields:
+                    continue
+                limiter.finish_event()
+                if data_lines:
+                    yield "\n".join(data_lines)
+                data_lines = []
+                has_event_fields = False
+                continue
+
+            has_event_fields = True
+            field, separator, value = line.partition(":")
+            if field != "data":
+                continue
+            if separator and value.startswith(" "):
+                value = value[1:]
+            data_lines.append(value)
+
+        if has_event_fields:
+            limiter.finish_event()
+            if data_lines:
+                yield "\n".join(data_lines)
+
     def _request_body(self, request: LLMRequest, *, stream: bool) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.model,
@@ -225,9 +289,8 @@ class OpenAIAdapter(HTTPAdapterMixin):
         }
         if request.tools:
             body["tools"] = request.tools
-        if self.max_output_tokens is not None:
-            body["max_tokens"] = self.max_output_tokens
-        if request.prefix_cache_key and not stream:
+        body["max_tokens"] = self.max_output_tokens
+        if request.prefix_cache_key:
             # This is intentionally adapter-specific: only compatible gateways
             # that understand ``extra_body`` receive this optimization hint.
             body["extra_body"] = {"prefix_cache_key": request.prefix_cache_key}

@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
 from engine.llm.contracts import DEFAULT_CONTEXT_WINDOW
-from engine.llm.observability import llm_purpose
+from .budget import (
+    CONTEXT_COMPACTION_INPUT_RATIO,
+    CONTEXT_COMPACTION_TRIGGER,
+    CONTEXT_SAFETY_MARGIN_RATIO,
+    context_budget_for,
+    estimate_compressible_tokens,
+    estimate_messages_tokens,
+    estimate_tokens,
+    model_limits_for,
+)
+from .summary import summarize_session
 
 if TYPE_CHECKING:
     from engine.llm.port import LLMPort
@@ -18,54 +29,7 @@ PRUNE_PROTECT_THRESHOLD_CHARS = 8000
 PRUNE_MIN_CHARS = 2000
 CONTEXT_TRIGGER_RATIO = 0.7
 DEFAULT_CONTEXT_LIMIT = DEFAULT_CONTEXT_WINDOW
-CONTEXT_DISPLAY_WINDOW = 256_000
-CONTEXT_COMPACTION_TRIGGER = 128_000
-DEFAULT_MAX_OUTPUT_TOKENS = 4_096
-CONTEXT_SAFETY_MARGIN_RATIO = 0.10
-CONTEXT_COMPACTION_INPUT_RATIO = 0.85
-
-COMPACT_SYSTEM_PROMPT = """\
-You are summarizing a conversation for an AI assistant that will lose all prior context.
-This summary becomes the assistant's ONLY memory. Preserve every critical detail.
-
-Output this exact XML structure:
-
-<context_summary>
-  <conversation_overview>
-    <!-- One paragraph: user's goal, what was done, current state -->
-  </conversation_overview>
-  <key_knowledge>
-    <!-- Bullet list: facts, conventions, constraints discovered -->
-  </key_knowledge>
-  <file_system_state>
-    <!-- Files read/modified/created and what was learned -->
-  </file_system_state>
-  <recent_actions>
-    <!-- Last few significant actions and outcomes -->
-  </recent_actions>
-  <current_plan>
-    <!-- Step-by-step plan with [DONE]/[IN PROGRESS]/[TODO] markers -->
-  </current_plan>
-</context_summary>
-"""
-
-COMPACT_USER_PROMPT = (
-    "Summarize our conversation above. Focus on what we did, what we're doing, "
-    "which files we're working on, and what's next. Be dense with information."
-)
-
-
-def estimate_tokens(text: str) -> int:
-    """粗略 token 估算。CJK 汉字约 1 字符/token，其余约 3 字符/token。
-
-    旧版统一 len//3 对中文低估 2~3 倍，导致 compact 总在超出上下文窗口
-    之后才触发。宁可略微高估提前压缩，也不要漏判把窗口撑爆。
-    """
-    if not text:
-        return 0
-    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
-    return cjk + (len(text) - cjk) // 3
-
+CONTEXT_DISPLAY_WINDOW = DEFAULT_CONTEXT_LIMIT
 
 def prune_tool_outputs(
     conversation: list[dict],
@@ -109,11 +73,7 @@ def prune_tool_outputs(
 
 
 def _conversation_tokens(conversation: list[dict]) -> int:
-    return sum(
-        estimate_tokens(m["content"])
-        for m in conversation
-        if isinstance(m.get("content"), str)
-    )
+    return estimate_compressible_tokens(conversation)
 
 
 def needs_compaction(
@@ -127,10 +87,7 @@ def needs_compaction(
 
 def context_limit_for_llm(llm: object | None) -> int:
     """Use the selected route's declared model window with a safe fallback."""
-    context_window = getattr(llm, "context_window", None)
-    if isinstance(context_window, bool) or not isinstance(context_window, int) or context_window <= 0:
-        return DEFAULT_CONTEXT_LIMIT
-    return context_window
+    return model_limits_for(llm).context_window
 
 
 def compaction_policy_for_llm(llm: object | None) -> tuple[int, float]:
@@ -142,22 +99,8 @@ def compaction_policy_for_llm(llm: object | None) -> tuple[int, float]:
     deciding when to compact. A smaller declared window remains the hard
     safety limit for that route.
     """
-    context_limit = min(context_limit_for_llm(llm), CONTEXT_COMPACTION_TRIGGER)
-    configured_output = getattr(llm, "max_output_tokens", None)
-    max_output_tokens = (
-        configured_output
-        if isinstance(configured_output, int)
-        and not isinstance(configured_output, bool)
-        and configured_output > 0
-        else DEFAULT_MAX_OUTPUT_TOKENS
-    )
-    output_reserve = min(max_output_tokens, max(context_limit - 1, 1))
-    safety_margin = min(
-        max(256, int(context_limit * CONTEXT_SAFETY_MARGIN_RATIO)),
-        max(context_limit - output_reserve - 1, 0),
-    )
-    input_budget = max(1, context_limit - output_reserve - safety_margin)
-    return input_budget, CONTEXT_COMPACTION_INPUT_RATIO
+    budget = context_budget_for(model_limits_for(llm))
+    return budget.safe_input_budget, CONTEXT_COMPACTION_INPUT_RATIO
 
 
 def prompt_budget_for_llm(llm: object | None) -> int:
@@ -178,52 +121,70 @@ def trim_conversation_for_context_limit(
     explicitly rejects context length, before any tool from the current model
     turn has been executed.
     """
-    if token_budget <= 0 or _conversation_tokens(conversation) <= token_budget:
-        return [dict(message) for message in conversation]
+    copied = [dict(message) for message in conversation]
+    if token_budget <= 0 or estimate_messages_tokens(copied) <= token_budget:
+        return copied
 
-    system_text = ""
-    for message in conversation:
-        if message.get("role") == "system" and isinstance(message.get("content"), str):
-            system_text = message["content"]
-            break
-
-    system_budget = int(token_budget * 0.55) if system_text else 0
-    system_text = _trim_middle(system_text, system_budget) if system_text else ""
-    history_budget = max(1, token_budget - estimate_tokens(system_text))
+    # The first system message is the runtime contract. Never silently rewrite
+    # it to make a request fit; callers must classify an oversized contract as
+    # an explicit unfit-static-prompt result.
+    protected: list[dict] = []
+    history_start = 0
+    while (
+        history_start < len(copied)
+        and copied[history_start].get("role") == "system"
+    ):
+        protected.append(copied[history_start])
+        history_start += 1
 
     history_lines: list[str] = []
-    for message in conversation:
+    for message in copied[history_start:]:
         role = str(message.get("role", "unknown"))
-        if role == "system":
-            continue
         content = message.get("content")
         if not isinstance(content, str) or not content:
             tool_calls = message.get("tool_calls")
-            if role == "assistant" and isinstance(tool_calls, list):
-                names = ", ".join(
-                    str(call.get("function", {}).get("name", "?"))
-                    for call in tool_calls
-                    if isinstance(call, dict)
+            if tool_calls:
+                content = json.dumps(
+                    tool_calls,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
                 )
-                content = f"[tool calls: {names}]" if names else ""
             else:
                 content = ""
         if content:
             history_lines.append(f"[{role}] {content}")
 
-    recovery_prefix = _trim_tail(
-        "[Context deterministically shortened after provider context-limit error]\n",
-        history_budget,
+    recovery_prefix = (
+        "[Context deterministically shortened to fit the selected model]\n"
     )
-    history_text = _trim_tail(
-        "\n".join(history_lines),
-        max(0, history_budget - estimate_tokens(recovery_prefix)),
-    )
-    result: list[dict] = []
-    if system_text:
-        result.append({"role": "system", "content": system_text})
-    result.append({"role": "user", "content": recovery_prefix + history_text})
-    return result
+    history_text = "\n".join(history_lines)
+
+    def candidate(keep: int) -> list[dict]:
+        tail = history_text[-keep:] if keep else ""
+        marker = "[... earlier context truncated ...]\n" if keep < len(history_text) else ""
+        return [
+            *protected,
+            {"role": "user", "content": recovery_prefix + marker + tail},
+        ]
+
+    minimum = candidate(0)
+    if estimate_messages_tokens(minimum) > token_budget:
+        # Return the protected contract unchanged. The final fitter will fail
+        # closed instead of corrupting it or calling the provider.
+        return protected
+
+    low, high = 0, len(history_text)
+    best = minimum
+    while low <= high:
+        keep = (low + high) // 2
+        current = candidate(keep)
+        if estimate_messages_tokens(current) <= token_budget:
+            best = current
+            low = keep + 1
+        else:
+            high = keep - 1
+    return best
 
 
 def _trim_middle(text: str, token_budget: int) -> str:
@@ -289,48 +250,30 @@ async def compact_history(conversation: list[dict], llm: "LLMPort") -> list[dict
     Returns a new conversation list: [system_prompt, summary_message].
     The original system prompt (first message) is preserved.
     """
-    system_msg = conversation[0] if conversation and conversation[0].get("role") == "system" else None
+    system_messages: list[dict] = []
+    for message in conversation:
+        if message.get("role") != "system":
+            break
+        system_messages.append(message)
 
-    summary_messages = [
-        {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
-    ]
-    for msg in conversation:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role == "system":
-            continue
-        if role == "tool":
-            # 工具结果是任务的关键证据，必须进摘要输入；
-            # 旧版整体丢弃 tool 消息 → 工具密集任务压缩一次即失忆。
-            if isinstance(content, str) and content:
-                summary_messages.append({"role": "user", "content": f"[工具结果] {content[:1500]}"})
-            continue
-        if role == "assistant" and not content and msg.get("tool_calls"):
-            # 带工具调用但无正文的 assistant 轮：记下调用了哪些工具。
-            names = ", ".join(
-                tc.get("function", {}).get("name", "?") for tc in msg["tool_calls"]
-            )
-            summary_messages.append({"role": "assistant", "content": f"[调用工具] {names}"})
-            continue
-        if role in ("user", "assistant") and content:
-            summary_messages.append({"role": role, "content": content[:2000]})
-
-    with llm_purpose("compact"):
-        response = await llm.chat(summary_messages + [{"role": "user", "content": COMPACT_USER_PROMPT}])
-    summary = (response.text or "").strip()
-    finish_reason = getattr(response, "finish_reason", None)
-    if not summary or finish_reason not in (None, "stop"):
+    summary_result = await summarize_session(conversation, llm)
+    if not summary_result.usable:
         # 摘要为空/被截断/被拒答时整体替换历史等于静默失忆——
         # 放弃本轮 compact，保留 prune 后的原始对话。
         logger.warning(
-            "compact_history discarded (finish_reason=%r, summary_chars=%d); keeping original conversation",
-            finish_reason, len(summary),
+            "compact_history discarded (status=%s, finish_reason=%r, "
+            "summary_chars=%d); keeping original conversation",
+            summary_result.status.value,
+            summary_result.finish_reason,
+            len(summary_result.summary),
         )
         return conversation
 
     result = []
-    if system_msg:
-        result.append(system_msg)
-    result.append({"role": "user", "content": f"[Previous conversation summary]\n{summary}"})
+    result.extend(system_messages)
+    result.append({
+        "role": "user",
+        "content": f"[Previous conversation summary]\n{summary_result.summary}",
+    })
     result.append({"role": "assistant", "content": "Understood. I have the full context from our previous conversation. How can I help?"})
     return result

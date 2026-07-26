@@ -6,7 +6,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from .events import EventType, ExecutionEvent
+from engine.execution.events import EventType, ExecutionEvent
 
 
 @dataclass(frozen=True)

@@ -394,3 +394,33 @@ test("config reopens the essential setup form with saved values intact", async (
   assert.equal(state.setupDraft.review_model, "review-model");
   assert.equal(state.setupDraft.api_key, "");
 });
+
+test("config advanced opens the full routing form at its first field", async () => {
+  const store = createAppStore();
+  store.getState().set({
+    config: {
+      configured: true,
+      has_api_key: true,
+      vendor: "Relay Co",
+      provider: "openai",
+      base_url: "https://gateway.example/v1",
+      model: "primary-model",
+      max_output_tokens: null,
+      routes: {},
+      models: {},
+      timeout_profiles: {},
+    },
+  });
+
+  await runShellCommand("/config advanced", {
+    bridge: {} as NodeBridge,
+    exit: () => {},
+    getState: store.getState,
+  });
+
+  const state = store.getState();
+  assert.equal(state.mode, "setup");
+  assert.equal(state.setupFlow, "advanced");
+  assert.equal(state.setupIndex, 0);
+  assert.equal(state.inputValue, "Relay Co");
+});

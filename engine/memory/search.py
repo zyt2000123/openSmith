@@ -132,21 +132,32 @@ class SearchIndex:
         stripped = query.strip()
         if not self._db or not stripped:
             return []
+        terms = list(dict.fromkeys(stripped.split()))[:16]
+        if not terms:
+            return []
         try:
-            if len(stripped) < 3:
+            if any(len(term) < 3 for term in terms):
                 # The trigram tokenizer matches nothing for queries shorter
-                # than 3 characters (common for 2-char CJK words) — fall back
-                # to a LIKE scan over the small episode corpus.
-                escaped = (
-                    stripped.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+                # than 3 characters (common for CJK words) — fall back to an
+                # all-term LIKE scan over the small episode corpus.
+                escaped_terms = [
+                    term.replace("\\", "\\\\")
+                    .replace("%", r"\%")
+                    .replace("_", r"\_")
+                    for term in terms
+                ]
+                predicates = " AND ".join(
+                    r"content LIKE ? ESCAPE '\'" for _ in escaped_terms
                 )
                 rows = await self._db.execute_fetchall(
-                    "SELECT entry_id FROM memory_fts "
-                    r"WHERE content LIKE ? ESCAPE '\' LIMIT ?",
-                    (f"%{escaped}%", top_k),
+                    f"SELECT entry_id FROM memory_fts WHERE {predicates} LIMIT ?",
+                    (*[f"%{term}%" for term in escaped_terms], top_k),
                 )
                 return [{"id": r["entry_id"], "score": 0.0} for r in rows]
-            safe_query = '"' + stripped.replace('"', '""') + '"'
+            safe_query = " AND ".join(
+                '"' + term.replace('"', '""') + '"'
+                for term in terms
+            )
             rows = await self._db.execute_fetchall(
                 "SELECT entry_id, bm25(memory_fts) AS score "
                 "FROM memory_fts WHERE memory_fts MATCH ? "

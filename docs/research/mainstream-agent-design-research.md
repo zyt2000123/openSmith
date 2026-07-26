@@ -322,12 +322,12 @@ LangGraph 把 checkpoint 作为运行时基础：每一步保存 graph state，�
 
 | 设计轴 | Agent-Smith 当前实现 | 判断 |
 |---|---|---|
-| Agent loop / workflow | [`run_agent_stream`](../../engine/execution/agent_loop.py) 已包含 ReAct、`SkillChain`、rubric、gate、回退、checkpoint 和结构化事件 | 基础较强，应继续深化，不需要重写一套 Orchestrator |
+| Agent loop / workflow | [`run_agent_stream`](../../engine/execution/orchestration/agent_loop.py) 负责 Direct/Pipeline 分派；ReAct、Pipeline、Gate 与生命周期已拆入各自子包 | 边界已加深，应继续通过架构测试防止职责回流 |
 | Model Provider | [`LLMClient`](../../engine/llm/client.py) 统一调用 OpenAI-compatible Chat Completions，并归一化 tool call 与 usage | 已有窄接口；缺少显式 capability 描述，不宜提前扩成“大一统 Provider” |
 | Tool Contract | [`ToolRegistry`](../../engine/tool/registry.py) 当前主要保存 name、description、parameters 和 callable | 能工作但偏浅；风险、并发、审批、执行环境、输出策略仍散落在注册表之外 |
-| Context / Memory | [`PromptAssembler`](../../engine/prompt/assembler.py) 分层组装身份、工作流、工具、Skill、记忆和运行时上下文；[`engine/memory/`](../../engine/memory/) 提供 recent 事件源、durable 编译、Dream 与 episode FTS 检索 | 方向符合主流；下一步是明确 context、session、durable memory 的生命周期和评测 |
+| Context / Memory | [`PromptAssembler`](../../engine/context/assembler.py) 分层组装身份、工作流、工具、Skill、记忆和运行时上下文；[`engine/memory/`](../../engine/memory/) 提供 recent 事件源、durable 编译、Dream 与 episode FTS 检索 | 方向符合主流；下一步是明确 context、session、durable memory 的生命周期和评测 |
 | Permission / Execution | `ToolPolicy` / `ToolGuard` 在工具前做规则和路径检查，但 [`shell.execute`](../../agents/tools/shell.py) 仍通过宿主机 subprocess 执行 | “是否允许”已有基础，“在哪里执行”仍缺真正的执行环境隔离 |
-| Observability / Eval | [`ExecutionEvent`](../../engine/execution/events.py) 已覆盖推理、工具、Skill、Gate、回退、阻塞、usage 和完成事件 | 有事件协议，但当前未发现持久化层级 trace 与 outcome/trajectory eval harness |
+| Observability / Eval | [`ExecutionEvent`](../../engine/execution/events.py) 定义协议；[`engine/observability/`](../../engine/observability/) 持久化脱敏 trace、summary 与诊断投影 | 已有本地可观测性；仍需独立的 outcome/trajectory eval harness |
 
 总体判断：Agent-Smith 已经具备主流 Agent 的核心骨架，真正的差距不在于“再增加几个 Agent”，而在于把 Tool Contract、执行环境、可恢复状态和 Eval 做成深模块。
 

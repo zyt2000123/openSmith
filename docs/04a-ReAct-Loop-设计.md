@@ -281,7 +281,7 @@ else:
 
 ## 六、预算与终止条件
 
-所有预算常量定义在 `engine/react_budget.py`：
+所有预算常量定义在 `engine/execution/react/budget.py`：
 
 ### 6.1 预算矩阵
 
@@ -487,7 +487,7 @@ Provisional 生命周期假设前端能够：
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `engine/execution/react_loop.py` | 657 | 核心循环 + 流式组装 + 适配器 |
-| `engine/react_budget.py` | 127 | 预算常量 + 假完成检测 + 预算耗尽兜底 |
+| `engine/execution/react/budget.py` | 124 | 预算常量 + 假完成检测 + 预算耗尽兜底 |
 | `engine/execution/events.py` | 62 | ExecutionEvent + EventType 枚举 |
 | `engine/execution/compression.py` | 159 | 工具裁剪 + LLM 摘要压缩 |
 | `engine/safety/tool_policy.py` | 74 | ToolGuard + FactGate 统一网关 |

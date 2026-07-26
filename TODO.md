@@ -45,7 +45,7 @@
 - [x] **工具结果回灌后偶发 HTTP 400** —— 2026-07-25 由 e2e 冒烟抓到并当天闭环。
       修复：`react_loop` 回灌 assistant 消息时，`response.reasoning` 非空则附加
       `reasoning_content`。非推理模型 reasoning 为空 → 字段不出现，同一条路径同时支持两类
-      模型，无需探测模型能力。回归：`engine/tests/test_reasoning_roundtrip.py`（3 条，含
+      模型，无需探测模型能力。回归：`engine/tests/execution/test_reasoning_roundtrip.py`（3 条，含
       多轮各自回传与非推理模型不多字段）。验证：e2e append 连续 5/5 通过（修前约 50% 失败）。
       现象：`server/tests/test_e2e_smoke.py::test_e2e_smoke[append]` 轨迹为 `read_file` →
       **下一次 LLM 请求 400**，流式（`adapters/openai.py:196`）与非流式回退

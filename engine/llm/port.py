@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any, Protocol, runtime_checkable
 
-from .contracts import ChatResponse, ProviderCapabilities
+from .contracts import ChatResponse, ModelLimits, ProviderCapabilities
 from .events import ProviderEvent
 
 
@@ -17,6 +17,9 @@ class LLMPort(Protocol):
     capabilities: ProviderCapabilities
     context_window: int
     context_window_declared: bool
+    max_output_tokens: int
+    max_output_tokens_declared: bool
+    limits: ModelLimits
     model: str
 
     async def chat(
@@ -30,6 +33,7 @@ class LLMPort(Protocol):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        prefix_cache_key: str | None = None,
     ) -> AsyncIterator[ProviderEvent]: ...
 
     def chat_stream(

@@ -10,11 +10,11 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncGenerator, Sequence
+from typing import TYPE_CHECKING, AsyncGenerator
 from uuid import uuid4
 
 from .backtrack import FailureLoopGuard, FailureSignature
-from engine.observability import EventType, ExecutionEvent, raw_text_delta
+from engine.execution.events import EventType, ExecutionEvent, raw_text_delta
 from .gate import Gate, GateResult, LLMGate, coerce_gate_result
 from .pipeline_context import (
     CTX_AGENT_ID,
@@ -61,7 +61,7 @@ async def run_pipeline(
     gate_llm: "LLMPort | None" = None,
     start_node_idx: int = 0,
     disabled_skill_names: frozenset[str] = frozenset(),
-    vision_messages: Sequence[dict] = (),
+    prefix_cache_key: str | None = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """Execute a pipeline: walk nodes sequentially, ReAct each, gate-check.
 
@@ -124,6 +124,7 @@ async def run_pipeline(
                     event_stream = react_event_loop(
                         llm, messages, tool_registry, tool_guard, max_react_iters,
                         provisional_lifecycle=False,
+                        prefix_cache_key=prefix_cache_key,
                     )
                 else:
                     skill_context = dict(context)
@@ -131,14 +132,12 @@ async def run_pipeline(
                         skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
                     elif attempt == 2:
                         skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
-                    # 兜底路径（上面 116 行）用 base_messages，图片已在其中；
-                    # skill 路径自建消息列表，必须自己带上，否则截图在整个
-                    # coding 工作流里对模型不可见。
-                    messages = [*vision_messages, {"role": "user", "content": user_message}]
+                    messages = [{"role": "user", "content": user_message}]
                     event_stream = execute_skill_events(
                         skill, llm, tool_registry, messages, skill_context,
                         max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
                         react_event_loop_fn=react_event_loop,
+                        prefix_cache_key=prefix_cache_key,
                     )
 
                 result = _NodeResult()

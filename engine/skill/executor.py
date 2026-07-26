@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Coroutine, TypeVar
 
 if TYPE_CHECKING:
-    from engine.observability import ExecutionEvent
     from engine.llm.port import LLMPort
     from engine.tool.registry import ToolRegistry
     from engine.safety.tool_guard import ToolGuard
 
 from .loader import SkillBody
-from engine.react_budget import DEFAULT_MAX_REACT_ITERS
 
-# Type aliases for the injected react loop functions.  Callers in
-# engine.execution (which already import both packages) pass the real
-# implementations — this keeps skill/ free from any execution/ import.
+# Execution callers already import both domains and inject the concrete loop.
+# This keeps skill/ free from any execution/ import.
 ReactLoopFn = Callable[..., Coroutine[Any, Any, str]]
-ReactEventLoopFn = Callable[..., AsyncGenerator["ExecutionEvent", None]]
+EventT = TypeVar("EventT")
 
 
 async def execute_skill(
@@ -24,22 +21,32 @@ async def execute_skill(
     tool_registry: "ToolRegistry",
     messages: list[dict],
     context: dict,
-    max_iters: int = DEFAULT_MAX_REACT_ITERS,
+    max_iters: int,
     tool_guard: "ToolGuard | None" = None,
     *,
     react_loop_fn: ReactLoopFn | None = None,
+    prefix_cache_key: str | None = None,
 ) -> str:
     """Inject SKILL.md content into prompt and run a ReAct loop.
 
     Returns the final assistant text output.
 
     ``react_loop_fn`` is the concrete react-loop implementation injected
-    by the caller (usually ``engine.execution.react_loop.react_loop``).
+    by the caller (usually ``engine.execution.react.react_loop.react_loop``).
     """
     if react_loop_fn is None:
-        raise TypeError("react_loop_fn is required — caller must inject the react loop implementation")
+        raise TypeError(
+            "react_loop_fn is required — caller must inject the react loop implementation"
+        )
     conversation = _skill_conversation(skill, messages, context)
-    return await react_loop_fn(llm, conversation, tool_registry, tool_guard, max_iters)
+    return await react_loop_fn(
+        llm,
+        conversation,
+        tool_registry,
+        tool_guard,
+        max_iters,
+        prefix_cache_key=prefix_cache_key,
+    )
 
 
 async def execute_skill_events(
@@ -48,19 +55,23 @@ async def execute_skill_events(
     tool_registry: "ToolRegistry",
     messages: list[dict],
     context: dict,
-    max_iters: int = DEFAULT_MAX_REACT_ITERS,
+    max_iters: int,
     tool_guard: "ToolGuard | None" = None,
     provisional_lifecycle: bool = True,
     *,
-    react_event_loop_fn: ReactEventLoopFn | None = None,
-) -> AsyncGenerator["ExecutionEvent", None]:
+    react_event_loop_fn: Callable[..., AsyncGenerator[EventT, None]] | None = None,
+    prefix_cache_key: str | None = None,
+) -> AsyncGenerator[EventT, None]:
     """Run a skill through the canonical event stream instead of a text adapter.
 
     ``react_event_loop_fn`` is the concrete event-loop implementation
-    injected by the caller (usually ``engine.execution.react_loop.react_event_loop``).
+    injected by the caller (usually
+    ``engine.execution.react.react_loop.react_event_loop``).
     """
     if react_event_loop_fn is None:
-        raise TypeError("react_event_loop_fn is required — caller must inject the react event loop implementation")
+        raise TypeError(
+            "react_event_loop_fn is required — caller must inject the react event loop implementation"
+        )
     conversation = _skill_conversation(skill, messages, context)
     async for event in react_event_loop_fn(
         llm,
@@ -69,6 +80,7 @@ async def execute_skill_events(
         tool_guard,
         max_iters,
         provisional_lifecycle=provisional_lifecycle,
+        prefix_cache_key=prefix_cache_key,
     ):
         yield event
 

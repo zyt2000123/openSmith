@@ -19,6 +19,7 @@ import {
   handleSkillsSelection,
   handleSkillToggle,
   handleSlashNavigation,
+  handleViewToggle,
   type ShellInputOptions,
 } from "./input.js";
 import { createModelPicker } from "./model-picker.js";
@@ -60,7 +61,6 @@ function inputOptions(bridge: NodeBridge, store: ReturnType<typeof createAppStor
     exit: () => {},
     bridge,
     getState: store.getState,
-    suppressRef: { current: null },
   };
 }
 
@@ -93,6 +93,16 @@ test("slash and skills navigation scrolls through the full lists", () => {
 
   assert.equal(handleSkillsNavigation({ pageUp: true } as Key, options), true);
   assert.equal(store.getState().skillsIndex, 0);
+});
+
+test("Ctrl-O remounts Static so existing transcript entries use the selected view", () => {
+  const store = createAppStore();
+  const options = inputOptions(new NodeBridge(store), store);
+  options.viewMode = "compact";
+
+  assert.equal(handleViewToggle("o", { ctrl: true } as Key, options), true);
+  assert.equal(store.getState().viewMode, "transcript");
+  assert.equal(store.getState().transcriptEpoch, 1);
 });
 
 test("enter arms the selected skill, returns to chat, and inserts its @ mention", () => {
@@ -471,4 +481,20 @@ test("Down leaves the draft untouched when not browsing history", () => {
 
   assert.equal(handleHistoryNavigation({ downArrow: true } as Key, options), false);
   assert.equal(store.getState().inputValue, "important draft");
+});
+
+test("history navigation restores the draft that existed before browsing", () => {
+  const store = createAppStore();
+  store.getState().set({
+    inputHistory: ["first message", "second message"],
+    historyIndex: -1,
+    inputValue: "important draft",
+  });
+  const options = inputOptions(new NodeBridge(store), store);
+
+  assert.equal(handleHistoryNavigation({ upArrow: true } as Key, options), true);
+  assert.equal(store.getState().inputValue, "second message");
+  assert.equal(handleHistoryNavigation({ downArrow: true } as Key, options), true);
+  assert.equal(store.getState().inputValue, "important draft");
+  assert.equal(store.getState().historyIndex, -1);
 });

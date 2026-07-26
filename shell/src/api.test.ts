@@ -19,14 +19,24 @@ test("SSE decoder exposes the run id when execution starts", () => {
 test("SSE decoder exposes context usage and compression state", () => {
   assert.deepEqual(
     decodeSseEvent(
-      'event: context_usage\ndata: {"context_tokens":128000,"context_window":256000,"context_percent":50,"estimated":false}',
+      'event: context_usage\ndata: {"context_tokens":64000,"context_window":128000,"context_percent":58,"estimated":false,"message_tokens":60000,"tool_schema_tokens":3500,"protocol_tokens":500,"effective_context_window":128000,"safe_input_budget":110000,"output_reserve":4096,"safety_margin":13904,"window_declared":true,"output_limit_declared":true,"fit_status":"fit"}',
     ),
     {
       type: "context_usage",
-      context_tokens: 128000,
-      context_window: 256000,
-      context_percent: 50,
+      context_tokens: 64000,
+      context_window: 128000,
+      context_percent: 58,
       estimated: false,
+      message_tokens: 60000,
+      tool_schema_tokens: 3500,
+      protocol_tokens: 500,
+      effective_context_window: 128000,
+      safe_input_budget: 110000,
+      output_reserve: 4096,
+      safety_margin: 13904,
+      window_declared: true,
+      output_limit_declared: true,
+      fit_status: "fit",
     },
   );
   assert.deepEqual(decodeSseEvent('event: compression\ndata: {"active":true}'), {
@@ -294,6 +304,49 @@ test("streamMessage stops after done even when the SSE body stays open", async (
     ]);
 
     assert.notEqual(result, "timeout", "done should end the stream without waiting for socket close");
+    assert.deepEqual(result, [{ type: "done", id: "message-1", status: "completed" }]);
+  } finally {
+    try {
+      streamController?.close();
+    } catch {
+      // The fixed reader cancels the stream before this cleanup runs.
+    }
+    await consume.catch(() => undefined);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("streamMessage recognizes a CR-only frame before the socket closes", async () => {
+  const originalFetch = globalThis.fetch;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      controller.enqueue(new TextEncoder().encode('event: done\rdata: {"id":"message-1"}\r\r'));
+    },
+  });
+
+  globalThis.fetch = async () =>
+    new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+
+  const consume = (async () => {
+    const events = [];
+    for await (const event of streamMessage("http://127.0.0.1:8140", "session-1", "hello", { timeoutMs: 1_000 })) {
+      events.push(event);
+    }
+    return events;
+  })();
+
+  try {
+    const result = await Promise.race([
+      consume,
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 100)),
+    ]);
+
+    assert.notEqual(result, "timeout", "a CR-only blank line must terminate the SSE frame");
     assert.deepEqual(result, [{ type: "done", id: "message-1", status: "completed" }]);
   } finally {
     try {

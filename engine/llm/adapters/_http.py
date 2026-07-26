@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from ..contracts import LLMResponseError, LLMTimeouts
+from ..contracts import LLMContextLengthError, LLMResponseError, LLMTimeouts
 from ._retry import (
     MAX_RETRIES,
     is_retryable_status,
@@ -31,6 +31,19 @@ MAX_STREAM_TOTAL_BYTES = 20 * 1024 * 1024
 MAX_STREAM_EVENT_BYTES = 1 * 1024 * 1024
 MAX_STREAM_EVENTS = 10_000
 MAX_STREAM_DURATION_SECONDS = 15 * 60
+MAX_ERROR_BODY_BYTES = 64 * 1024
+
+_CONTEXT_LIMIT_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "context limit",
+    "maximum context",
+    "max context",
+    "input length",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+)
 
 
 @dataclass
@@ -131,14 +144,75 @@ class HTTPAdapterMixin:
 
     async def _error_detail(self, response: httpx.Response, *, limit: int = 500) -> str:
         """Read a bounded slice of an error body so a 4xx says what was wrong."""
-        try:
-            raw = await response.aread()
-        except Exception:
-            return "<error body unavailable>"
-        compact = " ".join(raw.decode("utf-8", errors="replace").split())
+        compact = await self._read_error_text(response)
         if not compact:
             return "<empty error body>"
         return compact[:limit] + ("…" if len(compact) > limit else "")
+
+    async def _read_error_text(self, response: httpx.Response) -> str:
+        """Read only enough untrusted error data to classify the failure."""
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            async for chunk in response.aiter_bytes():
+                remaining = MAX_ERROR_BODY_BYTES - total
+                if remaining <= 0:
+                    break
+                chunks.append(chunk[:remaining])
+                total += min(len(chunk), remaining)
+                if len(chunk) > remaining:
+                    break
+        except Exception:
+            return ""
+        return " ".join(
+            b"".join(chunks).decode("utf-8", errors="replace").split()
+        )
+
+    async def _raise_for_status(self, response: httpx.Response) -> None:
+        """Raise a typed sanitized error before provider details leave the adapter."""
+        if response.is_success:
+            return
+        detail = await self._read_error_text(response)
+        logger.debug(
+            "%s error body (HTTP %d): %s",
+            self._error_label,
+            response.status_code,
+            detail[:500] + ("…" if len(detail) > 500 else ""),
+        )
+        context_error = self._context_length_error(response.status_code, detail)
+        if context_error is not None:
+            raise context_error
+        response.raise_for_status()
+
+    def _context_length_error(
+        self,
+        status_code: int,
+        detail: str,
+    ) -> LLMContextLengthError | None:
+        if status_code not in {400, 413, 422}:
+            return None
+        folded = detail.casefold()
+        if not any(marker in folded for marker in _CONTEXT_LIMIT_MARKERS):
+            return None
+
+        provider_code: str | None = None
+        try:
+            payload = json.loads(detail)
+        except (json.JSONDecodeError, RecursionError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                raw_code = error.get("code") or error.get("type")
+                if isinstance(raw_code, str) and raw_code:
+                    provider_code = raw_code[:100]
+
+        return LLMContextLengthError(
+            f"{self._error_label} request exceeds the selected model context "
+            f"window (HTTP {status_code}).",
+            http_status=status_code,
+            provider_code=provider_code,
+        )
 
     async def _read_bounded(
         self,
@@ -157,13 +231,7 @@ class HTTPAdapterMixin:
                 # 到日志与前端，而错误体常回显请求内容（含 prompt）。见
                 # test_request_failure_does_not_surface_provider_error_body。
                 # 折中：只落 debug 日志，排查时开 debug，默认零暴露。
-                logger.debug(
-                    "%s error body (HTTP %d): %s",
-                    self._error_label,
-                    response.status_code,
-                    await self._error_detail(response),
-                )
-                response.raise_for_status()
+                await self._raise_for_status(response)
             chunks: list[bytes] = []
             total = 0
             async for chunk in response.aiter_bytes():

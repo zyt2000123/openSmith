@@ -1,3 +1,4 @@
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { defineCatalog, validateSpec } from "@json-render/core";
 import { standardComponentDefinitions } from "@json-render/ink/catalog";
@@ -6,8 +7,100 @@ import { schema } from "@json-render/ink/schema";
 const MAX_ELEMENTS = 64;
 const MAX_DEPTH = 8;
 const MAX_IMAGES = 4;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION = 8_192;
+const MAX_IMAGE_PIXELS = 16_000_000;
 const ELEMENT_ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+
+type ImageDimensions = { width: number; height: number };
+
+const JPEG_START_OF_FRAME_MARKERS = new Set([
+  0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+]);
+
+function nextJpegMarker(data: Buffer, offset: number): { marker: number; segmentOffset: number } | null {
+  const prefixOffset = data.indexOf(0xff, offset);
+  if (prefixOffset < 0) return null;
+  let markerOffset = prefixOffset + 1;
+  while (data[markerOffset] === 0xff) markerOffset += 1;
+  const marker = data[markerOffset];
+  return marker === undefined ? null : { marker, segmentOffset: markerOffset + 1 };
+}
+
+function jpegSegmentLength(data: Buffer, offset: number): number | null {
+  if (offset + 1 >= data.length) return null;
+  const length = data.readUInt16BE(offset);
+  return length >= 2 && offset + length <= data.length ? length : null;
+}
+
+function jpegDimensions(data: Buffer): ImageDimensions | null {
+  if (data.length < 4 || data[0] !== 0xff || data[1] !== 0xd8) return null;
+  let offset = 2;
+  while (offset + 3 < data.length) {
+    const next = nextJpegMarker(data, offset);
+    if (!next || next.marker === 0xd9 || next.marker === 0xda) return null;
+    const { marker, segmentOffset } = next;
+    offset = segmentOffset;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    const segmentLength = jpegSegmentLength(data, offset);
+    if (segmentLength === null) return null;
+    if (JPEG_START_OF_FRAME_MARKERS.has(marker) && segmentLength >= 7) {
+      return { width: data.readUInt16BE(offset + 5), height: data.readUInt16BE(offset + 3) };
+    }
+    offset += segmentLength;
+  }
+  return null;
+}
+
+function webpDimensions(data: Buffer): ImageDimensions | null {
+  if (data.length < 20 || data.toString("ascii", 0, 4) !== "RIFF" || data.toString("ascii", 8, 12) !== "WEBP") {
+    return null;
+  }
+  const format = data.toString("ascii", 12, 16);
+  if (format === "VP8X" && data.length >= 30) {
+    return { width: data.readUIntLE(24, 3) + 1, height: data.readUIntLE(27, 3) + 1 };
+  }
+  if (format === "VP8L" && data.length >= 25 && data[20] === 0x2f) {
+    const bits = data.readUInt32LE(21);
+    return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+  }
+  if (format === "VP8 " && data.length >= 30 && data[23] === 0x9d && data[24] === 0x01 && data[25] === 0x2a) {
+    return { width: data.readUInt16LE(26) & 0x3fff, height: data.readUInt16LE(28) & 0x3fff };
+  }
+  return null;
+}
+
+function decodedImageDimensions(data: Buffer, extension: string): ImageDimensions | null {
+  if (
+    extension === ".png" &&
+    data.length >= 24 &&
+    data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) &&
+    data.toString("ascii", 12, 16) === "IHDR"
+  ) {
+    return { width: data.readUInt32BE(16), height: data.readUInt32BE(20) };
+  }
+  if (
+    extension === ".gif" &&
+    data.length >= 10 &&
+    (data.toString("ascii", 0, 6) === "GIF87a" || data.toString("ascii", 0, 6) === "GIF89a")
+  ) {
+    return { width: data.readUInt16LE(6), height: data.readUInt16LE(8) };
+  }
+  if (extension === ".jpg" || extension === ".jpeg") return jpegDimensions(data);
+  if (extension === ".webp") return webpDimensions(data);
+  return null;
+}
+
+function hasSafeDecodedSize(source: string, extension: string): boolean {
+  const dimensions = decodedImageDimensions(readFileSync(source), extension);
+  if (!dimensions || dimensions.width < 1 || dimensions.height < 1) return false;
+  return (
+    dimensions.width <= MAX_IMAGE_DIMENSION &&
+    dimensions.height <= MAX_IMAGE_DIMENSION &&
+    dimensions.width * dimensions.height <= MAX_IMAGE_PIXELS
+  );
+}
 
 const smithUiComponentDefinitions = {
   Box: { ...standardComponentDefinitions.Box, props: standardComponentDefinitions.Box.props.partial() },
@@ -202,7 +295,19 @@ function localProjectImagePath(value: unknown): string | null {
   const projectRoot = path.resolve(process.env.SMITH_PROJECT_CWD?.trim() || process.cwd());
   const resolved = path.resolve(projectRoot, value);
   if (resolved !== projectRoot && !resolved.startsWith(`${projectRoot}${path.sep}`)) return null;
-  return IMAGE_EXTENSIONS.has(path.extname(resolved).toLowerCase()) ? resolved : null;
+  const extension = path.extname(resolved).toLowerCase();
+  if (!IMAGE_EXTENSIONS.has(extension)) return null;
+  try {
+    const canonicalRoot = realpathSync(projectRoot);
+    const canonicalSource = realpathSync(resolved);
+    if (canonicalSource !== canonicalRoot && !canonicalSource.startsWith(`${canonicalRoot}${path.sep}`)) return null;
+    const stats = statSync(canonicalSource);
+    return stats.isFile() && stats.size <= MAX_IMAGE_BYTES && hasSafeDecodedSize(canonicalSource, extension)
+      ? canonicalSource
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function imageDimension(value: unknown): number | null {

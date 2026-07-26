@@ -3,14 +3,22 @@
   "version": "0.3.1",
   "private": false,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
   "bin": {
     "smith": "./bin/smith.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
     "check": "biome check src/",
     "format": "biome format --write src/",
-    "test": "tsc -p tsconfig.json && node scripts/run-tests.mjs",
+    "test": "npm run clean && tsc -p tsconfig.json && node scripts/run-tests.mjs",
     "prepack": "npm run build"
   },
   "dependencies": {
@@ -18,10 +26,9 @@
     "@assistant-ui/tap": "^0.9.4",
     "@json-render/core": "^0.19.0",
     "@json-render/ink": "^0.19.0",
-    "ink": "^7.1.0",
+    "ink": "^6.8.0",
     "ink-picture": "^2.1.0",
     "ink-spinner": "^5.0.0",
-    "ink-text-input": "^6.0.0",
     "marked": "^18.0.7",
     "react": "^19.2.0",
     "shiki": "4.3.1",

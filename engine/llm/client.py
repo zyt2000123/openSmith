@@ -12,7 +12,14 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from .adapters.base import ProviderAdapter
-from .contracts import ChatResponse, LLMRequest, LLMResponseError, ToolCallData
+from .contracts import (
+    ChatResponse,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    LLMRequest,
+    LLMResponseError,
+    ModelLimits,
+    ToolCallData,
+)
 from .events import ProviderEvent, ProviderEventType
 from .observability import (
     GenerationRecord,
@@ -40,6 +47,23 @@ class ProviderClient:
         self.capabilities = adapter.capabilities
         self.context_window = adapter.context_window
         self.context_window_declared = adapter.context_window_declared
+        configured_output = getattr(adapter, "max_output_tokens", None)
+        self.max_output_tokens = (
+            configured_output
+            if isinstance(configured_output, int)
+            and not isinstance(configured_output, bool)
+            and configured_output > 0
+            else DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        self.max_output_tokens_declared = bool(
+            getattr(adapter, "max_output_tokens_declared", False)
+        )
+        self.limits = ModelLimits(
+            context_window=self.context_window,
+            context_window_declared=self.context_window_declared,
+            max_output_tokens=self.max_output_tokens,
+            max_output_tokens_declared=self.max_output_tokens_declared,
+        )
 
     @property
     def adapter(self) -> ProviderAdapter:
@@ -78,15 +102,20 @@ class ProviderClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        prefix_cache_key: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
-        self._validate_requested_capabilities(tools, None)
+        self._validate_requested_capabilities(tools, prefix_cache_key)
         if not self.stream:
             # The non-streaming path funnels through ``chat()``, which already
             # emits the generation record; wrapping it again would double-count.
-            return self._complete_as_events(messages, tools)
+            return self._complete_as_events(messages, tools, prefix_cache_key)
         if not self.capabilities.streaming:
             raise LLMResponseError(f"Provider {self.provider} does not support streaming.")
-        return self._observed_stream(LLMRequest(messages=messages, tools=tools))
+        return self._observed_stream(LLMRequest(
+            messages=messages,
+            tools=tools,
+            prefix_cache_key=prefix_cache_key,
+        ))
 
     async def _observed_stream(self, request: LLMRequest) -> AsyncIterator[ProviderEvent]:
         """Relay the adapter stream while accounting one generation record."""
@@ -166,10 +195,15 @@ class ProviderClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        prefix_cache_key: str | None,
     ) -> AsyncIterator[ProviderEvent]:
         """Normalize a non-streaming completion into the same event contract."""
         yield ProviderEvent(ProviderEventType.RESPONSE_CREATED, {"provider": self.provider})
-        response = await self.chat(messages, tools)
+        response = await self.chat(
+            messages,
+            tools,
+            prefix_cache_key=prefix_cache_key,
+        )
         if response.reasoning:
             yield ProviderEvent(ProviderEventType.REASONING_DELTA, {"delta": response.reasoning})
         if response.text:

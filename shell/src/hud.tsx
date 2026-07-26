@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { Box, Text, useWindowSize } from "ink";
+import { Box, Text } from "ink";
 import { Fragment, memo, type ReactNode, useEffect, useState } from "react";
 
 import type { ToolActivity } from "./activity.js";
 import type { ContextUsage, TokenUsage } from "./api.js";
 import { BORDER, ERROR, GIT, MODEL, MUTED, PROJECT, SESSION, SUCCESS, WARNING } from "./theme.js";
 import type { TranscriptViewMode } from "./transcript-state.js";
+import { useWindowSize } from "./window-size.js";
 
 type HudSegment = {
   text: string;

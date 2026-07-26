@@ -110,9 +110,10 @@ anchors its non-bypassable platform-write protection on it.
 | Engine assembly | `server/app/services/engine_runtime.py` |
 | Agent lifecycle | `server/app/services/agent_profile_service.py` |
 | Chat + execution | `server/app/services/session_service.py` |
-| Run lifecycle | `engine/execution/orchestration/agent_loop.py` |
+| Run lifecycle | `engine/execution/orchestration/lifecycle.py` |
+| Agent dispatch | `engine/execution/orchestration/agent_loop.py` |
 | ReAct loop | `engine/execution/react/react_loop.py` |
-| Task routing | `engine/execution/routing/task_router.py`, `engine/identity_catalog.py` |
+| Task routing | `engine/execution/routing/task_router.py`, `engine/identity/catalog.py` |
 | Pipeline + skill chain | `engine/execution/pipeline/pipeline.py`, `.../skill_chain.py` |
 | Prompt assembly | `engine/context/assembler.py` |
 | Tool policy | `engine/safety/tool_policy.py` (hard guard before soft challenge) |

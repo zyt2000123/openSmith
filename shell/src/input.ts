@@ -1,5 +1,4 @@
 import { type Key, useInput } from "ink";
-import type { MutableRefObject } from "react";
 
 import type { SkillSummary } from "./api.js";
 import type { NodeBridge } from "./bridge.js";
@@ -15,6 +14,7 @@ import { advanceModelPicker, moveModelPicker } from "./model-picker.js";
 import { fieldValue, isEditableSetupField, nextSetupIndex, setSetupField, setupFieldAt } from "./setup.js";
 import { isSkillEnabled, selectedSkillMentionState } from "./skill-mention.js";
 import type { AppStore, Mode, Panel } from "./store.js";
+import { clearTerminal } from "./term.js";
 import { TOKEN_TABS } from "./token-stats.js";
 import type { TranscriptViewMode } from "./transcript-state.js";
 
@@ -41,7 +41,6 @@ export type ShellInputOptions = {
   exit: () => void;
   bridge: NodeBridge;
   getState: () => AppStore;
-  suppressRef: MutableRefObject<string | null>;
 };
 
 function moveSetupSelection(options: ShellInputOptions, direction: 1 | -1): void {
@@ -83,12 +82,13 @@ export function handleCtrlC(input: string, key: Key, options: ShellInputOptions)
   return true;
 }
 
-function handleViewToggle(input: string, key: Key, options: ShellInputOptions): boolean {
+export function handleViewToggle(input: string, key: Key, options: ShellInputOptions): boolean {
   if (!key.ctrl || input !== "o") return false;
 
-  options.suppressRef.current = input;
   const viewMode = options.viewMode === "compact" ? "transcript" : "compact";
-  options.getState().set({ viewMode, statusLine: `${viewMode} view.` });
+  clearTerminal();
+  const state = options.getState();
+  state.set({ viewMode, transcriptEpoch: state.transcriptEpoch + 1, statusLine: `${viewMode} view.` });
   return true;
 }
 
@@ -363,14 +363,18 @@ export function handleHistoryNavigation(key: Key, options: ShellInputOptions): b
 
   if (key.upArrow) {
     const index = state.historyIndex === -1 ? state.inputHistory.length - 1 : Math.max(0, state.historyIndex - 1);
-    state.set({ historyIndex: index, inputValue: state.inputHistory[index] || "" });
+    state.set({
+      historyIndex: index,
+      historyDraft: state.historyIndex === -1 ? state.inputValue : state.historyDraft,
+      inputValue: state.inputHistory[index] || "",
+    });
     return true;
   }
 
   if (state.historyIndex === -1) return false;
   const index = state.historyIndex + 1;
   if (index >= state.inputHistory.length) {
-    state.set({ historyIndex: -1, inputValue: "" });
+    state.set({ historyIndex: -1, historyDraft: "", inputValue: state.historyDraft });
   } else {
     state.set({ historyIndex: index, inputValue: state.inputHistory[index] || "" });
   }

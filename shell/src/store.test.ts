@@ -97,8 +97,8 @@ test("context usage replaces the HUD value and compression toggles input state",
 
   store.getState().applyEvent({
     type: "context_usage",
-    context_tokens: 128_000,
-    context_window: 256_000,
+    context_tokens: 64_000,
+    context_window: 128_000,
     context_percent: 50,
     estimated: false,
   });

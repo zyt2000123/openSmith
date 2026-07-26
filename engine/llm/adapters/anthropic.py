@@ -53,6 +53,7 @@ class AnthropicAdapter(HTTPAdapterMixin):
         self.timeouts = config.timeouts
         self.context_window_declared = config.context_window is not None
         self.context_window = config.context_window or DEFAULT_CONTEXT_WINDOW
+        self.max_output_tokens_declared = config.max_output_tokens is not None
         # Anthropic requires max_tokens; other adapters preserve their provider
         # defaults unless the shared configuration explicitly sets a limit.
         self.max_output_tokens = config.max_output_tokens or 4096
@@ -87,10 +88,27 @@ class AnthropicAdapter(HTTPAdapterMixin):
             usage: dict[str, Any] = {}
             emitted_usage = False
             served_model: str | None = None
+            created_emitted = False
+            pending_events: list[ProviderEvent] = []
+
+            def commit_attempt() -> list[ProviderEvent]:
+                nonlocal created_emitted
+                if created_emitted:
+                    return []
+                created_emitted = True
+                committed = [
+                    ProviderEvent(
+                        ProviderEventType.RESPONSE_CREATED,
+                        {"model": self.model},
+                    ),
+                    *pending_events,
+                ]
+                pending_events.clear()
+                return committed
+
             try:
                 response = await self._http.send(http_request, stream=True)
-                response.raise_for_status()
-                yield ProviderEvent(ProviderEventType.RESPONSE_CREATED, {"model": self.model})
+                await self._raise_for_status(response)
 
                 async for event_name, payload_text in self._iter_sse(response):
                     try:
@@ -124,6 +142,8 @@ class AnthropicAdapter(HTTPAdapterMixin):
                             raise LLMResponseError(
                                 "Anthropic stream tool_use block is missing id or name."
                             )
+                        for committed_event in commit_attempt():
+                            yield committed_event
                         saw_content_event = True
                         yield ProviderEvent(
                             ProviderEventType.FUNCTION_CALL_ARGUMENTS_DELTA,
@@ -150,6 +170,8 @@ class AnthropicAdapter(HTTPAdapterMixin):
                         if delta_type == "text_delta":
                             text = delta.get("text")
                             if isinstance(text, str) and text:
+                                for committed_event in commit_attempt():
+                                    yield committed_event
                                 saw_content_event = True
                                 yield ProviderEvent(
                                     ProviderEventType.OUTPUT_TEXT_DELTA,
@@ -158,6 +180,8 @@ class AnthropicAdapter(HTTPAdapterMixin):
                         elif delta_type == "thinking_delta":
                             thinking = delta.get("thinking")
                             if isinstance(thinking, str) and thinking:
+                                for committed_event in commit_attempt():
+                                    yield committed_event
                                 saw_content_event = True
                                 yield ProviderEvent(
                                     ProviderEventType.REASONING_DELTA,
@@ -166,6 +190,8 @@ class AnthropicAdapter(HTTPAdapterMixin):
                         elif delta_type == "input_json_delta":
                             partial_json = delta.get("partial_json")
                             if isinstance(partial_json, str):
+                                for committed_event in commit_attempt():
+                                    yield committed_event
                                 saw_content_event = True
                                 yield ProviderEvent(
                                     ProviderEventType.FUNCTION_CALL_ARGUMENTS_DELTA,
@@ -180,7 +206,14 @@ class AnthropicAdapter(HTTPAdapterMixin):
                         self._merge_usage(usage, event.get("usage"))
                         if usage:
                             emitted_usage = True
-                            yield ProviderEvent(ProviderEventType.USAGE, {"usage": dict(usage)})
+                            usage_event = ProviderEvent(
+                                ProviderEventType.USAGE,
+                                {"usage": dict(usage)},
+                            )
+                            if created_emitted:
+                                yield usage_event
+                            else:
+                                pending_events.append(usage_event)
                         continue
 
                     if event_type == "error":
@@ -198,6 +231,8 @@ class AnthropicAdapter(HTTPAdapterMixin):
 
                 if not saw_stop:
                     raise LLMResponseError("Anthropic stream ended before message_stop.")
+                for committed_event in commit_attempt():
+                    yield committed_event
                 if usage and not emitted_usage:
                     yield ProviderEvent(ProviderEventType.USAGE, {"usage": dict(usage)})
                 yield ProviderEvent(
@@ -411,36 +446,9 @@ class AnthropicAdapter(HTTPAdapterMixin):
             for block in content:
                 if not isinstance(block, dict):
                     raise LLMResponseError("Message content blocks must be objects.")
-                copied.append(AnthropicAdapter._translate_block(block))
+                copied.append(dict(block))
             return copied
         return [{"type": "text", "text": str(content)}]
-
-    @staticmethod
-    def _translate_block(block: dict[str, Any]) -> dict[str, Any]:
-        """Rewrite an OpenAI image part into Anthropic's base64 source form.
-
-        Every other block type passes through unchanged: the engine's
-        conversation is OpenAI-shaped by design, and Anthropic accepts the same
-        text/tool_use/tool_result shapes. Images are the one divergence.
-        """
-        if block.get("type") != "image_url":
-            return dict(block)
-        source = block.get("image_url")
-        url = source.get("url") if isinstance(source, dict) else None
-        header, _, data = url.partition(",") if isinstance(url, str) else ("", "", "")
-        if not header.startswith("data:") or not header.endswith(";base64") or not data:
-            # Anthropic also has a url source type, but the engine only ever
-            # produces data URLs (engine/llm/image_input.py). Anything else is a
-            # bug worth naming here instead of forwarding as an opaque 400.
-            raise LLMResponseError("Anthropic image blocks require a base64 data: URL.")
-        return {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": header[len("data:"):].removesuffix(";base64"),
-                "data": data,
-            },
-        }
 
     @staticmethod
     def _text_content(content: object) -> str:

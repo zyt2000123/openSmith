@@ -4,7 +4,7 @@
  */
 
 import { createStore } from "zustand/vanilla";
-import { applyToolActivity, createToolActivity, type ToolActivity } from "./activity.js";
+import { applyToolActivity, cancelRunningToolActivity, createToolActivity, type ToolActivity } from "./activity.js";
 import type {
   AgentHealth,
   AgentProfile,
@@ -32,6 +32,7 @@ import {
   closeLatestTurn,
   createSystemEntry,
   createTurnEntry,
+  interruptLatestTurn,
   limitTranscript,
   removeApprovalNotice,
   type TranscriptEntry,
@@ -61,8 +62,6 @@ export type SetupDraft = {
   api_key: string;
   model: string;
   review_model: string;
-  /** Blank is a real choice: no vision route means images depend on the main model. */
-  image_model: string;
   max_output_tokens: string;
   routes: string;
   models: string;
@@ -113,6 +112,7 @@ export type AppState = {
   inputValue: string;
   inputHistory: string[];
   historyIndex: number;
+  historyDraft: string;
   statusLine: string;
   setupDraft: SetupDraft;
   setupFlow: SetupFlow;
@@ -132,6 +132,7 @@ export type AppActions = {
   pushTurn: (userText: string) => void;
   applyEvent: (event: StreamEvent) => void;
   closeTurn: () => void;
+  interruptTurn: (outcome: "cancelled" | "error") => void;
   resetChat: () => void;
   clearChat: () => void;
   startFreshSession: () => void;
@@ -318,6 +319,7 @@ export function createAppStore(initialHistory: string[] = []) {
     inputValue: "",
     inputHistory: initialHistory,
     historyIndex: -1,
+    historyDraft: "",
     statusLine: "Booting Smith…",
     setupDraft: {
       vendor: "",
@@ -326,7 +328,6 @@ export function createAppStore(initialHistory: string[] = []) {
       api_key: "",
       model: "gpt-4.1-mini",
       review_model: "",
-      image_model: "",
       max_output_tokens: "",
       routes: "",
       models: "",
@@ -353,6 +354,7 @@ export function createAppStore(initialHistory: string[] = []) {
             ? s.inputHistory
             : [...s.inputHistory, text].slice(-HISTORY_LIMIT),
         historyIndex: -1,
+        historyDraft: "",
       })),
     pushSystemLine: (text, tone = "info") => set((s) => appendTranscript(s, createSystemEntry(text, tone))),
     pushTurn: (userText) =>
@@ -363,6 +365,11 @@ export function createAppStore(initialHistory: string[] = []) {
       })),
     applyEvent: (event) => set((state) => applyStreamState(state, event)),
     closeTurn: () => set((s) => ({ transcript: closeLatestTurn(s.transcript) })),
+    interruptTurn: (outcome) =>
+      set((s) => ({
+        toolActivity: cancelRunningToolActivity(s.toolActivity),
+        transcript: interruptLatestTurn(s.transcript, outcome),
+      })),
 
     resetChat: () =>
       set((s) => ({

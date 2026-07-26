@@ -7,10 +7,33 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
 from uuid import uuid4
 
-from engine.llm.contracts import ChatResponse, LLMResponseError, ToolCallData
+from engine.context import ContextReceipt, fit_request, measure_request
+from engine.context.compression import (
+    compaction_policy_for_llm,
+    trim_conversation_for_context_limit,
+)
+from engine.execution.events import EventType, ExecutionEvent
+from engine.execution.runtime_control import tool_blocked_prompt
+from engine.llm.contracts import (
+    ChatResponse,
+    LLMContextLengthError,
+    LLMResponseError,
+    ToolCallData,
+)
 from engine.llm.events import ProviderEvent, ProviderEventType
 from engine.llm.usage import normalize_usage
-from engine.react_budget import (
+from engine.safety.approval import (
+    ApprovalRequest,
+    ApprovalTimeoutError,
+    build_approval_presentation,
+    current_approval_context,
+    summarize_arguments,
+)
+from engine.safety.fact_gate import FactGate, current_fact_gate
+from engine.safety.tool_policy import ToolPolicy
+from engine.tool.interface import ToolCall
+
+from .budget import (
     CONTINUE_AFTER_LENGTH_HINT,
     CONVERSATION_HARD_LIMIT,
     CONVERSATION_KEEP_HEAD,
@@ -29,28 +52,6 @@ from engine.react_budget import (
     budget_exhausted_message,
     looks_like_incomplete_final_after_tool,
 )
-from engine.execution.runtime_control import tool_blocked_prompt
-from engine.safety.approval import (
-    ApprovalRequest,
-    ApprovalTimeoutError,
-    build_approval_presentation,
-    current_approval_context,
-    summarize_arguments,
-)
-from engine.safety.tool_policy import ToolPolicy
-from engine.safety.fact_gate import FactGate, current_fact_gate
-from engine.tool.interface import ToolCall
-
-from engine.context.compression import (
-    CONTEXT_DISPLAY_WINDOW,
-    compress,
-    compaction_policy_for_llm,
-    estimate_tokens,
-    needs_compaction,
-    prune_tool_outputs,
-    trim_conversation_for_context_limit,
-)
-from engine.observability import EventType, ExecutionEvent
 from .smith_ui import smith_ui_fallback, validate_smith_ui_call
 
 if TYPE_CHECKING:
@@ -233,48 +234,43 @@ def _usage_event_data(usage: dict | None) -> dict | None:
     }
 
 
-def _conversation_token_count(conversation: list[dict]) -> int:
-    return sum(
-        estimate_tokens(message["content"])
-        for message in conversation
-        if isinstance(message.get("content"), str)
-    )
-
-
 def _context_usage_event(
-    conversation: list[dict],
+    receipt: ContextReceipt,
     *,
     input_tokens: int | None = None,
+    fit_status: str,
 ) -> ExecutionEvent:
-    """Report the current model input size, with an estimate fallback."""
+    """Report selected-route capacity and the complete request cost."""
     estimated = not isinstance(input_tokens, int) or input_tokens <= 0
-    context_tokens = input_tokens if not estimated else _conversation_token_count(conversation)
+    context_tokens = (
+        input_tokens if not estimated else receipt.estimated_input_tokens
+    )
     context_percent = round(
-        min(context_tokens, CONTEXT_DISPLAY_WINDOW) / CONTEXT_DISPLAY_WINDOW * 100
+        min(context_tokens, receipt.safe_input_budget)
+        / receipt.safe_input_budget
+        * 100
     )
     return ExecutionEvent(EventType.CONTEXT_USAGE, {
         "context_tokens": context_tokens,
-        "context_window": CONTEXT_DISPLAY_WINDOW,
+        "context_window": receipt.model_context_window,
         "context_percent": context_percent,
         "estimated": estimated,
+        "message_tokens": receipt.message_tokens,
+        "tool_schema_tokens": receipt.tool_schema_tokens,
+        "protocol_tokens": receipt.protocol_tokens,
+        "effective_context_window": receipt.effective_context_window,
+        "safe_input_budget": receipt.safe_input_budget,
+        "output_reserve": receipt.output_reserve,
+        "safety_margin": receipt.safety_margin,
+        "window_declared": receipt.window_declared,
+        "output_limit_declared": receipt.output_limit_declared,
+        "fit_status": fit_status,
     })
 
 
-def _will_compact(conversation: list[dict], llm: object | None) -> bool:
-    """Predict whether ``compress`` will call the summarizing LLM."""
-    if llm is None:
-        return False
-    preview = [dict(message) for message in conversation]
-    prune_tool_outputs(preview)
-    context_limit, trigger_ratio = compaction_policy_for_llm(llm)
-    return needs_compaction(
-        preview,
-        context_limit=context_limit,
-        trigger_ratio=trigger_ratio,
-    )
-
-
 def _is_context_limit_error(error: BaseException) -> bool:
+    if isinstance(error, LLMContextLengthError):
+        return True
     if not isinstance(error, LLMResponseError):
         return False
     message = str(error).casefold()
@@ -358,6 +354,7 @@ async def react_loop(
     max_iters: int = DEFAULT_MAX_REACT_ITERS,
     *,
     fact_gate: FactGate | None = None,
+    prefix_cache_key: str | None = None,
 ) -> str:
     """Run the canonical ReAct event loop and collect final assistant text."""
     chunks: list[str] = []
@@ -368,6 +365,7 @@ async def react_loop(
         tool_guard,
         max_iters,
         fact_gate=fact_gate,
+        prefix_cache_key=prefix_cache_key,
     ):
         if event.type == EventType.TEXT_DELTA:
             chunks.append(str(event.data.get("text", "")))
@@ -390,6 +388,7 @@ async def react_stream_loop(
     max_iters: int = DEFAULT_MAX_REACT_ITERS,
     *,
     fact_gate: FactGate | None = None,
+    prefix_cache_key: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Run the canonical ReAct event loop and expose text deltas only.
 
@@ -403,6 +402,7 @@ async def react_stream_loop(
         tool_guard,
         max_iters,
         fact_gate=fact_gate,
+        prefix_cache_key=prefix_cache_key,
     ):
         if event.type == EventType.TEXT_DELTA:
             text = event.data.get("text", "")
@@ -427,6 +427,7 @@ async def react_event_loop(
     *,
     fact_gate: FactGate | None = None,
     provisional_lifecycle: bool = True,
+    prefix_cache_key: str | None = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """ReAct loop: model response, tool calls, results, and next turn in one history."""
     tools = tool_registry.get_schemas() or None
@@ -449,40 +450,10 @@ async def react_event_loop(
     active_provision_ids: list[str] = []
     last_error_key: str | None = None
     identical_error_count = 0
-    compact_llm: "LLMPort | None" = llm
-    ineffective_compacts = 0
     context_recoveries = 0
+    model_compaction_enabled = True
 
     while productive_iters < max_iters:
-        compression_started = _will_compact(conversation, compact_llm)
-        if compression_started:
-            yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
-        try:
-            conversation = await compress(conversation, compact_llm)
-        except Exception:
-            if compression_started:
-                yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
-            for provision_id in active_provision_ids:
-                yield _provisional_retract_event(provision_id, "compression_error")
-            active_provision_ids.clear()
-            raise
-        if compression_started:
-            yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
-        yield _context_usage_event(conversation)
-        if compact_llm is not None:
-            context_limit, trigger_ratio = compaction_policy_for_llm(compact_llm)
-            if needs_compaction(
-                conversation,
-                context_limit=context_limit,
-                trigger_ratio=trigger_ratio,
-            ):
-                # compact 失败或摘要仍超限：连续两次无效后熔断 LLM 压缩，
-                # 避免每轮迭代重放一次注定失败的摘要调用；prune 和硬截断继续生效。
-                ineffective_compacts += 1
-                if ineffective_compacts >= 2:
-                    compact_llm = None
-            else:
-                ineffective_compacts = 0
         if len(conversation) > CONVERSATION_HARD_LIMIT:
             # ponytail: keep head (system + initial user) and recent tail
             head = conversation[:CONVERSATION_KEEP_HEAD]
@@ -498,7 +469,66 @@ async def react_event_loop(
                 head.pop()
             conversation = head + tail
 
+        pre_fit_receipt = measure_request(conversation, tools, llm)
+        compression_started = (
+            pre_fit_receipt.message_tokens
+            >= pre_fit_receipt.compaction_trigger
+        )
+        if compression_started:
+            yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
+        fit = await fit_request(
+            conversation,
+            tools,
+            llm,
+            prefix_cache_key=prefix_cache_key,
+            allow_model_compaction=model_compaction_enabled,
+        )
+        if any(
+            action in {"compaction_failed", "compaction_rejected"}
+            for action in fit.actions
+        ):
+            model_compaction_enabled = False
+        fit_changed = list(fit.messages) != conversation
+        if fit_changed and not compression_started:
+            yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
+        conversation = [dict(message) for message in fit.messages]
+        tools = [dict(tool) for tool in fit.tools] if fit.tools else None
+        if compression_started or fit_changed:
+            yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
+        yield _context_usage_event(
+            fit.receipt,
+            fit_status=fit.status.value,
+        )
+        if not fit.fits:
+            for provision_id in active_provision_ids:
+                yield _provisional_retract_event(
+                    provision_id,
+                    "context_capacity_exhausted",
+                )
+            active_provision_ids.clear()
+            yield ExecutionEvent(EventType.INCOMPLETE, {
+                "reason": "context_capacity_exhausted",
+                "fit_status": fit.status.value,
+                "estimated_input_tokens": fit.receipt.estimated_input_tokens,
+                "safe_input_budget": fit.receipt.safe_input_budget,
+                "model_context_window": fit.receipt.model_context_window,
+                "output_reserve": fit.receipt.output_reserve,
+                "actions": list(fit.actions),
+            })
+            return
+
         yield ExecutionEvent(EventType.THINKING, {})
+        provider_prefix_cache_key = (
+            fit.prefix_cache_key
+            if bool(
+                getattr(
+                    getattr(llm, "capabilities", None),
+                    "prefix_cache_key",
+                    False,
+                )
+            )
+            else None
+        )
         response_text_was_streamed = False
         response_provision_id: str | None = None
         stream_events = getattr(llm, "chat_events", None)
@@ -508,7 +538,16 @@ async def react_event_loop(
             if provisional_lifecycle:
                 response_provision_id = uuid4().hex
             try:
-                async for provider_event in stream_events(conversation, tools=tools):
+                provider_stream = (
+                    stream_events(
+                        conversation,
+                        tools=tools,
+                        prefix_cache_key=provider_prefix_cache_key,
+                    )
+                    if provider_prefix_cache_key
+                    else stream_events(conversation, tools=tools)
+                )
+                async for provider_event in provider_stream:
                     accumulator.add(provider_event)
                     is_text_delta = provider_event.type == ProviderEventType.OUTPUT_TEXT_DELTA
                     raw_provision_id = response_provision_id if is_text_delta else None
@@ -530,7 +569,28 @@ async def react_event_loop(
                         ProviderEventType.FUNCTION_CALL_ARGUMENTS_DELTA,
                     ):
                         saw_content_event = True
-            except Exception:
+            except Exception as stream_exc:
+                if _is_context_limit_error(stream_exc):
+                    if context_recoveries >= 1:
+                        for provision_id in active_provision_ids:
+                            yield _provisional_retract_event(
+                                provision_id,
+                                "context_limit",
+                            )
+                        active_provision_ids.clear()
+                        yield ExecutionEvent(EventType.INCOMPLETE, {
+                            "reason": "context_limit",
+                            "recoveries": context_recoveries,
+                        })
+                        return
+                    context_recoveries += 1
+                    yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
+                    conversation = _recover_context_after_provider_rejection(
+                        conversation,
+                        llm,
+                    )
+                    yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
+                    continue
                 # Fallback to non-streaming only if this response emitted no
                 # semantic delta and no earlier continuation is still visible
                 # as a provisional draft.  Otherwise the fallback could
@@ -541,7 +601,15 @@ async def react_event_loop(
                     active_provision_ids.clear()
                     raise
                 try:
-                    response = await llm.chat(conversation, tools=tools)
+                    response = await (
+                        llm.chat(
+                            conversation,
+                            tools=tools,
+                            prefix_cache_key=provider_prefix_cache_key,
+                        )
+                        if provider_prefix_cache_key
+                        else llm.chat(conversation, tools=tools)
+                    )
                 except Exception as exc:
                     if not _is_context_limit_error(exc):
                         raise
@@ -567,7 +635,15 @@ async def react_event_loop(
                 response_text_was_streamed = accumulator.streamed_text
         else:
             try:
-                response = await llm.chat(conversation, tools=tools)
+                response = await (
+                    llm.chat(
+                        conversation,
+                        tools=tools,
+                        prefix_cache_key=provider_prefix_cache_key,
+                    )
+                    if provider_prefix_cache_key
+                    else llm.chat(conversation, tools=tools)
+                )
             except Exception as exc:
                 if not _is_context_limit_error(exc):
                     raise
@@ -586,8 +662,9 @@ async def react_event_loop(
         if usage:
             yield ExecutionEvent(EventType.TOKEN_USAGE, usage)
         yield _context_usage_event(
-            conversation,
+            fit.receipt,
             input_tokens=usage.get("input_tokens") if usage else None,
+            fit_status=fit.status.value,
         )
 
         thought = (response.reasoning or (response.text if response.has_tool_calls else "")).strip()
@@ -937,7 +1014,11 @@ async def react_event_loop(
                         consecutive_errors = 0
                     continue
 
-            result = await tool_registry.execute(call)
+            with tool_registry.authorize_execution(
+                call,
+                approval_id=granted_approval_id,
+            ):
+                result = await tool_registry.execute(call)
             conversation.append({"role": "tool", "tool_call_id": result.call_id, "content": result.content})
             result_event = {
                 "id": tc.id,
