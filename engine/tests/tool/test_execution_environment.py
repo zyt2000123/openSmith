@@ -450,7 +450,7 @@ def test_registry_authorization_never_bypasses_a_hard_safety_block(
     )
 
     async def run():
-        with registry.authorize_execution(call):
+        with registry.authorize_execution(call, approval_id="approval-1"):
             return await registry.execute(call)
 
     result = asyncio.run(run())
@@ -511,6 +511,66 @@ def test_registry_requires_an_approval_id_for_approval_gated_execution(
     async def run():
         with registry.authorize_execution(call):
             return await registry.execute(call)
+
+    result = asyncio.run(run())
+
+    assert result.is_error
+    assert result.error_kind == "approval_required"
+    assert calls == []
+
+
+def test_registry_authorizes_only_the_exact_approved_call(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    class FakeSandbox:
+        name = "sandbox"
+
+        async def run_command(
+            self, command=None, *, argv=None, cwd=None, timeout_seconds=30.0, env=None
+        ) -> CommandResult:
+            return CommandResult(exit_code=0)
+
+    async def shell(*, command: str, cwd: str | None = None, environment=None) -> str:
+        calls.append(command)
+        return "ran"
+
+    registry = ToolRegistry()
+    registry.register(
+        "shell",
+        "",
+        {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "cwd": {"type": "string"},
+            },
+        },
+        shell,
+        path_args=("cwd",),
+        opaque_command=True,
+        permission_level="execute",
+        approval_policy="always",
+        side_effect="external",
+        execution_environment="sandbox",
+    )
+    registry.bind_working_directory(tmp_path)
+    registry.bind_execution_environment(FakeSandbox())
+    guard = ToolGuard(
+        ROOT / "agents" / "safety" / "dangerous_commands.json",
+        tool_registry=registry.definitions(),
+    )
+    guard.set_working_directory(tmp_path)
+    registry.bind_tool_guard(guard)
+    approved = registry.normalize_call(
+        ToolCall(id="approved", name="shell", arguments={"command": "pwd"})
+    )
+    substituted = registry.normalize_call(
+        ToolCall(id="substituted", name="shell", arguments={"command": "echo changed"})
+    )
+
+    async def run():
+        with registry.authorize_execution(approved, approval_id="approval-1"):
+            return await registry.execute(substituted)
 
     result = asyncio.run(run())
 
