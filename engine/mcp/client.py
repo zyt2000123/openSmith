@@ -28,6 +28,10 @@ CLIENT_INFO = {"name": "agent-smith", "version": "0.2.0"}
 MAX_TOOL_NAME_LENGTH = 64
 MAX_MCP_RESPONSE_BYTES = 1024 * 1024
 MAX_MCP_TOOL_LIST_PAGES = 100
+_FRAMING_BROKEN_MESSAGE = (
+    "MCP stdio transport retired: an earlier response exceeded the maximum "
+    "size and left the stream desynchronized"
+)
 
 
 @dataclass
@@ -79,6 +83,11 @@ class StdioMCPTransport:
         # interleave reads and one waiter would consume (and drop) another
         # waiter's response, so request/response exchanges are serialized.
         self._request_lock = asyncio.Lock()
+        # Set once a response overruns the read buffer.  readline() clears its
+        # buffer on overrun while the rest of that message is still arriving,
+        # so the newline framing is gone for good and no later request on this
+        # pipe can trust what it reads.
+        self._framing_broken = False
         self.label = " ".join(command)
 
     async def connect(self) -> None:
@@ -88,6 +97,12 @@ class StdioMCPTransport:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._env,
+            # asyncio caps a subprocess StreamReader at 64 KiB by default,
+            # which silently sits 16x below the size this transport already
+            # declares it accepts.  A tools/list from a server with many
+            # tools clears 64 KiB easily, so the default made those servers
+            # unusable rather than merely slow.
+            limit=MAX_MCP_RESPONSE_BYTES,
         )
         # An MCP server's stderr is diagnostic-only, but it is still a pipe.
         # If nobody consumes it, a noisy or malicious server can fill the OS
@@ -102,11 +117,32 @@ class StdioMCPTransport:
         while await stream.read(4096):
             pass
 
+    @staticmethod
+    async def _drain_stdout_after_kill(process: asyncio.subprocess.Process) -> None:
+        """Let the subprocess transport finish once the process is dead.
+
+        A stdout reader that nobody consumes pauses at its high-water mark, and
+        a paused reader never observes EOF -- so the transport keeps its pipes
+        open and ``process.wait()`` blocks forever, even after SIGKILL.  Only
+        safe once the process is killed: before that, draining to EOF would
+        wait on a healthy server that has no reason to exit.
+        """
+        stdout = getattr(process, "stdout", None)
+        if stdout is None:
+            return
+        try:
+            while await asyncio.wait_for(stdout.read(65536), timeout=5):
+                pass
+        except Exception:
+            log.debug("failed to drain MCP server stdout during shutdown", exc_info=True)
+
     async def send_request(self, method: str, params: dict) -> dict:
         if self._process is None or self._process.stdin is None or self._process.stdout is None:
             raise RuntimeError("MCP stdio transport not connected")
 
         async with self._request_lock:
+            if self._framing_broken:
+                raise RuntimeError(_FRAMING_BROKEN_MESSAGE)
             self._request_id += 1
             request_id = self._request_id
             msg = {
@@ -119,7 +155,19 @@ class StdioMCPTransport:
             await self._process.stdin.drain()
 
             while True:
-                line = await asyncio.wait_for(self._process.stdout.readline(), timeout=30)
+                try:
+                    line = await asyncio.wait_for(self._process.stdout.readline(), timeout=30)
+                except ValueError as exc:
+                    # Over the buffer limit readline() raises a bare
+                    # ValueError.  Unlike the HTTP transport -- which is
+                    # stateless per request and so cannot poison the next one
+                    # -- the rest of the oversized message keeps arriving on
+                    # this shared pipe, and a later request would read a
+                    # fragment of it and either mis-pair a response or fail to
+                    # parse one.  Retire the transport instead of leaving the
+                    # session with a connection that silently lies.
+                    self._framing_broken = True
+                    raise RuntimeError("MCP stdio response exceeds maximum size") from exc
                 if not line:
                     raise RuntimeError("MCP server closed stdout unexpectedly")
                 resp = json.loads(line.decode())
@@ -154,6 +202,7 @@ class StdioMCPTransport:
             await asyncio.wait_for(process.wait(), timeout=self._close_timeout)
         except asyncio.TimeoutError:
             process.kill()
+            await self._drain_stdout_after_kill(process)
             await process.wait()
             log.warning("MCP server killed after timeout")
         except asyncio.CancelledError:
@@ -162,6 +211,7 @@ class StdioMCPTransport:
             if process.returncode is None:
                 process.kill()
                 try:
+                    await asyncio.shield(self._drain_stdout_after_kill(process))
                     await asyncio.shield(process.wait())
                 except Exception:
                     log.warning("failed to reap cancelled MCP server", exc_info=True)
@@ -358,10 +408,15 @@ class MCPClient:
                 name = t.get("name")
                 if not isinstance(name, str) or not name:
                     continue
+                description = t.get("description", "")
+                input_schema = t.get("inputSchema", {})
+                if not isinstance(description, str) or not isinstance(input_schema, dict):
+                    log.warning("Skipping MCP tool with invalid metadata: %s", name)
+                    continue
                 tools.append(MCPTool(
                     name=name,
-                    description=t.get("description", ""),
-                    input_schema=t.get("inputSchema", {}),
+                    description=description,
+                    input_schema=input_schema,
                 ))
             next_cursor = result.get("nextCursor")
             if not isinstance(next_cursor, str) or not next_cursor:
@@ -396,7 +451,7 @@ class MCPClient:
             schemas.append({
                 "type": "function",
                 "function": {
-                    "name": f"mcp_{tool_part}",
+                    "name": _safe_tool_name_part(f"mcp_{tool_part}"),
                     "description": tool.description,
                     "parameters": tool.input_schema,
                 },
@@ -443,7 +498,9 @@ async def register_mcp_tools_with_prefix(
         if not tool_part:
             log.warning("Skipping MCP tool with empty/invalid name: %r", tool.name)
             continue
-        registered_name = f"{safe_prefix}_{tool_part}"
+        # Cap the joined name, not the two halves: a provider applies its
+        # 64-character limit to what it actually receives.
+        registered_name = _safe_tool_name_part(f"{safe_prefix}_{tool_part}")
         try:
             registry.register(
                 name=registered_name,
