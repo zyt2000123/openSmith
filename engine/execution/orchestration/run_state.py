@@ -19,7 +19,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
-from engine.observability.events import EventType, ExecutionEvent
+from engine.execution.events import EventType, ExecutionEvent
 
 
 class RunStatus(str, Enum):
@@ -81,6 +81,24 @@ def _bounded_text(value: object | None, *, limit: int = 200) -> str | None:
     return text[:limit] or None
 
 
+def _bounded_error_details(value: object) -> dict[str, object] | None:
+    """Keep only the small, non-sensitive error classification fields."""
+    if not isinstance(value, dict):
+        return None
+    details: dict[str, object] = {}
+    for key in ("kind", "stage", "type", "provider"):
+        text = _bounded_text(value.get(key), limit=100)
+        if text is not None:
+            details[key] = text
+    status = value.get("http_status")
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        details["http_status"] = status
+    retryable = value.get("retryable")
+    if isinstance(retryable, bool):
+        details["retryable"] = retryable
+    return details or None
+
+
 @dataclass
 class RunState:
     """Persisted metadata for one execution attempt."""
@@ -101,6 +119,7 @@ class RunState:
     current_tool: str | None = None
     reason: str | None = None
     error: str | None = None
+    error_details: dict[str, object] | None = None
     approval_id: str | None = None
     approval_tool: str | None = None
     approval_level: str | None = None
@@ -112,6 +131,7 @@ class RunState:
         *,
         reason: str | None = None,
         error: str | None = None,
+        error_details: dict[str, object] | None = None,
     ) -> None:
         target = RunStatus(status)
         if target not in _ALLOWED_TRANSITIONS[self.status]:
@@ -124,6 +144,8 @@ class RunState:
             self.reason = _bounded_text(reason)
         if error is not None:
             self.error = _bounded_text(error)
+        if error_details is not None:
+            self.error_details = _bounded_error_details(error_details)
         self.updated_at = _now()
 
     def record_event(
@@ -165,6 +187,7 @@ class RunState:
             "current_tool": self.current_tool,
             "reason": self.reason,
             "error": self.error,
+            "error_details": self.error_details,
             "approval_id": self.approval_id,
             "approval_tool": self.approval_tool,
             "approval_level": self.approval_level,
@@ -203,6 +226,7 @@ class RunState:
             current_tool=_bounded_text(data.get("current_tool")),
             reason=_bounded_text(data.get("reason")),
             error=_bounded_text(data.get("error")),
+            error_details=_bounded_error_details(data.get("error_details")),
             approval_id=_bounded_text(data.get("approval_id")),
             approval_tool=_bounded_text(data.get("approval_tool")),
             approval_level=_bounded_text(data.get("approval_level")),
@@ -405,11 +429,17 @@ class RunStateStore:
         event_type: str | None = None,
         reason: str | None = None,
         error: str | None = None,
+        error_details: dict[str, object] | None = None,
     ) -> RunState:
         state = self._require(run_id)
         if event_type is not None:
             state.record_event(event_type)
-        state.transition(status, reason=reason, error=error)
+        state.transition(
+            status,
+            reason=reason,
+            error=error,
+            error_details=error_details,
+        )
         self.save(state)
         return state
 
@@ -469,6 +499,11 @@ def project_execution_event(
                 event_type=event_type,
                 reason=str(reason) if reason is not None else None,
                 error=str(reason) if status is RunStatus.FAILED and reason is not None else None,
+                error_details=(
+                    _bounded_error_details(event.data.get("error"))
+                    if status is RunStatus.FAILED
+                    else None
+                ),
             )
             return
 

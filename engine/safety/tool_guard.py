@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -11,7 +12,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from engine.safety.approval import current_approval_context
 from engine.tool.interface import ToolCall, ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 # ── Permission Levels (req #2: default-deny + tiered approval) ──
@@ -157,7 +161,7 @@ class AuditLog:
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
-            pass
+            logger.warning("failed to append tool safety audit", exc_info=True)
 
 
 _SENSITIVE_ARG_KEY_PARTS = (
@@ -384,10 +388,18 @@ class ToolGuard:
 
         if opaque_command:
             cmd = tool_call.arguments.get("command", "")
-            if self.file_guard.is_working_directory_scoped:
+            definition = self._tool_registry.get(tool_call.name)
+            requires_sandbox = (
+                definition is not None
+                and definition.execution_environment == "sandbox"
+            )
+            if self.file_guard.is_working_directory_scoped and not requires_sandbox:
                 return GuardResult(
                     allowed=False,
-                    reason="Shell is unavailable while a working-directory boundary is active",
+                    reason=(
+                        "Opaque command execution requires a sandbox while a "
+                        "working-directory boundary is active"
+                    ),
                 )
             _, write_paths = _extract_shell_paths(cmd)
             for wp in write_paths:
@@ -460,11 +472,20 @@ class ToolGuard:
     def check(self, tool_call: ToolCall) -> GuardResult:
         level = self._resolve_permission_level(tool_call.name)
         tool_whitelisted = self.whitelist.is_tool_allowed(tool_call.name)
+        approval_context = current_approval_context()
+        audit_context: dict[str, object] = {"call_id": tool_call.id}
+        if approval_context is not None:
+            audit_context["run_id"] = approval_context[1]
 
         file_result = self._check_file_paths(tool_call)
         if file_result is not None:
             file_result.level = level
-            self.audit.record(tool_call.name, tool_call.arguments, file_result)
+            self.audit.record(
+                tool_call.name,
+                tool_call.arguments,
+                file_result,
+                **audit_context,
+            )
             return file_result
 
         match_targets = _rule_match_targets(tool_call.arguments)
@@ -494,7 +515,13 @@ class ToolGuard:
                         reason=f"[{rule.get('id', '?')}] {reason}",
                         level=PermissionLevel.DESTRUCTIVE,
                     )
-                    self.audit.record(tool_call.name, tool_call.arguments, result, rule_id=rule.get("id"))
+                    self.audit.record(
+                        tool_call.name,
+                        tool_call.arguments,
+                        result,
+                        rule_id=rule.get("id"),
+                        **audit_context,
+                    )
                     return result
 
         approval_required = self._requires_approval(tool_call)
@@ -509,5 +536,6 @@ class ToolGuard:
             tool_call.arguments,
             result,
             whitelisted=tool_whitelisted,
+            **audit_context,
         )
         return result

@@ -27,6 +27,7 @@ __all__ = [
 
 from .dream import run_dream, DreamReport, dream_report_completed
 from .compile import run_compilation, assemble_memory
+from .maintenance import MemoryLifecycleHooks, MemoryMaintenanceService
 
 __all__ += [
     "run_dream",
@@ -34,6 +35,8 @@ __all__ += [
     "dream_report_completed",
     "run_compilation",
     "assemble_memory",
+    "MemoryLifecycleHooks",
+    "MemoryMaintenanceService",
 ]
 
 # search depends on aiosqlite, which may be absent when this package is

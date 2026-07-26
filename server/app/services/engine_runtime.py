@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from common.config import AGENT_DIR, BUILTIN_IDENTITIES_DIR, BUILTIN_SKILLS_DIR, PATHS, SAFETY_RULES_PATH
-from engine.execution.pipeline.skill_chain import SkillChain, load_gate_content
-from engine.identity_catalog import IdentityCatalog, load_identity_catalog
-from engine.execution.orchestration.runtime import RuntimeContext, RuntimeServices
+from engine.execution import RuntimeContext, RuntimeServices, validate_execution_assets
+from engine.identity import IdentityCatalog, load_identity_catalog
 from engine.llm.model_config import LLMUsage, build_llm_client, resolve_llm_config
 from engine.llm.contracts import GEMINI_OPENAI_BASE_URL
 from engine.llm.factory import normalize_provider_name
 from engine.llm.port import LLMPort
+from engine.observability import RunObservation
 from engine.safety.tool_guard import ToolGuard
 from engine.skill.registry import SkillRegistry
 from engine.tool.registry import ToolRegistry
@@ -42,7 +42,8 @@ def _maybe_record(client: LLMPort) -> LLMPort:
     """Wrap the client so real runs land in a JSONL recording (opt-in).
 
     Set ``AGENT_SMITH_RECORD_LLM=/path/to/case.jsonl`` and every model turn of
-    every subsequent run appends there, ready to replay via ``engine.replay``.
+    every subsequent run appends there, ready to replay via
+    :mod:`engine.llm.replay`.
     Only the *responses* are written, never the prompt — so a recording cannot
     leak conversation content, and replay does not need it (turns are served in
     recorded order rather than matched against messages).
@@ -50,7 +51,7 @@ def _maybe_record(client: LLMPort) -> LLMPort:
     target = os.environ.get("AGENT_SMITH_RECORD_LLM", "").strip()
     if not target:
         return client
-    from engine.replay import RecordingLLM
+    from engine.llm.replay import RecordingLLM
 
     path = Path(target).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,20 +115,14 @@ def _interactive_model_metadata(config: dict[str, Any]) -> dict[str, str]:
 def load_runtime_identity_catalog(*, force: bool = False) -> IdentityCatalog:
     """Load the one catalog and validate its declared assets for every entry point."""
     catalog = load_identity_catalog(BUILTIN_IDENTITIES_DIR, force=force)
-    # 门禁/条件内容必须先于 pipeline YAML 解析注册，否则合法 gate key 报 unknown。
-    gate_content = load_gate_content(PATHS.project_root / "agents")
-    pipelines = SkillChain.load_pipelines(
-        PATHS.project_root / "agents" / "pipelines",
-        gate_registry=gate_content.gates,
-        condition_registry=gate_content.conditions,
-    )
     skill_registry = SkillRegistry()
     PATHS.ensure_base_dirs()
     skill_registry.load_builtin(BUILTIN_SKILLS_DIR)
     skill_registry.load_agent_skills(AGENT_DIR / "skills")
-    catalog.validate_assets(
-        pipelines.keys(),
-        (summary["name"] for summary in skill_registry.list_summaries()),
+    validate_execution_assets(
+        catalog,
+        agents_dir=PATHS.project_root / "agents",
+        skill_names=(summary["name"] for summary in skill_registry.list_summaries()),
     )
     return catalog
 
@@ -148,12 +143,6 @@ def build_engine_runtime(
     interactive_config = resolve_llm_config(**interactive_kwargs)
     gate_config = resolve_llm_config(usage=LLMUsage.GATE)
     background_config = resolve_llm_config(usage=LLMUsage.BACKGROUND)
-    # An omitted route inherits the base model, so an unset image model looks
-    # exactly like the interactive one here. Same model means there is nothing
-    # to fall back to: probing the main model already decides the outcome.
-    vision_config: dict[str, Any] | None = resolve_llm_config(usage=LLMUsage.VISION)
-    if vision_config and vision_config.get("model") == interactive_config.get("model"):
-        vision_config = None
     runtime = RuntimeContext(
         agent_id=agent_id,
         agent_name=agent_name,
@@ -163,16 +152,18 @@ def build_engine_runtime(
         metadata=_interactive_model_metadata(interactive_config),
         identity_catalog=load_runtime_identity_catalog(),
     )
+    skill_registry = SkillRegistry()
+    skill_registry.load_builtin(BUILTIN_SKILLS_DIR)
     services = RuntimeServices(
         llm=manager.get_for_config(interactive_config),
         gate_llm=manager.get_for_config(gate_config),
         background_llm=manager.get_for_config(background_config),
-        vision_llm=manager.get_for_config(vision_config) if vision_config else None,
         tool_registry=ToolRegistry(),
-        skill_registry=SkillRegistry(),
+        skill_registry=skill_registry,
         tool_guard=ToolGuard(SAFETY_RULES_PATH),
         mcp_session_pool=_mcp_client_session_pool,
         owns_mcp_clients=False,
+        observation_factory=RunObservation.start,
         owns_llm_clients=False,
     )
     return runtime, services

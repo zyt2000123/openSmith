@@ -7,53 +7,70 @@ transport and client implementations in ``engine.mcp.client``.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Any
 
-if TYPE_CHECKING:
-    from engine.execution.orchestration.runtime import RuntimeContext, RuntimeServices
+from engine.tool.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 
-async def register_mcp_tools(
+@dataclass(frozen=True)
+class MCPRegistration:
+    """Clients and tool count produced by one profile registration."""
+
+    clients: tuple[Any, ...] = ()
+    registered_tools: int = 0
+
+
+async def register_configured_mcp_tools(
     profile_config: dict,
-    runtime: "RuntimeContext",
-    services: "RuntimeServices",
-) -> None:
+    *,
+    session_id: str | None,
+    agent_id: str,
+    tool_registry: ToolRegistry,
+    session_pool: Any | None = None,
+) -> MCPRegistration:
     """Register MCP tools from the agent's profile configuration.
 
     Iterates ``profile_config["mcp_servers"]`` and connects each server,
     isolating failures so one broken server cannot prevent the rest from
-    registering.
+    registering.  The caller receives the clients and applies its own
+    ownership policy; this module never reaches into an execution container.
     """
     mcp_servers = profile_config.get("mcp_servers", [])
     if not isinstance(mcp_servers, list) or not mcp_servers:
-        return
+        return MCPRegistration()
     valid_servers = [server for server in mcp_servers if isinstance(server, dict)]
-    session_pool = services.mcp_session_pool if runtime.session_id else None
-    if session_pool is not None:
+    if session_pool is not None and session_id:
         try:
-            servers = await session_pool.acquire(runtime.session_id, valid_servers)
-            services.mcp_clients.extend(server.client for server in servers)
+            servers = await session_pool.acquire(session_id, valid_servers)
             from engine.mcp.client import register_mcp_tools_with_prefix
+            registered_tools = 0
             for server in servers:
-                await register_mcp_tools_with_prefix(
-                    services.tool_registry,
+                registered_tools += await register_mcp_tools_with_prefix(
+                    tool_registry,
                     server.client,
                     prefix=server.prefix,
                     tools=server.tools,
                 )
+            return MCPRegistration(
+                clients=tuple(server.client for server in servers),
+                registered_tools=registered_tools,
+            )
         except Exception:
-            logger.exception("failed to register session MCP tools (agent=%s)", runtime.agent_id)
-        return
+            logger.exception("failed to register session MCP tools (agent=%s)", agent_id)
+        return MCPRegistration()
     try:
         from engine.mcp.client import (
             MCPClient,
             register_mcp_tools_with_prefix,
         )
     except Exception:
-        logger.exception("failed to import MCP client (agent=%s)", runtime.agent_id)
-        return
+        logger.exception("failed to import MCP client (agent=%s)", agent_id)
+        return MCPRegistration()
+    clients: list[Any] = []
+    registered_tools = 0
     for srv in valid_servers:
         try:
             transport = mcp_transport_from_config(srv)
@@ -62,13 +79,18 @@ async def register_mcp_tools(
             prefix = mcp_tool_prefix_from_config(srv)
             client = MCPClient(transport=transport)
             await client.connect()
-            services.mcp_clients.append(client)
-            await register_mcp_tools_with_prefix(services.tool_registry, client, prefix=prefix)
+            clients.append(client)
+            registered_tools += await register_mcp_tools_with_prefix(
+                tool_registry,
+                client,
+                prefix=prefix,
+            )
         except Exception:
             logger.exception(
                 "failed to register MCP server (agent=%s, server=%r)",
-                runtime.agent_id, mcp_server_log_summary(srv),
+                agent_id, mcp_server_log_summary(srv),
             )
+    return MCPRegistration(tuple(clients), registered_tools)
 
 
 def mcp_transport_from_config(config: dict):

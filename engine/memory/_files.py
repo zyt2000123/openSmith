@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import tempfile
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from typing import AsyncIterator, BinaryIO, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -13,6 +16,83 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 MEMORY_LAYER_FILES: tuple[str, ...] = ("durable.md", "recent.md")
+
+
+def _lock_file_path(target: Path) -> Path:
+    return target.with_name(f"{target.name}.lock")
+
+
+def _acquire_lock_handle(target: Path) -> BinaryIO:
+    lock_path = _lock_file_path(target)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        handle = os.fdopen(fd, "a+b")
+    except BaseException:
+        os.close(fd)
+        raise
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def _release_lock_handle(handle: BinaryIO) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+@contextmanager
+def interprocess_file_lock(target: Path) -> Iterator[None]:
+    """Hold an advisory process-wide lock associated with ``target``."""
+    handle = _acquire_lock_handle(target)
+    try:
+        yield
+    finally:
+        _release_lock_handle(handle)
+
+
+@asynccontextmanager
+async def async_interprocess_file_lock(target: Path) -> AsyncIterator[None]:
+    """Acquire ``interprocess_file_lock`` without blocking the event loop."""
+    acquisition = asyncio.create_task(
+        asyncio.to_thread(_acquire_lock_handle, target)
+    )
+    try:
+        handle = await asyncio.shield(acquisition)
+    except asyncio.CancelledError:
+        handle = await acquisition
+        _release_lock_handle(handle)
+        raise
+    try:
+        yield
+    finally:
+        _release_lock_handle(handle)
 
 
 # ---------------------------------------------------------------------------

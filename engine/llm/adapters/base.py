@@ -17,6 +17,8 @@ class ProviderAdapter(Protocol):
     capabilities: ProviderCapabilities
     context_window: int
     context_window_declared: bool
+    max_output_tokens: int | None
+    max_output_tokens_declared: bool
 
     async def complete(self, request: LLMRequest) -> ChatResponse: ...
 

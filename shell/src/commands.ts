@@ -1,7 +1,7 @@
 import type { SkillSummary } from "./api.js";
 import { errorMessage, type NodeBridge } from "./bridge.js";
 import { LIFECYCLE_HOOKS } from "./hooks.js";
-import { createSetupDraft } from "./setup.js";
+import { createSetupDraft, fieldValue, setupFieldAt } from "./setup.js";
 import { isSkillEnabled } from "./skill-mention.js";
 import type { AppStore, Panel } from "./store.js";
 
@@ -30,7 +30,7 @@ const HELP_TEXT = [
   "- `/clear` — delete the current session and start fresh",
   "- `/compress` — summarize and persist the active session context",
   "- `/model` — discover relay models and configure the primary or review model",
-  "- `/config` — edit LLM config",
+  "- `/config [advanced]` — edit essential or routed LLM config",
   "- `/sessions` — recent sessions",
   "- `/token` — local token usage dashboard",
   "- `/runs` — recent Agent runs and outcome metrics",
@@ -96,7 +96,7 @@ export function buildSlashItems(): SlashItem[] {
       id: "config",
       title: "/config",
       command: "/config",
-      description: "Edit LLM config.",
+      description: "Edit LLM config; add `advanced` for route overrides.",
       category: "Commands",
     },
     {
@@ -214,17 +214,21 @@ export function parseSkill(raw: string, skills: SkillSummary[]): { skill: SkillS
   return skill ? { skill, prompt: match[2]?.trim() || "" } : null;
 }
 
-function openConfig(context: CommandContext): void {
+function openConfig(args: string[], context: CommandContext): void {
   const state = context.getState();
+  if (args.length > 1 || (args[0] !== undefined && args[0] !== "advanced")) {
+    state.set({ statusLine: "Usage: /config [advanced]" });
+    return;
+  }
   const draft = createSetupDraft(state.config);
+  const setupFlow = args[0] === "advanced" ? "advanced" : "initial";
   state.set({
     mode: "setup",
-    // Keep /config on the essential setup flow; advanced routing remains available to the runtime.
-    setupFlow: "initial",
+    setupFlow,
     setupIndex: 0,
     setupDraft: draft,
-    inputValue: draft.provider,
-    statusLine: "Editing config.",
+    inputValue: fieldValue(draft, setupFieldAt(0, setupFlow)),
+    statusLine: setupFlow === "advanced" ? "Editing advanced config." : "Editing config.",
   });
 }
 
@@ -298,7 +302,7 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
       state.set({ statusLine: `Project initialization failed: ${errorMessage(error)}` });
     }
   },
-  "/config": (_args, context) => openConfig(context),
+  "/config": (args, context) => openConfig(args, context),
   "/approve": async (_args, context) => {
     await context.bridge.resolveApproval(true);
   },

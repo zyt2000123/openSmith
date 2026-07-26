@@ -3,31 +3,15 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 
-from .events import ExecutionEvent
+from engine.execution.events import ExecutionEvent, RunObservationContext
 from .recorder import EventProjection, RunEventRecorder
 from .summary_store import RunMetadata, RunSummaryStore
 from .trace_store import TraceStore
 
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class RunObservationContext:
-    """Non-sensitive ownership and lifecycle context for one run."""
-
-    run_id: str
-    agent_id: str
-    profile_dir: Path
-    session_id: str | None = None
-    identity_id: str | None = None
-    working_dir: str | None = None
-    forced_skill: str | None = None
-    created_at: str | None = None
 
 
 class RunObservation:

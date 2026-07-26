@@ -1,10 +1,11 @@
-import { Box, Text, useWindowSize } from "ink";
+import { Box, Text } from "ink";
 
 import type { TokenDay, TokenStats } from "./api.js";
 import { PanelContainer } from "./panel-container.js";
 import { TabbedPanel } from "./tabbed-panel.js";
 import { ACCENT, ASSISTANT, INFO, MUTED, WARNING } from "./theme.js";
 import { buildRecentDays, formatTokenCount, TOKEN_TAB_LABELS, TOKEN_TABS, type TokenTab } from "./token-stats.js";
+import { useWindowSize } from "./window-size.js";
 
 const BAR_HEIGHT = 6;
 const BAR_WIDTH = 10;

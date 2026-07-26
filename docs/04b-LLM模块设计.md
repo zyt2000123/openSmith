@@ -257,10 +257,11 @@ adapter 不负责：任务路由、prompt 构造、工具权限、会话保存�
 
 ```bash
 cd engine
-uv run pytest tests/test_llm_client.py tests/test_llm_adapters.py tests/test_prompt_assembler.py -q
+uv run pytest tests/llm -q
+uv run pytest tests/execution/test_react_budget.py tests/execution/test_reasoning_roundtrip.py -q
 
 cd ../server
-uv run pytest tests/test_config_service.py tests/test_config_loader.py -q
+uv run pytest tests/test_config_service.py tests/test_config_loader.py tests/test_llm_recording.py -q
 ```
 
 重点回归项：
@@ -274,7 +275,73 @@ uv run pytest tests/test_config_service.py tests/test_config_loader.py -q
 - 端点、超时、响应体和 SSE 限制；
 - provider 错误不泄露敏感正文。
 
-## 11. 当前边界
+## 11. 收敛状态与验收口径（2026-07-26）
+
+### 11.1 当前结论
+
+在当前保留的功能范围内，LLM 模块的实现与架构已经收敛，可进入稳定维护阶段。判断依据不是文件是否拆完，而是以下调用链已经通过统一 Interface 和回归测试闭合：
+
+```text
+配置解析
+→ LLMPort / ProviderClient
+→ Provider Adapter
+→ ChatResponse / ProviderEvent
+→ ReAct 累积响应
+→ 工具执行与 observation 回灌
+→ 下一轮模型请求或最终回复
+→ usage / generation 记录
+→ client 关闭
+```
+
+当前收敛范围包括：
+
+- 文本模型调用；
+- reasoning 的流式接收与后续轮次回传；
+- 流式与非流式响应；
+- OpenAI、Anthropic 和 Gemini OpenAI-compatible adapter；
+- 工具调用参数累积、执行结果回灌及多轮 ReAct；
+- interactive、gate、background 三类用途路由；
+- 超时、重试、响应限制、用量记录和客户端生命周期。
+
+图片粘贴、图片消息和视觉模型路由已按产品范围移除，不属于该闭环，也不应作为 LLM 模块未完成项重新加入。Gemini 当前明确使用 OpenAI-compatible endpoint；这不等同于实现了一套独立的 Gemini 原生协议。
+
+### 11.2 当前验证快照
+
+2026-07-26 在当前工作树完成了以下验证：
+
+| 范围 | 结果 |
+|---|---|
+| `engine/tests/llm` | `70 passed` |
+| Engine 架构约束 | `11 passed` |
+| Engine 全量回归 | `557 passed, 5 deselected` |
+| Server LLM 配置、运行时装配、client 缓存与关闭 | `9 passed` |
+
+5 个未执行用例均为当前 Codex 沙箱中无法嵌套启动的 macOS Seatbelt 实执行测试；实际环境错误为 `sandbox-exec: sandbox_apply: Operation not permitted`，不属于 LLM 调用链失败。以上数字是一次验收快照，不替代后续改动后的重新运行。
+
+### 11.3 真实模型 E2E 门禁
+
+真实模型 E2E 位于 `server/tests/test_e2e_smoke.py`，默认通过 pytest `skipif` 关闭。它只有在以下两个条件同时满足时才会调用真实模型：
+
+1. pytest 收集到了 `test_e2e_smoke.py`；
+2. 环境变量 `AGENT_SMITH_E2E` 为非空。
+
+因此，启动 Server、运行 Shell 或进行普通聊天不会触发该测试。若长期设置了 `AGENT_SMITH_E2E=1`，运行包含该文件的完整 Server 测试集也会触发真实调用，不要求单独指定文件。
+
+手动执行：
+
+```bash
+cd server
+AGENT_SMITH_E2E=1 uv run pytest tests/test_e2e_smoke.py -v
+```
+
+该测试会产生真实模型费用，并在 pytest 临时工作区验证自然语言输入、模型决策、工具调用、文件系统结果和 run 正常收尾。它是发布前的在线接线验证门禁，不是 LLM 模块继续拆分或重新设计的前置条件。
+
+因此应分别使用两个状态：
+
+- **功能与架构收敛：是。**
+- **当前供应商、凭据、网络和模型组合已在线验证：只有最近一次真实 E2E 通过后才能判定。**
+
+## 12. 当前边界
 
 该模块刻意不做以下事情：
 

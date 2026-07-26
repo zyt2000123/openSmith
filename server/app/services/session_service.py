@@ -9,16 +9,17 @@ from typing import AsyncGenerator
 
 from fastapi import HTTPException
 
-from engine.execution.orchestration.agent_loop import (
+from engine.execution import (
+    EngineRequest,
+    RunStateError,
+    RunStateStore,
+    RunStatus,
+    raw_text_delta,
     run_stream_with_runtime as engine_run_stream_with_runtime,
     resume_stream_with_runtime as engine_resume_stream_with_runtime,
 )
-from engine.observability import raw_text_delta
-from engine.execution.react.smith_ui import smith_ui_fallback, validate_smith_ui_call
-from engine.context import CONTEXT_DISPLAY_WINDOW, compact_history
-from engine.execution.orchestration.run_state import RunStateError, RunStateStore, RunStatus
-from engine.execution.orchestration.runtime import EngineRequest
-from engine.identity_catalog import IdentityCatalog, IdentityCatalogError
+from engine.context import CONTEXT_DISPLAY_WINDOW, summarize_session
+from engine.identity import IdentityCatalog, IdentityCatalogError
 from engine.llm.model_config import resolve_llm_config
 from common.yaml_utils import YamlConfigError
 
@@ -236,7 +237,7 @@ class SessionService:
         profile_name = profile["name"] if profile else "Agent"
         _runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
         try:
-            compacted = await compact_history(
+            summary_result = await summarize_session(
                 [{"role": row["role"], "content": row["content"]} for row in rows],
                 services.llm,
             )
@@ -247,18 +248,13 @@ class SessionService:
                 if inspect.isawaitable(result):
                     await result
 
-        summary_prefix = "[Previous conversation summary]\n"
-        summary_messages = [
-            item for item in compacted
-            if item.get("role") == "user"
-            and isinstance(item.get("content"), str)
-            and item["content"].startswith(summary_prefix)
-        ]
-        if not summary_messages:
-            raise HTTPException(422, "Model did not return a usable context summary")
-        summary = summary_messages[-1]["content"][len(summary_prefix):].strip()
-        if not summary:
-            raise HTTPException(422, "Model returned an empty context summary")
+        if not summary_result.usable:
+            raise HTTPException(
+                422,
+                "Model did not return a usable context summary "
+                f"({summary_result.status.value})",
+            )
+        summary = summary_result.summary
 
         await self.session_repo.set_context(session_id, summary, len(rows))
         return ContextCompressionOut(
@@ -496,36 +492,11 @@ class SessionService:
                         visible_raw_reply.append(delta)
                         yield sse("message", {"text": delta})
                 elif t == "smith_ui":
-                    try:
-                        ui_working_dir = Path(working_dir).resolve() if working_dir else None
-                        ui_call = {
-                            "spec": ev.data.get("spec"),
-                            "images": ev.data.get("images", []),
-                        }
-                        validated = (
-                            validate_smith_ui_call(ui_call, working_dir=ui_working_dir)
-                            if ev.data.get("version") == 1
-                            else None
-                        )
-                    except (OSError, ValueError):
-                        validated = None
-                    if validated is not None and validated.ok and validated.payload is not None:
-                        yield sse("smith_ui", validated.payload)
-                    else:
-                        reason = (
-                            validated.reason
-                            if validated is not None and validated.reason
-                            else "Invalid smith-ui event"
-                        )
-                        logger.warning("fell back from invalid smith-ui event for session=%s", session_id)
-                        yield sse("smith_ui_fallback", smith_ui_fallback(ev.data, reason))
+                    # The execution boundary only emits normalized smith-ui
+                    # payloads; the Server is a transport adapter here.
+                    yield sse("smith_ui", ev.data)
                 elif t == "smith_ui_fallback":
-                    reason = ev.data.get("reason")
-                    code = ev.data.get("code")
-                    if isinstance(reason, str) and isinstance(code, str) and len(reason) <= 500 and len(code) <= 16_000:
-                        yield sse("smith_ui_fallback", {"reason": reason, "code": code})
-                    else:
-                        yield sse("smith_ui_fallback", smith_ui_fallback(ev.data, "Invalid smith-ui fallback"))
+                    yield sse("smith_ui_fallback", ev.data)
                 elif t == "provisional_text_delta":
                     provision_id = str(ev.data.get("provision_id", ""))
                     text = ev.data.get("text")
@@ -616,6 +587,24 @@ class SessionService:
                         "context_window": ev.data.get("context_window", CONTEXT_DISPLAY_WINDOW),
                         "context_percent": ev.data.get("context_percent", 0),
                         "estimated": bool(ev.data.get("estimated", True)),
+                        "message_tokens": ev.data.get("message_tokens", 0),
+                        "tool_schema_tokens": ev.data.get("tool_schema_tokens", 0),
+                        "protocol_tokens": ev.data.get("protocol_tokens", 0),
+                        "effective_context_window": ev.data.get(
+                            "effective_context_window",
+                            ev.data.get("context_window", CONTEXT_DISPLAY_WINDOW),
+                        ),
+                        "safe_input_budget": ev.data.get(
+                            "safe_input_budget",
+                            ev.data.get("context_window", CONTEXT_DISPLAY_WINDOW),
+                        ),
+                        "output_reserve": ev.data.get("output_reserve", 0),
+                        "safety_margin": ev.data.get("safety_margin", 0),
+                        "window_declared": bool(ev.data.get("window_declared", False)),
+                        "output_limit_declared": bool(
+                            ev.data.get("output_limit_declared", False)
+                        ),
+                        "fit_status": str(ev.data.get("fit_status", "unknown")),
                     })
                 elif t == "context_compression_start":
                     yield sse("compression", {"active": True})

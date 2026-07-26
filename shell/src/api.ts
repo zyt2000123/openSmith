@@ -1,9 +1,9 @@
 import { localAuthHeaders } from "./auth.js";
 import { parseSmithUiPayload, type SmithUiPayload } from "./smith-ui-schema.js";
 
-export const CONTEXT_DISPLAY_WINDOW = 256_000;
+export const CONTEXT_DISPLAY_WINDOW = 128_000;
 
-export type LlmUsage = "interactive" | "gate" | "background" | "vision";
+export type LlmUsage = "interactive" | "gate" | "background";
 export type LlmTimeoutField = "connect" | "read" | "stream_read" | "write" | "pool";
 
 export type LlmRoute = {
@@ -110,6 +110,16 @@ export type ContextUsage = {
   context_window: number;
   context_percent: number;
   estimated: boolean;
+  message_tokens?: number;
+  tool_schema_tokens?: number;
+  protocol_tokens?: number;
+  effective_context_window?: number;
+  safe_input_budget?: number;
+  output_reserve?: number;
+  safety_margin?: number;
+  window_declared?: boolean;
+  output_limit_declared?: boolean;
+  fit_status?: string;
 };
 
 export type StreamTerminalStatus = "completed" | "failed" | "incomplete";
@@ -528,11 +538,10 @@ type ParsedSseChunk = {
 };
 
 function splitSseBuffer(buffer: string): { chunks: string[]; remainder: string } {
-  // Split on the SSE frame separator (a blank line), accepting LF or CRLF. The
-  // raw buffer keeps a trailing CR until its LF arrives, so a `\r\n` that a read
-  // boundary splits across chunks is never mistaken for a frame boundary.
+  // Split on the SSE frame separator (a blank line). The SSE grammar permits
+  // CRLF, bare LF, and bare CR line endings, including mixed pairs.
   const chunks: string[] = [];
-  const boundary = /\r?\n\r?\n/g;
+  const boundary = /(?:\r\n|(?<!\r)\n|\r(?!\n))(?:\r\n|(?<!\r)\n|\r(?!\n))/g;
   let lastIndex = 0;
   let match = boundary.exec(buffer);
 
@@ -687,6 +696,24 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     context_window: Number(payload.context_window ?? CONTEXT_DISPLAY_WINDOW),
     context_percent: Number(payload.context_percent ?? 0),
     estimated: Boolean(payload.estimated ?? true),
+    message_tokens: Number(payload.message_tokens ?? 0),
+    tool_schema_tokens: Number(payload.tool_schema_tokens ?? 0),
+    protocol_tokens: Number(payload.protocol_tokens ?? 0),
+    effective_context_window: Number(
+      payload.effective_context_window
+      ?? payload.context_window
+      ?? CONTEXT_DISPLAY_WINDOW,
+    ),
+    safe_input_budget: Number(
+      payload.safe_input_budget
+      ?? payload.context_window
+      ?? CONTEXT_DISPLAY_WINDOW,
+    ),
+    output_reserve: Number(payload.output_reserve ?? 0),
+    safety_margin: Number(payload.safety_margin ?? 0),
+    window_declared: Boolean(payload.window_declared ?? false),
+    output_limit_declared: Boolean(payload.output_limit_declared ?? false),
+    fit_status: String(payload.fit_status ?? "unknown"),
   }),
   compression: (payload) => ({
     type: "compression",

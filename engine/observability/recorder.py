@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from .events import EventType, ExecutionEvent
+from engine.execution.events import EventType, ExecutionEvent
 from .projections import RunSummary, RunSummaryProjection
 from .trace_store import TraceStore
 

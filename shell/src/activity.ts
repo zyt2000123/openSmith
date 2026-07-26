@@ -1,6 +1,6 @@
 import type { StreamEvent } from "./api.js";
 
-export type ToolState = "running" | "success" | "error" | "blocked" | "preflight";
+export type ToolState = "running" | "success" | "error" | "blocked" | "preflight" | "cancelled";
 
 export const TOOL_ACTIVITY_CALL_LIMIT = 256;
 
@@ -59,6 +59,7 @@ function changeStateCount(activity: ToolActivity, state: ToolState, name: string
     case "preflight":
       return { ...activity, preflight: changeCount(activity.preflight, name, amount) };
     case "running":
+    case "cancelled":
       return activity;
   }
 }
@@ -121,4 +122,15 @@ export function applyToolActivity(activity: ToolActivity, event: StreamEvent): T
   if (event.type === "tool_call") return startTool(activity, event);
   if (event.type === "tool_result") return settleTool(activity, event);
   return activity;
+}
+
+export function cancelRunningToolActivity(activity: ToolActivity): ToolActivity {
+  if (Object.keys(activity.running).length === 0) return activity;
+
+  const calls = { ...activity.calls };
+  for (const id of Object.keys(activity.running)) {
+    const call = calls[id];
+    if (call?.state === "running") calls[id] = { ...call, state: "cancelled" };
+  }
+  return { ...activity, calls: pruneCalls(calls), running: {} };
 }

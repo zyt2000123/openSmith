@@ -17,6 +17,7 @@ from typing import Awaitable, Callable
 
 from ._files import (
     atomic_write_text,
+    interprocess_file_lock,
     safe_file_in_dir,
     safe_markdown_files,
     sanitize_memory_text,
@@ -249,15 +250,21 @@ def _bounded_event_value(value: str) -> str:
 
 
 def _increment_counter(counter_file: Path, retry_threshold: int) -> int:
-    count = 0
-    if counter_file.is_file():
-        try:
-            count = int(counter_file.read_text().strip())
-        except (ValueError, OSError):
-            count = 0
-    count = min(count + 1, retry_threshold)
-    atomic_write_text(counter_file, str(count))
-    return count
+    with interprocess_file_lock(counter_file):
+        count = 0
+        if counter_file.is_file():
+            try:
+                count = int(counter_file.read_text().strip())
+            except (ValueError, OSError):
+                count = 0
+        count = min(count + 1, retry_threshold)
+        atomic_write_text(counter_file, str(count))
+        return count
+
+
+def _reset_counter(counter_file: Path) -> None:
+    with interprocess_file_lock(counter_file):
+        atomic_write_text(counter_file, "0")
 
 
 async def save_conversation_memory(
@@ -335,7 +342,7 @@ async def save_conversation_memory(
     has_learning_signal = explicit_signal is not None or bool(stable_signals)
     if (count >= _COMPILE_INTERVAL or has_learning_signal) and compile_maintenance is not None:
         if await compile_maintenance(memory_dir):
-            atomic_write_text(counter_file, "0")
+            _reset_counter(counter_file)
 
     # Low-frequency Dream consolidation (separate counter)
     from .dream import DREAM_INTERVAL
@@ -344,7 +351,7 @@ async def save_conversation_memory(
 
     if d_count >= DREAM_INTERVAL and dream_maintenance is not None:
         if await dream_maintenance(memory_dir):
-            atomic_write_text(dream_counter, "0")
+            _reset_counter(dream_counter)
 
 
 def sanitize_event_value(value: str) -> str:

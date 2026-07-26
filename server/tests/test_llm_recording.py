@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.services import engine_runtime
-from engine.replay import RecordingLLM
+from engine.llm.replay import RecordingLLM
 
 
 _CONFIG = {"provider": "openai", "model": "test-model", "base_url": "https://example.invalid"}

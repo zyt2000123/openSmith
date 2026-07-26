@@ -11,7 +11,7 @@ from typing import Any
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
 
-from .events import ExecutionEvent
+from engine.execution.events import ExecutionEvent
 
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization)", re.I)

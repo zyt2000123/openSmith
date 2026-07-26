@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
 import logging
@@ -133,12 +133,36 @@ class PromptManifest:
 
     rendered_prompt_hash: str
     layers: tuple[dict[str, str | int], ...]
+    budget: dict[str, object] = field(default_factory=dict)
 
     def to_trace_data(self) -> dict[str, object]:
         return {
             "schema_version": 1,
             "rendered_prompt_hash": self.rendered_prompt_hash,
             "layers": [dict(layer) for layer in self.layers],
+            "budget": dict(self.budget),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PromptPlan:
+    """Explicit result of applying the static-prompt retention policy."""
+
+    token_budget: int
+    source_tokens: int
+    required_tokens: int
+    rendered_tokens: int
+    within_budget: bool
+    trimmed_layers: tuple[str, ...]
+
+    def to_trace_data(self) -> dict[str, object]:
+        return {
+            "token_budget": self.token_budget,
+            "source_tokens": self.source_tokens,
+            "required_tokens": self.required_tokens,
+            "rendered_tokens": self.rendered_tokens,
+            "within_budget": self.within_budget,
+            "trimmed_layers": list(self.trimmed_layers),
         }
 
 
@@ -149,6 +173,8 @@ class AssembledPrompt:
     text: str
     layers: tuple[PromptLayer, ...]
     manifest: PromptManifest
+    prefix_cache_key: str
+    plan: PromptPlan
 
 
 def _estimate_tokens(text: str) -> int:
@@ -250,25 +276,49 @@ class PromptAssembler:
             output_style_path=output_style_path,
         )
 
-        # Compute hash of the stable profile and capability prefix.
-        # These rarely change between calls for the same agent.
-        stable_content = _SEPARATOR.join(self._render_layer(layer) for layer in layers[:6])
-        stable_hash = hashlib.md5(stable_content.encode()).hexdigest()
-        cache_key = str(agent_dir)
-
-        cached = _prompt_cache.get(cache_key)
-        if cached and cached[0] == stable_hash:
-            # Layers are rebuilt for every call; this validates cache coherence
-            # and keeps the provider prefix-cache hint current.
-            pass
-        _prompt_cache[cache_key] = (stable_hash, stable_content)
-
         rendered_layers = self._trim_to_budget(layers, max_tokens)
         text = self.render_layers(rendered_layers)
+        plan = PromptPlan(
+            token_budget=max_tokens,
+            source_tokens=sum(self._layer_token_cost(layer) for layer in layers),
+            required_tokens=sum(
+                self._layer_token_cost(layer)
+                for layer in layers
+                if layer.trim_priority is None
+            ),
+            rendered_tokens=sum(
+                self._layer_token_cost(layer) for layer in rendered_layers
+            ),
+            within_budget=(
+                not max_tokens
+                or sum(
+                    self._layer_token_cost(layer)
+                    for layer in rendered_layers
+                ) <= max_tokens
+            ),
+            trimmed_layers=tuple(
+                source.name
+                for source, rendered in zip(layers, rendered_layers)
+                if source.content.strip() and not rendered.content.strip()
+            ),
+        )
+        # Bind the routing hint to the stable prefix that is actually rendered,
+        # not to pre-trim source material that the provider never receives.
+        stable_content = _SEPARATOR.join(
+            self._render_layer(layer) for layer in rendered_layers[:6]
+        )
+        stable_hash = hashlib.sha256(stable_content.encode()).hexdigest()
+        _prompt_cache[str(agent_dir)] = (stable_hash, stable_content)
+        manifest = replace(
+            self._manifest_for(layers, rendered_layers, text),
+            budget=plan.to_trace_data(),
+        )
         return AssembledPrompt(
             text=text,
             layers=rendered_layers,
-            manifest=self._manifest_for(layers, rendered_layers, text),
+            manifest=manifest,
+            prefix_cache_key=stable_hash,
+            plan=plan,
         )
 
     def build_layers(

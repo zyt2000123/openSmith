@@ -9,6 +9,8 @@ import { createTurnEntry } from "./transcript-state.js";
 test("request errors keep details in the transcript without duplicating them in the status line", () => {
   const store = createAppStore();
   const bridge = new NodeBridge(store);
+  store.getState().pushTurn("run it");
+  store.getState().applyEvent({ type: "tool_call", id: "tool-1", name: "shell", hint: "npm test" });
   const reportRequestError = (
     bridge as unknown as {
       reportRequestError: (error: unknown) => void;
@@ -19,6 +21,12 @@ test("request errors keep details in the transcript without duplicating them in 
 
   const state = store.getState();
   const lastEntry = state.transcript.at(-1);
+  const turn = state.transcript.at(-2);
+  assert.ok(turn?.kind === "turn");
+  const block = turn.blocks.find((candidate) => candidate.type === "tool");
+  assert.ok(block?.type === "tool");
+  assert.equal(block.state, "error");
+  assert.deepEqual(state.toolActivity.running, {});
   assert.equal(lastEntry?.kind, "system");
   assert.equal(lastEntry?.kind === "system" && lastEntry.text, "[error] Request timed out after 120000ms.");
   assert.equal(state.statusLine, "Request failed. See the transcript for details.");
@@ -175,6 +183,28 @@ test("cancelling a request allows a new session before the stream cleanup finish
   assert.equal(bridge.cancelRequest(), true);
   assert.equal(internal.activeRequest, controller);
   assert.equal(bridge.startNewSession(), true);
+});
+
+test("cancelling a request settles every running tool in the transcript and HUD", () => {
+  const store = createAppStore();
+  const bridge = new NodeBridge(store);
+  const controller = new AbortController();
+  const internal = bridge as unknown as { activeRequest: AbortController | null };
+  internal.activeRequest = controller;
+  store.getState().pushTurn("run it");
+  store.getState().applyEvent({ type: "tool_call", id: "tool-1", name: "shell", hint: "npm test" });
+  store.getState().set({ busy: true });
+
+  assert.equal(bridge.cancelRequest(), true);
+
+  const state = store.getState();
+  const turn = state.transcript.at(-1);
+  assert.ok(turn?.kind === "turn");
+  const block = turn.blocks.find((candidate) => candidate.type === "tool");
+  assert.ok(block?.type === "tool");
+  assert.equal(block.state, "cancelled");
+  assert.equal(turn.streaming, false);
+  assert.deepEqual(state.toolActivity.running, {});
 });
 
 test("leaving the token panel while it loads does not reopen it", async () => {

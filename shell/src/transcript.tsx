@@ -1,7 +1,7 @@
 /** Transcript rendering — state shapes and transitions live in transcript-state.ts. */
 
 import { MarkdownText } from "@assistant-ui/react-ink-markdown";
-import { Box, Text, useWindowSize } from "ink";
+import { Box, Text } from "ink";
 import { useEffect, useState } from "react";
 
 import type { ToolState } from "./activity.js";
@@ -28,6 +28,7 @@ import type {
   TurnBlock,
   TurnEntry,
 } from "./transcript-state.js";
+import { useWindowSize } from "./window-size.js";
 
 const TOOL_PRESENTATION: Record<ToolState, { color: string; marker: string; label: string }> = {
   running: { color: WARNING, marker: "◐", label: "running" },
@@ -35,6 +36,7 @@ const TOOL_PRESENTATION: Record<ToolState, { color: string; marker: string; labe
   error: { color: ERROR, marker: "✕", label: "error" },
   blocked: { color: WARNING, marker: "⛔", label: "permission blocked" },
   preflight: { color: WARNING, marker: "◆", label: "fact preflight" },
+  cancelled: { color: MUTED, marker: "○", label: "cancelled" },
 };
 
 const MARKDOWN_OPTIONS = {

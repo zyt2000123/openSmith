@@ -25,7 +25,7 @@ Smith is a single, always-on agent that runs locally. It keeps conversation cont
 
 ### Prerequisites
 
-- Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 18+
+- Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22+
 
 ### Install
 

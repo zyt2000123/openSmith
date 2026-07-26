@@ -7,6 +7,7 @@ import type { StoreApi } from "zustand/vanilla";
 
 import { createToolActivity } from "./activity.js";
 import {
+  CONTEXT_DISPLAY_WINDOW,
   compressSession,
   createSession,
   deleteSession,
@@ -235,7 +236,7 @@ export class NodeBridge {
     if (!controller || controller.signal.aborted) return false;
 
     controller.abort();
-    this.s.closeTurn();
+    this.s.interruptTurn("cancelled");
     const pendingApproval = this.s.pendingApproval;
     this.s.set({
       pendingApproval: null,
@@ -737,7 +738,7 @@ export class NodeBridge {
         tokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
         contextUsage: {
           context_tokens: 0,
-          context_window: 256_000,
+          context_window: CONTEXT_DISPLAY_WINDOW,
           context_percent: 0,
           estimated: true,
         },
@@ -1065,7 +1066,7 @@ export class NodeBridge {
   private reportRequestError(error: unknown): void {
     const message = errorMessage(error);
     const pendingApproval = this.s.pendingApproval;
-    this.s.closeTurn();
+    this.s.interruptTurn("error");
     this.s.set({
       pendingApproval: null,
       approvalResolving: false,

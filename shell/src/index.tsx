@@ -1,10 +1,9 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import { useShikiHighlighter } from "@assistant-ui/react-ink-markdown";
-import { Box, render, Static, Text, useApp, useWindowSize } from "ink";
+import { Box, render, Static, Text, useApp } from "ink";
 import { InkPictureProvider } from "ink-picture";
 import Spinner from "ink-spinner";
-import TextInput from "ink-text-input";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "zustand";
 
@@ -21,6 +20,7 @@ import {
   type SlashItem,
   selectedSlashItem,
 } from "./commands.js";
+import { Composer } from "./composer.js";
 import { loadHistory, saveHistory } from "./history.js";
 import { LIFECYCLE_HOOKS } from "./hooks.js";
 import { RunProgress, StatusHud } from "./hud.js";
@@ -68,6 +68,7 @@ import { ACCENT, BORDER, ERROR, INFO, MUTED, SELECTED_BACKGROUND, SELECTED_FOREG
 import { TokenStatsPanel } from "./token-panel.js";
 import { TranscriptEntryView } from "./transcript.js";
 import { splitTranscript, type TranscriptEntry, type TranscriptViewMode } from "./transcript-state.js";
+import { useWindowSize } from "./window-size.js";
 
 const SHELL_VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 const PROJECT_CWD = path.resolve(process.env.SMITH_PROJECT_CWD?.trim() || process.cwd());
@@ -746,7 +747,7 @@ function FooterInput(props: ShellFooterProps) {
     <>
       <Box borderColor={props.busy ? ACCENT : BORDER} borderStyle="round" paddingX={1}>
         <Text color={ACCENT}>{"❯ "}</Text>
-        <TextInput
+        <Composer
           value={props.inputValue}
           placeholder={placeholder}
           focus={!props.compressing && !props.inputLocked}
@@ -968,7 +969,6 @@ async function submitSetup(
 
 function SmithApp() {
   const { exit } = useApp();
-  const suppressRef = useRef<string | null>(null);
   const highlighter = useShikiHighlighter({ theme: "github-dark" });
 
   const mode = useS((state) => state.mode);
@@ -1051,11 +1051,6 @@ function SmithApp() {
   }, [isFullScreenPanel]);
   const handleInputChange = useCallback(
     (value: string) => {
-      const suppressed = suppressRef.current;
-      if (suppressed) {
-        suppressRef.current = null;
-        if (value === `${inputValue}${suppressed}`) return;
-      }
       if (panel !== "chat") {
         getState().set({ inputValue: value, skillsIndex: 0 });
         return;
@@ -1066,7 +1061,7 @@ function SmithApp() {
       }
       getState().set({ inputValue: value });
     },
-    [inputValue, panel],
+    [panel],
   );
   const handleChatSubmit = useCallback(
     (value: string) => {
@@ -1135,7 +1130,6 @@ function SmithApp() {
     exit,
     bridge,
     getState,
-    suppressRef,
   });
 
   return (

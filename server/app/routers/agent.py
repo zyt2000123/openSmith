@@ -247,7 +247,7 @@ async def update_auto_task(
     return await svc.update_auto_task(task_id, body)
 
 
-@router.post("/auto-tasks/{task_id}/trigger", response_model=AutoTaskRunOut)
+@router.post("/auto-tasks/{task_id}/trigger", response_model=AutoTaskRunOut, status_code=202)
 async def trigger_auto_task(
     task_id: str,
     svc: AgentService = Depends(get_agent_service),

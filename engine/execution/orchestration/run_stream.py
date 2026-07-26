@@ -6,7 +6,7 @@ import inspect
 from collections.abc import AsyncIterator
 from typing import AsyncGenerator, Awaitable, Callable
 
-from engine.observability import EventType, ExecutionEvent
+from engine.execution.events import EventType, ExecutionEvent
 
 
 class _AgentRunEventIterator(AsyncIterator[ExecutionEvent]):

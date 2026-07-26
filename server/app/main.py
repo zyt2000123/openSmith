@@ -8,7 +8,7 @@ from fastapi import Depends
 
 from common.database import close_db
 from common.config import AGENT_DIR
-from engine.execution.orchestration.run_state import RunStateError, RunStateStore
+from engine.execution import RunStateError, RunStateStore
 from engine.llm.observability import set_default_generation_sink
 
 from .infrastructure.auth import get_local_token, require_auth
@@ -17,6 +17,7 @@ from .routers import (
     agent,
     config,
 )
+from .services.auto_task_service import cancel_background_runs
 from .services.scheduler import run_scheduler
 from .services.token_stats_service import TokenStatsService
 
@@ -49,6 +50,9 @@ async def lifespan(app: FastAPI):
         await scheduler_task
     except asyncio.CancelledError:
         pass
+    # Detached auto-task runs outlive the request and the tick that started them,
+    # so drain them before the LLM clients they are still using go away.
+    await cancel_background_runs()
     await close_shared_llm_clients()
     await close_db()
 

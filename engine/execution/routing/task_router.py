@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from engine.identity_catalog import IdentityCatalog, RouteDecision
+from engine.identity import IdentityCatalog, RouteDecision
 from engine.llm.observability import llm_purpose
 
 # Backward-compatible re-exports — canonical home is engine.safety.eval_guard.

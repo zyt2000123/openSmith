@@ -373,14 +373,56 @@ def test_persisted_api_configuration_resolves_to_engine_route(monkeypatch, tmp_p
     }
 
 
-def test_config_route_rejects_unknown_route_names() -> None:
+@pytest.mark.parametrize("usage", ["not-a-route", "vision"])
+def test_config_route_rejects_unknown_route_names(usage: str) -> None:
     with pytest.raises(ValidationError):
-        LLMConfig(routes={"not-a-route": {"model": "unexpected"}})
+        LLMConfig(routes={usage: {"model": "unexpected"}})
 
 
 def test_config_route_rejects_boolean_timeout_values() -> None:
     with pytest.raises(ValidationError):
         LLMConfig(timeout_profiles={"gate": {"read": True}})
+
+
+def test_config_service_ignores_legacy_vision_config_and_cleans_it_on_save(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A removed visual route must not brick reads or survive the next save."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(ConfigService, "_config_path", config_path)
+    config_path.write_text(
+        """
+llm:
+  api_key: primary-secret
+  base_url: https://primary.example/v1
+  model: primary-model
+  routes:
+    vision:
+      model: image-model
+      api_key: image-secret
+    gate:
+      model: review-model
+      timeout_profile: vision
+  timeout_profiles:
+    vision:
+      read: 90
+""".strip(),
+        encoding="utf-8",
+    )
+
+    service = ConfigService()
+    public = service.get_llm_config()
+
+    assert public["routes"] == {"gate": {"model": "review-model", "has_api_key": False}}
+    assert public["timeout_profiles"] == {}
+
+    service.set_llm_config(updates={"model": "updated-primary-model"})
+    stored = load_yaml(config_path)
+    assert "vision" not in stored["llm"].get("routes", {})
+    assert "vision" not in stored["llm"].get("timeout_profiles", {})
+    assert stored["llm"]["routes"]["gate"] == {"model": "review-model"}
+    assert config_service_module._USAGES == {usage.value for usage in model_config.LLMUsage}
 
 
 def test_config_service_persists_native_provider_route_and_generation_limit(monkeypatch, tmp_path: Path) -> None:
@@ -479,6 +521,96 @@ def test_config_api_rejects_invalid_named_model_profile(monkeypatch, tmp_path: P
         )
 
     assert response.status_code == 422
+
+
+def test_config_service_reports_the_interactive_route_as_the_effective_llm(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A route override is what actually runs, so the UI has to be shown that."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: openai
+  api_key: primary-secret
+  base_url: https://primary.example/v1
+  model: base-model
+  routes:
+    interactive:
+      model: route-model
+      base_url: https://route.example/v1
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ConfigService, "_config_path", config_path)
+
+    shown = ConfigService().get_llm_config()
+
+    assert shown["model"] == "route-model"
+    assert shown["base_url"] == "https://route.example/v1"
+    assert shown["provider"] == "openai"
+
+
+def test_config_service_lets_a_model_patch_clear_a_shadowing_interactive_route(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Editing the shown model must take effect, not lose to a stale route copy."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: openai
+  api_key: primary-secret
+  base_url: https://primary.example/v1
+  model: base-model
+  routes:
+    interactive:
+      model: stale-model
+      timeout_profile: interactive
+    gate:
+      model: gate-model
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ConfigService, "_config_path", config_path)
+
+    saved = ConfigService().set_llm_config(updates={"model": "chosen-model"})
+
+    assert saved["model"] == "chosen-model"
+    stored = load_yaml(config_path)
+    assert stored["llm"]["model"] == "chosen-model"
+    assert stored["llm"]["routes"]["interactive"] == {"timeout_profile": "interactive"}
+    assert stored["llm"]["routes"]["gate"] == {"model": "gate-model"}
+
+
+def test_config_service_keeps_an_explicitly_patched_interactive_model(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Naming the route model in the same patch is intent, not a stale leftover."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: openai
+  api_key: primary-secret
+  base_url: https://primary.example/v1
+  model: base-model
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ConfigService, "_config_path", config_path)
+
+    saved = ConfigService().set_llm_config(
+        updates={"model": "base-choice", "routes": {"interactive": {"model": "route-choice"}}},
+    )
+
+    assert saved["model"] == "route-choice"
+    stored = load_yaml(config_path)
+    assert stored["llm"]["model"] == "base-choice"
+    assert stored["llm"]["routes"]["interactive"]["model"] == "route-choice"
 
 
 def test_config_api_rejects_unknown_provider_and_boolean_generation_limit(monkeypatch, tmp_path: Path) -> None:

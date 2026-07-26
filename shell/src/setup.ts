@@ -7,7 +7,7 @@ export const PROVIDER_PRESETS = {
   gemini: { base_url: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
 } as const;
 
-const LLM_USAGES = ["interactive", "gate", "background", "vision"] as const satisfies readonly LlmUsage[];
+const LLM_USAGES = ["interactive", "gate", "background"] as const satisfies readonly LlmUsage[];
 const TIMEOUT_FIELDS = ["connect", "read", "stream_read", "write", "pool"] as const;
 
 export const INITIAL_SETUP_FIELDS = [
@@ -17,7 +17,6 @@ export const INITIAL_SETUP_FIELDS = [
   "api_key",
   "model",
   "review_model",
-  "image_model",
   "save",
 ] as const;
 
@@ -28,7 +27,6 @@ export const SETUP_FIELDS = [
   "api_key",
   "model",
   "review_model",
-  "image_model",
   "max_output_tokens",
   "routes",
   "models",
@@ -49,7 +47,6 @@ const SETUP_FIELD_LABELS: Record<SetupField, string> = {
   base_url: "base URL",
   model: "model",
   review_model: "review model (optional)",
-  image_model: "image model (optional)",
   max_output_tokens: "max output tokens (blank=keep, -=provider default)",
   api_key: "API key",
   routes: "route overrides (JSON)",
@@ -93,7 +90,10 @@ function jsonForRouteOverrides(config: LlmConfig | null): string {
     const route = config.routes?.[usage];
     if (!route) continue;
     const { has_api_key: _hasApiKey, ...override } = route;
-    if (Object.keys(override).length > 0) routes[usage] = override;
+    // The `model` field already edits the interactive model -- echoing it here as
+    // well would let this stale copy override that field when the draft is saved.
+    if (usage === "interactive") delete override.model;
+    if (Object.keys(override).length > 0 || route.has_api_key) routes[usage] = override;
   }
   return Object.keys(routes).length > 0 ? JSON.stringify(routes) : "";
 }
@@ -121,7 +121,6 @@ export function createSetupDraft(config: LlmConfig | null): SetupDraft {
     base_url: config?.base_url || "",
     model: config?.model || "",
     review_model: config?.routes?.gate?.model || "",
-    image_model: config?.routes?.vision?.model || "",
     max_output_tokens: config?.max_output_tokens?.toString() ?? "",
     api_key: "",
     routes: jsonForRouteOverrides(config),
@@ -323,7 +322,6 @@ function routeForUsage(routes: Partial<Record<LlmUsage, LlmRouteInput | null>>, 
 /** Build the API patch while keeping all secret fields out of the JSON editor. */
 export function buildLlmConfigInput(draft: SetupDraft): LlmConfigInput {
   const reviewModel = draft.review_model.trim();
-  const imageModel = draft.image_model.trim();
   const routes = parseRoutes(draft.routes) ?? {};
   const timeoutProfiles = parseTimeoutProfiles(draft.timeout_profiles);
   const models = parseModels(draft.models);
@@ -343,9 +341,11 @@ export function buildLlmConfigInput(draft: SetupDraft): LlmConfigInput {
     base_url: draft.base_url.trim(),
     model: draft.model.trim(),
   };
-  if (reviewModel) routeForUsage(routes, "gate").model = reviewModel;
-  // 留空是有意义的选项，不是缺省值：没有 vision 路由时，能否读图完全取决于主模型。
-  if (imageModel) routeForUsage(routes, "vision").model = imageModel;
+  if (reviewModel) {
+    routeForUsage(routes, "gate").model = reviewModel;
+  } else if (routes.gate && Object.hasOwn(routes.gate, "model")) {
+    routes.gate.model = null;
+  }
   input.routes = routes;
   input.timeout_profiles = timeoutProfiles ?? {};
   if (models !== undefined) input.models = models;

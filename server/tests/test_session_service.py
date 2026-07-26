@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services import session_service as session_service_module
 from app.services.session_service import SessionService
-from engine.identity_catalog import IdentityCatalog
+from engine.execution import RunStateStore
+from engine.identity import IdentityCatalog
 
 
 class FakeSessionRepo:
@@ -344,12 +345,67 @@ async def test_stream_message_persists_token_usage_with_project_and_model(
 
 
 @pytest.mark.asyncio
+async def test_stream_message_forwards_complete_context_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return (
+            SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id),
+            object(),
+        )
+
+    async def fake_engine_events(request, runtime, services):
+        yield SimpleNamespace(type=SimpleNamespace(value="context_usage"), data={
+            "context_tokens": 64_000,
+            "context_window": 128_000,
+            "context_percent": 58,
+            "estimated": False,
+            "message_tokens": 60_000,
+            "tool_schema_tokens": 3_500,
+            "protocol_tokens": 500,
+            "effective_context_window": 128_000,
+            "safe_input_budget": 110_000,
+            "output_reserve": 4_096,
+            "safety_margin": 13_904,
+            "window_declared": True,
+            "output_limit_declared": True,
+            "fit_status": "fit",
+        })
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="text_delta"),
+            data={"text": "done"},
+        )
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_run_stream_with_runtime",
+        _fake_run(fake_engine_events),
+    )
+
+    events = [
+        event
+        async for event in SessionService(
+            FakeSessionRepo(),
+            FakeAgentProfileRepo(),
+        ).stream_message("smith-id", "sess-1", "hello")
+    ]
+    receipt = json.loads(
+        next(event for event in events if event["event"] == "context_usage")["data"]
+    )
+
+    assert receipt["context_window"] == 128_000
+    assert receipt["safe_input_budget"] == 110_000
+    assert receipt["tool_schema_tokens"] == 3_500
+    assert receipt["output_reserve"] == 4_096
+    assert receipt["fit_status"] == "fit"
+
+
+@pytest.mark.asyncio
 async def test_resume_run_reuses_session_scope_and_discards_partial_reply(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from engine.execution.orchestration.run_state import RunStateStore
-
     captured: dict[str, object] = {}
     repo = FakeSessionRepo()
     repo.identity_id = "smith"
@@ -426,8 +482,6 @@ async def test_resume_run_rejects_an_older_run_without_deleting_later_turns(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from engine.execution.orchestration.run_state import RunStateStore
-
     repo = FakeSessionRepo()
     repo.messages = [
         {"id": "u-1", "session_id": "sess-1", "role": "user", "content": "first", "created_at": "1"},
@@ -464,8 +518,6 @@ async def test_prepare_resume_rejects_a_retired_identity_without_discarding_part
     tmp_path: Path,
 ) -> None:
     """Resume preflight must be read-only until the identity is known to be valid."""
-    from engine.execution.orchestration.run_state import RunStateStore
-
     repo = FakeSessionRepo()
     repo.identity_id = "smith"
     identities_dir = tmp_path / "identities"
@@ -818,20 +870,16 @@ async def test_stream_message_forwards_validated_smith_ui_event(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_stream_message_falls_back_to_code_for_invalid_smith_ui_event(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stream_message_forwards_engine_smith_ui_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
         return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
 
     async def fake_engine_reply_events(request, runtime, services):
         yield SimpleNamespace(
-            type=SimpleNamespace(value="smith_ui"),
+            type=SimpleNamespace(value="smith_ui_fallback"),
             data={
-                "version": 1,
-                "spec": {
-                    "root": "input",
-                    "elements": {"input": {"type": "TextInput", "props": {}, "children": []}},
-                },
-                "images": [],
+                "reason": "component type 'TextInput' is not permitted",
+                "code": '{"type":"TextInput"}',
             },
         )
 

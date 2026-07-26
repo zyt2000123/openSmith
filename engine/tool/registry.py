@@ -3,17 +3,24 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
+import json
 import logging
 import re
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Any
 
 from engine.sandbox import ExecutionEnvironment, LocalExecutionEnvironment
+
 from .interface import ToolCall, ToolDefinition, ToolResult
 from .truncation import truncate_output
 
 if TYPE_CHECKING:
-    from engine.execution.tool_execution.tool_ledger import ToolExecutionLedger
+    from engine.safety.tool_guard import ToolGuard
+
+    from .ledger import ToolExecutionLedger
 
 _TOOL_ALIASES = {
     "websearch": "web_search",
@@ -43,6 +50,35 @@ def _canonical_tool_name(name: str) -> str:
     return _TOOL_ALIASES.get(name, name)
 
 
+def _is_async_callable(func: Callable) -> bool:
+    return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(
+        getattr(func, "__call__", None)
+    )
+
+
+def _accepts_environment(func: Callable) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return "environment" in parameters
+
+
+def _call_fingerprint(call: ToolCall) -> str:
+    return json.dumps(
+        {
+            "id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+            "idempotency_key": call.idempotency_key,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {}
@@ -52,6 +88,12 @@ class ToolRegistry:
         self._host_environment: ExecutionEnvironment = LocalExecutionEnvironment()
         self._sandbox_environment: ExecutionEnvironment | None = None
         self._wants_environment: set[str] = set()
+        self._serial_locks: dict[str, asyncio.Lock] = {}
+        self._tool_guard: ToolGuard | None = None
+        self._authorized_call: ContextVar[tuple[str, str | None] | None] = ContextVar(
+            f"agent_smith_authorized_tool_call_{id(self)}",
+            default=None,
+        )
 
     def register(
         self,
@@ -106,6 +148,16 @@ class ToolRegistry:
             raise ValueError(
                 f"Tool {name} side_effect must be one of {sorted(_VALID_SIDE_EFFECTS)}"
             )
+        if (
+            timeout_seconds is not None
+            and resolved_side_effect != "none"
+            and not _is_async_callable(func)
+        ):
+            raise ValueError(
+                f"Tool {name} uses a synchronous side-effecting handler and cannot "
+                "declare timeout_seconds; use an async handler with cooperative "
+                "cancellation or omit the timeout"
+            )
         if concurrency not in _VALID_CONCURRENCY:
             raise ValueError(
                 f"Tool {name} concurrency must be one of {sorted(_VALID_CONCURRENCY)}"
@@ -114,6 +166,12 @@ class ToolRegistry:
             raise ValueError(
                 f"Tool {name} execution_environment must be one of "
                 f"{sorted(_VALID_EXECUTION_ENVIRONMENTS)}"
+            )
+        accepts_environment = _accepts_environment(func)
+        if execution_environment != "host" and not accepts_environment:
+            raise ValueError(
+                f"Tool {name} declares execution_environment={execution_environment!r} "
+                "and must accept an 'environment' parameter"
             )
         defn = ToolDefinition(
             name=name,
@@ -135,11 +193,8 @@ class ToolRegistry:
             execution_environment=execution_environment,
         )
         self._tools[name] = (defn, func)
-        try:
-            if "environment" in inspect.signature(func).parameters:
-                self._wants_environment.add(name)
-        except (TypeError, ValueError):
-            pass
+        if accepts_environment:
+            self._wants_environment.add(name)
 
     def load_providers(self, tools_dir: Path) -> None:
         """Auto-discover tool providers from a directory of .py files.
@@ -269,9 +324,38 @@ class ToolRegistry:
         self._tools[tool_name] = (defn, wrapper(func))
         return True
 
-    def bind_execution_ledger(self, ledger: "ToolExecutionLedger | None") -> None:
+    def bind_execution_ledger(self, ledger: ToolExecutionLedger | None) -> None:
         """Bind a per-run ledger used to protect side-effecting tools."""
         self._execution_ledger = ledger
+
+    def bind_tool_guard(self, guard: ToolGuard | None) -> None:
+        """Install the runtime hard-safety backstop for direct executions."""
+        self._tool_guard = guard
+
+    @contextmanager
+    def authorize_execution(
+        self,
+        call: ToolCall,
+        *,
+        approval_id: str | None = None,
+    ) -> Iterator[None]:
+        """Seal one normalized call after the runtime policy has approved it.
+
+        The ReAct loop owns policy evaluation and any user-approval wait.  This
+        short-lived permit lets :meth:`execute` distinguish that path from
+        internal callers that accidentally invoke the registry directly.
+        Approval-gated calls additionally require the broker-issued approval
+        identifier; a matching call fingerprint alone is insufficient.
+        """
+
+        normalized = self.normalize_call(call)
+        token = self._authorized_call.set(
+            (_call_fingerprint(normalized), approval_id)
+        )
+        try:
+            yield
+        finally:
+            self._authorized_call.reset(token)
 
     def bind_execution_environment(self, environment: ExecutionEnvironment | None) -> None:
         """Bind an execution backend without replacing the host backend.
@@ -367,13 +451,17 @@ class ToolRegistry:
         arguments: dict,
         timeout_seconds: float | None,
     ) -> Any:
-        if timeout_seconds is None:
-            result = func(**arguments)
+        async def invoke() -> Any:
+            if _is_async_callable(func):
+                result = func(**arguments)
+            else:
+                result = await asyncio.to_thread(func, **arguments)
             return await result if inspect.isawaitable(result) else result
 
-        if inspect.iscoroutinefunction(func):
-            return await asyncio.wait_for(func(**arguments), timeout_seconds)
-        return await asyncio.wait_for(asyncio.to_thread(func, **arguments), timeout_seconds)
+        operation = invoke()
+        if timeout_seconds is None:
+            return await operation
+        return await asyncio.wait_for(operation, timeout_seconds)
 
     @staticmethod
     def _finalize_result(result: ToolResult, tool_name: str) -> ToolResult:
@@ -388,43 +476,14 @@ class ToolRegistry:
             metadata=dict(result.metadata),
         )
 
-    async def execute(self, call: ToolCall) -> ToolResult:
-        # ``execute`` is also used by a few internal integrations and tests
-        # directly.  Normalize here as a backstop so those callers cannot skip
-        # the path binding enforced by the ReAct loop.
-        call = self.normalize_call(call)
-        tool_name = _canonical_tool_name(call.name)
-
-        entry = self._tools.get(tool_name)
-        if entry is None:
-            return ToolResult(
-                call_id=call.id,
-                content=f"Unknown tool: {call.name}",
-                is_error=True,
-                error_kind="unknown_tool",
-            )
-
-        if self._enabled is not None and tool_name not in self._enabled:
-            return ToolResult(
-                call_id=call.id,
-                content=f"Tool disabled: {tool_name}",
-                is_error=True,
-                error_kind="tool_disabled",
-            )
-
-        defn, func = entry
-        required_env = defn.execution_environment
-        environment = self._environment_for(required_env)
-        if environment is None:
-            return ToolResult(
-                call_id=call.id,
-                content=(
-                    f"Error: tool '{tool_name}' requires the '{required_env}' execution "
-                    "environment, but no matching backend is bound"
-                ),
-                is_error=True,
-                error_kind="environment_unavailable",
-            )
+    async def _execute_registered(
+        self,
+        call: ToolCall,
+        tool_name: str,
+        defn: ToolDefinition,
+        func: Callable,
+        environment: ExecutionEnvironment,
+    ) -> ToolResult:
         ledger = self._execution_ledger if defn.side_effect != "none" else None
         idempotency_key = call.idempotency_key or (
             ledger.idempotency_key_for(
@@ -496,6 +555,94 @@ class ToolRegistry:
                 result=result,
             )
         return result
+
+    async def execute(self, call: ToolCall) -> ToolResult:
+        # ``execute`` is also used by a few internal integrations and tests
+        # directly.  Normalize here as a backstop so those callers cannot skip
+        # the path binding enforced by the ReAct loop.
+        call = self.normalize_call(call)
+        tool_name = _canonical_tool_name(call.name)
+
+        entry = self._tools.get(tool_name)
+        if entry is None:
+            return ToolResult(
+                call_id=call.id,
+                content=f"Unknown tool: {call.name}",
+                is_error=True,
+                error_kind="unknown_tool",
+            )
+
+        if self._enabled is not None and tool_name not in self._enabled:
+            return ToolResult(
+                call_id=call.id,
+                content=f"Tool disabled: {tool_name}",
+                is_error=True,
+                error_kind="tool_disabled",
+            )
+
+        defn, func = entry
+        if self._tool_guard is not None:
+            decision = self._tool_guard.check(call)
+            authorization = self._authorized_call.get()
+            authorized = (
+                authorization is not None
+                and authorization[0] == _call_fingerprint(call)
+            )
+            approval_granted = (
+                authorized
+                and bool(authorization[1])
+            )
+            blocked_by_policy = not decision.allowed
+            approval_required = decision.approval_required and not approval_granted
+            if blocked_by_policy or approval_required:
+                reason = decision.reason or (
+                    f"Approval required for {tool_name}"
+                    if approval_required
+                    else f"Tool blocked by policy: {tool_name}"
+                )
+                return ToolResult(
+                    call_id=call.id,
+                    content=f"[BLOCKED] {reason}",
+                    is_error=True,
+                    error_kind=(
+                        "policy_blocked" if blocked_by_policy else "approval_required"
+                    ),
+                    metadata={
+                        "blocked": True,
+                        "approval_required": approval_required,
+                        "level": decision.level.value,
+                    },
+                )
+
+        required_env = defn.execution_environment
+        environment = self._environment_for(required_env)
+        if environment is None:
+            return ToolResult(
+                call_id=call.id,
+                content=(
+                    f"Error: tool '{tool_name}' requires the '{required_env}' execution "
+                    "environment, but no matching backend is bound"
+                ),
+                is_error=True,
+                error_kind="environment_unavailable",
+            )
+        if defn.concurrency == "serial":
+            lock = self._serial_locks.setdefault(tool_name, asyncio.Lock())
+            async with lock:
+                return await self._execute_registered(
+                    call,
+                    tool_name,
+                    defn,
+                    func,
+                    environment,
+                )
+        return await self._execute_registered(
+            call,
+            tool_name,
+            defn,
+            func,
+            environment,
+        )
 
     def list_tools(self) -> list[ToolDefinition]:
         if self._enabled is None:

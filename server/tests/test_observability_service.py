@@ -6,12 +6,10 @@ import pytest
 from fastapi import HTTPException
 
 from app.services.observability_service import ObservabilityService
+from engine.execution import EventType, ExecutionEvent, RunObservationContext
 from engine.observability import (
-    EventType,
-    ExecutionEvent,
     ObservabilityReader,
     RunObservation,
-    RunObservationContext,
 )
 
 

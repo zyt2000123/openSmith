@@ -8,7 +8,7 @@ import type { Message, StreamEvent } from "./api.js";
 import type { SmithUiPayload } from "./smith-ui-schema.js";
 
 type SystemTone = "info" | "error";
-export type SkillState = "running" | "retry" | "done" | "blocked" | "error";
+export type SkillState = "running" | "retry" | "done" | "blocked" | "error" | "cancelled";
 export type TranscriptViewMode = "compact" | "transcript";
 
 export function limitTranscript(entries: TranscriptEntry[], limit: number): TranscriptEntry[] {
@@ -324,6 +324,33 @@ export function closeLatestTurn(entries: TranscriptEntry[]): TranscriptEntry[] {
   return updateLastTurn(entries, (turn) => ({
     ...turn,
     blocks: finishThinkingBlocks(turn.blocks),
+    provisional: [],
+    streaming: false,
+  }));
+}
+
+export function interruptLatestTurn(
+  entries: TranscriptEntry[],
+  outcome: Extract<ToolState, "cancelled" | "error">,
+): TranscriptEntry[] {
+  const fallback = outcome === "cancelled" ? "Cancelled before completion." : "Request failed before completion.";
+  return updateLastTurn(entries, (turn) => ({
+    ...turn,
+    blocks: finishThinkingBlocks(turn.blocks).map((block) => {
+      if (block.type === "tool" && block.state === "running") {
+        return { ...block, state: outcome, summary: block.summary || fallback };
+      }
+      if (block.type !== "skill") return block;
+      return {
+        ...block,
+        state: block.state === "running" || block.state === "retry" ? outcome : block.state,
+        activities: block.activities.map((activity) =>
+          activity.state === "running"
+            ? { ...activity, state: outcome, summary: activity.summary || fallback }
+            : activity,
+        ),
+      };
+    }),
     provisional: [],
     streaming: false,
   }));

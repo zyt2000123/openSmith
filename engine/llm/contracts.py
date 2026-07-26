@@ -14,6 +14,7 @@ import httpx
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # Conservative fallback when a model/route does not declare its real window.
 DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_MAX_OUTPUT_TOKENS = 4_096
 
 
 class LLMError(RuntimeError):
@@ -22,6 +23,21 @@ class LLMError(RuntimeError):
 
 class LLMResponseError(LLMError):
     """Raised when a provider returns a payload outside the internal contract."""
+
+
+class LLMContextLengthError(LLMResponseError):
+    """Typed, sanitized rejection for an over-capacity model request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        provider_code: str | None = None,
+    ) -> None:
+        self.http_status = http_status
+        self.provider_code = provider_code
+        super().__init__(message)
 
 
 class UnsupportedProviderError(LLMError):
@@ -80,6 +96,16 @@ class LLMProviderConfig:
     timeouts: LLMTimeouts = field(default_factory=LLMTimeouts)
     max_output_tokens: int | None = None
     context_window: int | None = None
+
+
+@dataclass(frozen=True)
+class ModelLimits:
+    """Normalized capacity facts used to fit provider requests."""
+
+    context_window: int
+    context_window_declared: bool
+    max_output_tokens: int
+    max_output_tokens_declared: bool
 
 
 @dataclass(frozen=True)

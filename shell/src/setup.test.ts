@@ -12,7 +12,6 @@ function draft(overrides: Partial<SetupDraft> = {}): SetupDraft {
     base_url: "https://api.openai.com/v1",
     model: "gpt-4.1-mini",
     review_model: "",
-    image_model: "",
     max_output_tokens: "",
     api_key: "",
     routes: "",
@@ -28,7 +27,7 @@ function draft(overrides: Partial<SetupDraft> = {}): SetupDraft {
 test("initial setup separates the supplier name from the compatible protocol", () => {
   assert.deepEqual(
     [...INITIAL_SETUP_FIELDS],
-    ["vendor", "provider", "base_url", "api_key", "model", "review_model", "image_model", "save"],
+    ["vendor", "provider", "base_url", "api_key", "model", "review_model", "save"],
   );
 });
 
@@ -76,10 +75,69 @@ test("setup saves only essential fields and clears legacy advanced settings", ()
 });
 
 test("setup clears the review route when no review model is configured", () => {
-  const result = buildLlmConfigInput(draft({ review_model: "" }));
+  const config: LlmConfig = {
+    configured: true,
+    has_api_key: true,
+    vendor: "OpenAI",
+    provider: "openai",
+    base_url: "https://api.openai.com/v1",
+    model: "gpt-4.1-mini",
+    max_output_tokens: null,
+    routes: { gate: { model: "old-review-model", has_api_key: false } },
+    timeout_profiles: {},
+    models: {},
+  };
+  const setupDraft = createSetupDraft(config);
+  setupDraft.review_model = "";
 
-  assert.deepEqual(result.routes, {});
+  const result = buildLlmConfigInput(setupDraft);
+
+  assert.deepEqual(result.routes, { gate: { model: null } });
   assert.deepEqual(result.timeout_profiles, {});
+});
+
+test("setup preserves a route whose only stored value is its API key", () => {
+  const config: LlmConfig = {
+    configured: true,
+    has_api_key: true,
+    vendor: "OpenAI",
+    provider: "openai",
+    base_url: "https://api.openai.com/v1",
+    model: "gpt-4.1-mini",
+    max_output_tokens: null,
+    routes: { gate: { has_api_key: true } },
+    timeout_profiles: {},
+    models: {},
+  };
+
+  const setupDraft = createSetupDraft(config);
+  const result = buildLlmConfigInput(setupDraft);
+
+  assert.deepEqual(JSON.parse(setupDraft.routes), { gate: {} });
+  assert.deepEqual(result.routes, { gate: {} });
+});
+
+test("setup does not echo the interactive model into the route override editor", () => {
+  const config: LlmConfig = {
+    configured: true,
+    has_api_key: true,
+    vendor: "OpenAI",
+    provider: "openai",
+    base_url: "https://api.openai.com/v1",
+    model: "route-model",
+    max_output_tokens: null,
+    routes: { interactive: { model: "route-model", timeout_profile: "interactive", has_api_key: false } },
+    timeout_profiles: {},
+    models: {},
+  };
+
+  const setupDraft = createSetupDraft(config);
+  const result = buildLlmConfigInput({ ...setupDraft, model: "chosen-model" });
+
+  assert.deepEqual(JSON.parse(setupDraft.routes), { interactive: { timeout_profile: "interactive" } });
+  assert.equal(setupDraft.model, "route-model");
+  assert.equal(result.model, "chosen-model");
+  assert.deepEqual(result.routes, { interactive: { timeout_profile: "interactive" } });
 });
 
 test("setup rejects a provider that only exists on Object.prototype", () => {

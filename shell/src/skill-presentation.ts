@@ -11,6 +11,7 @@ const PRESENTATION: Record<SkillState, SkillPresentation> = {
   done: { heading: "Agent complete", tone: "success" },
   blocked: { heading: "Agent blocked", tone: "warning" },
   error: { heading: "Agent failed", tone: "error" },
+  cancelled: { heading: "Agent cancelled", tone: "warning" },
 };
 
 export function skillPresentation(state: SkillState): SkillPresentation {

@@ -11,7 +11,7 @@ test("clearing a conversation removes the armed skill and all HUD state", () => 
   assert.equal(conversation.turnCount, 0);
   assert.deepEqual(conversation.contextUsage, {
     context_tokens: 0,
-    context_window: 256_000,
+    context_window: 128_000,
     context_percent: 0,
     estimated: true,
   });

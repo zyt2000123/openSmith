@@ -109,10 +109,10 @@ The tools do not read environment proxy variables, persist cookies, reuse user b
 - `agents/tools/web_fetch.py`: fetch schema, HTTP-first/render policy, extraction, browser integration, and fetch-specific formatting.
 - `agents/tools/web_search.py`: query validation, DDG request, structured parser, and search-specific formatting.
 - `engine/tool/registry.py`: compatibility-only legacy error-prefix recognition.
-- `engine/prompt/assembler.py`: conditional external-content safety guidance.
+- `engine/context/assembler.py`: conditional external-content safety guidance.
 - `engine/tests/test_web_security.py`: URL/address policy, proxy authentication, DNS pinning, port limits, redirect and subresource protection, timeout, and cleanup tests.
 - `engine/tests/test_web_tools.py`: fetch/search behavior, parsing fixtures, rendering policy, output markers, concurrency, and error-contract tests.
-- `engine/tests/test_tool_design_fixes.py`: retain alias/allowlist coverage; remove web implementation assertions moved to focused suites.
+- `engine/tests/tool/test_tool_design_fixes.py`: retain alias/allowlist coverage; remove web implementation assertions moved to focused suites.
 - `docs/06-Agent模板与技能规范.md` and `docs/11-Agent设计文档.md`: exact schema, limits, trust model, and network semantics.
 
 No server router/service or common-layer changes are required. The dependency direction remains `server -> engine -> common`; agent tool providers still import no engine or server code.

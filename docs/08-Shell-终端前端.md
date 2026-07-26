@@ -1,7 +1,7 @@
 # 08 · Shell 终端前端
 
 > 本文描述当前源码已接入的 Shell；功能是否存在以注册、调用路径和回归测试为准。
-> Shell 的版本来自 `shell/package.json`，当前为 `0.2.3`。
+> Shell 的版本来自 `shell/package.json`，当前为 `0.3.1`。
 
 ## 1. 定位与责任边界
 
@@ -24,8 +24,8 @@ UI 组件不直接 import `engine/`，也不应把显示文本反向当作执行
 
 | 项目 | 当前选择 |
 | --- | --- |
-| 包 | `smith-shell@0.2.3`，ESM |
-| 终端 UI | Ink 7 + React 19 |
+| 包 | `smith-shell@0.3.1`，ESM，Node.js 22+ |
+| 终端 UI | Ink 6 + React 19 |
 | 状态 | Zustand 5 (`zustand/vanilla` + React selector) |
 | 正文 Markdown | `@assistant-ui/react-ink-markdown` |
 | GFM 表格 AST | `marked` |

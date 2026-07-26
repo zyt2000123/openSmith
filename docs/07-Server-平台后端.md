@@ -805,39 +805,30 @@ SQLite 数据库位于 `~/.agent-smith/sqlite/agent-smith.sqlite`，使用 WAL �
 
 ## 执行引擎集成
 
-服务层通过 `engine/execution/agent_loop.py` 中的两个入口与 AI 引擎交互：
+服务层只通过 `engine.execution` 公共接口与 AI 引擎交互：
 
-### reply(agent_id, name, user_message) -> str
+- `run_stream_with_runtime(EngineRequest, RuntimeContext, RuntimeServices)`：
+  返回带 `run_id`、取消与终态语义的 `AgentRunStream`。
+- `resume_stream_with_runtime(...)`：恢复可恢复 Run，并通过 Tool Ledger
+  避免重复副作用。
+- `reply_with_runtime(...)`：复用同一完整生命周期的非流式适配器。
 
-同步回复。内部流程：
-
-1. 从四层配置合并 LLM 参数（平台级 -> 模板级 -> Agent 级 -> 会话级）
-2. 加载工具/技能注册表
-3. 组装 system prompt
-4. 通过关键词评分路由任务类型（DIRECT / BUGFIX / FEATURE）
-5. 构建技能链（SkillChain）
-6. 执行 `run_agent()`：
-   - **DIRECT 任务** — 单次 ReAct 循环（思考 -> 工具调用 -> 观察）
-   - **BUGFIX / FEATURE 任务** — 遍历 SkillChain DAG 节点，每个节点内部执行 ReAct 循环
-7. 保存对话记忆，学习用户偏好
-
-### reply_stream(agent_id, name, user_message) -> AsyncGenerator[str, None]
-
-流式回复。与 `reply` 相同的前置流程，区别在于：
-
-- **DIRECT 任务** — 通过 `llm.chat_stream()` 逐 chunk yield
-- **技能链任务** — 回退到非流式 `run_agent()`，完成后一次性 yield 完整结果
+`engine_runtime.py` 是组合根：解析模型路由，构建 Tool/Skill Registry，
+并把 `RunObservation` 作为 execution 定义的观察者 Adapter 注入
+`RuntimeServices`。`session_service.py` 只把 `ExecutionEvent` 映射为 SSE，
+不导入 Pipeline、Gate、ReAct 或 Smith UI 校验实现。
 
 ### 技能链（SkillChain）
 
-定义在 `engine/execution/skill_chain.py`：
+定义在 `engine/execution/pipeline/skill_chain.py`，仅由 Engine 内部使用：
 
 | 任务类型 | 技能链 |
 |----------|--------|
 | FEATURE | planning -> architecture（条件执行） -> testing-strategy -> change-validation -> code-review |
 | BUGFIX | sde-debug -> planning -> testing-strategy -> change-validation -> code-review |
 
-每个节点支持门禁检查（`gate.py`，9 种门禁类型）和回溯（`backtrack.py`）。
+每个节点支持门禁检查（`pipeline/gate.py`）和回溯
+（`pipeline/backtrack.py`）。
 
 ---
 

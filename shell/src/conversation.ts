@@ -21,6 +21,7 @@ export type EmptyConversation = {
   runStartedAt: number | null;
   recoverableRunId: string | null;
   historyIndex: number;
+  historyDraft: string;
   slashIndex: number;
   skillsIndex: number;
   skillActionIndex: number;
@@ -52,6 +53,7 @@ export function createEmptyConversation(panel: ConversationPanel, statusLine: st
     runStartedAt: null,
     recoverableRunId: null,
     historyIndex: -1,
+    historyDraft: "",
     slashIndex: 0,
     skillsIndex: 0,
     skillActionIndex: 0,

@@ -21,7 +21,6 @@ from typing import Iterator
 
 from engine.tool.interface import ToolCall, ToolDefinition
 
-
 _DISABLE_VALUES = frozenset({"0", "false", "off", "disabled", "disable", "no"})
 _CURRENT_FACT_GATE: ContextVar[FactGate | None] = ContextVar(
     "agent_smith_fact_gate",
@@ -141,6 +140,20 @@ class FactGate:
         if not self.enabled:
             return FactGateResult(False)
 
+        # Shell owns a command-level classifier.  Its metadata also declares
+        # ``cwd`` as a path argument, but that directory is execution context,
+        # not a file being written.  Classify shell first so read-only commands
+        # do not become false-positive file-write challenges.
+        if call.name == "shell":
+            command = str(call.arguments.get("command") or "").strip()
+            if not command or _is_read_only_shell(command):
+                return FactGateResult(False)
+            key = f"{self._scope}:{_STATE_CHANGING_SHELL_KEY}"
+            if key in self._checked:
+                return FactGateResult(False)
+            self._pending.add(key)
+            return FactGateResult(True, _shell_challenge(command))
+
         write_path_args = self._resolve_write_path_args(call.name)
         if write_path_args:
             raw_path = next(
@@ -155,16 +168,6 @@ class FactGate:
                 return FactGateResult(False)
             self._pending.add(key)
             return FactGateResult(True, _file_challenge(call.name, path))
-
-        if call.name == "shell":
-            command = str(call.arguments.get("command") or "").strip()
-            if not command or _is_read_only_shell(command):
-                return FactGateResult(False)
-            key = f"{self._scope}:{_STATE_CHANGING_SHELL_KEY}"
-            if key in self._checked:
-                return FactGateResult(False)
-            self._pending.add(key)
-            return FactGateResult(True, _shell_challenge(command))
 
         read_actions = self._resolve_read_actions(call.name)
         if read_actions is not None:

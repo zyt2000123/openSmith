@@ -7,7 +7,7 @@
 > - `10-自研Agent框架深度解析.md` —— 设计理念 WHY + 框架对比 + 面试问答
 > - **本文（11）** —— 设计规格：是什么、怎么设计的、约定是什么、如何扩展
 >
-> 所有描述均以当前代码为准（引用形如 `engine/execution/agent_loop.py:31`）。
+> 所有描述均以当前代码为准（引用形如 `engine/execution/orchestration/agent_loop.py`）。
 
 ---
 
@@ -87,7 +87,7 @@ Agent-Smith 交付的不是"聊天机器人"，而是**本地 Agent**：
 | **Tool（工具）** | 一个可被 LLM 调用的原子能力（Python 函数） | `agents/tools/*.py` + MCP 外接 | 启动时注册 |
 | **Plugin（插件）** | 外部事件源 + 处理器（如 GitHub、日报） | `agents/plugins/<name>/` | 服务启动时发现、触发器常驻 |
 | **Memory（记忆）** | Smith 的证据与三份正式记忆视图 | `~/.agent-smith/agent/memory/` + `context.md` | 单 Smith 共享，持续写入、审核式编译与遗忘 |
-| **Gate（门禁）** | 一段产出的质量检查器 | `engine/execution/gate.py` | 每个技能链节点绑定一个 |
+| **Gate（门禁）** | 一段产出的质量检查器 | `engine/execution/pipeline/gate.py` | 每个技能链节点绑定一个 |
 | **SkillChain（技能链）** | 带门禁和回退边的技能 DAG | `agents/pipelines/*.yaml` | 由身份路由引用 |
 
 ### 2.2 实体关系
@@ -159,16 +159,16 @@ Template ──(初始化时复制)──▶ Agent Profile(Smith) ──(1:N)─
 engine 内部模块与依赖：
 
 ```
-execution ──▶ llm, prompt, skill, tool, safety, memory
-prompt    ──▶ memory.compile（读编译产物）
-skill     ──▶ tool（executor 里执行工具调用）
-tool      ──▶ (无内部依赖；MCP 为外部进程)
-memory / safety / plugin ──▶ 互不依赖
+server composition ──▶ execution + observability
+execution ──▶ llm, context, skill, tool, safety, memory, mcp
+observability ──▶ execution.events（实现 execution 定义的观察者协议）
+skill ──▶ llm/tool/safety 的窄接口（ReAct 实现由 execution 注入）
+tool / mcp / memory / safety ──▶ 不反向依赖 execution 实现
 ```
 
 ### 3.2 一次对话的完整生命周期（流式）
 
-入口：`server/app/services/session_service.py:56` → `engine/execution/agent_loop.py:581`
+入口：`server/app/services/session_service.py` → `engine.execution` 公共接口 → `engine/execution/orchestration/lifecycle.py`
 
 ```
 1. app 发 POST /sessions/{id}/messages/stream
@@ -447,7 +447,7 @@ record(sig) 裁决规则（max_same=2, max_strategies=2）：
 
 ### 6.8 事件协议与本地 Trace（observability/）
 
-引擎与前端之间的流式契约由 `engine/observability/events.py` 定义。每种 `EventType` 带自由 dict 负载；传输层负责将它格式化为 SSE：
+引擎与前端之间的流式契约由 `engine/execution/events.py` 定义。每种 `EventType` 带自由 dict 负载；传输层负责将它格式化为 SSE：
 
 ```
 route_decided → skill_start → tool_call_start/tool_call_result …
@@ -679,15 +679,20 @@ env（AGENTSMITH_LLM_*，最低）
 
 ## 十三、服务端集成契约
 
-engine 对上只暴露两个入口（server 不触碰引擎内部）：
+engine 通过 `engine.execution` 暴露稳定运行契约，server 不导入
+`execution.orchestration`、`pipeline` 或 `react` 实现：
 
 ```python
-# engine/execution/agent_loop.py
-async def reply(agent_id, name, user_message) -> str
-async def reply_stream(agent_id, name, user_message) -> AsyncGenerator[str]
+from engine.execution import (
+    EngineRequest,
+    RuntimeContext,
+    RuntimeServices,
+    reply_with_runtime,
+    run_stream_with_runtime,
+)
 ```
 
-`SessionService`（server/app/services/session_service.py）的职责边界：会话存在性校验 → 用户消息落库 → 调 engine → 助手消息落库 → SSE 组帧（`event: message` 逐块 + `event: done` 收尾）。**server 不知道技能链、门禁、记忆的存在**——它们全部封装在这两个函数之后。
+`SessionService`（`server/app/services/session_service.py`）的职责边界：会话存在性校验 → 用户消息落库 → 调 engine → 助手消息落库 → SSE 组帧。Pipeline、Gate、ReAct 与 Smith UI 校验均封装在公共执行边界之后；observability Adapter 由 `server/app/services/engine_runtime.py` 在组合时注入。
 
 ---
 
@@ -733,16 +738,20 @@ async def reply_stream(agent_id, name, user_message) -> AsyncGenerator[str]
 
 | 子系统 | 文件 | 行数 | 职责 |
 |---|---|---|---|
-| 执行 | `engine/execution/agent_loop.py` | 613 | ReAct 三变体 + 链执行 + reply/reply_stream 入口 |
-| 执行 | `engine/execution/skill_chain.py` | 167 | SkillNode/SkillChain、预置链、workflow.md 解析 |
-| 执行 | `engine/execution/gate.py` | 580 | 13 门禁（含 SkillRubricGate / LLMGate / UnderstandingGate / ContractAlignmentGate） |
-| 执行 | `engine/execution/task_router.py` | 71 | 覆写/关键词/LLM 三级路由 |
-| 执行 | `engine/execution/backtrack.py` | 37 | FailureLoopGuard 状态机 |
-| 执行 | `engine/execution/checkpoint.py` | 76 | SessionCheckpoint 断点存取 |
-| 可观测性 | `engine/observability/events.py` | — | ExecutionEvent 流式契约 |
+| 执行接口 | `engine/execution/__init__.py` | — | Server 可使用的运行契约与入口 |
+| 编排 | `engine/execution/orchestration/lifecycle.py` | — | Run 生命周期、状态投影、清理与终态 |
+| 编排 | `engine/execution/orchestration/preparation.py` | — | 路由、工具、Skill、Memory 与 Prompt 准备 |
+| 编排 | `engine/execution/orchestration/agent_loop.py` | — | Direct/Pipeline 分派 |
+| Pipeline | `engine/execution/pipeline/skill_chain.py` | — | SkillNode/SkillChain 与 YAML 解析 |
+| Pipeline | `engine/execution/pipeline/gate.py` | — | Gate 实现 |
+| Pipeline | `engine/execution/pipeline/backtrack.py` | — | FailureLoopGuard 状态机 |
+| Pipeline | `engine/execution/pipeline/checkpoint.py` | — | SessionCheckpoint 断点存取 |
+| ReAct | `engine/execution/react/react_loop.py` | — | 单步 ReAct 事件循环 |
+| 路由 | `engine/execution/routing/task_router.py` | — | Identity/关键词/LLM 路由 |
+| 执行契约 | `engine/execution/events.py` | — | ExecutionEvent 流式契约 |
 | 可观测性 | `engine/observability/trace_store.py` | — | 脱敏、限长、本地 JSONL trace |
 | 可观测性 | `engine/observability/recorder.py` | — | 记录边界与执行控制投影扇出 |
-| 可观测性 | `engine/observability/runtime.py` | — | 执行层唯一写入门面 RunObservation |
+| 可观测性 | `engine/observability/runtime.py` | — | 由组合根注入的 RunObservation Adapter |
 | 可观测性 | `engine/observability/reader.py` | — | 服务层唯一查询门面 ObservabilityReader |
 | 可观测性 | `engine/observability/incidents.py` | — | 从摘要与脱敏 trace 派生 Run Incident |
 | 可观测性 | `engine/observability/diagnosis.py` | — | 结构化 RCA：失败节点、证据和建议 |
@@ -758,11 +767,14 @@ async def reply_stream(agent_id, name, user_message) -> AsyncGenerator[str]
 | 记忆 | `engine/memory/search.py` | — | 可自愈的 FTS5 trigram 索引 |
 | 记忆 | `engine/memory/dream.py` | — | 全层危险行清洗 + durable 审核式整理 |
 | 记忆 | `engine/memory/user_learner.py` | — | 偏好检测 + 置信度证据信号（不直接写 Markdown） |
+| 记忆 | `engine/memory/maintenance.py` | — | Idle/Daily 生命周期维护 |
 | LLM | `engine/llm/client.py` | 124 | OpenAI-compatible 客户端（重试/流式/prefix cache） |
+| LLM | `engine/llm/replay.py` | — | Provider 响应录制与确定性回放 |
 | 工具 | `engine/tool/registry.py` | 97 | provider 加载、schema、执行与截断 |
-| 工具 | `engine/tool/mcp_client.py` | 151 | MCP 客户端与注册（STDIO + Streamable HTTP） |
+| 工具 | `engine/tool/ledger.py` | — | 副作用调用账本与恢复保护 |
+| 工具 | `engine/tool/snapshot.py` | — | 会话快照 |
+| MCP | `engine/mcp/{client,config,session_pool}.py` | — | MCP 连接、窄参数注册与会话池 |
 | 技能 | `engine/skill/{loader,registry,executor,store}.py` | 326 | SKILL.md 解析/双源注册/注入执行/版本化 |
-| 插件 | `engine/plugin/{registry,trigger,loader}.py` | 286 | manifest 发现/三种触发器/handler 加载 |
 | 安全 | `engine/safety/tool_guard.py` | 296 | ToolGuard + FileGuard |
 | 安全 | `engine/safety/fact_gate.py` | 411 | 事实门禁（LLM 产出事实性校验） |
 | 安全 | `engine/safety/tool_policy.py` | 73 | 工具策略（能力边界声明） |

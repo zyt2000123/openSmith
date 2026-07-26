@@ -22,24 +22,14 @@ browser = ["playwright>=1.50"]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = [
-    "engine",
-    "engine.execution",
-    "engine.observability",
-    "engine.llm",
-    "engine.llm.adapters",
-    "engine.mcp",
-    "engine.memory",
-    "engine.prompt",
-    "engine.safety",
-    "engine.sandbox",
-    "engine.skill",
-    "engine.tool",
-]
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["engine*"]
+exclude = ["engine.tests*"]
+namespaces = false
 
 [tool.setuptools.package-dir]
-engine = "."
+"" = ".."
 
 [tool.setuptools.package-data]
 "engine.memory" = ["MEMORY_POLICY.md"]

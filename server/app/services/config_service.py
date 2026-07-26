@@ -10,11 +10,13 @@ from fastapi import HTTPException
 from common.config import DATA_DIR
 from common.yaml_utils import YamlConfigError, load_yaml, save_yaml
 from engine.llm.factory import normalize_provider_name
-from engine.llm.model_config import validate_llm_base_url
+from engine.llm.model_config import LLMUsage, normalize_legacy_llm_config, validate_llm_base_url
 from engine.llm.contracts import UnsupportedProviderError
 
 
-_USAGES = frozenset(("interactive", "gate", "background"))
+# Derived from the engine's own usage enum, never restated so the public
+# configuration contract stays aligned with the engine's supported routes.
+_USAGES = frozenset(usage.value for usage in LLMUsage)
 _BASE_STRING_FIELDS = ("provider", "api_key", "base_url", "model")
 _VENDOR_FIELD = "vendor"
 _ROUTE_STRING_FIELDS = _BASE_STRING_FIELDS
@@ -170,6 +172,8 @@ class ConfigService:
         if llm is not None:
             if not isinstance(llm, dict):
                 self._invalid("llm configuration must be a mapping")
+            llm = normalize_legacy_llm_config(llm)
+            config["llm"] = llm
             self._validate_stored_llm(llm)
         return config
 
@@ -216,9 +220,12 @@ class ConfigService:
             "configured": configured,
             "has_api_key": bool(llm.get("api_key")),
             "vendor": self._string_or_empty(llm.get("vendor")),
-            "provider": self._string_or_empty(llm.get("provider")) or "openai",
-            "model": self._string_or_empty(llm.get("model")),
-            "base_url": self._string_or_empty(llm.get("base_url")),
+            # Report what the interactive route actually resolves to, not the base
+            # value it may be shadowing. The setup UI edits these three fields, so
+            # showing the base model made a live route override invisible.
+            "provider": self._string_or_empty(effective("provider")) or "openai",
+            "model": self._string_or_empty(effective("model")),
+            "base_url": self._string_or_empty(effective("base_url")),
             "max_output_tokens": llm.get("max_output_tokens"),
             "context_window": llm.get("context_window"),
             "routes": self._public_routes(routes),
@@ -440,6 +447,32 @@ class ConfigService:
         else:
             llm.pop("timeout_profiles", None)
 
+    def _align_interactive_model(self, llm: dict[str, Any], updates: Mapping[str, Any]) -> None:
+        """Drop a ``routes.interactive.model`` left shadowing a base model patch.
+
+        ``get_llm_config`` reports the interactive route's effective model, and the
+        setup UI has no separate field for it -- so a top-level ``model`` patch is
+        the user editing the model they were shown. A stale route override would
+        silently win over it. A patch that names the route model itself is explicit
+        intent and is left alone.
+        """
+        routes_patch = updates.get("routes")
+        if isinstance(routes_patch, Mapping):
+            interactive_patch = routes_patch.get("interactive")
+            if isinstance(interactive_patch, Mapping) and "model" in interactive_patch:
+                return
+        routes = llm.get("routes")
+        if not isinstance(routes, dict):
+            return
+        interactive = routes.get("interactive")
+        if not isinstance(interactive, dict) or "model" not in interactive:
+            return
+        interactive.pop("model")
+        if not interactive:
+            routes.pop("interactive")
+        if not routes:
+            llm.pop("routes")
+
     def set_llm_config(self, *, updates: Mapping[str, Any]) -> dict[str, Any]:
         cfg = self._load_config()
         llm = cfg.setdefault("llm", {})
@@ -479,6 +512,8 @@ class ConfigService:
             self._apply_models_patch(llm, updates["models"])
         if "timeout_profiles" in updates:
             self._apply_timeout_profiles_patch(llm, updates["timeout_profiles"])
+        if "model" in updates and updates["model"] is not None:
+            self._align_interactive_model(llm, updates)
 
         try:
             save_yaml(self._config_path, cfg)
