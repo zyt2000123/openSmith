@@ -55,8 +55,9 @@ logger = logging.getLogger(__name__)
 _MEMORY_POLICY = load_memory_policy()
 _DREAM_OFFSET_FILE = ".dream_offset"
 _DREAM_COMMIT_FILE = ".dream_commit.json"
-# Leave room for the 10K durable baseline inside the review source while still
-# fitting one maximum-sized persisted event without silently deferring it.
+_DREAM_CLEANUP_FILE = ".dream_cleanup.json"
+# Absolute per-batch budget. A producer-valid oversized event is compacted with
+# an explicit marker instead of wedging Dream at the same JSONL line forever.
 MAX_DREAM_EVIDENCE_SOURCE_CHARS = 20_000
 
 
@@ -99,6 +100,19 @@ class DreamCommit:
     end_offset: int
     old_hash: str
     new_hash: str
+
+
+@dataclass(frozen=True)
+class DreamCleanup:
+    """A pending source-log replacement and its post-cleanup checkpoints."""
+
+    cleaned: int
+    old_recent_hash: str
+    new_recent_hash: str
+    compile_offset: int
+    durable_offset: int
+    durable_offset_present: bool
+    dream_offset: int
 
 
 def dream_report_completed(report: DreamReport) -> bool:
@@ -163,6 +177,14 @@ async def run_dream(
         logger.warning("dream recovery failed: %s", recovery_error)
         return report
 
+    cleanup_recovery_error = _recover_dream_cleanup(memory_dir)
+    if cleanup_recovery_error:
+        error = f"cleanup recovery: {cleanup_recovery_error}"
+        report.errors.append(error)
+        _record_dream_failure(memory_dir, error)
+        logger.warning("dream cleanup recovery failed: %s", cleanup_recovery_error)
+        return report
+
     try:
         _sanitize_all_layers(memory_dir, report)
     except Exception as exc:
@@ -206,12 +228,11 @@ async def run_dream(
 
     try:
         audited_offset = _read_dream_offset(memory_dir)
-        cleaned = _cleanup_log(
+        _cleanup_log(
             memory_dir,
             report,
             audited_offset=audited_offset,
         )
-        _write_dream_offset(memory_dir, audited_offset - cleaned)
     except Exception as exc:
         error = f"cleanup: {type(exc).__name__}: {exc}"
         report.errors.append(error)
@@ -283,16 +304,29 @@ def _all_memory_files(memory_dir: Path) -> list[Path]:
 
 
 def _read_dream_offset(memory_dir: Path) -> int:
-    """Read the current-log-relative checkpoint, replaying safely when stale."""
+    """Read a trusted current-log-relative checkpoint or fail closed."""
     path = memory_dir / _DREAM_OFFSET_FILE
-    try:
-        return max(0, int(path.read_text(encoding="utf-8").strip()))
-    except (OSError, ValueError):
+    if not path.exists() and not path.is_symlink():
         return 0
+    if path.is_symlink():
+        raise OSError("Dream offset is unavailable or unsafe")
+    safe_path = safe_file_in_dir(memory_dir, path)
+    if safe_path is None:
+        raise OSError("Dream offset is unavailable or unsafe")
+    try:
+        offset = int(safe_path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OSError("Dream offset is unavailable or unsafe") from exc
+    if offset < 0:
+        raise OSError("Dream offset is unavailable or unsafe")
+    return offset
 
 
 def _write_dream_offset(memory_dir: Path, offset: int) -> None:
-    atomic_write_text(memory_dir / _DREAM_OFFSET_FILE, str(max(0, offset)))
+    path = memory_dir / _DREAM_OFFSET_FILE
+    if path.is_symlink():
+        raise OSError("Dream offset is unavailable or unsafe")
+    atomic_write_text(path, str(max(0, offset)))
 
 
 def _text_hash(text: str) -> str:
@@ -367,6 +401,125 @@ def _clear_dream_commit(memory_dir: Path) -> None:
     (memory_dir / _DREAM_COMMIT_FILE).unlink(missing_ok=True)
 
 
+def _write_dream_cleanup(memory_dir: Path, cleanup: DreamCleanup) -> None:
+    """Journal a source-log replacement before changing any checkpoint."""
+    atomic_write_text(
+        memory_dir / _DREAM_CLEANUP_FILE,
+        json.dumps(
+            {
+                "cleaned": cleanup.cleaned,
+                "old_recent_hash": cleanup.old_recent_hash,
+                "new_recent_hash": cleanup.new_recent_hash,
+                "compile_offset": cleanup.compile_offset,
+                "durable_offset": cleanup.durable_offset,
+                "durable_offset_present": cleanup.durable_offset_present,
+                "dream_offset": cleanup.dream_offset,
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | None]:
+    """Load a trusted pending Dream cleanup without following unsafe links."""
+    path = memory_dir / _DREAM_CLEANUP_FILE
+    if not path.exists() and not path.is_symlink():
+        return None, None
+    safe_path = safe_file_in_dir(memory_dir, path)
+    if safe_path is None:
+        return None, "Dream cleanup is unavailable or unsafe"
+    try:
+        payload = json.loads(safe_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None, "Dream cleanup could not be read"
+    if not isinstance(payload, dict):
+        return None, "Dream cleanup has an invalid format"
+
+    cleaned = payload.get("cleaned")
+    old_recent_hash = payload.get("old_recent_hash")
+    new_recent_hash = payload.get("new_recent_hash")
+    compile_offset = payload.get("compile_offset")
+    durable_offset = payload.get("durable_offset")
+    durable_offset_present = payload.get("durable_offset_present")
+    dream_offset = payload.get("dream_offset")
+    if (
+        isinstance(cleaned, bool)
+        or not isinstance(cleaned, int)
+        or cleaned <= 0
+        or not isinstance(old_recent_hash, str)
+        or not isinstance(new_recent_hash, str)
+        or len(old_recent_hash) != 64
+        or len(new_recent_hash) != 64
+        or isinstance(compile_offset, bool)
+        or not isinstance(compile_offset, int)
+        or compile_offset < 0
+        or isinstance(durable_offset, bool)
+        or not isinstance(durable_offset, int)
+        or durable_offset < 0
+        or not isinstance(durable_offset_present, bool)
+        or isinstance(dream_offset, bool)
+        or not isinstance(dream_offset, int)
+        or dream_offset < 0
+    ):
+        return None, "Dream cleanup has invalid fields"
+    return (
+        DreamCleanup(
+            cleaned,
+            old_recent_hash,
+            new_recent_hash,
+            compile_offset,
+            durable_offset,
+            durable_offset_present,
+            dream_offset,
+        ),
+        None,
+    )
+
+
+def _clear_dream_cleanup(memory_dir: Path) -> None:
+    (memory_dir / _DREAM_CLEANUP_FILE).unlink(missing_ok=True)
+
+
+def _write_dream_cleanup_offsets(memory_dir: Path, cleanup: DreamCleanup) -> None:
+    """Apply journaled post-cleanup checkpoints idempotently."""
+    atomic_write_text(memory_dir / ".compile_offset", str(cleanup.compile_offset))
+    if cleanup.durable_offset_present:
+        atomic_write_text(memory_dir / ".durable_offset", str(cleanup.durable_offset))
+    _write_dream_offset(memory_dir, cleanup.dream_offset)
+
+
+def _recover_dream_cleanup(memory_dir: Path) -> str | None:
+    """Finish an interrupted log cleanup without re-sending audited evidence."""
+    cleanup, cleanup_error = _load_dream_cleanup(memory_dir)
+    if cleanup_error or cleanup is None:
+        return cleanup_error
+
+    recent = safe_file_in_dir(memory_dir, memory_dir / "recent.jsonl")
+    if recent is None:
+        return "recent evidence is unavailable during Dream cleanup recovery"
+    try:
+        current_hash = _text_hash(recent.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return "recent evidence could not be read during Dream cleanup recovery"
+
+    if current_hash == cleanup.old_recent_hash:
+        # The journal reached disk but the source-log replacement did not.
+        try:
+            _clear_dream_cleanup(memory_dir)
+        except OSError:
+            return "stale Dream cleanup could not be cleared"
+        return None
+    if current_hash != cleanup.new_recent_hash:
+        return "recent evidence changed during Dream cleanup recovery"
+
+    try:
+        _write_dream_cleanup_offsets(memory_dir, cleanup)
+        _clear_dream_cleanup(memory_dir)
+    except OSError as exc:
+        return f"Dream cleanup checkpoints could not be recovered: {exc}"
+    return None
+
+
 def _recover_dream_commit(memory_dir: Path, *, allow_uncommitted: bool) -> str | None:
     """Finish a durable write that succeeded before its evidence checkpoint.
 
@@ -390,7 +543,11 @@ def _recover_dream_commit(memory_dir: Path, *, allow_uncommitted: bool) -> str |
     except (OSError, UnicodeError):
         return "durable target could not be read during Dream recovery"
 
-    if current_hash == commit.old_hash:
+    if current_hash == commit.new_hash:
+        # This also covers an accepted no-op consolidation: its old and new
+        # hashes match, but the reviewed decision is already durable.
+        pass
+    elif current_hash == commit.old_hash:
         if allow_uncommitted:
             try:
                 _clear_dream_commit(memory_dir)
@@ -398,10 +555,13 @@ def _recover_dream_commit(memory_dir: Path, *, allow_uncommitted: bool) -> str |
                 return "stale Dream commit could not be cleared"
             return None
         return "durable write was not committed"
-    if current_hash != commit.new_hash:
+    else:
         return "durable target changed outside the pending Dream commit"
 
-    current_offset = _read_dream_offset(memory_dir)
+    try:
+        current_offset = _read_dream_offset(memory_dir)
+    except OSError:
+        return "Dream offset is unavailable or unsafe"
     if current_offset < commit.end_offset:
         recent = safe_file_in_dir(memory_dir, memory_dir / "recent.jsonl")
         if recent is None:
@@ -466,7 +626,16 @@ def _load_dream_evidence(memory_dir: Path) -> DreamEvidence:
         logger.warning("dream could not read recent evidence", exc_info=True)
         return DreamEvidence(0, 0, "", 0, "recent.jsonl could not be read")
 
-    stored_offset = _read_dream_offset(memory_dir)
+    try:
+        stored_offset = _read_dream_offset(memory_dir)
+    except OSError:
+        return DreamEvidence(
+            0,
+            0,
+            "",
+            len(lines),
+            "Dream offset is unavailable or unsafe",
+        )
     start_offset = stored_offset if stored_offset <= len(lines) else 0
     source_parts: list[str] = []
     end_offset = start_offset
@@ -480,15 +649,11 @@ def _load_dream_evidence(memory_dir: Path) -> DreamEvidence:
             end_offset = line_number + 1
             continue
 
-        rendered = _entries_to_source([parsed], summary_limit=1000)
-        if len(rendered) > MAX_DREAM_EVIDENCE_SOURCE_CHARS:
-            return DreamEvidence(
-                start_offset,
-                end_offset,
-                "",
-                len(lines),
-                f"eligible evidence at line {line_number + 1} exceeds Dream input budget",
-            )
+        rendered = _entries_to_source(
+            [parsed],
+            summary_limit=1000,
+            source_limit=MAX_DREAM_EVIDENCE_SOURCE_CHARS,
+        )
         candidate = "\n".join((*source_parts, rendered))
         if len(candidate) > MAX_DREAM_EVIDENCE_SOURCE_CHARS:
             break
@@ -580,6 +745,13 @@ async def _consolidate_durable(
             raise MemoryCompilationError("consolidation output exceeded character budget")
 
         accepted = original_content.strip() + "\n"
+        _write_dream_commit(
+            memory_dir,
+            evidence,
+            old_text=original_content,
+            new_text=consolidated,
+        )
+        commit_written = True
         if consolidated == accepted:
             report.skipped = "durable.md already consolidated"
             append_memory_history(
@@ -593,13 +765,6 @@ async def _consolidate_durable(
             )
             return True
 
-        _write_dream_commit(
-            memory_dir,
-            evidence,
-            old_text=original_content,
-            new_text=consolidated,
-        )
-        commit_written = True
         atomic_write_text(durable_path.with_name("durable.md.bak"), original_content)
         atomic_write_text(durable_path, consolidated)
         append_memory_history(
@@ -673,9 +838,7 @@ def _cleanup_log(
     *,
     audited_offset: int,
 ) -> int:
-    """Truncate recent.jsonl entries that are both before every compile
-    checkpoint AND older than MAX_WINDOW_DAYS, preserving the rolling window.
-    """
+    """Remove only a contiguous expired prefix already consumed everywhere."""
     recent = safe_file_in_dir(memory_dir, memory_dir / "recent.jsonl")
     offset_file = memory_dir / ".compile_offset"
 
@@ -693,11 +856,12 @@ def _cleanup_log(
     if offset <= 0:
         return 0
 
-    lines = recent.read_text(encoding="utf-8").strip().splitlines()
+    source_text = recent.read_text(encoding="utf-8")
+    lines = source_text.strip().splitlines()
     if not lines:
         return 0
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=MAX_WINDOW_DAYS)).isoformat()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_WINDOW_DAYS)
     safe_offset = 0
     for i, line in enumerate(lines[:offset]):
         try:
@@ -708,23 +872,37 @@ def _cleanup_log(
         if not isinstance(entry, dict):
             safe_offset = i + 1
             continue
-        ts = entry.get("timestamp", "")
-        if ts and ts < cutoff:
-            safe_offset = i + 1
+        timestamp = entry.get("timestamp")
+        if not isinstance(timestamp, str) or not timestamp:
+            break
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            break
+        if parsed_timestamp.tzinfo is None:
+            parsed_timestamp = parsed_timestamp.replace(tzinfo=timezone.utc)
+        if parsed_timestamp.astimezone(timezone.utc) >= cutoff:
+            break
+        safe_offset = i + 1
 
     if safe_offset <= 0:
         return 0
 
     remaining = lines[safe_offset:]
-    atomic_write_text(recent, "\n".join(remaining) + "\n" if remaining else "")
-    report.log_lines_cleaned = safe_offset
-
-    atomic_write_text(offset_file, str(max(0, compile_offset - safe_offset)))
-
+    remaining_text = "\n".join(remaining) + "\n" if remaining else ""
     durable_offset_file = memory_dir / ".durable_offset"
-    if durable_offset_file.is_file():
-        atomic_write_text(
-            durable_offset_file,
-            str(max(0, durable_offset - safe_offset)),
-        )
+    cleanup = DreamCleanup(
+        cleaned=safe_offset,
+        old_recent_hash=_text_hash(source_text),
+        new_recent_hash=_text_hash(remaining_text),
+        compile_offset=max(0, compile_offset - safe_offset),
+        durable_offset=max(0, durable_offset - safe_offset),
+        durable_offset_present=durable_offset_file.is_file(),
+        dream_offset=max(0, audited_offset - safe_offset),
+    )
+    _write_dream_cleanup(memory_dir, cleanup)
+    atomic_write_text(recent, remaining_text)
+    _write_dream_cleanup_offsets(memory_dir, cleanup)
+    _clear_dream_cleanup(memory_dir)
+    report.log_lines_cleaned = safe_offset
     return safe_offset

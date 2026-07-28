@@ -1335,6 +1335,37 @@ def test_dream_reconciles_a_maximum_sized_event_without_silent_deferral(
     assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "1"
 
 
+def test_dream_compacts_a_maximum_sized_signal_event_without_wedging(
+    tmp_path: Path,
+) -> None:
+    """A producer-valid signal payload must be reconciled, not retried forever."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    original = DURABLE_DOC.format(
+        evidence="- **Existing**: " + ("accepted durable fact " * 10).strip() + "."
+    )
+    (memory_dir / "durable.md").write_text(original, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps({
+            "task": "maximum-signal-evidence-" + ("x" * 15_900),
+            "summary": "This event must not wedge Dream maintenance.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "scope": "project",
+            "evidence": "user_explicit",
+            "signals": ["signal-" + ("s" * 16_000) for _ in range(16)],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    generator = StaticLLM(original)
+
+    report = asyncio.run(run_dream(memory_dir, generator, reviewer=PassReviewer()))
+
+    assert report.errors == []
+    assert "[... event content omitted from this compilation input ...]" in generator.calls[0][-1]["content"]
+    assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "1"
+
+
 def test_dream_sanitizes_jsonl_evidence_before_sending_it_to_models(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
@@ -1497,6 +1528,116 @@ def test_dream_recovers_an_accepted_durable_write_before_replaying_evidence(
     assert (memory_dir / "durable.md").read_text(encoding="utf-8") == replacement
 
 
+def test_dream_recovers_an_unchanged_accepted_result_without_replaying_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    original = DURABLE_DOC.format(
+        evidence="- **Storage**: Keep the accepted storage decision for this project."
+    )
+    (memory_dir / "durable.md").write_text(original, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps({
+            "task": "accepted evidence with no durable change",
+            "summary": "Keep the accepted storage decision.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "scope": "project",
+            "evidence": "user_explicit",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    original_atomic_write = dream_module.atomic_write_text
+
+    def fail_checkpoint(path: Path, content: str) -> None:
+        if path.name == ".dream_offset":
+            raise OSError("simulated checkpoint failure")
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(dream_module, "atomic_write_text", fail_checkpoint)
+    first = asyncio.run(
+        run_dream(memory_dir, StaticLLM(original), reviewer=PassReviewer())
+    )
+
+    assert first.errors
+    assert (memory_dir / ".dream_commit.json").exists()
+
+    monkeypatch.setattr(dream_module, "atomic_write_text", original_atomic_write)
+
+    class NoReplayLLM:
+        async def chat(self, messages: list[dict], **_: object) -> ChatResponse:
+            raise AssertionError("recovery must not replay accepted evidence")
+
+    second = asyncio.run(
+        run_dream(memory_dir, NoReplayLLM(), reviewer=PassReviewer())  # type: ignore[arg-type]
+    )
+
+    assert second.errors == []
+    assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "1"
+    assert not (memory_dir / ".dream_commit.json").exists()
+
+
+def test_dream_recovers_cleanup_after_log_replacement_without_replaying_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    original = DURABLE_DOC.format(
+        evidence="- **Storage**: Keep the original storage decision for this project."
+    )
+    replacement = DURABLE_DOC.format(
+        evidence="- **Storage**: Use the corrected storage decision for this project."
+    )
+    (memory_dir / "durable.md").write_text(original, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps({
+            "task": "old storage decision correction",
+            "summary": "Use the corrected storage decision for this project.",
+            "timestamp": "2020-01-01T00:00:00+00:00",
+            "kind": "decision",
+            "scope": "project",
+            "evidence": "user_explicit",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (memory_dir / ".compile_offset").write_text("1", encoding="utf-8")
+    (memory_dir / ".durable_offset").write_text("1", encoding="utf-8")
+    original_atomic_write = dream_module.atomic_write_text
+
+    def fail_compile_offset(path: Path, content: str) -> None:
+        if path.name == ".compile_offset":
+            raise OSError("simulated cleanup checkpoint failure")
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(dream_module, "atomic_write_text", fail_compile_offset)
+    first = asyncio.run(
+        run_dream(memory_dir, StaticLLM(replacement), reviewer=PassReviewer())
+    )
+
+    assert first.errors
+    assert (memory_dir / ".dream_cleanup.json").exists()
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == ""
+
+    monkeypatch.setattr(dream_module, "atomic_write_text", original_atomic_write)
+
+    class NoReplayLLM:
+        async def chat(self, messages: list[dict], **_: object) -> ChatResponse:
+            raise AssertionError("cleanup recovery must not replay audited evidence")
+
+    second = asyncio.run(
+        run_dream(memory_dir, NoReplayLLM(), reviewer=PassReviewer())  # type: ignore[arg-type]
+    )
+
+    assert second.errors == []
+    assert not (memory_dir / ".dream_cleanup.json").exists()
+    assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "0"
+    assert (memory_dir / ".durable_offset").read_text(encoding="utf-8") == "0"
+    assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "0"
+
+
 def test_dream_requires_reviewer_before_replacing_durable(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
@@ -1654,6 +1795,36 @@ def test_dream_rejects_recent_evidence_symlink_outside_memory(tmp_path: Path) ->
     assert history[-1]["target"] == "dream"
     assert history[-1]["status"] == "failed"
     assert "recent.jsonl is unavailable or unsafe" in history[-1]["error"]
+
+
+def test_dream_rejects_an_unsafe_checkpoint_symlink(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    durable = DURABLE_DOC.format(
+        evidence="- **Storage**: Keep the original storage decision for this project."
+    )
+    (memory_dir / "durable.md").write_text(durable, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps({
+            "task": "must be audited",
+            "summary": "This evidence must not be skipped.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "scope": "project",
+            "evidence": "user_explicit",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside-offset"
+    outside.write_text("1", encoding="utf-8")
+    (memory_dir / ".dream_offset").symlink_to(outside)
+    generator = StaticLLM(durable)
+
+    report = asyncio.run(run_dream(memory_dir, generator, reviewer=PassReviewer()))
+
+    assert report.errors == ["evidence: Dream offset is unavailable or unsafe"]
+    assert generator.calls == []
+    assert outside.read_text(encoding="utf-8") == "1"
 
 
 def test_dream_records_a_benign_no_evidence_attempt(tmp_path: Path) -> None:
@@ -1851,6 +2022,38 @@ def test_dream_cleanup_respects_lagging_durable_offset(tmp_path: Path) -> None:
     assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "4"
     assert (memory_dir / ".durable_offset").read_text(encoding="utf-8") == "0"
     assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "7"
+
+
+def test_dream_cleanup_keeps_current_entries_before_later_stale_entries(
+    tmp_path: Path,
+) -> None:
+    """Cleanup may only remove a contiguous expired prefix from the source log."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    entries = [
+        {"task": "old-prefix", "summary": "old", "timestamp": "2020-01-01T00:00:00+00:00"},
+        {
+            "task": "current-must-stay",
+            "summary": "current",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+        {"task": "old-after-current", "summary": "old", "timestamp": "2020-01-02T00:00:00+00:00"},
+    ]
+    (memory_dir / "recent.jsonl").write_text(
+        "\n".join(json.dumps(entry) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+    (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
+    (memory_dir / ".compile_offset").write_text("3", encoding="utf-8")
+    (memory_dir / ".durable_offset").write_text("3", encoding="utf-8")
+
+    report = asyncio.run(run_dream(memory_dir, StaticLLM()))
+
+    remaining = (memory_dir / "recent.jsonl").read_text(encoding="utf-8")
+    assert report.log_lines_cleaned == 1
+    assert "old-prefix" not in remaining
+    assert "current-must-stay" in remaining
+    assert "old-after-current" in remaining
 
 
 def test_compile_recent_skips_non_dict_json_lines(tmp_path: Path) -> None:
