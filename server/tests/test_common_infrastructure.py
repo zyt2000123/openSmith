@@ -69,8 +69,9 @@ def test_wheel_data_files_declare_every_bundled_skill() -> None:
 
     ``bundled_skills_dir`` prefers that installed copy, so a skill missing from
     the declaration is absent from a wheel install while still working from a
-    source checkout. setuptools needs one entry per skill (a glob would flatten
-    every ``SKILL.md`` into a single directory), so assert the two stay in sync.
+    source checkout.  Nested reference material may add extra data-file
+    targets, so compare their skill roots with the directories that ship a
+    ``SKILL.md``.
     """
     repo_root = Path(__file__).resolve().parents[2]
     pyproject = tomllib.loads(
@@ -78,7 +79,7 @@ def test_wheel_data_files_declare_every_bundled_skill() -> None:
     )
     prefix = "agent_smith_common/builtin_skills/"
     declared = {
-        target[len(prefix) :]
+        target[len(prefix) :].split("/", 1)[0]
         for target in pyproject["tool"]["setuptools"]["data-files"]
         if target.startswith(prefix)
     }
