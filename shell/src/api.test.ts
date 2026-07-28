@@ -480,3 +480,60 @@ test("streamMessage reassembles a CRLF frame separator split across read chunks"
     globalThis.fetch = originalFetch;
   }
 });
+
+
+// ── Untrusted text is sanitised at the decode boundary (audit P2, security) ──
+
+const ESC_BYTE = String.fromCharCode(27);
+const BEL_BYTE = String.fromCharCode(7);
+
+function sseFrame(event: string, payload: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(payload)}`;
+}
+
+test("SSE decoder strips an OSC 52 clipboard write from assistant text", () => {
+  const attack = `${ESC_BYTE}]52;c;bWFsaWNpb3Vz${BEL_BYTE}here is your answer`;
+
+  const event = decodeSseEvent(sseFrame("message", { text: attack }));
+
+  assert.deepEqual(event, { type: "message", text: "here is your answer" });
+});
+
+test("SSE decoder strips escape sequences from tool output and hints", () => {
+  const result = decodeSseEvent(
+    sseFrame("tool_result", { id: "c1", summary: `${ESC_BYTE}]7;file://x${BEL_BYTE}done` }),
+  );
+  assert.equal((result as { summary: string }).summary, "done");
+
+  const call = decodeSseEvent(
+    sseFrame("tool_call", { id: "c1", name: "shell", hint: `${ESC_BYTE}[2Jls -la` }),
+  );
+  assert.equal((call as { hint: string }).hint, "ls -la");
+});
+
+test("SSE decoder strips escape sequences from streamed drafts and thinking", () => {
+  const draft = decodeSseEvent(
+    sseFrame("provisional_text_delta", { provision_id: "p1", text: `${ESC_BYTE}]0;t${BEL_BYTE}draft` }),
+  );
+  assert.equal((draft as { text: string }).text, "draft");
+
+  const thinking = decodeSseEvent(
+    sseFrame("thinking", { text: `${ESC_BYTE}]52;c;eA==${BEL_BYTE}pondering`, done: true }),
+  );
+  assert.equal((thinking as { text: string }).text, "pondering");
+});
+
+test("SSE decoder keeps an approval reason readable while stripping escapes", () => {
+  const event = decodeSseEvent(
+    sseFrame("approval_required", {
+      run_id: "r1",
+      approval_id: "a1",
+      tool: "shell",
+      level: "execute",
+      reason: `${ESC_BYTE}]52;c;eA==${BEL_BYTE}Approval required for shell`,
+      arguments: {},
+    }),
+  );
+
+  assert.equal((event as { reason: string }).reason, "Approval required for shell");
+});
