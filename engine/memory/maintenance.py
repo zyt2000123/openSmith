@@ -195,13 +195,25 @@ class MemoryMaintenanceService:
         try:
             from engine.memory.dream import dream_report_completed, run_dream
 
-            report = await run_dream(memory_dir, self.llm, reviewer=self.reviewer)
+            report = await asyncio.wait_for(
+                run_dream(memory_dir, self.llm, reviewer=self.reviewer),
+                timeout=_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
+            )
             if not dream_report_completed(report):
                 reason = "; ".join(report.errors) if report.errors else report.skipped
                 logger.warning("conversation-memory Dream did not complete: %s", reason)
                 return False
             return True
-        except Exception:
+        except Exception as exc:
+            try:
+                from engine.memory.dream import _record_dream_failure
+
+                _record_dream_failure(
+                    memory_dir,
+                    f"maintenance: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                logger.warning("could not audit Dream maintenance failure", exc_info=True)
             logger.warning("conversation-memory Dream consolidation failed", exc_info=True)
             return False
 

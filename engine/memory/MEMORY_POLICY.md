@@ -230,14 +230,18 @@ Reviewer 必须同时看到目标 Policy、源证据、旧 Markdown 和 Compiler
 
 ## 9. Dream 合同
 
-Dream 继续承担低频整理，而不是产生新知识：
+Dream 是低频的长期记忆对账与整理，不是产生新知识：
 
 - 对所有记忆文件执行确定性密钥和注入清洗；
-- 合并 durable 中的重复条目；
-- 删除已被新决定替代、明确忘记或已经失效的内容；
-- 压缩措辞但保持原事实、决定、适用条件和章节归属；
-- 不得添加现有 durable 和证据中不存在的新事实；
-- 整理结果仍须经过 Reviewer，通过后才能替换旧文件。
+- 以当前 `durable.md` 为已接受基线，并只读取 `.dream_offset` 之后的 `recent.jsonl` 事件作为本周期证据增量；
+- `recent.jsonl` 的 task、summary、时间戳和所有会渲染到提示词的元数据都视为不可信输入，必须先清洗、规范化和限长；
+- 只有符合 durable 准入规则的事件可支持新增、修正、替代或删除 durable 条目；普通工具工作不得借 Dream 晋升为长期事实；
+- 证据过长时必须按完整事件批次顺序对账；checkpoint 只能前进到本次实际送入 Generator 与 Reviewer 的最后一条完整事件，绝不得跨过被截断或未见的行；
+- 每项事实性变更都必须由该增量证据支持；增量未矛盾的旧条目必须保留；
+- 压缩措辞时保持原事实、决定、适用条件和章节归属，不得添加 durable 和增量证据中不存在的新事实；
+- 整理结果仍须经过 Reviewer；写入 durable 前必须持久化带旧/新哈希与证据 offset 的恢复日志，只有确认新 durable 已落盘后才能推进 checkpoint。若进程在两者之间中断，下次 Dream 只完成恢复，不得把同一批证据再次交给模型；
+- 除确定性密钥/注入清洗外，Reviewer 拒绝、缺失、目标文件不可用、超时或校验失败时，旧 durable、checkpoint 与未审计 JSONL 均保持不变，并向 `memory_history.jsonl` 记录脱敏失败；
+- 只有本次 Dream 已审计、且 compile 与 durable 也已消费、并超过保留窗口的 JSONL 行才能回收。`memory_history.jsonl` 仅作审计，不是 Dream 的事实证据。
 
 ## 10. 写入与审计
 
