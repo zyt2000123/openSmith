@@ -521,6 +521,123 @@ def test_trace_keeps_ordinary_values_intact() -> None:
     assert rendered["arguments"]["cwd"] == "/repo"
 
 
+# ── Third batch: P1-2 / P1-16 / P1-17 ──
+
+def test_colliding_mcp_tool_names_are_all_registered() -> None:
+    """Names that fold together must all survive registration.
+
+    `search-docs` and `search_docs` both clean to `search_docs`, and the loser hit
+    register()'s duplicate-name error and vanished from the session behind a
+    warning — the model silently lost a tool.  Cleaning stays lossy on purpose
+    (`safe-tool` is meant to become `safe_tool`); only the collision is suffixed.
+    """
+    import asyncio
+
+    from engine.mcp.client import MAX_TOOL_NAME_LENGTH, MCPTool, register_mcp_tools_with_prefix
+    from engine.tool.registry import ToolRegistry
+
+    class FakeClient:
+        async def list_tools(self):
+            return [MCPTool("search-docs", "", {}), MCPTool("search_docs", "", {})]
+
+        async def call_tool(self, name, arguments):
+            return name
+
+    async def run():
+        registry = ToolRegistry()
+        count = await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp")
+        return count, sorted(tool.name for tool in registry.list_tools())
+
+    count, names = asyncio.run(run())
+    assert count == 2, f"both tools must register, got {count}: {names}"
+    assert len(set(names)) == 2, f"names must stay distinct: {names}"
+    assert "mcp_search_docs" in names, f"the first name keeps its spelling: {names}"
+    assert all(len(name) <= MAX_TOOL_NAME_LENGTH for name in names), names
+
+
+def test_non_colliding_mcp_tool_name_keeps_its_spelling() -> None:
+    """Dedup must not disturb the ordinary case (existing contract)."""
+    import asyncio
+
+    from engine.mcp.client import MCPTool, register_mcp_tools_with_prefix
+    from engine.tool.registry import ToolRegistry
+
+    class FakeClient:
+        async def list_tools(self):
+            return [MCPTool("safe-tool", "", {})]
+
+        async def call_tool(self, name, arguments):
+            return name
+
+    async def run():
+        registry = ToolRegistry()
+        await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp_docs")
+        return [tool.name for tool in registry.list_tools()]
+
+    assert asyncio.run(run()) == ["mcp_docs_safe_tool"]
+
+
+def test_backtrack_event_carries_the_failure_reason() -> None:
+    """Backtracking must tell the target node why it was sent back.
+
+    Without it the target re-runs against the original request with no signal
+    about what failed, so it reproduces the same output — and FailureLoopGuard
+    counts per skill without resetting, so that is the only correction the
+    pipeline ever gets.
+
+    Source-level assertion, not behavioural: driving a real double-gate-failure
+    backtrack needs a chain plus stub LLM and gates. Stated plainly so nobody
+    mistakes this for proof that the hint reaches the target node.
+    """
+    import inspect
+
+    from engine.execution.pipeline import pipeline as pipeline_module
+
+    lines = inspect.getsource(pipeline_module).splitlines()
+    backtrack_at = next(
+        index for index, line in enumerate(lines) if "EventType.BACKTRACK" in line
+    )
+    emitted = "\n".join(lines[backtrack_at:backtrack_at + 6])
+    assert '"reason"' in emitted, f"BACKTRACK must carry the gate reason:\n{emitted}"
+
+    # The hint must be assigned *before* the jump, mirroring the retry branch.
+    hint_assignments = [
+        index
+        for index, line in enumerate(lines)
+        if "CTX_RETRY_HINT] = gate_result.retry_hint" in line
+    ]
+    assert hint_assignments, "no retry-hint assignment found at all"
+    assert any(index < backtrack_at for index in hint_assignments), (
+        "the retry hint is only set on the retry path, so a backtrack still runs blind"
+    )
+
+
+def test_tool_provider_contract_error_is_logged_visibly(tmp_path: Path, caplog) -> None:
+    """A duplicate tool name must not disappear with only a debug-level trace."""
+    import logging
+
+    from engine.tool.registry import ToolRegistry
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    body = (
+        'TOOL_META = {{"name": "dup_tool", "description": "d", "parameters": {{}}}}\n'
+        "async def execute(**kwargs):\n"
+        "    return {!r}\n"
+    )
+    (tools / "a_first.py").write_text(body.format("first"))
+    (tools / "b_second.py").write_text(body.format("second"))
+
+    registry = ToolRegistry()
+    with caplog.at_level(logging.ERROR):
+        registry.load_providers(tools)
+
+    assert any(
+        "unavailable" in record.message or "unavailable" in record.getMessage()
+        for record in caplog.records
+    ), f"the dropped tool must be reported at ERROR: {[r.getMessage() for r in caplog.records]}"
+
+
 # ── P1-15: approval redaction is weaker than the audit-log redaction ──
 
 def test_approval_redacts_credential_name_variants() -> None:
