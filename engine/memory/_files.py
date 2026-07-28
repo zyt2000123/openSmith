@@ -119,8 +119,15 @@ def contains_secret(text: str) -> bool:
 
 _INJECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(?i)ignore\s+(?:all\s+)?previous\s+instructions"),
-    re.compile(r"(?i)you\s+(?:are|must)\s+now\s+(?:a|an|the)?\s*\w+"),
-    re.compile(r"(?i)(?:^|\s)system\s*:"),
+    # An article is required: "you are now a pirate" is a role change, while
+    # "you are now ready to deploy" is ordinary prose that memory must keep.
+    re.compile(r"(?i)you\s+(?:are|must)\s+now\s+(?:a|an|the)\s+\w+"),
+    # A bare "system:" appears in ordinary notes ("system: darwin 25.5.0").
+    # Only treat it as injection when it introduces an instruction.
+    re.compile(
+        r"(?i)(?:^|\s)system\s*:\s*(?:you\b|your\b|ignore\b|forget\b|"
+        r"disregard\b|act\s+as\b|from\s+now\s+on\b|new\s+\w+\s*:)"
+    ),
     re.compile(r"(?i)new\s+(?:system\s+)?(?:role|instruction|policy)"),
     re.compile(r"(?i)override\s+(?:your|the|all)\s+(?:instructions|rules|policy)"),
     re.compile(r"忽略(?:之前|上面|先前)(?:的)?(?:所有|全部)?(?:指令|指示|规则|提示)"),

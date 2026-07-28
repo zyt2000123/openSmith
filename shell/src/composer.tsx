@@ -52,10 +52,20 @@ export function applyComposerEdit(value: string, cursor: number, input: string, 
   if (key.home) return { value, cursor: 0 };
   if (key.end) return { value, cursor: graphemes.length };
 
-  if (key.backspace || key.delete) {
+  if (key.backspace) {
     if (position === 0) return { value, cursor: position };
     graphemes.splice(position - 1, 1);
     return { value: graphemes.join(""), cursor: position - 1 };
+  }
+
+  // ink 6.8 reported both DEL (0x7f) and Forward Delete (ESC [ 3 ~) as
+  // `key.delete`, so the two could not be told apart and both deleted
+  // backwards. ink 7 maps them separately, and the composer tracks the cursor,
+  // so Forward Delete can finally remove the grapheme ahead of it.
+  if (key.delete) {
+    if (position >= graphemes.length) return { value, cursor: position };
+    graphemes.splice(position, 1);
+    return { value: graphemes.join(""), cursor: position };
   }
 
   if (
@@ -99,13 +109,32 @@ export function Composer({
   const [cursor, setCursor] = useState(() => splitComposerGraphemes(value).length);
   const previousValue = useRef(value);
   const pendingLocalValue = useRef<string | null>(null);
+  // Ink's App.handleReadable drains one stdin chunk in a synchronous `while`
+  // loop, calling the input handler once per parsed event, while React only
+  // re-renders (and so only refreshes the handler's closure) afterwards. A
+  // chunk split by an escape boundary — "abc<ESC>[Adef", an SSH-coalesced
+  // burst, a paste containing ESC — therefore delivered every event after the
+  // first a stale `value`/`cursor`, and each one overwrote the previous edit:
+  // typing that lands as one chunk kept only its final segment. These refs are
+  // the live values; the handler updates them before returning so the next
+  // event in the same chunk sees the edit.
+  const liveValue = useRef(value);
+  const liveCursor = useRef(cursor);
 
   useEffect(() => {
     const length = splitComposerGraphemes(value).length;
     if (pendingLocalValue.current === value) {
       pendingLocalValue.current = null;
-      setCursor((current) => Math.min(current, length));
+      setCursor((current) => {
+        const next = Math.min(current, length);
+        liveCursor.current = next;
+        return next;
+      });
     } else if (previousValue.current !== value) {
+      // Changed from outside (history navigation, slash completion, a cleared
+      // composer after submit): adopt it as the new live state.
+      liveValue.current = value;
+      liveCursor.current = length;
       setCursor(length);
     }
     previousValue.current = value;
@@ -113,14 +142,17 @@ export function Composer({
 
   useInput(
     (input, key) => {
+      const currentValue = liveValue.current;
       if (key.return) {
-        onSubmit?.(value);
+        onSubmit?.(currentValue);
         return;
       }
 
-      const next = applyComposerEdit(value, cursor, input, key);
+      const next = applyComposerEdit(currentValue, liveCursor.current, input, key);
+      liveCursor.current = next.cursor;
       setCursor(next.cursor);
-      if (next.value !== value) {
+      if (next.value !== currentValue) {
+        liveValue.current = next.value;
         pendingLocalValue.current = next.value;
         onChange(next.value);
       }

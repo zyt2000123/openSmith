@@ -68,7 +68,10 @@ function handleSetupInput(key: Key, options: ShellInputOptions): void {
     return;
   }
   if (key.escape && options.configConfigured) {
-    options.getState().set({ mode: "chat", panel: "welcome", inputValue: "", statusLine: "Back." });
+    // "chat", not "welcome": the save path already returns to chat, and from
+    // welcome the history keys do nothing, so Esc appeared to need pressing
+    // twice.
+    options.getState().set({ mode: "chat", panel: "chat", inputValue: "", statusLine: "Back." });
   }
 }
 
@@ -247,9 +250,33 @@ function handleTokenNavigation(key: Key, options: ShellInputOptions): boolean {
   return true;
 }
 
+/**
+ * Whether the approval prompt is on screen and may therefore consume keys.
+ *
+ * The full-screen tokens/runs panels replace the footer that renders it. The
+ * store returns to chat when an approval arrives, so this only covers the
+ * reverse order — a panel opened while an approval was already pending — where
+ * Enter must not approve and Esc must not cancel the run, sight-unseen.
+ */
+function approvalPromptVisible(state: AppStore): boolean {
+  return Boolean(state.pendingApproval) && state.panel !== "tokens" && state.panel !== "runs";
+}
+
+/**
+ * Leave history browsing because the user edited the text themselves.
+ *
+ * `historyDraft` is only snapshotted on the way in (at index -1). If browsing
+ * stayed active through a manual edit, returning to the bottom would restore
+ * that stale draft over the new text and discard it silently.
+ */
+export function exitHistoryBrowsing(state: AppStore): void {
+  if (state.historyIndex === -1) return;
+  state.set({ historyIndex: -1, historyDraft: "" });
+}
+
 export function handleApprovalInput(key: Key, options: ShellInputOptions): boolean {
   const state = options.getState();
-  if (!state.pendingApproval) return false;
+  if (!approvalPromptVisible(state)) return false;
 
   if (key.tab) return true;
 

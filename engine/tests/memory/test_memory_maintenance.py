@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import multiprocessing
 import os
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import engine.memory.maintenance as maintenance_module
 from engine.memory.maintenance import (
     MemoryLifecycleHooks,
     MemoryMaintenanceService,
@@ -207,6 +209,126 @@ def test_memory_idle_hook_uses_same_maintenance_service(tmp_path: Path) -> None:
     results = asyncio.run(run())
 
     assert results == [True]
+
+
+def test_dream_maintenance_retries_when_durable_target_is_unavailable(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    event = (
+        '{"task":"durable correction","summary":"Correct the durable fact.",'
+        '"timestamp":"2026-07-28T00:00:00+00:00","kind":"decision",'
+        '"scope":"project","evidence":"user_explicit"}\n'
+    )
+    (memory_dir / "recent.jsonl").write_text(event, encoding="utf-8")
+    (memory_dir / ".dream_counter").write_text("50", encoding="utf-8")
+
+    result = asyncio.run(MemoryMaintenanceService(StaticLLM()).run_dream(memory_dir))  # type: ignore[arg-type]
+
+    assert result is False
+    assert (memory_dir / ".dream_counter").read_text(encoding="utf-8") == "50"
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == event
+    assert not (memory_dir / ".dream_offset").exists()
+
+
+def test_dream_maintenance_completes_the_reconciliation_cycle(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    original = """# Durable Project Memory
+
+## Confirmed Facts
+- **Storage**: Keep the original storage decision for this project.
+
+## Decisions
+
+## Reusable Procedures
+
+## Known Pitfalls
+"""
+    replacement = """# Durable Project Memory
+
+## Confirmed Facts
+- **Storage**: Use the corrected storage decision for this project.
+
+## Decisions
+
+## Reusable Procedures
+
+## Known Pitfalls
+"""
+    (memory_dir / "durable.md").write_text(original, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        '{"task":"storage correction","summary":"Use the corrected storage decision '
+        'for this project.","timestamp":"2026-07-28T00:00:00+00:00",'
+        '"kind":"decision","scope":"project","evidence":"user_explicit"}\n',
+        encoding="utf-8",
+    )
+    (memory_dir / ".dream_counter").write_text("50", encoding="utf-8")
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            StaticLLM(replacement),
+            reviewer=PassReviewer(),
+        ).run_dream(memory_dir)
+    )
+
+    assert result is True
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == replacement
+    assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "1"
+    assert (memory_dir / ".dream_counter").read_text(encoding="utf-8") == "0"
+
+
+def test_dream_maintenance_times_out_and_preserves_retry_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    durable = """# Durable Project Memory
+
+## Confirmed Facts
+- **Storage**: Keep an accepted storage decision for this project with enough detail.
+
+## Decisions
+
+## Reusable Procedures
+
+## Known Pitfalls
+"""
+    (memory_dir / "durable.md").write_text(durable, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        '{"task":"storage correction","summary":"Correct the storage decision.",'
+        '"timestamp":"2026-07-28T00:00:00+00:00","kind":"decision",'
+        '"scope":"project","evidence":"user_explicit"}\n',
+        encoding="utf-8",
+    )
+    (memory_dir / ".dream_counter").write_text("50", encoding="utf-8")
+    monkeypatch.setattr(
+        maintenance_module,
+        "_MEMORY_MAINTENANCE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    class HangingLLM:
+        async def chat(self, *args, **kwargs) -> ChatResponse:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def run() -> bool:
+        service = MemoryMaintenanceService(HangingLLM(), reviewer=PassReviewer())  # type: ignore[arg-type]
+        return await asyncio.wait_for(service.run_dream(memory_dir), timeout=0.1)
+
+    assert asyncio.run(run()) is False
+    assert (memory_dir / ".dream_counter").read_text(encoding="utf-8") == "50"
+    assert not (memory_dir / ".dream_offset").exists()
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert history[-1]["target"] == "dream"
+    assert history[-1]["status"] == "failed"
+    assert "TimeoutError" in history[-1]["error"]
 
 
 def test_idle_maintenance_retries_pending_work_without_running_below_threshold(
@@ -425,3 +547,56 @@ def test_memory_hook_rebinds_when_runtime_dependencies_change() -> None:
     assert services.hooks is not None
     assert len(services.hooks._handlers) == 1
     assert services.hooks._handlers[0].maintenance.llm is second
+
+
+# ── Deferred maintenance must be observable (dreaming indicator) ──
+
+
+def test_maintenance_status_reports_idle_for_a_fresh_memory_dir(tmp_path):
+    from engine.memory import memory_maintenance_status
+
+    (tmp_path / "memory").mkdir()
+
+    assert memory_maintenance_status(tmp_path / "memory") == {
+        "compile": "idle",
+        "dream": "idle",
+    }
+
+
+def test_maintenance_status_reports_pending_from_the_marker_file(tmp_path):
+    from engine.memory import memory_maintenance_status
+    from engine.memory.maintenance import MemoryMaintenanceService
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    MemoryMaintenanceService._mark_pending("dream", memory_dir)
+
+    status = memory_maintenance_status(memory_dir)
+
+    assert status["dream"] == "pending"
+    assert status["compile"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_status_reports_running_while_a_task_is_in_flight(tmp_path):
+    from engine.memory import memory_maintenance_status
+    from engine.memory.maintenance import MemoryMaintenanceService
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    release = asyncio.Event()
+
+    async def blocked() -> None:
+        await release.wait()
+
+    key = (memory_dir.resolve(), "compile")
+    task = asyncio.create_task(blocked())
+    MemoryMaintenanceService._background_tasks[key] = task
+    try:
+        assert memory_maintenance_status(memory_dir)["compile"] == "running"
+    finally:
+        release.set()
+        await task
+        MemoryMaintenanceService._background_tasks.pop(key, None)
+
+    assert memory_maintenance_status(memory_dir)["compile"] == "idle"

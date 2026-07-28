@@ -6,6 +6,7 @@ import {
   applyStreamEvent,
   createSystemEntry,
   createTurnEntry,
+  interruptLatestTurn,
   removeApprovalNotice,
   restoreTranscript,
   splitTranscript,
@@ -309,4 +310,99 @@ test("splitTranscript keeps the streaming turn and everything after it dynamic",
     active.map((entry) => entry.id),
     [open.id],
   );
+});
+
+// ── Audit 2026-07-26 P1: `done` must converge running blocks ──────────────
+
+function turnWithRunningBlocks(): TranscriptEntry[] {
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, { type: "skill", name: "architecture", status: "start" });
+  entries = applyStreamEvent(entries, { type: "tool_call", id: "c1", name: "shell", hint: "" });
+  return entries;
+}
+
+function statefulBlocks(turn: TurnEntry) {
+  return turn.blocks.filter((block) => block.type === "skill" || block.type === "tool");
+}
+
+test("done converges skill and tool blocks left running", () => {
+  const entries = applyStreamEvent(turnWithRunningBlocks(), {
+    type: "done",
+    status: "completed",
+  });
+
+  const turn = lastTurn(entries);
+  assert.equal(turn.streaming, false);
+  const blocks = statefulBlocks(turn);
+  assert.ok(blocks.length >= 1);
+  for (const block of blocks) {
+    assert.notEqual((block as { state: string }).state, "running", `${block.type} block left running`);
+    // A tool call inside an active skill becomes one of its activities.
+    for (const activity of (block as { activities?: { state: string }[] }).activities ?? []) {
+      assert.notEqual(activity.state, "running", "skill activity left running");
+    }
+  }
+});
+
+test("done maps a failed run onto error state, not cancelled", () => {
+  const entries = applyStreamEvent(turnWithRunningBlocks(), {
+    type: "done",
+    status: "failed",
+  });
+
+  const turn = lastTurn(entries);
+  const skill = statefulBlocks(turn).find((block) => block.type === "skill");
+  assert.equal((skill as { state: string } | undefined)?.state, "error");
+});
+
+test("done leaves already settled blocks untouched", () => {
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, { type: "tool_call", id: "c1", name: "shell", hint: "" });
+  entries = applyStreamEvent(entries, {
+    type: "tool_result",
+    id: "c1",
+    error: false,
+    blocked: false,
+    preflight: false,
+    summary: "ok",
+  });
+  entries = applyStreamEvent(entries, { type: "done", status: "completed" });
+
+  const turn = lastTurn(entries);
+  const tool = statefulBlocks(turn).find((block) => block.type === "tool");
+  assert.equal((tool as { state: string } | undefined)?.state, "success");
+});
+
+// ── Audit 2026-07-26 P2: a cancelled turn must keep the text the server stores ──
+
+test("interrupt freezes the visible draft as assistant text", () => {
+  // The server persists visible_provisional_reply as the assistant message, so
+  // erasing it here would leave the user with a blank turn while the stored
+  // session, and the next request's history, held text they never read.
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, {
+    type: "provisional_text_delta",
+    provisionId: "p1",
+    text: "partial answer",
+  });
+
+  const interrupted = interruptLatestTurn(entries, "cancelled");
+
+  const turn = lastTurn(interrupted);
+  assert.equal(turn.assistantText, "partial answer");
+  assert.deepEqual(turn.provisional, []);
+});
+
+test("interrupt does not overwrite committed assistant text with a draft", () => {
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, { type: "message", text: "committed" });
+  entries = applyStreamEvent(entries, {
+    type: "provisional_text_delta",
+    provisionId: "p1",
+    text: "draft",
+  });
+
+  const turn = lastTurn(interruptLatestTurn(entries, "error"));
+
+  assert.equal(turn.assistantText, "committed");
 });

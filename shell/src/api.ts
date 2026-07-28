@@ -1,4 +1,5 @@
 import { localAuthHeaders } from "./auth.js";
+import { sanitizeTerminalText, sanitizeUnknownText } from "./sanitize.js";
 import { parseSmithUiPayload, type SmithUiPayload } from "./smith-ui-schema.js";
 
 export const CONTEXT_DISPLAY_WINDOW = 128_000;
@@ -123,6 +124,13 @@ export type ContextUsage = {
 };
 
 export type StreamTerminalStatus = "completed" | "failed" | "incomplete";
+
+export type MaintenanceState = "idle" | "pending" | "running";
+
+export type MemoryMaintenance = {
+  compile: MaintenanceState;
+  dream: MaintenanceState;
+};
 
 export type RunState = {
   run_id: string;
@@ -261,7 +269,11 @@ export type LlmConfigInput = {
 };
 
 function buildUrl(baseUrl: string, pathname: string): string {
-  return new URL(pathname, `${baseUrl.replace(/\/$/, "")}/`).toString();
+  // Resolve as a relative reference: `new URL("/api/x", "http://gw/smith/")`
+  // discards `/smith`, so behind a sub-path reverse proxy the health probe
+  // (which concatenates strings and keeps the prefix) passed while every real
+  // request 404'd.
+  return new URL(pathname.replace(/^\//, ""), `${baseUrl.replace(/\/$/, "")}/`).toString();
 }
 
 async function request<T>(baseUrl: string, pathname: string, options: RequestOptions = {}): Promise<T> {
@@ -440,11 +452,24 @@ export type Message = {
 };
 
 export async function listMessages(baseUrl: string, sessionId: string): Promise<Message[]> {
-  return request<Message[]>(baseUrl, `/api/agent/sessions/${sessionId}/messages`);
+  const messages = await request<Message[]>(baseUrl, `/api/agent/sessions/${sessionId}/messages`);
+  // Restored history is model-authored too, and it reaches the terminal through
+  // the same renderers as live output — sanitise it on the same boundary.
+  return messages.map((message) => ({ ...message, content: sanitizeTerminalText(message.content) }));
 }
 
 export async function listSkills(baseUrl: string): Promise<SkillSummary[]> {
   return request<SkillSummary[]>(baseUrl, "/api/agent/skills");
+}
+
+/**
+ * Deferred memory maintenance state.
+ *
+ * Compilation and dreaming run as background tasks that outlive the turn that
+ * scheduled them, so no per-run SSE stream can carry their state — it is polled.
+ */
+export async function fetchMemoryMaintenance(baseUrl: string): Promise<MemoryMaintenance> {
+  return request<MemoryMaintenance>(baseUrl, "/api/agent/memory/status");
 }
 
 export async function setSkillEnabled(baseUrl: string, skillName: string, enabled: boolean): Promise<SkillSummary> {
@@ -577,7 +602,11 @@ function parseSseChunk(rawChunk: string): ParsedSseChunk | null {
     }
     return { eventName, payload: payload as Record<string, unknown> };
   } catch {
-    throw new Error(`Invalid JSON in SSE ${eventName} event.`);
+    // Without a sample there is no way to learn what the server actually sent.
+    // Sanitised and bounded: the payload is untrusted and reaches a terminal.
+    throw new Error(
+      `Invalid JSON in SSE ${eventName} event: ${sanitizeTerminalText(dataLines.join("\n")).slice(0, 200)}`,
+    );
   }
 }
 
@@ -626,7 +655,7 @@ function smithUiFallback(payload: Record<string, unknown>, defaultReason: string
 }
 
 const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
-  message: (payload) => ({ type: "message", text: String(payload.text ?? "") }),
+  message: (payload) => ({ type: "message", text: sanitizeUnknownText(payload.text) }),
   smith_ui: (payload) => {
     const parsed = parseSmithUiPayload(payload);
     return parsed ? { type: "smith_ui", payload: parsed } : smithUiFallback(payload, "Unsupported smith-ui payload");
@@ -641,7 +670,7 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
       approvalId: String(payload.approval_id ?? ""),
       tool: String(payload.tool ?? "tool"),
       level: String(payload.level ?? "execute"),
-      reason: String(payload.reason ?? "Approval required"),
+      reason: sanitizeUnknownText(payload.reason) || "Approval required",
       arguments: objectPayload(payload.arguments),
       ...(presentation ? { presentation } : {}),
     };
@@ -649,7 +678,7 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
   provisional_text_delta: (payload) => ({
     type: "provisional_text_delta",
     provisionId: String(payload.provision_id ?? ""),
-    text: String(payload.text ?? ""),
+    text: sanitizeUnknownText(payload.text),
   }),
   provisional_commit: (payload) => ({
     type: "provisional_commit",
@@ -658,18 +687,18 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
   provisional_retract: (payload) => ({
     type: "provisional_retract",
     provisionId: String(payload.provision_id ?? ""),
-    reason: String(payload.reason ?? ""),
+    reason: sanitizeUnknownText(payload.reason),
   }),
   thinking: (payload) => ({
     type: "thinking",
-    text: String(payload.text ?? ""),
+    text: sanitizeUnknownText(payload.text),
     done: Boolean(payload.done),
   }),
   tool_call: (payload) => ({
     type: "tool_call",
     id: String(payload.id ?? ""),
-    name: String(payload.name ?? "tool"),
-    hint: String(payload.hint ?? ""),
+    name: sanitizeUnknownText(payload.name) || "tool",
+    hint: sanitizeUnknownText(payload.hint),
   }),
   tool_result: (payload) => ({
     type: "tool_result",
@@ -677,7 +706,7 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     error: Boolean(payload.error),
     blocked: Boolean(payload.blocked),
     preflight: Boolean(payload.preflight),
-    summary: String(payload.summary ?? ""),
+    summary: sanitizeUnknownText(payload.summary),
   }),
   skill: (payload) => ({
     type: "skill",
@@ -700,15 +729,9 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     tool_schema_tokens: Number(payload.tool_schema_tokens ?? 0),
     protocol_tokens: Number(payload.protocol_tokens ?? 0),
     effective_context_window: Number(
-      payload.effective_context_window
-      ?? payload.context_window
-      ?? CONTEXT_DISPLAY_WINDOW,
+      payload.effective_context_window ?? payload.context_window ?? CONTEXT_DISPLAY_WINDOW,
     ),
-    safe_input_budget: Number(
-      payload.safe_input_budget
-      ?? payload.context_window
-      ?? CONTEXT_DISPLAY_WINDOW,
-    ),
+    safe_input_budget: Number(payload.safe_input_budget ?? payload.context_window ?? CONTEXT_DISPLAY_WINDOW),
     output_reserve: Number(payload.output_reserve ?? 0),
     safety_margin: Number(payload.safety_margin ?? 0),
     window_declared: Boolean(payload.window_declared ?? false),

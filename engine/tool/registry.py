@@ -500,6 +500,7 @@ class ToolRegistry:
                 call_id=call.id,
                 tool_name=tool_name,
                 idempotency_key=idempotency_key,
+                idempotent=defn.idempotent,
             )
             if decision.result is not None:
                 return decision.result
@@ -582,7 +583,9 @@ class ToolRegistry:
 
         defn, func = entry
         if self._tool_guard is not None:
-            decision = self._tool_guard.check(call)
+            # The ReAct loop already evaluated and audited this call; this is a
+            # backstop for internal callers, so it must not log a second time.
+            decision = self._tool_guard.check(call, audit=False)
             authorization = self._authorized_call.get()
             authorized = (
                 authorization is not None

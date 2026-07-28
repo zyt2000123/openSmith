@@ -62,9 +62,23 @@ type ServerTarget = {
   preferredPort: number;
 };
 
+const SERVER_TERMINATION_GRACE_MS = 1_000;
+const STDERR_KEEP_CHUNKS = 40;
+const STDERR_TAIL_LINES = 8;
+const STDERR_TAIL_CHARS = 800;
+
+/** Last few stderr lines, bounded, for a startup-failure message. */
+function stderrTail(chunks: string[]): string {
+  const text = chunks.join("").trimEnd();
+  if (!text) return "";
+  const tail = text.split("\n").slice(-STDERR_TAIL_LINES).join("\n");
+  return tail.length > STDERR_TAIL_CHARS ? tail.slice(-STDERR_TAIL_CHARS) : tail;
+}
+
 type LaunchedServer = {
   child: ChildProcess;
   getSpawnError: () => Error | undefined;
+  getStderrTail: () => string;
 };
 
 let ownedServer: ChildProcess | null = null;
@@ -77,8 +91,23 @@ function sleep(ms: number): Promise<void> {
 }
 
 function cleanupOwnedServer(): void {
-  if (ownedServer?.exitCode === null) ownedServer.kill("SIGTERM");
+  const child = ownedServer;
   ownedServer = null;
+  if (!child || child.exitCode !== null) return;
+
+  // SIGTERM alone left a busy uvicorn running as an orphan holding the port,
+  // so the next /reconnect failed for a reason nothing reported. kill() returns
+  // false when the signal could not be delivered at all.
+  if (!child.kill("SIGTERM")) {
+    child.kill("SIGKILL");
+    return;
+  }
+  // These handlers run on process exit, where waiting is not an option, so the
+  // follow-up is best-effort and unref'd.
+  const escalation = setTimeout(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }, SERVER_TERMINATION_GRACE_MS);
+  escalation.unref?.();
 }
 
 function registerCleanup(): void {
@@ -149,14 +178,16 @@ async function compatibilityIssue(baseUrl: string): Promise<string | null> {
 
 async function inspectExistingServer(
   target: ServerTarget,
-): Promise<{ healthy: boolean; connection: ServerConnection | null }> {
+): Promise<{ healthy: boolean; connection: ServerConnection | null; issue?: string }> {
   const healthy = await isHealthy(target.baseUrl);
   if (!healthy) return { healthy: false, connection: null };
 
   const issue = await compatibilityIssue(target.baseUrl);
   if (!issue) return { healthy: true, connection: { baseUrl: target.baseUrl, started: false } };
   if (target.envOverride) throw new Error(`Configured SMITH_SERVER_URL points to an incompatible server: ${issue}`);
-  return { healthy: true, connection: null };
+  // The same reason was already computed here; the default path used to drop it
+  // and start a second server with no explanation of why the first was rejected.
+  return { healthy: true, connection: null, issue };
 }
 
 async function isCompatibleServer(baseUrl: string): Promise<boolean> {
@@ -200,17 +231,33 @@ function launchLocalServer(baseUrl: string): LaunchedServer {
 
   const child = spawn("uv", ["run", "uvicorn", "app.main:app", "--port", port], {
     cwd: serverDir,
-    stdio: "ignore",
+    // stderr is piped, not ignored: first startup is where a port clash, a
+    // broken venv or an import error shows up, and discarding uvicorn's own
+    // message left the user with "exited before becoming healthy" and no way to
+    // diagnose it. Bounded so a chatty server cannot grow this without limit.
+    stdio: ["ignore", "ignore", "pipe"],
     env: { ...process.env, PYTHONUNBUFFERED: "1" },
   });
   let spawnError: Error | undefined;
   child.once("error", (error) => {
     spawnError = error;
   });
+  const diagnostics: string[] = [];
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    diagnostics.push(chunk);
+    if (diagnostics.length > STDERR_KEEP_CHUNKS) diagnostics.splice(0, diagnostics.length - STDERR_KEEP_CHUNKS);
+  });
 
   ownedServer = child;
   registerCleanup();
-  return { child, getSpawnError: () => spawnError };
+  return { child, getSpawnError: () => spawnError, getStderrTail: () => stderrTail(diagnostics) };
+}
+
+/** Append the server's own stderr, which is usually the whole diagnosis. */
+function withServerDiagnostics(message: string, launch: LaunchedServer): string {
+  const tail = launch.getStderrTail();
+  return tail ? `${message}\n\nServer output:\n${tail}` : message;
 }
 
 async function waitForCompatibleServer(
@@ -236,13 +283,13 @@ async function waitForCompatibleServer(
       throw new Error(`Could not launch the local Smith server: ${spawnError.message}`);
     }
     if (launch.child.exitCode !== null) {
-      throw new Error("Local server exited before becoming healthy.");
+      throw new Error(withServerDiagnostics("Local server exited before becoming healthy.", launch));
     }
     await sleep(500);
   }
 
   cleanupOwnedServer();
-  throw new Error("Timed out while starting the local Smith server.");
+  throw new Error(withServerDiagnostics("Timed out while starting the local Smith server.", launch));
 }
 
 export async function ensureLocalServer(): Promise<ServerConnection> {
@@ -253,5 +300,14 @@ export async function ensureLocalServer(): Promise<ServerConnection> {
 
   const baseUrl = await launchUrl(target, existing.healthy);
   const launch = launchLocalServer(baseUrl);
-  return waitForCompatibleServer(baseUrl, launch, existing.healthy);
+  const connection = await waitForCompatibleServer(baseUrl, launch, existing.healthy);
+  if (!existing.issue) return connection;
+  // Say why the server already on the port was not used, instead of silently
+  // starting a second one.
+  return {
+    ...connection,
+    note: connection.note
+      ? `${connection.note} (${existing.issue})`
+      : `Started an isolated shell server on ${baseUrl}; the server already running was incompatible: ${existing.issue}.`,
+  };
 }

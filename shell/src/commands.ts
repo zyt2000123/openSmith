@@ -37,7 +37,6 @@ const HELP_TEXT = [
   "- `/trace [run-id]` — diagnose the latest run or a specific Run",
   "- `/skills` — inspect or run a standard SKILL.md skill",
   "- `/skill <name> [prompt]` — arm a skill, or run it straight away with a prompt",
-  "- `/approve`, `/deny` — answer a pending approval without leaving the composer",
   "- `/hooks` — inspect runtime lifecycle hooks",
   "- `/mcp` — inspect configured MCP servers and tools",
   "- `/resume [session-id]` — recover the latest interrupted run, or open a session; use `/resume run <run-id>` for a specific run",
@@ -303,12 +302,6 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
     }
   },
   "/config": (args, context) => openConfig(args, context),
-  "/approve": async (_args, context) => {
-    await context.bridge.resolveApproval(true);
-  },
-  "/deny": async (_args, context) => {
-    await context.bridge.resolveApproval(false);
-  },
   "/skills": (_args, context) => {
     const state = context.getState();
     state.set({ panel: "skill-actions", inputValue: "", skillActionIndex: 0, statusLine: "Choose an action." });

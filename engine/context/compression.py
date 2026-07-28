@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_PRUNED_MARKER = "[pruned]"
 PRUNE_PROTECT_TURNS = 2
 PRUNE_PROTECT_THRESHOLD_CHARS = 8000
 PRUNE_MIN_CHARS = 2000
@@ -55,7 +56,10 @@ def prune_tool_outputs(
             if turns < protect_turns:
                 continue
             content = msg.get("content", "")
-            if isinstance(content, str) and "[pruned]" in content:
+            # Exact match, not substring: a real tool output that merely
+            # mentions the marker (grepping this repo does) would otherwise
+            # stop pruning early.
+            if content == _PRUNED_MARKER:
                 break
             char_count = len(content) if isinstance(content, str) else 0
             total_chars += char_count
@@ -67,7 +71,7 @@ def prune_tool_outputs(
         return 0
 
     for msg in to_prune:
-        msg["content"] = "[pruned]"
+        msg["content"] = _PRUNED_MARKER
 
     return pruned_chars
 

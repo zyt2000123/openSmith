@@ -3,7 +3,7 @@ import { Box, Text } from "ink";
 import { Fragment, memo, type ReactNode, useEffect, useState } from "react";
 
 import type { ToolActivity } from "./activity.js";
-import type { ContextUsage, TokenUsage } from "./api.js";
+import { type ContextUsage, fetchMemoryMaintenance, type MemoryMaintenance, type TokenUsage } from "./api.js";
 import { BORDER, ERROR, GIT, MODEL, MUTED, PROJECT, SESSION, SUCCESS, WARNING } from "./theme.js";
 import type { TranscriptViewMode } from "./transcript-state.js";
 import { useWindowSize } from "./window-size.js";
@@ -195,6 +195,58 @@ function useGitBranch(cwd: string): string | null {
   return branch;
 }
 
+export const MEMORY_POLL_INTERVAL_MS = 10_000;
+
+/**
+ * Poll deferred memory maintenance.
+ *
+ * Compilation and dreaming are background tasks that outlive the turn that
+ * scheduled them, so they cannot ride a per-run SSE stream. They are minute-
+ * scale, so a coarse poll is enough; a failed probe reports nothing rather than
+ * an error, because an indicator must never be the reason a shell looks broken.
+ */
+function useMemoryMaintenance(baseUrl: string): MemoryMaintenance | null {
+  const [maintenance, setMaintenance] = useState<MemoryMaintenance | null>(null);
+
+  useEffect(() => {
+    if (!baseUrl) return;
+    let alive = true;
+    const refresh = () => {
+      void fetchMemoryMaintenance(baseUrl).then(
+        (next) => {
+          if (alive) setMaintenance(next);
+        },
+        () => {
+          if (alive) setMaintenance(null);
+        },
+      );
+    };
+    refresh();
+    const timer = setInterval(refresh, MEMORY_POLL_INTERVAL_MS);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [baseUrl]);
+
+  return maintenance;
+}
+
+/**
+ * The label for ambient memory work, or null when there is nothing to show.
+ *
+ * Running work outranks owed work, and dreaming outranks compiling: dreaming is
+ * the rarer, longer, more expensive pass, so it is the one worth naming.
+ */
+export function memoryMaintenanceLabel(maintenance: MemoryMaintenance | null): string | null {
+  if (!maintenance) return null;
+  if (maintenance.dream === "running") return "dreaming";
+  if (maintenance.compile === "running") return "compiling memory";
+  if (maintenance.dream === "pending") return "dream queued";
+  if (maintenance.compile === "pending") return "memory queued";
+  return null;
+}
+
 function segmentKey(segment: HudSegment): string {
   return [segment.text, segment.color ?? "", segment.bold ? "bold" : ""].join(":");
 }
@@ -234,13 +286,22 @@ function countedToolParts(counts: Record<string, number>, marker: string, color:
     ]);
 }
 
-function collectToolParts(activity: ToolActivity): HudPart[] {
+function memoryParts(maintenance: MemoryMaintenance | null): HudPart[] {
+  const label = memoryMaintenanceLabel(maintenance);
+  if (!label) return [];
+  // Ambient, not an activity: memory work belongs to the agent, not to this
+  // turn, so it reads as a dim aside rather than a tool result.
+  return [[{ text: `☾ ${label}`, color: MUTED }]];
+}
+
+function collectToolParts(activity: ToolActivity, maintenance: MemoryMaintenance | null): HudPart[] {
   return [
     ...runningToolParts(activity.running),
     ...countedToolParts(activity.successes, "✓", SUCCESS, 4),
     ...countedToolParts(activity.blocked, "⛔", WARNING, 2),
     ...countedToolParts(activity.preflight, "◆", WARNING, 2),
     ...countedToolParts(activity.errors, "!", ERROR, 2),
+    ...memoryParts(maintenance),
   ];
 }
 
@@ -294,6 +355,7 @@ export const StatusHud = memo(function StatusHud(options: {
   model: string;
   projectName: string;
   cwd: string;
+  baseUrl: string;
   sessionId?: string;
   turnCount: number;
   viewMode: TranscriptViewMode;
@@ -303,9 +365,10 @@ export const StatusHud = memo(function StatusHud(options: {
 }) {
   const { columns } = useWindowSize();
   const gitBranch = useGitBranch(options.cwd);
+  const maintenance = useMemoryMaintenance(options.baseUrl);
   const maxWidth = Math.max(1, columns - 4);
   const headerLines = wrapParts(buildHeaderParts({ ...options, gitBranch }), maxWidth);
-  const activityLines = wrapParts(collectToolParts(options.toolActivity), maxWidth);
+  const activityLines = wrapParts(collectToolParts(options.toolActivity, maintenance), maxWidth);
 
   return (
     <Box flexDirection="column">

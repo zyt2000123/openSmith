@@ -24,7 +24,7 @@ import { Composer } from "./composer.js";
 import { loadHistory, saveHistory } from "./history.js";
 import { LIFECYCLE_HOOKS } from "./hooks.js";
 import { RunProgress, StatusHud } from "./hud.js";
-import { useShellInput } from "./input.js";
+import { exitHistoryBrowsing, useShellInput } from "./input.js";
 import {
   getCategorizedVisibleList,
   getVisibleList,
@@ -571,6 +571,7 @@ type ShellFooterProps = {
   skillMentions: SkillSummary[];
   skillMentionIndex: number;
   viewMode: TranscriptViewMode;
+  baseUrl: AppStore["baseUrl"];
   config: AppStore["config"];
   selectedModelProfile: AppStore["selectedModelProfile"];
   currentSession: AppStore["currentSession"];
@@ -781,6 +782,7 @@ function ShellFooter(props: ShellFooterProps) {
         model={props.selectedModelProfile || props.config?.model || "-"}
         projectName={path.basename(PROJECT_CWD)}
         cwd={PROJECT_CWD}
+        baseUrl={props.baseUrl}
         sessionId={props.currentSession?.id}
         tokenUsage={props.tokenUsage}
         contextUsage={props.contextUsage}
@@ -846,11 +848,6 @@ async function submitWhileBusy(
   slashIndex: number,
 ): Promise<void> {
   if (input.startsWith("/")) {
-    if (input === "/approve" || input === "/deny") {
-      await runShellCommand(input, { bridge, exit: () => {}, getState, workingDir: PROJECT_CWD });
-      rememberSubmittedInput(input);
-      return;
-    }
     if (!completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
       getState().set({ statusLine: `${input} is unavailable while Smith is working. Press Esc to cancel the run.` });
     }
@@ -893,7 +890,15 @@ async function submitChat(
   skillMentionIndex: number,
   exit: () => void,
 ): Promise<void> {
-  if (!acceptsComposerSubmission(panel)) return;
+  if (!acceptsComposerSubmission(panel)) {
+    // The list panels keep accepting characters, so Enter looked broken: it was
+    // rejected here without a word, leaving the user to discover on their own
+    // that the composer has to be cleared with Esc first.
+    if (value.trim()) {
+      getState().set({ statusLine: "Press Esc to leave this panel before sending a message." });
+    }
+    return;
+  }
   const input = value.trim();
   if (!input) return;
 
@@ -981,6 +986,7 @@ function SmithApp() {
   const pendingSkill = useS((state) => state.pendingSkill);
   const queuedMessages = useS((state) => state.queuedMessages);
   const viewMode = useS((state) => state.viewMode);
+  const baseUrl = useS((state) => state.baseUrl);
   const transcript = useS((state) => state.transcript);
   const transcriptEpoch = useS((state) => state.transcriptEpoch);
   const turnCount = useS((state) => state.turnCount);
@@ -1013,7 +1019,10 @@ function SmithApp() {
 
   const activeSetupField = setupFieldAt(setupIndex, setupFlow);
   const slashItems = useMemo(() => filterSlash(buildSlashItems(), inputValue), [inputValue]);
-  const slashMenuOpen = mode === "chat" && inputValue.startsWith("/");
+  // Panel-scoped input is not chat input: typing "/" while a list panel is open
+  // used to open the slash palette and take over the arrows, Tab and Esc that
+  // the panel needs.
+  const slashMenuOpen = mode === "chat" && acceptsComposerSubmission(panel) && inputValue.startsWith("/");
   const skillMentionMenuOpen = mode === "chat" && isSkillMentionQuery(inputValue);
   const skillMentions = useMemo(() => filterSkillMentions(skills, inputValue), [inputValue, skills]);
   const visibleSkills = useMemo(() => {
@@ -1051,6 +1060,9 @@ function SmithApp() {
   }, [isFullScreenPanel]);
   const handleInputChange = useCallback(
     (value: string) => {
+      // Typing ends history browsing, so the stale draft captured on the way
+      // in cannot later overwrite what was just typed.
+      exitHistoryBrowsing(getState());
       if (panel !== "chat") {
         getState().set({ inputValue: value, skillsIndex: 0 });
         return;
@@ -1167,6 +1179,7 @@ function SmithApp() {
           <ShellFooter
             activeSetupField={activeSetupField}
             approvalIndex={approvalIndex}
+            baseUrl={baseUrl}
             approvalResolving={approvalResolving}
             modelPicker={modelPicker}
             busy={busy}

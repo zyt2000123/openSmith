@@ -202,6 +202,29 @@ function appendTranscript(state: AppState, entry: TranscriptEntry): Partial<AppS
   return boundedTranscript(state, [...state.transcript, entry]);
 }
 
+/**
+ * Close out an approval once its tool reports back.
+ *
+ * On denial or the server's 300s timeout the engine emits a tool_result and
+ * nothing else, so without this the prompt lingered as a zombie whose Enter
+ * 404'd and whose Esc killed the whole run. Approvals are strictly serial — the
+ * engine blocks in broker.wait — so the next tool_result is always this call's.
+ *
+ * Written as a pass over the computed update rather than another branch inside
+ * applyStreamState, which is already at its complexity budget.
+ */
+function clearApprovalOnToolResult(state: AppState, event: StreamEvent, next: Partial<AppState>): Partial<AppState> {
+  if (event.type !== "tool_result" || !state.pendingApproval) return next;
+
+  return {
+    ...next,
+    pendingApproval: null,
+    approvalResolving: false,
+    statusLine: "",
+    transcript: removeApprovalNotice(next.transcript ?? state.transcript, state.pendingApproval.approvalId),
+  };
+}
+
 function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState> {
   if (event.type === "token_usage") {
     return {
@@ -241,7 +264,10 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
       pendingApproval: null,
       approvalResolving: false,
       recoverableRunId: event.status === "completed" ? null : (event.runId ?? state.recoverableRunId),
-      toolActivity: applyToolActivity(state.toolActivity, event),
+      // A tool whose result never arrived would otherwise stay in the running
+      // map for the rest of the session, leaving the HUD spinner on for every
+      // later turn.  The transcript converges the same blocks on done.
+      toolActivity: cancelRunningToolActivity(applyToolActivity(state.toolActivity, event)),
       transcript: state.pendingApproval
         ? removeApprovalNotice(transcript, state.pendingApproval.approvalId)
         : transcript,
@@ -261,6 +287,10 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
       pendingApproval: event,
       approvalIndex: 0,
       approvalResolving: false,
+      // The full-screen tokens/runs panels replace the footer that renders the
+      // approval prompt, so leaving the panel up would ask the user to approve
+      // a tool call they cannot see.  Return to chat and let them read it.
+      ...(state.panel === "tokens" || state.panel === "runs" ? { panel: "chat" as const } : {}),
       statusLine: "Approval required. Review the request and choose Allow or Deny.",
       toolActivity: applyToolActivity(state.toolActivity, event),
       // The only stream event that appends an entry, so it needs the same bound
@@ -362,8 +392,9 @@ export function createAppStore(initialHistory: string[] = []) {
         ...appendTranscript(s, createTurnEntry(userText)),
         turnCount: s.turnCount + 1,
         turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        toolActivity: { ...s.toolActivity, calls: {}, running: {} },
       })),
-    applyEvent: (event) => set((state) => applyStreamState(state, event)),
+    applyEvent: (event) => set((state) => clearApprovalOnToolResult(state, event, applyStreamState(state, event))),
     closeTurn: () => set((s) => ({ transcript: closeLatestTurn(s.transcript) })),
     interruptTurn: (outcome) =>
       set((s) => ({

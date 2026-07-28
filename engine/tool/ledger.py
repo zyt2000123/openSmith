@@ -126,7 +126,21 @@ class ToolExecutionLedger:
         finally:
             connection.close()
 
-    def begin(self, *, call_id: str, tool_name: str, idempotency_key: str) -> ToolLedgerDecision:
+    def begin(
+        self,
+        *,
+        call_id: str,
+        tool_name: str,
+        idempotency_key: str,
+        idempotent: bool = False,
+    ) -> ToolLedgerDecision:
+        """Claim one logical side effect, or replay/refuse a prior attempt.
+
+        An *idempotent* tool declares that repeating the operation reaches the
+        same end state, so an uncertain prior attempt may be retried instead of
+        being refused for the rest of the run.  A completed attempt is still
+        replayed from its recorded result rather than executed again.
+        """
         now = self._now()
         connection = self._connect()
         try:
@@ -147,7 +161,19 @@ class ToolExecutionLedger:
                 return ToolLedgerDecision(claimed=True)
 
             status, content, is_error, error_kind, side_effect_status = row
-            connection.commit()
+            if status != "completed" and idempotent:
+                # Reclaim inside the same transaction that observed the row, so
+                # two concurrent retries cannot both take the claim.
+                reclaimed = connection.execute(
+                    "UPDATE tool_executions SET status=?, call_id=?, updated_at=? "
+                    "WHERE run_id=? AND idempotency_key=? AND status=?",
+                    ("running", call_id, now, self.run_id, idempotency_key, status),
+                ).rowcount
+                connection.commit()
+                if reclaimed:
+                    return ToolLedgerDecision(claimed=True)
+            else:
+                connection.commit()
             if status == "completed":
                 return ToolLedgerDecision(
                     claimed=False,

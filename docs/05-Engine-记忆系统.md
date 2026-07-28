@@ -145,21 +145,36 @@ compile_context → compile_recent → compile_durable
 - `.fp_context`、`.fp_recent`、`.fp_durable`：输入指纹；
 - `.compile_offset`：本轮完整编译进度；
 - `.durable_offset`：长期记忆已经消费到的事件行；
+- `.dream_offset`：当前 `recent.jsonl` 中已经被成功 Dream 对账的事件行；只在完整证据批次通过后前进，日志截断后按剩余行数同步回退；缺失时从零开始，链接、损坏或负值状态会失败关闭并保留计数重试；
+- `.dream_commit.json`：durable 已审核替换、但对应 `.dream_offset` 尚未确认时的恢复日志；只保存旧/新哈希和行 offset，不保存记忆正文；
+- `.dream_cleanup.json`：`recent.jsonl` 已审计前缀的回收日志，保存旧/新日志哈希和 compile、durable、Dream 的目标 offset；启动时优先完成它，避免日志已截断而 offset 尚未同步时重放证据；
 - `.compile_counter`：普通事件编译计数器。
 
 `recent.md` 始终基于完整滚动窗口重建，不从 compile offset 截断；`durable.md` 始终从 durable offset 增量读取。只有成功消费的层才更新自己的指纹或 offset，失败后下次继续重试。
 
 ## 7. Dream
 
-Dream 继续沿用每 50 个有效 turn 的低频机制，只整理，不创造新知识：
+Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆的**对账闭环**，而不只是文案压缩：
+
+```text
+当前 durable.md
+  + recent.jsonl[.dream_offset:]
+  → 清洗所有字段并切成完整 durable 证据批次
+  → 每批 Generator 生成校正稿 → Reviewer 审核与确定性校验
+  → 每个审核通过结果先写 .dream_commit.json（包括文本未变化）
+  → 备份并原子替换 durable.md（若有变化）
+  → 确认 durable 哈希后推进该批 .dream_offset
+  → 所有批次完成后，先写 .dream_cleanup.json，再替换 JSONL 并按日志同步三个 offset
+```
 
 1. 对 `context.md`、`recent.md`、`durable.md` 和 episodes 做确定性密钥与注入清洗；
-2. 按 MemoryPolicy 合并 durable 重复项、删除已替代内容并压缩措辞；
-3. 使用 Reviewer 审核整理结果；
-4. 通过后备份并原子替换；失败则保留旧 durable；
-5. 在 compile 与 durable offset 都已消费且事件超过窗口后清理旧 JSONL 行。
+2. 将当前 durable 作为已接受基线，把两次成功 Dream 之间的 JSONL 增量作为唯一的事实性变更证据；普通 `work` 事件不能通过 Dream 晋升为长期记忆；所有渲染字段（含 `evidence` 等元数据）都先经过安全清洗；
+3. 增量超过输入预算时按完整事件批次依次处理。单个合法事件超过输入预算时会生成带明确省略标记的有界安全投影，而不是失败或无限重试；一个 checkpoint 只覆盖已经送入 Generator 和 Reviewer 的事件投影，未见行不会被跳过；
+4. Generator 只能保留、补充、修正或删除有证据支持的条目；未被增量矛盾的旧条目必须保留；
+5. Reviewer、结构、预算、路径和安全校验全部通过后，先写入恢复日志（即使 durable 文本未变化）；确认目标 durable 哈希后才推进该批 checkpoint。若 checkpoint 写入中断，下次仅根据恢复日志完成 checkpoint，不重新调用模型；
+6. 清理上限是 `min(compile_offset, durable_offset, 本次 Dream 已审计 offset)`，且只清理连续的过期前缀。清理前写入 `.dream_cleanup.json`，其中含旧/新日志哈希与三个目标 offset；若中断，下次先恢复 cleanup journal，再读取任何新证据，避免丢失、跳过或重放。
 
-`.dream_counter` 只在 Dream 完整成功或属于正常无事可做时归零；审核失败会保留计数，等待下一次维护。
+`MemoryMaintenanceService` 对 Dream 使用有界维护超时；超时、证据不可读、恢复/清理失败都会保留计数供重试，并写入脱敏 `memory_history.jsonl`。`memory_history.jsonl` 仅记录哈希、状态和错误，不能作为 Dream 的事实证据。
 
 ## 8. 召回与 Prompt 组装
 
@@ -185,7 +200,7 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，只整理，不创造�
 | `memory/compile.py` | 视图筛选、Compiler/Reviewer 调用、指纹与 offset |
 | `memory/_review.py` | 通用生成—审核重试协议 |
 | `memory/history.py` | 追加脱敏审计记录 |
-| `memory/dream.py` | 低频清洗、整理和日志回收 |
+| `memory/dream.py` | 低频清洗、durable 与事件增量对账、checkpoint 和受限日志回收 |
 | `memory/user_learner.py` | 只产出稳定偏好信号，不写 Markdown |
 | `memory/maintenance.py` | 生命周期锁、超时，以及由执行层注入的 LLM 依赖 |
 | `prompt/assembler.py` | 组合已接受的记忆，不理解编译规则 |
@@ -214,11 +229,12 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，只整理，不创造�
 5. Reviewer 拒绝、缺失或超时时，旧文件和指纹不变，并产生审计记录。
 6. `recent.md` 在 3–7 天窗口为空时被清除。
 7. durable offset 防止旧事件重复合并。
-8. Dream 不增加现有 durable 无法支持的事实。
-9. 正常回答不读取 `recent.jsonl` 或 `memory_history.jsonl`。
-10. durable 不整份常驻，只按当前问题召回匹配条目。
-11. `SMITH.md` 永远不被自动学习修改。
-12. engine、server 回归测试与 wheel package-data 校验通过。
+8. Dream 只根据当前 durable 与 `.dream_offset` 后的 JSONL 证据校正；审核失败时 durable、checkpoint 和未审计日志不变。
+9. Dream 的单个超大合法事件会以显式有界投影被处理，不会永久阻塞 checkpoint；审核通过但文本未变、durable 替换和 JSONL cleanup 的中断都不得触发同一证据的模型重放。
+10. 正常回答不读取 `recent.jsonl` 或 `memory_history.jsonl`。
+11. durable 不整份常驻，只按当前问题召回匹配条目。
+12. `SMITH.md` 永远不被自动学习修改。
+13. engine、server 回归测试与 wheel package-data 校验通过。
 
 ## 12. 当前限制
 
@@ -227,4 +243,4 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，只整理，不创造�
 - 事件分类使用小型确定性信号集；复杂隐含偏好只有在重复启发式命中或用户明确表达后才进入正式记忆。
 - `.bak` 只保存上一个版本；完整变更轨迹依赖 `memory_history.jsonl` 的哈希和原始证据日志。
 
-当前实现基线：2026-07-13。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/memory/test_memory_policy.py` 与 `engine/tests/memory/test_memory_pipeline.py` 为准。
+当前实现基线：2026-07-28。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/memory/test_memory_policy.py`、`engine/tests/memory/test_memory_pipeline.py` 与 `engine/tests/memory/test_memory_maintenance.py` 为准。

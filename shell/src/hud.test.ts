@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildRunProgressParts, formatElapsed } from "./hud.js";
+import { buildRunProgressParts, formatElapsed, memoryMaintenanceLabel } from "./hud.js";
 import { MUTED } from "./theme.js";
 
 test("formats active run duration for the status HUD", () => {
@@ -33,4 +33,25 @@ test("keeps the existing compact progress line when no token usage is available"
     { text: "(0s", color: MUTED },
     { text: ")", color: MUTED },
   ]);
+});
+
+// ── Ambient memory maintenance (dreaming indicator) ──
+
+test("memory label names the running pass, dreaming first", () => {
+  assert.equal(memoryMaintenanceLabel({ compile: "running", dream: "running" }), "dreaming");
+  assert.equal(memoryMaintenanceLabel({ compile: "running", dream: "idle" }), "compiling memory");
+});
+
+test("memory label prefers running work over queued work", () => {
+  assert.equal(memoryMaintenanceLabel({ compile: "running", dream: "pending" }), "compiling memory");
+});
+
+test("memory label reports queued work when nothing is running", () => {
+  assert.equal(memoryMaintenanceLabel({ compile: "pending", dream: "pending" }), "dream queued");
+  assert.equal(memoryMaintenanceLabel({ compile: "pending", dream: "idle" }), "memory queued");
+});
+
+test("memory label shows nothing when idle or unavailable", () => {
+  assert.equal(memoryMaintenanceLabel({ compile: "idle", dream: "idle" }), null);
+  assert.equal(memoryMaintenanceLabel(null), null);
 });

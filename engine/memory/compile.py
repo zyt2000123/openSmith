@@ -207,27 +207,38 @@ def _entries_to_source(
         summary, _, _ = sanitize_memory_text(str(entry.get("summary", "?")))
         if summary_limit is not None:
             summary = _truncate_source(summary, summary_limit)
-        metadata = ", ".join(
-            f"{key}={entry[key]}"
-            for key in ("kind", "scope", "evidence", "status", "reason")
-            if entry.get(key)
-        )
+        metadata_parts = []
+        for key in ("kind", "scope", "evidence", "status", "reason"):
+            value = _safe_source_metadata(entry.get(key))
+            if value:
+                metadata_parts.append(f"{key}={value}")
+        metadata = ", ".join(metadata_parts)
         signals = entry.get("signals")
         if isinstance(signals, list):
             safe_signals = []
             for signal in signals:
-                cleaned, _, _ = sanitize_memory_text(str(signal))
+                cleaned = _safe_source_metadata(signal)
                 if cleaned.strip():
                     safe_signals.append(cleaned.strip())
             if safe_signals:
                 metadata = ", ".join(filter(None, (metadata, f"signals={safe_signals}")))
         metadata_suffix = f" ({metadata})" if metadata else ""
+        timestamp = _safe_source_metadata(entry.get("timestamp", "?"), limit=64) or "?"
         lines.append(
-            f"- [{str(entry.get('timestamp', '?'))[:16]}]{metadata_suffix} {task}: {summary}"
+            f"- [{timestamp[:16]}]{metadata_suffix} {task}: {summary}"
         )
 
     source = "\n".join(lines)
     return _truncate_source(source, source_limit) if source_limit is not None else source
+
+
+def _safe_source_metadata(value: object, *, limit: int = 500) -> str:
+    """Render untrusted JSONL metadata as a bounded, prompt-safe scalar."""
+    if value is None:
+        return ""
+    cleaned, _, _ = sanitize_memory_text(str(value))
+    normalized = " ".join(cleaned.split())
+    return _truncate_source(normalized, limit) if len(normalized) > limit else normalized
 
 
 _RECENT_KINDS = {

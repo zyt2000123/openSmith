@@ -143,3 +143,94 @@ test("failed runs retain their id for recovery while completed runs clear it", (
   store.getState().applyEvent({ type: "done", runId: "run-2", status: "completed" });
   assert.equal(store.getState().recoverableRunId, null);
 });
+
+// ── Audit 2026-07-26 P1: approval must never arrive behind a hidden panel ──
+
+const APPROVAL = {
+  type: "approval_required" as const,
+  runId: "r1",
+  approvalId: "a1",
+  tool: "shell",
+  level: "execute",
+  reason: "Approval required for shell",
+  arguments: {},
+};
+
+test("approval_required returns from a full-screen panel to chat", () => {
+  const store = createAppStore();
+  store.getState().set({ panel: "tokens" });
+
+  store.getState().applyEvent(APPROVAL);
+
+  assert.equal(store.getState().panel, "chat");
+  assert.equal(store.getState().pendingApproval?.approvalId, "a1");
+});
+
+test("approval_required leaves a non-full-screen panel alone", () => {
+  const store = createAppStore();
+  store.getState().set({ panel: "welcome" });
+
+  store.getState().applyEvent(APPROVAL);
+
+  assert.equal(store.getState().panel, "welcome");
+});
+
+test("done clears the running tool activity map", () => {
+  const store = createAppStore();
+  store.getState().applyEvent({ type: "tool_call", id: "c1", name: "shell", hint: "" });
+  assert.equal(Object.keys(store.getState().toolActivity.running).length, 1);
+
+  store.getState().applyEvent({ type: "done", status: "completed" });
+
+  assert.deepEqual(store.getState().toolActivity.running, {});
+});
+
+// ── Audit 2026-07-26 P3: approval and per-turn activity bookkeeping ──
+
+test("a tool result ends the approval phase", () => {
+  // On denial or the server's 300s timeout the engine reports a tool_result and
+  // nothing else, so without this the prompt stayed on screen as a zombie whose
+  // Enter 404'd and whose Esc killed the whole run.
+  const store = createAppStore();
+  store.getState().applyEvent(APPROVAL);
+  assert.ok(store.getState().pendingApproval);
+
+  store.getState().applyEvent({
+    type: "tool_result",
+    id: "c1",
+    error: false,
+    blocked: true,
+    preflight: false,
+    summary: "Approval timed out",
+  });
+
+  assert.equal(store.getState().pendingApproval, null);
+  assert.equal(store.getState().approvalResolving, false);
+});
+
+test("a new turn clears per-call activity but keeps cumulative counts", () => {
+  // Gateways that number call ids sequentially reuse "call_0" every turn; a
+  // settled entry from the previous turn made the new call return early, so the
+  // HUD showed no spinner and counted no success.
+  const store = createAppStore();
+  store.getState().applyEvent({ type: "tool_call", id: "call_0", name: "shell", hint: "" });
+  store.getState().applyEvent({
+    type: "tool_result",
+    id: "call_0",
+    error: false,
+    blocked: false,
+    preflight: false,
+    summary: "ok",
+  });
+  assert.equal(store.getState().toolActivity.successes.shell, 1);
+
+  store.getState().pushTurn("next question");
+
+  assert.deepEqual(store.getState().toolActivity.calls, {});
+  assert.deepEqual(store.getState().toolActivity.running, {});
+  assert.equal(store.getState().toolActivity.successes.shell, 1, "cumulative counts must survive");
+
+  // The reused id is now tracked again instead of being ignored.
+  store.getState().applyEvent({ type: "tool_call", id: "call_0", name: "shell", hint: "" });
+  assert.equal(Object.keys(store.getState().toolActivity.running).length, 1);
+});

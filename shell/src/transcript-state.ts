@@ -127,6 +127,11 @@ function appendProvisionalText(provisional: ProvisionalText[], provisionId: stri
   return next;
 }
 
+/** Concatenate a turn's visible drafts, matching what the server persists. */
+function provisionalToText(provisional: ProvisionalText[]): string {
+  return provisional.map((item) => item.text).join("");
+}
+
 function updateLastTurn(entries: TranscriptEntry[], updater: (turn: TurnEntry) => TurnEntry): TranscriptEntry[] {
   const index = findLastTurnIndex(entries);
   if (index === -1) {
@@ -332,10 +337,16 @@ export function closeLatestTurn(entries: TranscriptEntry[]): TranscriptEntry[] {
 export function interruptLatestTurn(
   entries: TranscriptEntry[],
   outcome: Extract<ToolState, "cancelled" | "error">,
+  fallbackSummary?: string,
 ): TranscriptEntry[] {
-  const fallback = outcome === "cancelled" ? "Cancelled before completion." : "Request failed before completion.";
+  const fallback =
+    fallbackSummary ?? (outcome === "cancelled" ? "Cancelled before completion." : "Request failed before completion.");
   return updateLastTurn(entries, (turn) => ({
     ...turn,
+    // The server persists whatever draft was visible as the assistant message.
+    // Erasing it here would show the user an empty turn while the stored
+    // session — and the next request's history — held text they never saw.
+    assistantText: turn.assistantText || provisionalToText(turn.provisional),
     blocks: finishThinkingBlocks(turn.blocks).map((block) => {
       if (block.type === "tool" && block.state === "running") {
         return { ...block, state: outcome, summary: block.summary || fallback };
@@ -549,7 +560,13 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
       return entries;
 
     case "done":
-      return closeLatestTurn(entries);
+      // Several legitimate server sequences end a turn without a terminal
+      // event for every block: a pipeline node skipped after a backtrack gets
+      // no SKILL_END, and an exception between TOOL_CALL_START and its result
+      // is smoothed into done(failed).  Closing the turn without converging
+      // those blocks leaves a permanent "running" card burned into <Static>.
+      if (event.status === "failed") return interruptLatestTurn(entries, "error");
+      return interruptLatestTurn(entries, "cancelled", "Ended without a result.");
   }
 }
 
