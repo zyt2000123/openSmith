@@ -27,6 +27,22 @@ export function splitComposerGraphemes(value: string): string[] {
   return Array.from(value);
 }
 
+/** A CSI sequence, or the shorter two-byte ESC form; pasted terminal output carries these. */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching them is the point
+const ANSI_SEQUENCE = /\u001b\[[0-9;?]*[\u0020-\u002f]*[\u0040-\u007e]|\u001b[\u0040-\u005a\u005c-\u005f]/g;
+const LINE_BREAK = /\r\n?|\n/g;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching them is the point
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/g;
+
+/**
+ * Reduce a raw input chunk to text this single-line composer can render safely:
+ * terminal escapes are dropped, line breaks fold into spaces, and any remaining
+ * control byte is removed so it can never reach Ink's renderer.
+ */
+export function sanitizeComposerInput(input: string): string {
+  return input.replace(ANSI_SEQUENCE, "").replace(LINE_BREAK, " ").replace(CONTROL_CHARACTER, "");
+}
+
 export function applyComposerEdit(value: string, cursor: number, input: string, key: Key): ComposerEdit {
   const graphemes = splitComposerGraphemes(value);
   const position = Math.min(Math.max(0, cursor), graphemes.length);
@@ -59,17 +75,14 @@ export function applyComposerEdit(value: string, cursor: number, input: string, 
     return { value, cursor: position };
   }
 
-  const inserted = splitComposerGraphemes(input);
-  // Ink presents a terminal paste as one multi-grapheme input chunk.  Keep the
-  // composer to preserve ordinary key entry, but deliberately reject that
-  // batch input now that paste support has been removed.
-  const hasControlCharacter = Array.from(input).some((character) => {
-    const codePoint = character.codePointAt(0);
-    return codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f);
-  });
-  if (inserted.length !== 1 || hasControlCharacter) {
+  // Ink delivers a terminal paste - and an IME word commit - as one
+  // multi-grapheme chunk, so the chunk itself carries no signal about intent.
+  // Accept the text and strip what must never reach the renderer instead.
+  const sanitized = sanitizeComposerInput(input);
+  if (!sanitized) {
     return { value, cursor: position };
   }
+  const inserted = splitComposerGraphemes(sanitized);
   graphemes.splice(position, 0, ...inserted);
   return { value: graphemes.join(""), cursor: position + inserted.length };
 }
