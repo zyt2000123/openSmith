@@ -99,12 +99,12 @@ server (FastAPI + CLI)
 engine (execution) ◄── agents (identity, skills, tools, safety)
       │
       ▼
-common (config, SQLite, filesystem)
+common (paths, YAML, SQLite, filesystem)
 ```
 
 | Layer | What It Does |
 |---|---|
-| `common/` | Config, SQLite WAL, filesystem, logging — zero business logic |
+| `common/` | Paths, YAML configuration, SQLite connection, filesystem resources — zero business logic |
 | `engine/` | Task routing, skill chains, ReAct loop, LLM adapters, memory, tools, safety |
 | `agents/` | Smith identity, pipelines, built-in skills, tool providers, safety rules |
 | `server/` | FastAPI app, service orchestration, agent/session lifecycle, CLI |

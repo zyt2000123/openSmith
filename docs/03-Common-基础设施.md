@@ -1,6 +1,6 @@
 # 03 · Common 基础设施
 
-本文档是 `common/` 模块的完整参考文档，涵盖每个文件、每个函数、每个常量的行为说明。
+本文档描述 `common/` 当前对上层暴露的基础设施契约：路径、私有运行目录、SQLite 连接、YAML 配置，以及随安装包分发的内置技能资源。
 
 ---
 
@@ -12,10 +12,11 @@
 - **配置常量** — 上层模块所需的全局路径常量
 - **SQLite 连接管理** — 异步数据库连接的单例与生命周期
 - **YAML 工具** — 配置文件的安全读写与深度合并
+- **内置技能资源** — 从安装包或源码树发现、同步 Smith 自带技能到私有运行目录
 
 ### 1.1 零业务逻辑原则
 
-`common/` 不包含任何业务逻辑。它不知道什么是 Agent、Session、Skill 或 Memory。它只提供文件系统路径、数据库连接和配置解析工具。
+`common/` 不包含 Agent、Session、Memory、路由或技能执行等业务逻辑。它只提供文件系统路径、数据库连接和配置解析工具；对 `SKILL.md` 的识别仅用于同步随 Smith 分发的文件资源，不解析技能语义也不参与路由。
 
 ### 1.2 禁止上向依赖
 
@@ -53,6 +54,7 @@ common/
 |------|-----|------|
 | `PROJECT_ROOT_ENV` | `"AGENT_SMITH_PROJECT_ROOT"` | 环境变量名，用于显式指定项目根目录 |
 | `PRIVATE_DIR_MODE` | `0o700` | 目录权限模式。Owner 可读/可写/可执行，其他用户无任何权限 |
+| `PRIVATE_FILE_MODE` | `0o600` | 私有文件权限。Owner 可读/可写，其他用户无任何权限 |
 
 ### 3.2 `_default_project_root() -> Path`
 
@@ -143,16 +145,16 @@ def defaults(cls) -> "AppPaths":
 | `sqlite_path` | `data_dir` | `~/.agent-smith/sqlite/agent-smith.sqlite` | SQLite 数据库文件路径 |
 | `smith_profile_dir` | `project_root` | `<repo>/agents/smith/` | Smith 内置身份种子目录 |
 | `builtin_identities_dir` | `project_root` | `<repo>/agents/identities/` | YAML 领域身份目录 |
-| `builtin_skills_dir` | `project_root` | `<repo>/agents/skills/` | 内置技能定义目录 |
+| `builtin_skills_dir` | `data_dir` | `~/.agent-smith/builtin/skills/` | Smith 管理的、已同步的内置技能目录；不属于用户可编辑的 `agent/skills/` |
+| `bundled_skills_dir` | 安装包优先，源码树回退 | `<python-data>/agent_smith_common/builtin_skills/` 或 `<repo>/agents/skills/` | 内置技能的只读分发来源 |
 | `builtin_tools_dir` | `project_root` | `<repo>/agents/tools/` | 内置工具定义目录 |
 | `safety_rules_path` | `project_root` | `<repo>/agents/safety/dangerous_commands.json` | 危险命令安全规则文件 |
-| `builtin_plugins_dir` | `project_root` | `<repo>/agents/plugins/` | 内置插件目录 |
-| `user_plugins_dir` | `data_dir` | `~/.agent-smith/plugins/` | 用户自装插件目录 |
 
 路径按归属可分两组：
 
-- **数据侧** (`data_dir` 派生)：`agent_dir`、`sqlite_path`、`user_plugins_dir` — 运行时产生的用户数据
-- **源码侧** (`project_root` 派生)：`smith_profile_dir`、`builtin_identities_dir`、`builtin_skills_dir`、`builtin_tools_dir`、`safety_rules_path`、`builtin_plugins_dir` — 仓库内随代码分发的内容
+- **数据侧** (`data_dir` 派生)：`agent_dir`、`sqlite_path`、`builtin_skills_dir` — 用户数据、SQLite 文件和 Smith 管理的运行时技能副本
+- **源码侧** (`project_root` 派生)：`smith_profile_dir`、`builtin_identities_dir`、`builtin_tools_dir`、`safety_rules_path` — 仓库内随代码分发的内容
+- **分发来源**：`bundled_skills_dir` 优先使用 wheel 安装的 data files；仅在开发源码树中回退到 `agents/skills/`
 
 #### 3.4.3 `ensure_base_dirs() -> None`
 
@@ -161,15 +163,18 @@ def ensure_base_dirs(self) -> None:
     _ensure_private_dir(self.data_dir)
     _ensure_private_dir(self.agent_dir)
     _ensure_private_dir(self.sqlite_path.parent)
+    self._install_builtin_skills()
 ```
 
-确保三个关键数据目录存在且权限为 `0o700`：
+确保三个关键数据目录存在且权限为 `0o700`，并同步内置技能：
 
 1. `~/.agent-smith/` — 数据根目录
 2. `~/.agent-smith/agent/` — Agent 实例目录
 3. `~/.agent-smith/sqlite/` — SQLite 数据库所在目录
+4. 从 `bundled_skills_dir` 中找出包含顶层 `SKILL.md` 的目录，复制到 `~/.agent-smith/builtin/skills/`
+5. 删除该目标目录中不再属于当前分发集合的技能目录，并写入权限为 `0o600` 的 `.manifest.json`
 
-注意：只创建数据侧目录。源码侧目录（`agents/smith/`、`agents/skills/` 等）由仓库本身提供，不在此创建。
+wheel 安装时，分发来源是 `sysconfig.get_path("data")` 下的 `agent_smith_common/builtin_skills/`；源码开发时才回退到仓库的 `agents/skills/`。若分发来源不存在，技能同步安全地跳过。`agent/skills/` 仍保留给用户安装的技能，不会被此同步覆盖。
 
 ---
 
@@ -196,8 +201,6 @@ BUILTIN_IDENTITIES_DIR = PATHS.builtin_identities_dir
 BUILTIN_SKILLS_DIR = PATHS.builtin_skills_dir
 BUILTIN_TOOLS_DIR = PATHS.builtin_tools_dir
 SAFETY_RULES_PATH = PATHS.safety_rules_path
-BUILTIN_PLUGINS_DIR = PATHS.builtin_plugins_dir
-USER_PLUGINS_DIR = PATHS.user_plugins_dir
 ```
 
 导出的常量与 `AppPaths` 属性一一对应：
@@ -210,11 +213,9 @@ USER_PLUGINS_DIR = PATHS.user_plugins_dir
 | `SQLITE_PATH` | `sqlite_path` | `~/.agent-smith/sqlite/agent-smith.sqlite` |
 | `SMITH_PROFILE_DIR` | `smith_profile_dir` | `<repo>/agents/smith/` |
 | `BUILTIN_IDENTITIES_DIR` | `builtin_identities_dir` | `<repo>/agents/identities/` |
-| `BUILTIN_SKILLS_DIR` | `builtin_skills_dir` | `<repo>/agents/skills/` |
+| `BUILTIN_SKILLS_DIR` | `builtin_skills_dir` | `~/.agent-smith/builtin/skills/` |
 | `BUILTIN_TOOLS_DIR` | `builtin_tools_dir` | `<repo>/agents/tools/` |
 | `SAFETY_RULES_PATH` | `safety_rules_path` | `<repo>/agents/safety/dangerous_commands.json` |
-| `BUILTIN_PLUGINS_DIR` | `builtin_plugins_dir` | `<repo>/agents/plugins/` |
-| `USER_PLUGINS_DIR` | `user_plugins_dir` | `~/.agent-smith/plugins/` |
 
 ### 4.2 `ensure_dirs() -> None`
 
@@ -271,7 +272,8 @@ async def get_db() -> aiosqlite.Connection:
 3. 设置 `db.row_factory = aiosqlite.Row` — 查询结果以 `Row` 对象返回（支持按列名访问）
 4. 执行 `PRAGMA journal_mode=WAL` — 启用 Write-Ahead Logging，允许读写并发
 5. 执行 `PRAGMA foreign_keys=ON` — 启用外键约束（SQLite 默认关闭外键）
-6. 若初始化过程中任何步骤抛异常，立即 `await db.close()` 关闭连接后重新抛出
+6. 执行 `PRAGMA busy_timeout=5000` — Server 与 Shell 共享数据库文件时，写竞争最多等待 5 秒而非立即报 `database is locked`
+7. 若初始化过程中任何步骤抛异常，立即 `await db.close()` 关闭连接后重新抛出
 
 ### 5.3 `close_db() -> None`
 
@@ -286,7 +288,7 @@ async def close_db() -> None:
 3. 将 `_db` 引用取出、置 `None`
 4. 调用 `await db.close()`
 
-先置 `None` 再 `close()` 的顺序确保：即使 `close()` 耗时较长，其他协程在此期间调用 `get_db()` 会看到 `_db is None` 并创建新连接，而不会拿到一个正在关闭的连接。
+先置 `None` 再 `close()` 的顺序确保后续调用不会返回一个正在关闭的连接。`_db_lock` 会让发现 `_db is None` 的并发 `get_db()` 等待关闭完成，再串行创建新连接。
 
 ### 5.4 WAL 模式说明
 
@@ -306,8 +308,8 @@ Agent-Smith 作为本地单用户应用，WAL 模式的主要收益是允许 Fas
 
 | 常量 | 值 | 含义 |
 |------|-----|------|
-| `PRIVATE_DIR_MODE` | `0o700` | 目录权限（与 `paths.py` 中独立定义，值相同） |
-| `PRIVATE_FILE_MODE` | `0o600` | 文件权限。Owner 可读可写，其他用户无任何权限 |
+| `PRIVATE_DIR_MODE` | `0o700` | 从 `paths.py` 导入的目录权限常量 |
+| `PRIVATE_FILE_MODE` | `0o600` | 从 `paths.py` 导入的私有文件权限常量。Owner 可读可写，其他用户无任何权限 |
 
 ### 6.2 `YamlConfigError`
 
@@ -331,7 +333,7 @@ def _ensure_private_parent(path: Path) -> None:
     path.chmod(PRIVATE_DIR_MODE)
 ```
 
-与 `paths.py` 中的 `_ensure_private_dir` 功能相同，是独立实现。参数语义略有不同：此函数的调用者传入的是"文件所在目录的路径"（即 `p.parent`），而非文件路径本身。
+与 `paths.py` 中的 `_ensure_private_dir` 使用同一套权限常量，但封装为文件父目录的初始化操作。调用者传入的是文件所在目录（即 `p.parent`），而非文件路径本身。
 
 ### 6.4 `load_yaml(path: Path | str) -> dict[str, Any]`
 
@@ -476,10 +478,10 @@ yaml_utils.py ──────→ (无内部依赖)
 | 契约 | 具体要求 |
 |------|---------|
 | 路径稳定性 | `SMITH_PROFILE_DIR`、`BUILTIN_SKILLS_DIR` 等路径在进程生命周期内不变 |
-| 数据库可用性 | `get_db()` 返回已启用 WAL 和外键约束的连接 |
+| 数据库可用性 | `get_db()` 返回已启用 WAL、外键和 5 秒 busy timeout 的连接 |
 | YAML 安全性 | `load_yaml()` 使用 `safe_load`，不会执行危险的 YAML 构造 |
 | 合并确定性 | `merge_configs()` 的覆盖语义一致，`None` 值不覆盖 |
-| 目录就绪 | 调用 `ensure_dirs()` 后，`data_dir`、`agent_dir`、`sqlite/` 目录已存在且权限正确 |
+| 目录就绪 | 调用 `ensure_dirs()` 后，`data_dir`、`agent_dir`、`sqlite/` 目录已存在且权限正确；可用分发资源会同步到 `builtin/skills/` |
 
 ### 9.2 server 对 common 的期望
 
@@ -491,13 +493,13 @@ yaml_utils.py ──────→ (无内部依赖)
 
 ### 9.3 common 不提供的东西
 
-- **Schema 管理** — common 不负责创建或迁移数据库表，这是 engine 的职责
+- **Schema 管理** — common 不负责创建或迁移数据库表；当前表结构由 `server/app/infrastructure/schema.py` 管理
 - **配置校验** — common 只解析 YAML 为字典，不校验配置内容的业务语义
 - **Agent/Session 概念** — common 的路径命名（如 `agent_dir`）只是字符串，不含业务含义
 
 ---
 
-## 10. pyproject.toml 依赖列表
+## 10. pyproject.toml — 依赖与分发资源
 
 ```toml
 [project]
@@ -515,3 +517,29 @@ dependencies = ["pyyaml>=6.0", "aiosqlite>=0.21"]
 构建系统使用 `setuptools>=69`。
 
 Python 版本要求 `>=3.11`（使用了 `X | Y` 联合类型语法等 3.10+ 特性，以及 `from __future__ import annotations`）。
+
+### 10.1 内置技能 data files
+
+`[tool.setuptools.data-files]` 将每个内置技能的 `SKILL.md` 以及需要随技能分发的引用文件写入 wheel 的 `agent_smith_common/builtin_skills/` 目录。安装后的 `bundled_skills_dir` 优先读取该位置，因此源码目录存在技能并不等于安装包已经包含它。
+
+新增内置技能或其引用文件时，必须同步更新该清单；`server/tests/test_common_infrastructure.py` 会比较包含顶层 `SKILL.md` 的源码技能目录与已声明的技能根目录，防止遗漏技能本体。
+
+---
+
+## 11. 验证与维护
+
+修改 `common/` 的路径、配置、数据库或分发资源时，至少执行：
+
+```bash
+cd server
+uv run pytest tests/test_common_infrastructure.py -q
+uv run pytest tests/test_config_service.py -q
+```
+
+分发资源有变化时，还应从仓库根目录构建 wheel：
+
+```bash
+uv build --wheel common
+```
+
+验证重点是：私有目录/文件权限、无效 YAML 的错误边界、原子写入、首次 SQLite 初始化的并发收敛，以及 wheel 中的内置技能资源。
