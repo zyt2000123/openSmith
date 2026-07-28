@@ -4,6 +4,7 @@ import type { Key } from "ink";
 
 import { NodeBridge } from "./bridge.js";
 import {
+  exitHistoryBrowsing,
   handleApprovalInput,
   handleCtrlC,
   handleEscape,
@@ -497,4 +498,37 @@ test("history navigation restores the draft that existed before browsing", () =>
   assert.equal(handleHistoryNavigation({ downArrow: true } as Key, options), true);
   assert.equal(store.getState().inputValue, "important draft");
   assert.equal(store.getState().historyIndex, -1);
+});
+
+// ── Audit 2026-07-26 P2: typing must leave history browsing ──
+
+test("editing the text while browsing history discards the stale draft", () => {
+  const state = {
+    historyIndex: 3,
+    historyDraft: "draft-A",
+    set(partial: Record<string, unknown>) {
+      Object.assign(this, partial);
+    },
+  };
+
+  exitHistoryBrowsing(state as never);
+
+  assert.equal(state.historyIndex, -1);
+  assert.equal(state.historyDraft, "");
+});
+
+test("editing the text outside history browsing changes nothing", () => {
+  let writes = 0;
+  const state = {
+    historyIndex: -1,
+    historyDraft: "keep-me",
+    set() {
+      writes += 1;
+    },
+  };
+
+  exitHistoryBrowsing(state as never);
+
+  assert.equal(writes, 0);
+  assert.equal(state.historyDraft, "keep-me");
 });

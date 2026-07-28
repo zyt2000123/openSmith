@@ -24,7 +24,7 @@ import { Composer } from "./composer.js";
 import { loadHistory, saveHistory } from "./history.js";
 import { LIFECYCLE_HOOKS } from "./hooks.js";
 import { RunProgress, StatusHud } from "./hud.js";
-import { useShellInput } from "./input.js";
+import { exitHistoryBrowsing, useShellInput } from "./input.js";
 import {
   getCategorizedVisibleList,
   getVisibleList,
@@ -848,11 +848,6 @@ async function submitWhileBusy(
   slashIndex: number,
 ): Promise<void> {
   if (input.startsWith("/")) {
-    if (input === "/approve" || input === "/deny") {
-      await runShellCommand(input, { bridge, exit: () => {}, getState, workingDir: PROJECT_CWD });
-      rememberSubmittedInput(input);
-      return;
-    }
     if (!completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
       getState().set({ statusLine: `${input} is unavailable while Smith is working. Press Esc to cancel the run.` });
     }
@@ -1054,6 +1049,9 @@ function SmithApp() {
   }, [isFullScreenPanel]);
   const handleInputChange = useCallback(
     (value: string) => {
+      // Typing ends history browsing, so the stale draft captured on the way
+      // in cannot later overwrite what was just typed.
+      exitHistoryBrowsing(getState());
       if (panel !== "chat") {
         getState().set({ inputValue: value, skillsIndex: 0 });
         return;

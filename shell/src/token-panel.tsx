@@ -8,6 +8,12 @@ import { buildRecentDays, formatTokenCount, TOKEN_TAB_LABELS, TOKEN_TABS, type T
 import { useWindowSize } from "./window-size.js";
 
 const BAR_HEIGHT = 6;
+const MIN_BAR_WIDTH = 4;
+const MODEL_NAME_WIDTH = 28;
+const MIN_MODEL_NAME_WIDTH = 8;
+const MODEL_VALUE_WIDTH = 8;
+/** "  123 session(s)" at three digits — the widest realistic suffix. */
+const SESSIONS_SUFFIX_WIDTH = 16;
 const BAR_WIDTH = 10;
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -88,6 +94,43 @@ export function planRollingBarChart(days: TokenDay[], columns: number): RollingB
   return null;
 }
 
+/**
+ * Overview row geometry. Ink wraps rather than clips, so a row wider than the
+ * terminal folds the date into two pieces and drops the value onto its own line.
+ * The date shortens before the bar is given up, and the bar is given up before
+ * the number is — a number that wrapped would read as belonging to no row.
+ */
+export function planOverviewRow(columns: number, valueWidth: number): { dateWidth: number; barWidth: number } {
+  const budget = Math.max(1, columns - 4);
+  // Full date with a bar, then short date with a bar, then either date alone.
+  // Two single spaces separate the cells; the number is never sacrificed.
+  for (const dateWidth of [10, 5]) {
+    const barWidth = budget - dateWidth - 2 - valueWidth;
+    if (barWidth >= MIN_BAR_WIDTH) return { dateWidth, barWidth: Math.min(BAR_WIDTH, barWidth) };
+  }
+  for (const dateWidth of [10, 5]) {
+    if (dateWidth + 2 + valueWidth <= budget) return { dateWidth, barWidth: 0 };
+  }
+  // Nothing but the number fits; a wrapped date is worse than no date.
+  return { dateWidth: 0, barWidth: 0 };
+}
+
+/**
+ * Models row geometry. The name column shrinks first, and only when even a
+ * truncated name will not fit does the "N session(s)" suffix go.
+ */
+export function planModelsRow(columns: number): { nameWidth: number; showSessions: boolean } {
+  const budget = Math.max(1, columns - 4);
+  for (const showSessions of [true, false]) {
+    const overhead = MODEL_VALUE_WIDTH + (showSessions ? SESSIONS_SUFFIX_WIDTH : 0);
+    const nameWidth = Math.min(MODEL_NAME_WIDTH, budget - overhead);
+    if (nameWidth >= MIN_MODEL_NAME_WIDTH) return { nameWidth, showSessions };
+  }
+  // Below the comfortable minimum, still never exceed the budget: a wrapped row
+  // is less readable than a heavily truncated model name.
+  return { nameWidth: Math.max(1, budget - MODEL_VALUE_WIDTH), showSessions: false };
+}
+
 function barSegments(day: TokenDay, maxTokens: number): { filled: number; input: number } {
   if (day.total_tokens <= 0 || maxTokens <= 0) return { filled: 0, input: 0 };
 
@@ -160,18 +203,24 @@ function StatsView({ stats }: { stats: TokenStats }) {
 }
 
 function OverviewView({ stats }: { stats: TokenStats }) {
+  const { columns } = useWindowSize();
   const days = stats.daily.filter((item) => item.total_tokens > 0).slice(-14);
   const max = Math.max(1, ...days.map((item) => item.total_tokens));
+  const values = days.map((day) => formatTokenCount(day.total_tokens));
+  const valueWidth = Math.max(1, ...values.map((value) => value.length));
+  const { dateWidth, barWidth } = planOverviewRow(columns, valueWidth);
   return (
     <Box flexDirection="column">
       {days.length === 0 ? (
         <Text color={MUTED}>No token usage recorded yet.</Text>
       ) : (
-        days.map((day) => (
+        days.map((day, index) => (
           <Box key={day.date}>
-            <Text color={MUTED}>{day.date} </Text>
-            <Text color={WARNING}>{"█".repeat(Math.max(1, Math.round((day.total_tokens / max) * 32)))}</Text>
-            <Text color={MUTED}> {formatTokenCount(day.total_tokens)}</Text>
+            {dateWidth > 0 ? <Text color={MUTED}>{dateWidth >= 10 ? day.date : day.date.slice(5)} </Text> : null}
+            {barWidth > 0 ? (
+              <Text color={WARNING}>{"█".repeat(Math.max(1, Math.round((day.total_tokens / max) * barWidth)))}</Text>
+            ) : null}
+            <Text color={MUTED}> {values[index]}</Text>
           </Box>
         ))
       )}
@@ -181,6 +230,8 @@ function OverviewView({ stats }: { stats: TokenStats }) {
 }
 
 function ModelsView({ stats }: { stats: TokenStats }) {
+  const { columns } = useWindowSize();
+  const { nameWidth, showSessions } = planModelsRow(columns);
   return (
     <Box flexDirection="column">
       {stats.models.length === 0 ? (
@@ -188,9 +239,9 @@ function ModelsView({ stats }: { stats: TokenStats }) {
       ) : (
         stats.models.map((model) => (
           <Box key={model.model}>
-            <Text color={ACCENT}>{model.model.padEnd(28).slice(0, 28)}</Text>
-            <Text color={INFO}>{formatTokenCount(model.total_tokens).padStart(8)}</Text>
-            <Text color={MUTED}>{`  ${model.sessions} session(s)`}</Text>
+            <Text color={ACCENT}>{model.model.padEnd(nameWidth).slice(0, nameWidth)}</Text>
+            <Text color={INFO}>{formatTokenCount(model.total_tokens).padStart(MODEL_VALUE_WIDTH)}</Text>
+            {showSessions ? <Text color={MUTED}>{`  ${model.sessions} session(s)`}</Text> : null}
           </Box>
         ))
       )}

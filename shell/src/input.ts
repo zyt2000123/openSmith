@@ -259,6 +259,18 @@ function approvalPromptVisible(state: AppStore): boolean {
   return Boolean(state.pendingApproval) && state.panel !== "tokens" && state.panel !== "runs";
 }
 
+/**
+ * Leave history browsing because the user edited the text themselves.
+ *
+ * `historyDraft` is only snapshotted on the way in (at index -1). If browsing
+ * stayed active through a manual edit, returning to the bottom would restore
+ * that stale draft over the new text and discard it silently.
+ */
+export function exitHistoryBrowsing(state: AppStore): void {
+  if (state.historyIndex === -1) return;
+  state.set({ historyIndex: -1, historyDraft: "" });
+}
+
 export function handleApprovalInput(key: Key, options: ShellInputOptions): boolean {
   const state = options.getState();
   if (!approvalPromptVisible(state)) return false;

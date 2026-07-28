@@ -7,7 +7,7 @@ import { MultiSelectList } from "./multi-select-list.js";
 import { PanelContainer } from "./panel-container.js";
 import { RunExplorerPanel } from "./run-panel.js";
 import { TabbedPanel } from "./tabbed-panel.js";
-import { planRollingBarChart, TokenStatsPanel } from "./token-panel.js";
+import { planModelsRow, planOverviewRow, planRollingBarChart, TokenStatsPanel } from "./token-panel.js";
 
 function stripAnsi(text: string): string {
   const ansiEscape = String.fromCharCode(27);
@@ -144,4 +144,77 @@ test("no bar chart column is ever narrower than the text it holds", () => {
 
 test("a terminal too narrow for even the short form drops the chart", () => {
   assert.equal(planRollingBarChart(ROLLING_WEEK, 12), null);
+});
+
+// ── Audit 2026-07-26 P2: Overview and Models must respect terminal width ──
+
+test("overview keeps the full date and a bar on a wide terminal", () => {
+  const plan = planOverviewRow(120, 7);
+
+  assert.equal(plan.dateWidth, 10);
+  assert.ok(plan.barWidth >= 4, `expected a usable bar, got ${plan.barWidth}`);
+});
+
+test("overview fits 36 columns, where the fixed 32-wide bar used to wrap", () => {
+  const plan = planOverviewRow(36, 7);
+
+  // The full date still fits here — the old bug was the hard-coded 32-column
+  // bar, not the date.
+  assert.equal(plan.dateWidth, 10);
+  assert.ok(plan.barWidth >= 4 && plan.barWidth <= 32 - 20, `bar too wide: ${plan.barWidth}`);
+});
+
+test("overview shortens the date once the full one crowds out the bar", () => {
+  const plan = planOverviewRow(26, 7);
+
+  assert.equal(plan.dateWidth, 5, "expected MM-DD");
+  assert.ok(plan.barWidth >= 4);
+});
+
+test("overview keeps only the number when nothing else fits", () => {
+  const plan = planOverviewRow(14, 7);
+
+  assert.equal(plan.dateWidth, 0);
+  assert.equal(plan.barWidth, 0);
+});
+
+test("overview drops the bar rather than wrapping the number", () => {
+  const plan = planOverviewRow(20, 7);
+
+  assert.equal(plan.barWidth, 0);
+});
+
+test("overview row never exceeds the usable width", () => {
+  for (const columns of [16, 20, 24, 30, 36, 48, 60, 80, 120]) {
+    const valueWidth = 7;
+    const plan = planOverviewRow(columns, valueWidth);
+    const separators = (plan.dateWidth > 0 ? 1 : 0) + 1;
+    const used = plan.dateWidth + plan.barWidth + separators + valueWidth;
+    assert.ok(used <= Math.max(1, columns - 4), `columns=${columns} used=${used} budget=${columns - 4}`);
+  }
+});
+
+test("models shrinks the name column before dropping the sessions suffix", () => {
+  const wide = planModelsRow(120);
+  assert.equal(wide.nameWidth, 28);
+  assert.equal(wide.showSessions, true);
+
+  const narrow = planModelsRow(48);
+  assert.ok(narrow.nameWidth < 28, "expected a narrower name column");
+  assert.equal(narrow.showSessions, true);
+});
+
+test("models drops the sessions suffix on a very narrow terminal", () => {
+  const plan = planModelsRow(28);
+
+  assert.equal(plan.showSessions, false);
+  assert.ok(plan.nameWidth >= 4);
+});
+
+test("models row never exceeds the usable width", () => {
+  for (const columns of [16, 24, 28, 36, 48, 60, 80, 120]) {
+    const plan = planModelsRow(columns);
+    const used = plan.nameWidth + 8 + (plan.showSessions ? 16 : 0);
+    assert.ok(used <= Math.max(1, columns - 4), `columns=${columns} used=${used}`);
+  }
 });

@@ -6,6 +6,7 @@ import {
   applyStreamEvent,
   createSystemEntry,
   createTurnEntry,
+  interruptLatestTurn,
   removeApprovalNotice,
   restoreTranscript,
   splitTranscript,
@@ -370,4 +371,38 @@ test("done leaves already settled blocks untouched", () => {
   const turn = lastTurn(entries);
   const tool = statefulBlocks(turn).find((block) => block.type === "tool");
   assert.equal((tool as { state: string } | undefined)?.state, "success");
+});
+
+// ── Audit 2026-07-26 P2: a cancelled turn must keep the text the server stores ──
+
+test("interrupt freezes the visible draft as assistant text", () => {
+  // The server persists visible_provisional_reply as the assistant message, so
+  // erasing it here would leave the user with a blank turn while the stored
+  // session, and the next request's history, held text they never read.
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, {
+    type: "provisional_text_delta",
+    provisionId: "p1",
+    text: "partial answer",
+  });
+
+  const interrupted = interruptLatestTurn(entries, "cancelled");
+
+  const turn = lastTurn(interrupted);
+  assert.equal(turn.assistantText, "partial answer");
+  assert.deepEqual(turn.provisional, []);
+});
+
+test("interrupt does not overwrite committed assistant text with a draft", () => {
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, { type: "message", text: "committed" });
+  entries = applyStreamEvent(entries, {
+    type: "provisional_text_delta",
+    provisionId: "p1",
+    text: "draft",
+  });
+
+  const turn = lastTurn(interruptLatestTurn(entries, "error"));
+
+  assert.equal(turn.assistantText, "committed");
 });

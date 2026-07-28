@@ -43,7 +43,7 @@ import {
 import { ensureLocalServer } from "./dev-server.js";
 import { createModelPicker, type ModelPickerTarget } from "./model-picker.js";
 import { MAX_QUEUED_MESSAGES, type QueuedMessage } from "./queue.js";
-import { createSetupDraft } from "./setup.js";
+import { createSetupDraft, fieldValue, setupFieldAt } from "./setup.js";
 import { type AppStore, TRANSCRIPT_LIMIT } from "./store.js";
 import { clearTerminal } from "./term.js";
 import { limitTranscript, removeApprovalNotice, restartLatestTurn, restoreTranscript } from "./transcript-state.js";
@@ -305,7 +305,7 @@ export class NodeBridge {
           setupFlow: "initial",
           setupDraft,
           setupIndex: 0,
-          inputValue: setupDraft.provider,
+          inputValue: fieldValue(setupDraft, setupFieldAt(0, "initial")),
           statusLine: "Run the initial setup to wake Smith up.",
         });
         return;
@@ -363,6 +363,7 @@ export class NodeBridge {
         this.s.set({
           mode: "setup",
           setupIndex: 0,
+          inputValue: fieldValue(this.s.setupDraft, setupFieldAt(0, this.s.setupFlow)),
           statusLine: "Interactive LLM route still needs an API key, base URL, and model.",
         });
         return;

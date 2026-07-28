@@ -127,6 +127,11 @@ function appendProvisionalText(provisional: ProvisionalText[], provisionId: stri
   return next;
 }
 
+/** Concatenate a turn's visible drafts, matching what the server persists. */
+function provisionalToText(provisional: ProvisionalText[]): string {
+  return provisional.map((item) => item.text).join("");
+}
+
 function updateLastTurn(entries: TranscriptEntry[], updater: (turn: TurnEntry) => TurnEntry): TranscriptEntry[] {
   const index = findLastTurnIndex(entries);
   if (index === -1) {
@@ -338,6 +343,10 @@ export function interruptLatestTurn(
     fallbackSummary ?? (outcome === "cancelled" ? "Cancelled before completion." : "Request failed before completion.");
   return updateLastTurn(entries, (turn) => ({
     ...turn,
+    // The server persists whatever draft was visible as the assistant message.
+    // Erasing it here would show the user an empty turn while the stored
+    // session — and the next request's history — held text they never saw.
+    assistantText: turn.assistantText || provisionalToText(turn.provisional),
     blocks: finishThinkingBlocks(turn.blocks).map((block) => {
       if (block.type === "tool" && block.state === "running") {
         return { ...block, state: outcome, summary: block.summary || fallback };
