@@ -143,3 +143,44 @@ test("failed runs retain their id for recovery while completed runs clear it", (
   store.getState().applyEvent({ type: "done", runId: "run-2", status: "completed" });
   assert.equal(store.getState().recoverableRunId, null);
 });
+
+// ── Audit 2026-07-26 P1: approval must never arrive behind a hidden panel ──
+
+const APPROVAL = {
+  type: "approval_required" as const,
+  runId: "r1",
+  approvalId: "a1",
+  tool: "shell",
+  level: "execute",
+  reason: "Approval required for shell",
+  arguments: {},
+};
+
+test("approval_required returns from a full-screen panel to chat", () => {
+  const store = createAppStore();
+  store.getState().set({ panel: "tokens" });
+
+  store.getState().applyEvent(APPROVAL);
+
+  assert.equal(store.getState().panel, "chat");
+  assert.equal(store.getState().pendingApproval?.approvalId, "a1");
+});
+
+test("approval_required leaves a non-full-screen panel alone", () => {
+  const store = createAppStore();
+  store.getState().set({ panel: "welcome" });
+
+  store.getState().applyEvent(APPROVAL);
+
+  assert.equal(store.getState().panel, "welcome");
+});
+
+test("done clears the running tool activity map", () => {
+  const store = createAppStore();
+  store.getState().applyEvent({ type: "tool_call", id: "c1", name: "shell", hint: "" });
+  assert.equal(Object.keys(store.getState().toolActivity.running).length, 1);
+
+  store.getState().applyEvent({ type: "done", status: "completed" });
+
+  assert.deepEqual(store.getState().toolActivity.running, {});
+});

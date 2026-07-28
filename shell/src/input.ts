@@ -247,9 +247,21 @@ function handleTokenNavigation(key: Key, options: ShellInputOptions): boolean {
   return true;
 }
 
+/**
+ * Whether the approval prompt is on screen and may therefore consume keys.
+ *
+ * The full-screen tokens/runs panels replace the footer that renders it. The
+ * store returns to chat when an approval arrives, so this only covers the
+ * reverse order — a panel opened while an approval was already pending — where
+ * Enter must not approve and Esc must not cancel the run, sight-unseen.
+ */
+function approvalPromptVisible(state: AppStore): boolean {
+  return Boolean(state.pendingApproval) && state.panel !== "tokens" && state.panel !== "runs";
+}
+
 export function handleApprovalInput(key: Key, options: ShellInputOptions): boolean {
   const state = options.getState();
-  if (!state.pendingApproval) return false;
+  if (!approvalPromptVisible(state)) return false;
 
   if (key.tab) return true;
 

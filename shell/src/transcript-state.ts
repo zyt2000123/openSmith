@@ -332,8 +332,10 @@ export function closeLatestTurn(entries: TranscriptEntry[]): TranscriptEntry[] {
 export function interruptLatestTurn(
   entries: TranscriptEntry[],
   outcome: Extract<ToolState, "cancelled" | "error">,
+  fallbackSummary?: string,
 ): TranscriptEntry[] {
-  const fallback = outcome === "cancelled" ? "Cancelled before completion." : "Request failed before completion.";
+  const fallback =
+    fallbackSummary ?? (outcome === "cancelled" ? "Cancelled before completion." : "Request failed before completion.");
   return updateLastTurn(entries, (turn) => ({
     ...turn,
     blocks: finishThinkingBlocks(turn.blocks).map((block) => {
@@ -549,7 +551,13 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
       return entries;
 
     case "done":
-      return closeLatestTurn(entries);
+      // Several legitimate server sequences end a turn without a terminal
+      // event for every block: a pipeline node skipped after a backtrack gets
+      // no SKILL_END, and an exception between TOOL_CALL_START and its result
+      // is smoothed into done(failed).  Closing the turn without converging
+      // those blocks leaves a permanent "running" card burned into <Static>.
+      if (event.status === "failed") return interruptLatestTurn(entries, "error");
+      return interruptLatestTurn(entries, "cancelled", "Ended without a result.");
   }
 }
 
