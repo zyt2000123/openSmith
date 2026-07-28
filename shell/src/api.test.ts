@@ -170,6 +170,21 @@ test("setSkillEnabled persists a skill toggle through the agent API", async () =
   }
 });
 
+test("HTTP error text is safe to present in the terminal", async () => {
+  const originalFetch = globalThis.fetch;
+  const attack = `${String.fromCharCode(27)}]52;c;eA==${String.fromCharCode(7)}request failed`;
+  globalThis.fetch = async () => new Response(attack, { status: 502, statusText: "Bad Gateway" });
+
+  try {
+    await assert.rejects(
+      setSkillEnabled("http://127.0.0.1:8140", "research", false),
+      (error: unknown) => error instanceof Error && error.message === "HTTP 502: request failed",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("SSE decoding accepts CR-only line endings", () => {
   assert.deepEqual(decodeSseEvent('event: done\rdata: {"id":"message-1"}'), {
     type: "done",
@@ -481,6 +496,34 @@ test("streamMessage reassembles a CRLF frame separator split across read chunks"
   }
 });
 
+test("streamMessage rejects an unfinished SSE frame larger than 256 KiB", async () => {
+  const originalFetch = globalThis.fetch;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: ${"x".repeat(256 * 1024 + 1)}`));
+      controller.close();
+    },
+  });
+  globalThis.fetch = async () =>
+    new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+
+  try {
+    await assert.rejects(
+      (async () => {
+        for await (const _event of streamMessage("http://127.0.0.1:8140", "session-1", "hello", { timeoutMs: 1_000 })) {
+          // The malformed frame never produces an event.
+        }
+      })(),
+      /SSE frame exceeded the 256 KiB limit\./,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 // ── Untrusted text is sanitised at the decode boundary (audit P2, security) ──
 
 const ESC_BYTE = String.fromCharCode(27);
@@ -533,4 +576,59 @@ test("SSE decoder keeps an approval reason readable while stripping escapes", ()
   );
 
   assert.equal((event as { reason: string }).reason, "Approval required for shell");
+});
+
+test("SSE decoder sanitizes every structured approval presentation field", () => {
+  const attack = `${ESC_BYTE}]52;c;eA==${BEL_BYTE}`;
+  const event = decodeSseEvent(
+    sseFrame("approval_required", {
+      run_id: "r1",
+      approval_id: "a1",
+      tool: "shell",
+      level: "execute",
+      reason: "Approval required",
+      arguments: {},
+      presentation: {
+        title: `${attack}Run command`,
+        summary: `${attack}Smith wants to run a command.`,
+        details: [{ label: `${attack}Command`, value: `${attack}git status` }],
+        reason: `${attack}Need approval.`,
+      },
+    }),
+  );
+
+  assert.equal(event?.type, "approval_required");
+  assert.deepEqual(event?.type === "approval_required" ? event.presentation : undefined, {
+    title: "Run command",
+    summary: "Smith wants to run a command.",
+    details: [{ label: "Command", value: "git status" }],
+    reason: "Need approval.",
+  });
+});
+
+test("SSE decoder sanitizes Smith-UI fallback and error event text", () => {
+  const attack = `${ESC_BYTE}]52;c;eA==${BEL_BYTE}`;
+  const fallback = decodeSseEvent(
+    sseFrame("smith_ui_fallback", { reason: `${attack}unsupported`, code: `${attack}{"safe":true}` }),
+  );
+
+  assert.deepEqual(fallback, {
+    type: "smith_ui_fallback",
+    reason: "unsupported",
+    code: '{"safe":true}',
+  });
+  assert.throws(
+    () => decodeSseEvent(sseFrame("error", { message: `${attack}stream failed` })),
+    (error: unknown) => error instanceof Error && error.message === "stream failed",
+  );
+});
+
+test("SSE decoder sanitizes skill metadata before transcript rendering", () => {
+  const attack = `${ESC_BYTE}]52;c;eA==${BEL_BYTE}`;
+
+  assert.deepEqual(decodeSseEvent(sseFrame("skill", { name: `${attack}research`, status: `${attack}start` })), {
+    type: "skill",
+    name: "research",
+    status: "start",
+  });
 });

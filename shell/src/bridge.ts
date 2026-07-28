@@ -43,6 +43,7 @@ import {
 import { ensureLocalServer } from "./dev-server.js";
 import { createModelPicker, type ModelPickerTarget } from "./model-picker.js";
 import { MAX_QUEUED_MESSAGES, type QueuedMessage } from "./queue.js";
+import { sanitizeTerminalText } from "./sanitize.js";
 import { createSetupDraft, fieldValue, setupFieldAt } from "./setup.js";
 import { type AppStore, TRANSCRIPT_LIMIT } from "./store.js";
 import { clearTerminal } from "./term.js";
@@ -52,7 +53,7 @@ import { limitTranscript, removeApprovalNotice, restartLatestTurn, restoreTransc
 const NOT_READY_STATUS = "Shell is not ready yet. Run /reconnect to retry the local server.";
 
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return sanitizeTerminalText(error instanceof Error ? error.message : String(error));
 }
 
 function formatTraceStatus(diagnosis: RunDiagnosis, proposal: RunImprovementProposal | null): string {

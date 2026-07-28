@@ -26,6 +26,7 @@ export const REQUIRED_API_OPERATIONS = [
   { method: "GET", path: "/api/agent/skills" },
   { method: "PUT", path: "/api/agent/skills/{skill_name}" },
   { method: "GET", path: "/api/agent/mcp" },
+  { method: "GET", path: "/api/agent/memory/status" },
   { method: "GET", path: "/api/agent/token-stats" },
   { method: "GET", path: "/api/agent/observability/runs" },
   { method: "GET", path: "/api/agent/observability/health" },
@@ -148,10 +149,15 @@ function serverTarget(): ServerTarget {
   };
 }
 
+/** Build a server endpoint without losing a configured reverse-proxy path prefix. */
+function serverEndpoint(baseUrl: string, pathname: string): string {
+  return new URL(pathname.replace(/^\/+/, ""), `${baseUrl.replace(/\/+$/, "")}/`).toString();
+}
+
 async function isHealthy(baseUrl: string): Promise<boolean> {
   const timeout = createTimeoutSignal(SERVER_PROBE_TIMEOUT_MS);
   try {
-    return (await fetch(`${baseUrl}/api/health`, { signal: timeout.signal })).ok;
+    return (await fetch(serverEndpoint(baseUrl, "/api/health"), { signal: timeout.signal })).ok;
   } catch {
     return false;
   } finally {
@@ -162,7 +168,7 @@ async function isHealthy(baseUrl: string): Promise<boolean> {
 async function compatibilityIssue(baseUrl: string): Promise<string | null> {
   const timeout = createTimeoutSignal(SERVER_PROBE_TIMEOUT_MS);
   try {
-    const response = await fetch(`${baseUrl}/openapi.json`, { signal: timeout.signal });
+    const response = await fetch(serverEndpoint(baseUrl, "/openapi.json"), { signal: timeout.signal });
     if (!response.ok) return `openapi responded with HTTP ${response.status}`;
 
     const payload = (await response.json()) as { paths?: Record<string, unknown> };

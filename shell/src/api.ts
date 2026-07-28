@@ -193,6 +193,7 @@ type RequestOptions = {
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
+const MAX_SSE_FRAME_CHARS = 256 * 1024;
 
 type TimeoutSignal = {
   signal: AbortSignal;
@@ -294,7 +295,7 @@ async function request<T>(baseUrl: string, pathname: string, options: RequestOpt
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text || response.statusText}`);
+      throw new Error(`HTTP ${response.status}: ${terminalText(text || response.statusText)}`);
     }
 
     if (response.status === 204) return undefined as T;
@@ -579,6 +580,12 @@ function splitSseBuffer(buffer: string): { chunks: string[]; remainder: string }
   return { chunks, remainder: buffer.slice(lastIndex) };
 }
 
+function assertSseFrameLimit(chunks: string[], remainder: string): void {
+  if (remainder.length > MAX_SSE_FRAME_CHARS || chunks.some((chunk) => chunk.length > MAX_SSE_FRAME_CHARS)) {
+    throw new Error("SSE frame exceeded the 256 KiB limit.");
+  }
+}
+
 function parseSseChunk(rawChunk: string): ParsedSseChunk | null {
   let eventName = "message";
   const dataLines: string[] = [];
@@ -621,6 +628,11 @@ function objectPayload(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
+/** Convert a decoded wire value into terminal-safe display text. */
+function terminalText(value: unknown): string {
+  return sanitizeTerminalText(typeof value === "string" ? value : String(value ?? ""));
+}
+
 function approvalPresentation(payload: Record<string, unknown>): ApprovalPresentation | undefined {
   const raw = objectPayload(payload.presentation);
   if (Object.keys(raw).length === 0) return undefined;
@@ -628,13 +640,13 @@ function approvalPresentation(payload: Record<string, unknown>): ApprovalPresent
   const details = Array.isArray(raw.details)
     ? raw.details.flatMap((item) => {
         const detail = objectPayload(item);
-        const label = String(detail.label ?? "").trim();
-        return label ? [{ label, value: String(detail.value ?? "") }] : [];
+        const label = terminalText(detail.label).trim();
+        return label ? [{ label, value: terminalText(detail.value) }] : [];
       })
     : [];
-  const title = String(raw.title ?? "").trim();
-  const summary = String(raw.summary ?? "").trim();
-  const reason = String(raw.reason ?? "").trim();
+  const title = terminalText(raw.title).trim();
+  const summary = terminalText(raw.summary).trim();
+  const reason = terminalText(raw.reason).trim();
   if (!title && !summary && details.length === 0 && !reason) return undefined;
   return {
     title: title || "Approval required",
@@ -645,12 +657,13 @@ function approvalPresentation(payload: Record<string, unknown>): ApprovalPresent
 }
 
 function smithUiFallback(payload: Record<string, unknown>, defaultReason: string): StreamEvent {
-  const reason = typeof payload.reason === "string" && payload.reason ? payload.reason.slice(0, 500) : defaultReason;
+  const reason =
+    typeof payload.reason === "string" && payload.reason ? terminalText(payload.reason).slice(0, 500) : defaultReason;
   const directCode = payload.code;
   if (typeof directCode === "string" && directCode.length <= 16_000) {
-    return { type: "smith_ui_fallback", reason, code: directCode };
+    return { type: "smith_ui_fallback", reason, code: terminalText(directCode) };
   }
-  const code = JSON.stringify(payload, null, 2);
+  const code = terminalText(JSON.stringify(payload, null, 2));
   return { type: "smith_ui_fallback", reason, code: code.length <= 16_000 ? code : `${code.slice(0, 15_980)}\n…` };
 }
 
@@ -710,8 +723,8 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
   }),
   skill: (payload) => ({
     type: "skill",
-    name: String(payload.name ?? ""),
-    status: String(payload.status ?? ""),
+    name: terminalText(payload.name),
+    status: terminalText(payload.status),
   }),
   token_usage: (payload) => ({
     type: "token_usage",
@@ -756,7 +769,7 @@ export function decodeSseEvent(rawChunk: string): StreamEvent | null {
   if (!parsed) return null;
 
   const { eventName, payload } = parsed;
-  if (eventName === "error") throw new Error(String(payload.message ?? payload.error ?? "Server stream failed."));
+  if (eventName === "error") throw new Error(terminalText(payload.message ?? payload.error) || "Server stream failed.");
 
   const decoder = SSE_EVENT_DECODERS[eventName];
   return decoder ? decoder(payload) : null;
@@ -794,6 +807,7 @@ async function* readSseEvents(
 
       buffer += decoder.decode(value, { stream: true });
       const parsed = splitSseBuffer(buffer);
+      assertSseFrameLimit(parsed.chunks, parsed.remainder);
       buffer = parsed.remainder;
       const consumed = consumeSseChunks(parsed.chunks, sawDone);
       sawDone = consumed.sawDone;
@@ -803,6 +817,7 @@ async function* readSseEvents(
 
     buffer += decoder.decode();
     const parsed = splitSseBuffer(buffer);
+    assertSseFrameLimit(parsed.chunks, parsed.remainder);
     const chunks = parsed.remainder.trim() ? [...parsed.chunks, parsed.remainder] : parsed.chunks;
     const consumed = consumeSseChunks(chunks, sawDone);
     yield* consumed.events;

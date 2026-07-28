@@ -30,6 +30,16 @@ function createStaticSpy() {
   };
 }
 
+test("system lines sanitize terminal control sequences at the display boundary", () => {
+  const store = createAppStore();
+  const attack = `${String.fromCharCode(27)}]52;c;eA==${String.fromCharCode(7)}request failed`;
+
+  store.getState().pushSystemLine(attack, "error");
+
+  const entry = store.getState().transcript.at(-1);
+  assert.equal(entry?.kind === "system" ? entry.text : "", "request failed");
+});
+
 test("system lines still reach the terminal after the transcript hits its limit", () => {
   const store = createAppStore();
   const staticSpy = createStaticSpy();
