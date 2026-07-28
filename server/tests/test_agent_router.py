@@ -210,3 +210,36 @@ def test_stream_route_returns_preflight_errors_before_opening_sse() -> None:
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Session not found"
+
+
+def test_memory_status_route_reports_deferred_maintenance() -> None:
+    class FakeAgentService:
+        def memory_maintenance(self) -> dict:
+            return {"compile": "idle", "dream": "running"}
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_agent_service] = lambda: FakeAgentService()
+
+    with TestClient(app) as client:
+        response = client.get("/api/agent/memory/status")
+
+    assert response.status_code == 200
+    assert response.json() == {"compile": "idle", "dream": "running"}
+
+
+def test_memory_status_rejects_an_unknown_state() -> None:
+    """The schema is the contract: an unexpected state must not reach clients."""
+
+    class FakeAgentService:
+        def memory_maintenance(self) -> dict:
+            return {"compile": "idle", "dream": "sleepwalking"}
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_agent_service] = lambda: FakeAgentService()
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/agent/memory/status")
+
+    assert response.status_code == 500

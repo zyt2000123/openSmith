@@ -571,6 +571,7 @@ type ShellFooterProps = {
   skillMentions: SkillSummary[];
   skillMentionIndex: number;
   viewMode: TranscriptViewMode;
+  baseUrl: AppStore["baseUrl"];
   config: AppStore["config"];
   selectedModelProfile: AppStore["selectedModelProfile"];
   currentSession: AppStore["currentSession"];
@@ -781,6 +782,7 @@ function ShellFooter(props: ShellFooterProps) {
         model={props.selectedModelProfile || props.config?.model || "-"}
         projectName={path.basename(PROJECT_CWD)}
         cwd={PROJECT_CWD}
+        baseUrl={props.baseUrl}
         sessionId={props.currentSession?.id}
         tokenUsage={props.tokenUsage}
         contextUsage={props.contextUsage}
@@ -981,6 +983,7 @@ function SmithApp() {
   const pendingSkill = useS((state) => state.pendingSkill);
   const queuedMessages = useS((state) => state.queuedMessages);
   const viewMode = useS((state) => state.viewMode);
+  const baseUrl = useS((state) => state.baseUrl);
   const transcript = useS((state) => state.transcript);
   const transcriptEpoch = useS((state) => state.transcriptEpoch);
   const turnCount = useS((state) => state.turnCount);
@@ -1167,6 +1170,7 @@ function SmithApp() {
           <ShellFooter
             activeSetupField={activeSetupField}
             approvalIndex={approvalIndex}
+            baseUrl={baseUrl}
             approvalResolving={approvalResolving}
             modelPicker={modelPicker}
             busy={busy}

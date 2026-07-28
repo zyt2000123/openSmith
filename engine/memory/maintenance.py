@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _MEMORY_MAINTENANCE_TIMEOUT_SECONDS = 900.0
 _COMPILE_PENDING_FILE = ".compile_pending"
 _DREAM_PENDING_FILE = ".dream_pending"
+MAINTENANCE_KINDS: tuple[str, ...] = ("compile", "dream")
 
 
 @dataclass(frozen=True)
@@ -245,6 +246,28 @@ class MemoryMaintenanceService:
         _reset_counter(memory_dir / f".{kind}_counter")
 
     @classmethod
+    def maintenance_status(cls, memory_dir: Path) -> dict[str, str]:
+        """Report, per maintenance kind, whether work is running or still owed.
+
+        ``running`` means a background task for it is in flight in this process.
+        ``pending`` means the work is owed — a marker file, or a counter past its
+        threshold — but nothing is executing it yet; the scheduler's idle tick
+        picks those up. Deferred maintenance is otherwise invisible: it spans
+        turns, so it cannot be reported over a per-run event stream.
+        """
+        resolved = memory_dir.resolve()
+        status: dict[str, str] = {}
+        for kind in MAINTENANCE_KINDS:
+            task = cls._background_tasks.get((resolved, kind))
+            if task is not None and not task.done():
+                status[kind] = "running"
+            elif cls._is_pending(kind, memory_dir):
+                status[kind] = "pending"
+            else:
+                status[kind] = "idle"
+        return status
+
+    @classmethod
     def _is_pending(cls, kind: str, memory_dir: Path) -> bool:
         if cls._pending_path(kind, memory_dir).is_file():
             return True
@@ -336,3 +359,12 @@ class MemoryLifecycleHooks:
 
     async def memory_daily_tick(self, memory_dir: Path) -> bool:
         return await self.maintenance.run_idle_maintenance(memory_dir)
+
+
+def memory_maintenance_status(memory_dir: Path) -> dict[str, str]:
+    """Read-only view of deferred memory maintenance, for status endpoints.
+
+    Deliberately free of LLM dependencies: a status probe must not have to build
+    provider clients just to answer whether compilation or dreaming is in flight.
+    """
+    return MemoryMaintenanceService.maintenance_status(memory_dir)

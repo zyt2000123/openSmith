@@ -12,6 +12,7 @@ from ..infrastructure.repositories.agent_profile_repo import AgentProfileRepo
 from ..infrastructure.repositories.session_repo import SessionRepo
 from ..schemas.agent_profile import AgentProfileOut
 from ..schemas.auto_task import AutoTaskCreate, AutoTaskRunOut, AutoTaskUpdate
+from ..schemas.memory import MemoryMaintenanceOut
 from ..schemas.session import ContextCompressionOut, MessageOut, SessionOut
 from ..schemas.run import ApprovalDecision
 from ..schemas.mcp import McpServerOut
@@ -125,6 +126,18 @@ class AgentService:
 
     async def delete_session(self, session_id: str) -> None:
         await self.session_service.delete_session(await self._profile_id(), session_id)
+
+    def memory_maintenance(self) -> MemoryMaintenanceOut:
+        """Report deferred memory maintenance so a client can show it.
+
+        Compilation and dreaming are scheduled as background tasks that outlive
+        the turn scheduling them, so no per-run event stream can carry their
+        state. Intentionally synchronous and LLM-free: reading a few marker
+        files must not build provider clients.
+        """
+        from engine.memory import memory_maintenance_status
+
+        return MemoryMaintenanceOut(**memory_maintenance_status(AGENT_DIR / "memory"))
 
     async def list_messages(
         self,

@@ -124,6 +124,13 @@ export type ContextUsage = {
 
 export type StreamTerminalStatus = "completed" | "failed" | "incomplete";
 
+export type MaintenanceState = "idle" | "pending" | "running";
+
+export type MemoryMaintenance = {
+  compile: MaintenanceState;
+  dream: MaintenanceState;
+};
+
 export type RunState = {
   run_id: string;
   agent_id: string;
@@ -445,6 +452,16 @@ export async function listMessages(baseUrl: string, sessionId: string): Promise<
 
 export async function listSkills(baseUrl: string): Promise<SkillSummary[]> {
   return request<SkillSummary[]>(baseUrl, "/api/agent/skills");
+}
+
+/**
+ * Deferred memory maintenance state.
+ *
+ * Compilation and dreaming run as background tasks that outlive the turn that
+ * scheduled them, so no per-run SSE stream can carry their state — it is polled.
+ */
+export async function fetchMemoryMaintenance(baseUrl: string): Promise<MemoryMaintenance> {
+  return request<MemoryMaintenance>(baseUrl, "/api/agent/memory/status");
 }
 
 export async function setSkillEnabled(baseUrl: string, skillName: string, enabled: boolean): Promise<SkillSummary> {

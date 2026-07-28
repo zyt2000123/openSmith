@@ -17,6 +17,7 @@ from ..schemas.session import (
     SessionModelUpdate,
     SessionOut,
 )
+from ..schemas.memory import MemoryMaintenanceOut
 from ..schemas.project_instruction import ProjectInstructionInit, ProjectInstructionOut
 from ..schemas.run import ApprovalDecision, RunStateOut
 from ..schemas.skill import SkillEnabledUpdate, SkillSummaryOut
@@ -40,6 +41,11 @@ async def get_profile(svc: AgentService = Depends(get_agent_service)):
 @router.post("/ensure", response_model=AgentProfileOut, status_code=201)
 async def ensure_profile(svc: AgentService = Depends(get_agent_service)):
     return await svc.ensure_profile()
+
+
+@router.get("/memory/status", response_model=MemoryMaintenanceOut)
+async def memory_status(svc: AgentService = Depends(get_agent_service)):
+    return svc.memory_maintenance()
 
 
 @router.get("/sessions", response_model=list[SessionOut])

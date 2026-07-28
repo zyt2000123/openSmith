@@ -425,3 +425,56 @@ def test_memory_hook_rebinds_when_runtime_dependencies_change() -> None:
     assert services.hooks is not None
     assert len(services.hooks._handlers) == 1
     assert services.hooks._handlers[0].maintenance.llm is second
+
+
+# ── Deferred maintenance must be observable (dreaming indicator) ──
+
+
+def test_maintenance_status_reports_idle_for_a_fresh_memory_dir(tmp_path):
+    from engine.memory import memory_maintenance_status
+
+    (tmp_path / "memory").mkdir()
+
+    assert memory_maintenance_status(tmp_path / "memory") == {
+        "compile": "idle",
+        "dream": "idle",
+    }
+
+
+def test_maintenance_status_reports_pending_from_the_marker_file(tmp_path):
+    from engine.memory import memory_maintenance_status
+    from engine.memory.maintenance import MemoryMaintenanceService
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    MemoryMaintenanceService._mark_pending("dream", memory_dir)
+
+    status = memory_maintenance_status(memory_dir)
+
+    assert status["dream"] == "pending"
+    assert status["compile"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_status_reports_running_while_a_task_is_in_flight(tmp_path):
+    from engine.memory import memory_maintenance_status
+    from engine.memory.maintenance import MemoryMaintenanceService
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    release = asyncio.Event()
+
+    async def blocked() -> None:
+        await release.wait()
+
+    key = (memory_dir.resolve(), "compile")
+    task = asyncio.create_task(blocked())
+    MemoryMaintenanceService._background_tasks[key] = task
+    try:
+        assert memory_maintenance_status(memory_dir)["compile"] == "running"
+    finally:
+        release.set()
+        await task
+        MemoryMaintenanceService._background_tasks.pop(key, None)
+
+    assert memory_maintenance_status(memory_dir)["compile"] == "idle"
