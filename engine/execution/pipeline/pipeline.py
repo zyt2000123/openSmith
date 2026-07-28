@@ -22,6 +22,7 @@ from .pipeline_context import (
     CTX_RETRY_HINT,
     CTX_ROUTE_ID,
     CTX_RUBRIC_FEEDBACK,
+    CTX_RUN_ID,
     CTX_SESSION_ID,
     CTX_STATE_DIR,
     CTX_WORKING_DIR,
@@ -382,6 +383,7 @@ def _save_checkpoint(context: dict, node_idx: int) -> None:
             context={k: v for k, v in context.items() if not k.startswith("_")},
             timestamp=datetime.now(timezone.utc).isoformat(),
             working_dir=str(context.get(CTX_WORKING_DIR) or ""),
+            run_id=str(context.get(CTX_RUN_ID) or ""),
         ))
     except Exception:
         logger.exception("failed to save session checkpoint")

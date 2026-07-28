@@ -7,11 +7,16 @@ record. Content authors extend Smith with YAML files under ``agents/identities``
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
 from common.yaml_utils import YamlConfigError, load_yaml
+
+# Keywords made purely of Latin letters/digits get word-boundary matching; any
+# keyword containing other scripts (CJK) keeps plain substring matching.
+_LATIN_KEYWORD_RE = re.compile(r"^[a-z0-9][a-z0-9 _-]*$")
 
 
 IDENTITY_SCHEMA = "agentsmith.identity/v1"
@@ -252,6 +257,47 @@ class IdentityCatalog:
                     )
 
     @staticmethod
+    def _keyword_hit(keyword: str, normalized: str) -> bool:
+        """Match a route keyword, requiring word boundaries for Latin script.
+
+        A bare substring test let ``git`` match "di*git*al" and "le*git*imate",
+        and because the git route carries the highest priority it then stole
+        ordinary feature/refactor requests and dropped them into a pipeline-less
+        ReAct run.
+
+        Both boundaries are asserted, with an explicit inflection suffix in
+        between.  Neither boundary alone suffices:
+
+        * A trailing ``\\b`` with no suffix allowance breaks every English
+          inflection — ``\\bcommit\\b`` misses "squash these commits", since the
+          plural "s" is itself a word character.
+        * A leading ``\\b`` alone lets the keyword match as a *prefix*, so
+          ``\\bpush`` hits "pushback" and ``\\bcommit`` hits "committee" — the same
+          misrouting defect, just triggered from the other side.
+
+        The optional doubled letter is restricted to a repeat of the stem's own
+        last character (debug → debu**gg**ing).  Allowing *any* single letter
+        there reopened the very same prefix collision through "stem + consonant +
+        e": bug→"bugle", add→"addle", design→"designee".  The stem also drops a
+        trailing "e" so drop-e forms match (create → creat**ing**).
+
+        Genuine compounds stay rejected: creature, issuer, address, committee,
+        pushback, designee, designated.
+
+        CJK keywords keep substring semantics — Chinese has no word separators,
+        so a boundary assertion would never fire there.
+        """
+        folded = keyword.casefold()
+        if _LATIN_KEYWORD_RE.match(folded):
+            stem = folded[:-1] if folded.endswith("e") else folded
+            if not stem:
+                return folded in normalized
+            doubled = re.escape(stem[-1])
+            pattern = rf"\b{re.escape(stem)}(?:{doubled}?(?:e|es|ed|ing|s|d|ly))?\b"
+            return re.search(pattern, normalized) is not None
+        return folded in normalized
+
+    @staticmethod
     def _score(route: RouteSpec, message: str) -> int:
         normalized = message.casefold()
         score = 0
@@ -259,7 +305,7 @@ class IdentityCatalog:
             if example.casefold() in normalized:
                 score += 10
         for keyword in route.keywords:
-            if keyword.casefold() in normalized:
+            if IdentityCatalog._keyword_hit(keyword, normalized):
                 score += 3
         return score
 

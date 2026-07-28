@@ -168,7 +168,7 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 650 passed, server 153 passed (5 skipped).
+Current baseline: engine 702 passed, server 155 passed (5 skipped).
 
 ## 10. Not Implemented Yet
 

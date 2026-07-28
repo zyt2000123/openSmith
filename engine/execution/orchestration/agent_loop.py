@@ -14,6 +14,7 @@ from engine.execution.pipeline.pipeline_context import (
     CTX_FORCED_SKILL,
     CTX_IDENTITY_ID,
     CTX_ROUTE_ID,
+    CTX_RUN_ID,
     CTX_SESSION_ID,
     CTX_STATE_DIR,
     CTX_TASK_TYPE,
@@ -158,6 +159,38 @@ async def run_agent_stream(
         yield event
 
 
+def _checkpoint_owner_still_running(
+    state_dir: str, owner_run_id: str, current_run_id: str
+) -> bool:
+    """True when the run that wrote a checkpoint is still executing.
+
+    Request identity alone cannot distinguish "the previous run crashed" from
+    "the previous run is still going", so re-submitting an identical message
+    (a client retry after a timeout, a second click) used to adopt the live
+    run's half-finished state — both runs then wrote the same working_dir with
+    no coordination between them.
+    """
+    if not owner_run_id or owner_run_id == current_run_id:
+        return False
+    try:
+        from .run_state import RunStateStore, RunStatus
+
+        state = RunStateStore(Path(state_dir)).get(owner_run_id)
+    except Exception:
+        # Unable to prove the owner is finished — refuse to adopt its state.
+        logger.warning("cannot inspect checkpoint owner %s", owner_run_id, exc_info=True)
+        return True
+    if state is None:
+        return False
+    # QUEUED counts as live too: that run has not executed yet, so handing its
+    # checkpoint to someone else is the same race, just earlier.
+    return state.status in {
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+        RunStatus.WAITING_APPROVAL,
+    }
+
+
 def _apply_crash_checkpoint(
     context: dict,
     route_id: str,
@@ -172,6 +205,7 @@ def _apply_crash_checkpoint(
     expected_agent_id = str(context.get(CTX_AGENT_ID) or "")
     expected_identity_id = str(context.get(CTX_IDENTITY_ID) or "")
     expected_working_dir = str(context.get(CTX_WORKING_DIR) or "")
+    current_run_id = str(context.get(CTX_RUN_ID) or "")
     try:
         from engine.execution.pipeline.checkpoint import SessionStateManager
 
@@ -183,12 +217,16 @@ def _apply_crash_checkpoint(
             expected_agent_id
             and expected_identity_id
             and expected_working_dir
+            and checkpoint.run_id
             and checkpoint.agent_id == expected_agent_id
             and checkpoint.identity_id == expected_identity_id
             and checkpoint.working_dir == expected_working_dir
             and checkpoint.route_id == route_id
             and checkpoint.context.get(CTX_USER_MESSAGE) == user_message
             and 0 <= checkpoint.skill_chain_index < node_count
+            and not _checkpoint_owner_still_running(
+                state_dir, checkpoint.run_id, current_run_id
+            )
         ):
             logger.info(
                 "session %s: resuming crashed chain, skipping %d completed node(s)",

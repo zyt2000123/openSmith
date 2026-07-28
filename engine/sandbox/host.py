@@ -48,8 +48,16 @@ class ExecutionEnvironment(Protocol):
     ) -> CommandResult: ...
 
 
-async def _read_limited(stream: asyncio.StreamReader) -> tuple[bytes, int]:
-    chunks: list[bytes] = []
+async def _read_limited(
+    stream: asyncio.StreamReader, sink: list[bytes] | None = None
+) -> tuple[bytes, int]:
+    """Read a stream to EOF, retaining at most ``MAX_OUTPUT`` bytes.
+
+    ``sink`` collects each retained chunk as it arrives, so a caller forced to
+    abandon this task on timeout can still recover whatever was read before the
+    stream stalled.
+    """
+    chunks: list[bytes] = sink if sink is not None else []
     retained = total = 0
     while chunk := await stream.read(_STREAM_CHUNK_SIZE):
         total += len(chunk)
@@ -90,19 +98,48 @@ async def _drain_streams(
     proc: asyncio.subprocess.Process,
     stdout_task: asyncio.Task[tuple[bytes, int]],
     stderr_task: asyncio.Task[tuple[bytes, int]],
-) -> tuple[tuple[bytes, int], tuple[bytes, int]]:
+    stdout_sink: list[bytes] | None = None,
+    stderr_sink: list[bytes] | None = None,
+) -> tuple[tuple[bytes, int], tuple[bytes, int], bool]:
+    """Drain both streams, giving up rather than waiting on a stalled pipe.
+
+    Returns ``(stdout, stderr, complete)``.  The final wait used to be unbounded,
+    which hung forever whenever the command spawned a grandchild that called
+    ``setsid()`` and inherited the pipes: ``killpg`` cannot reach it, so EOF never
+    arrives.  Because the shell tool is declared ``concurrency: "serial"``, that
+    left its lock held and every later shell call queued behind it.
+    """
     drain_task = asyncio.gather(stdout_task, stderr_task)
     try:
-        return await asyncio.wait_for(asyncio.shield(drain_task), _OUTPUT_DRAIN_TIMEOUT)
+        stdout, stderr = await asyncio.wait_for(
+            asyncio.shield(drain_task), _OUTPUT_DRAIN_TIMEOUT
+        )
+        return stdout, stderr, True
     except asyncio.TimeoutError:
         _signal_process_group(proc, signal.SIGTERM)
         try:
-            return await asyncio.wait_for(
+            stdout, stderr = await asyncio.wait_for(
                 asyncio.shield(drain_task), _TERMINATION_GRACE_SECONDS
             )
+            return stdout, stderr, True
         except asyncio.TimeoutError:
             _signal_process_group(proc, signal.SIGKILL)
-            return await drain_task
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    asyncio.shield(drain_task), _TERMINATION_GRACE_SECONDS
+                )
+                return stdout, stderr, True
+            except asyncio.TimeoutError:
+                # A detached grandchild still holds the pipes.  Abandon the read
+                # and surface what we have; blocking here is what wedged the tool.
+                await _cancel_stream_tasks(stdout_task, stderr_task)
+                partial_out = b"".join(stdout_sink or [])
+                partial_err = b"".join(stderr_sink or [])
+                return (
+                    (partial_out, len(partial_out)),
+                    (partial_err, len(partial_err)),
+                    False,
+                )
 
 
 async def _cancel_stream_tasks(
@@ -136,6 +173,9 @@ class LocalExecutionEnvironment:
         proc: asyncio.subprocess.Process | None = None
         stdout_task: asyncio.Task[tuple[bytes, int]] | None = None
         stderr_task: asyncio.Task[tuple[bytes, int]] | None = None
+        # Live buffers, so output already read survives an abandoned drain.
+        stdout_sink: list[bytes] = []
+        stderr_sink: list[bytes] = []
         try:
             options: dict[str, object] = {
                 "stdout": asyncio.subprocess.PIPE,
@@ -151,8 +191,8 @@ class LocalExecutionEnvironment:
                 assert argv is not None
                 proc = await asyncio.create_subprocess_exec(*argv, **options)
             assert proc.stdout is not None and proc.stderr is not None
-            stdout_task = asyncio.create_task(_read_limited(proc.stdout))
-            stderr_task = asyncio.create_task(_read_limited(proc.stderr))
+            stdout_task = asyncio.create_task(_read_limited(proc.stdout, stdout_sink))
+            stderr_task = asyncio.create_task(_read_limited(proc.stderr, stderr_sink))
             await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
         except FileNotFoundError:
             binary = argv[0] if argv else str(command)
@@ -174,11 +214,19 @@ class LocalExecutionEnvironment:
             return CommandResult(exit_code=None, error=str(exc))
 
         assert proc is not None and stdout_task is not None and stderr_task is not None
-        (stdout, stdout_total), (stderr, stderr_total) = await _drain_streams(
-            proc, stdout_task, stderr_task
+        (stdout, stdout_total), (stderr, stderr_total), drained = await _drain_streams(
+            proc, stdout_task, stderr_task, stdout_sink, stderr_sink
         )
         return CommandResult(
             exit_code=proc.returncode,
             stdout=_format_stream(stdout, stdout_total) if stdout else "",
             stderr=_format_stream(stderr, stderr_total) if stderr else "",
+            error=(
+                None
+                if drained
+                else (
+                    "output may be incomplete: a detached background process still "
+                    "holds the output pipes"
+                )
+            ),
         )

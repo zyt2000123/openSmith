@@ -30,6 +30,12 @@ class SessionCheckpoint:
     # Checkpoints are project-scoped.  An empty value represents a legacy
     # checkpoint and is intentionally not eligible for resume.
     working_dir: str = ""
+    # The run that wrote this checkpoint.  Resume used to match on request
+    # identity alone, which cannot tell "the previous run crashed" from "the
+    # previous run is still going" — so re-submitting the same message could
+    # adopt a live run's half-finished state.  Empty means a legacy checkpoint
+    # and, like working_dir, is not eligible for resume.
+    run_id: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

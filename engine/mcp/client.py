@@ -27,6 +27,9 @@ SUPPORTED_PROTOCOL_VERSIONS = {
 CLIENT_INFO = {"name": "agent-smith", "version": "0.2.0"}
 MAX_TOOL_NAME_LENGTH = 64
 MAX_MCP_RESPONSE_BYTES = 1024 * 1024
+# Whole-stream backstop for SSE, where the per-message cap resets each event.
+# Loose on purpose: only a server trickling events indefinitely should hit it.
+MAX_MCP_SSE_STREAM_BYTES = 64 * MAX_MCP_RESPONSE_BYTES
 MAX_MCP_TOOL_LIST_PAGES = 100
 _FRAMING_BROKEN_MESSAGE = (
     "MCP stdio transport retired: an earlier response exceeded the maximum "
@@ -556,18 +559,31 @@ async def _response_from_sse_stream(response: Any, request_id: int) -> dict:
 async def _iter_sse_data_stream(response: Any):
     data_lines: list[str] = []
     payload_size = 0
+    stream_size = 0
     async for raw_line in response.aiter_lines():
         line = raw_line.rstrip("\r")
         if not line:
             if data_lines:
                 yield "\n".join(data_lines)
                 data_lines = []
+                # Reset per event: this cap bounds a single message, and a long
+                # call legitimately streams many small progress notifications
+                # before its response arrives.
+                payload_size = 0
             continue
         if line.startswith("data:"):
             payload = line[5:].lstrip()
-            payload_size += len(payload.encode("utf-8"))
+            size = len(payload.encode("utf-8"))
+            payload_size += size
+            stream_size += size
             if payload_size > MAX_MCP_RESPONSE_BYTES:
                 raise RuntimeError("MCP SSE response exceeds maximum size")
+            # Per-event reset above removes any bound on the stream as a whole,
+            # which would let a server trickle small events forever (httpx's
+            # timeout is per-read and resets on every chunk).  Keep a deliberately
+            # loose ceiling so legitimate long calls are unaffected.
+            if stream_size > MAX_MCP_SSE_STREAM_BYTES:
+                raise RuntimeError("MCP SSE stream exceeds maximum total size")
             data_lines.append(payload)
     if data_lines:
         yield "\n".join(data_lines)
