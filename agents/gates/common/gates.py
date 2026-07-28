@@ -164,7 +164,11 @@ class ContractAlignmentGate:
             missing.append("explicit alignment verdict (一致/偏差/aligned/deviation)")
         if not self._CONCRETE_REF.search(stripped):
             missing.append("concrete references to plan items or files")
-        if not context.get(output_key("planning")) and "计划" not in stripped and "plan" not in stripped.lower():
+        has_planning_context = any(
+            key.endswith("planning_output") and bool(value)
+            for key, value in context.items()
+        )
+        if not has_planning_context and "计划" not in stripped and "plan" not in stripped.lower():
             missing.append("reference to the plan being aligned against")
 
         if not missing:

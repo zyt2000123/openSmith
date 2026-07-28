@@ -12,6 +12,25 @@
 路由规则。可变记忆和 pipeline 检查点按身份写入：
 `~/.agent-smith/agent/identity-state/<identity-id>/`。
 
+## 已发布的 Coding 身份插件
+
+`coding.yaml` 是第一套完整的领域身份插件：它把软件变更请求路由到
+`coding` pipeline，并将可用能力收束为 `coding-*` 的五个阶段技能。
+
+```text
+coding identity
+├── coding-understanding
+├── coding-planning
+├── coding-architecture       # 多文件计划时才运行
+├── coding-implementation
+└── coding-validation
+```
+
+对应的 pipeline、gate 和 condition 仍位于 `agents/` 的同类目录中，但其
+资产名使用 `coding-` 前缀，避免其他身份意外复用。服务启动时会校验：路由
+引用的 pipeline 存在、每个节点的 Skill 已注册、且节点属于该身份的
+`skills.enabled` allowlist；任一项缺失都拒绝启动，不会静默回退到通用 ReAct。
+
 ## 最小格式
 
 ```yaml
