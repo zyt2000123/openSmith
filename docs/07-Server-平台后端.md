@@ -840,7 +840,7 @@ SQLite 数据库位于 `~/.agent-smith/sqlite/agent-smith.sqlite`，使用 WAL �
 |------|------|
 | `DATA_DIR` | `~/.agent-smith/` |
 | `SMITH_PROFILE_DIR` | `<project_root>/agents/smith/` |
-| `BUILTIN_SKILLS_DIR` | `<project_root>/agents/skills/` |
+| `BUILTIN_SKILLS_DIR` | `~/.agent-smith/builtin/skills/`（由 `AppPaths` 同步内置分发资源） |
 | `BUILTIN_TOOLS_DIR` | `<project_root>/agents/tools/` |
 | `SAFETY_RULES_PATH` | `<project_root>/agents/safety/dangerous_commands.json` |
 
