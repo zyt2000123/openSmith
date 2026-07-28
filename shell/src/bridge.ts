@@ -846,9 +846,11 @@ export class NodeBridge {
     if (!ready) return false;
 
     const controller = this.startRequest();
-    // 回显先于建会话的网络往返：失败时该轮也留在转录里，由 reportRequestError 收尾。
-    this.s.pushTurn(text);
     try {
+      // 回显先于建会话的网络往返：失败时该轮也留在转录里，由 reportRequestError 收尾。
+      // 放在 try 内：pushTurn 会在转录超限时 clearTerminal()，其 EPIPE 同步抛出
+      // 会成为未处理 rejection（两个调用方都没有 .catch），Node 22+ 直接终止进程。
+      this.s.pushTurn(text);
       const session = await this.getOrCreateSession(ready.baseUrl, ready.currentSession, text, controller.signal);
       if (controller.signal.aborted) return true;
       await this.streamResponse(ready.baseUrl, session, text, skillName, controller.signal);
@@ -934,8 +936,14 @@ export class NodeBridge {
     if (signal.aborted) {
       try {
         await deleteSession(baseUrl, session.id);
-      } catch {
-        // Best-effort cleanup prevents a cancelled first message from leaving an orphan session.
+      } catch (error) {
+        // Best-effort cleanup of a cancelled first message. Swallowing it left
+        // an orphan session on the server that nothing ever mentioned; say so,
+        // because the user is the only one who can clear it.
+        this.s.pushSystemLine(
+          `Cancelled before the first reply; an empty session may remain on the server (${errorMessage(error)}).`,
+          "error",
+        );
       }
       throw signal.reason ?? new DOMException("The request was aborted.", "AbortError");
     }

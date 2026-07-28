@@ -52,10 +52,20 @@ export function applyComposerEdit(value: string, cursor: number, input: string, 
   if (key.home) return { value, cursor: 0 };
   if (key.end) return { value, cursor: graphemes.length };
 
-  if (key.backspace || key.delete) {
+  if (key.backspace) {
     if (position === 0) return { value, cursor: position };
     graphemes.splice(position - 1, 1);
     return { value: graphemes.join(""), cursor: position - 1 };
+  }
+
+  // ink 6.8 reported both DEL (0x7f) and Forward Delete (ESC [ 3 ~) as
+  // `key.delete`, so the two could not be told apart and both deleted
+  // backwards. ink 7 maps them separately, and the composer tracks the cursor,
+  // so Forward Delete can finally remove the grapheme ahead of it.
+  if (key.delete) {
+    if (position >= graphemes.length) return { value, cursor: position };
+    graphemes.splice(position, 1);
+    return { value: graphemes.join(""), cursor: position };
   }
 
   if (

@@ -51,9 +51,7 @@ const ESCAPE_SEQUENCE = new RegExp(
  * forms of CSI and OSC; stripping the introducer leaves the payload behind as
  * inert visible text.
  */
-// biome-ignore lint/complexity/useRegexLiterals: a literal would put control
-// characters in the source, where they are invisible in review — the exact
-// failure this module defends against. See the file header.
+// biome-ignore lint/complexity/useRegexLiterals: a literal would put control characters in the source, where they are invisible in review — the exact failure this module defends against. See the file header.
 const UNSAFE_CONTROL = new RegExp("[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]", "g");
 
 /**

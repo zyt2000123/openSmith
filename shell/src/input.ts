@@ -68,7 +68,10 @@ function handleSetupInput(key: Key, options: ShellInputOptions): void {
     return;
   }
   if (key.escape && options.configConfigured) {
-    options.getState().set({ mode: "chat", panel: "welcome", inputValue: "", statusLine: "Back." });
+    // "chat", not "welcome": the save path already returns to chat, and from
+    // welcome the history keys do nothing, so Esc appeared to need pressing
+    // twice.
+    options.getState().set({ mode: "chat", panel: "chat", inputValue: "", statusLine: "Back." });
   }
 }
 

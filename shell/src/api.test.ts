@@ -481,7 +481,6 @@ test("streamMessage reassembles a CRLF frame separator split across read chunks"
   }
 });
 
-
 // ── Untrusted text is sanitised at the decode boundary (audit P2, security) ──
 
 const ESC_BYTE = String.fromCharCode(27);
@@ -505,9 +504,7 @@ test("SSE decoder strips escape sequences from tool output and hints", () => {
   );
   assert.equal((result as { summary: string }).summary, "done");
 
-  const call = decodeSseEvent(
-    sseFrame("tool_call", { id: "c1", name: "shell", hint: `${ESC_BYTE}[2Jls -la` }),
-  );
+  const call = decodeSseEvent(sseFrame("tool_call", { id: "c1", name: "shell", hint: `${ESC_BYTE}[2Jls -la` }));
   assert.equal((call as { hint: string }).hint, "ls -la");
 });
 

@@ -890,7 +890,15 @@ async function submitChat(
   skillMentionIndex: number,
   exit: () => void,
 ): Promise<void> {
-  if (!acceptsComposerSubmission(panel)) return;
+  if (!acceptsComposerSubmission(panel)) {
+    // The list panels keep accepting characters, so Enter looked broken: it was
+    // rejected here without a word, leaving the user to discover on their own
+    // that the composer has to be cleared with Esc first.
+    if (value.trim()) {
+      getState().set({ statusLine: "Press Esc to leave this panel before sending a message." });
+    }
+    return;
+  }
   const input = value.trim();
   if (!input) return;
 
@@ -1011,7 +1019,10 @@ function SmithApp() {
 
   const activeSetupField = setupFieldAt(setupIndex, setupFlow);
   const slashItems = useMemo(() => filterSlash(buildSlashItems(), inputValue), [inputValue]);
-  const slashMenuOpen = mode === "chat" && inputValue.startsWith("/");
+  // Panel-scoped input is not chat input: typing "/" while a list panel is open
+  // used to open the slash palette and take over the arrows, Tab and Esc that
+  // the panel needs.
+  const slashMenuOpen = mode === "chat" && acceptsComposerSubmission(panel) && inputValue.startsWith("/");
   const skillMentionMenuOpen = mode === "chat" && isSkillMentionQuery(inputValue);
   const skillMentions = useMemo(() => filterSkillMentions(skills, inputValue), [inputValue, skills]);
   const visibleSkills = useMemo(() => {

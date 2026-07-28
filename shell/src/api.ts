@@ -269,7 +269,11 @@ export type LlmConfigInput = {
 };
 
 function buildUrl(baseUrl: string, pathname: string): string {
-  return new URL(pathname, `${baseUrl.replace(/\/$/, "")}/`).toString();
+  // Resolve as a relative reference: `new URL("/api/x", "http://gw/smith/")`
+  // discards `/smith`, so behind a sub-path reverse proxy the health probe
+  // (which concatenates strings and keeps the prefix) passed while every real
+  // request 404'd.
+  return new URL(pathname.replace(/^\//, ""), `${baseUrl.replace(/\/$/, "")}/`).toString();
 }
 
 async function request<T>(baseUrl: string, pathname: string, options: RequestOptions = {}): Promise<T> {
@@ -598,7 +602,11 @@ function parseSseChunk(rawChunk: string): ParsedSseChunk | null {
     }
     return { eventName, payload: payload as Record<string, unknown> };
   } catch {
-    throw new Error(`Invalid JSON in SSE ${eventName} event.`);
+    // Without a sample there is no way to learn what the server actually sent.
+    // Sanitised and bounded: the payload is untrusted and reaches a terminal.
+    throw new Error(
+      `Invalid JSON in SSE ${eventName} event: ${sanitizeTerminalText(dataLines.join("\n")).slice(0, 200)}`,
+    );
   }
 }
 
@@ -721,15 +729,9 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     tool_schema_tokens: Number(payload.tool_schema_tokens ?? 0),
     protocol_tokens: Number(payload.protocol_tokens ?? 0),
     effective_context_window: Number(
-      payload.effective_context_window
-      ?? payload.context_window
-      ?? CONTEXT_DISPLAY_WINDOW,
+      payload.effective_context_window ?? payload.context_window ?? CONTEXT_DISPLAY_WINDOW,
     ),
-    safe_input_budget: Number(
-      payload.safe_input_budget
-      ?? payload.context_window
-      ?? CONTEXT_DISPLAY_WINDOW,
-    ),
+    safe_input_budget: Number(payload.safe_input_budget ?? payload.context_window ?? CONTEXT_DISPLAY_WINDOW),
     output_reserve: Number(payload.output_reserve ?? 0),
     safety_margin: Number(payload.safety_margin ?? 0),
     window_declared: Boolean(payload.window_declared ?? false),

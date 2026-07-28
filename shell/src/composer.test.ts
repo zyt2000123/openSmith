@@ -42,3 +42,26 @@ test("a chunk carrying only control bytes is ignored", () => {
 
   assert.deepEqual(result, { value: "AB", cursor: 1 });
 });
+
+// ── Audit 2026-07-26 P3: Forward Delete removes the grapheme ahead ──
+
+test("forward delete removes the character after the cursor", () => {
+  const edit = applyComposerEdit("abc", 1, "", { delete: true } as never);
+
+  assert.equal(edit.value, "ac");
+  assert.equal(edit.cursor, 1);
+});
+
+test("backspace still removes the character before the cursor", () => {
+  const edit = applyComposerEdit("abc", 1, "", { backspace: true } as never);
+
+  assert.equal(edit.value, "bc");
+  assert.equal(edit.cursor, 0);
+});
+
+test("forward delete at the end of the line is a no-op", () => {
+  const edit = applyComposerEdit("abc", 3, "", { delete: true } as never);
+
+  assert.equal(edit.value, "abc");
+  assert.equal(edit.cursor, 3);
+});
