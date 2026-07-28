@@ -250,13 +250,17 @@ def test_hardlink_check_covers_git_worktree_layout(tmp_path: Path) -> None:
     hooks.mkdir(parents=True)
     hook = hooks / "pre-commit"
     hook.write_text("#!/bin/sh\noriginal\n")
-    (main_repo / ".git" / "worktrees" / "wt").mkdir(parents=True)
+    # Mirror what git actually writes, including the marker files the pointer
+    # validation looks for.
+    (main_repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    gitdir = main_repo / ".git" / "worktrees" / "wt"
+    gitdir.mkdir(parents=True)
+    (gitdir / "HEAD").write_text("ref: refs/heads/wt\n")
+    (gitdir / "commondir").write_text("../..\n")
 
     worktree = tmp_path / "wt"
     worktree.mkdir()
-    (worktree / ".git").write_text(
-        f"gitdir: {main_repo / '.git' / 'worktrees' / 'wt'}\n"
-    )
+    (worktree / ".git").write_text(f"gitdir: {gitdir}\n")
     link = worktree / "innocuous_backup.txt"
     os.link(hook, link)
 
@@ -460,6 +464,121 @@ def test_checkpoint_owned_by_a_finished_run_is_adopted(tmp_path: Path) -> None:
     assert not _checkpoint_owner_still_running(
         str(tmp_path), "goneruns0000000000000000000001", "currentrun00000000000000000001"
     ), "an unknown/finished owner must not block adoption"
+
+
+# ── Round-4 review: the P1-7 fix reused CommandResult.error as a warning ──
+
+def test_incomplete_output_is_not_reported_as_execution_failure() -> None:
+    """A truncated drain must not discard the exit code and captured output.
+
+    shell.py treats any ``error`` as "the command failed" and returns early, so
+    folding "output may be incomplete" into that field turned a successful build
+    into a bare error string.
+    """
+    from engine.sandbox.host import CommandResult
+
+    result = CommandResult(
+        exit_code=0,
+        stdout="build finished: 42 tests passed",
+        output_incomplete=True,
+    )
+    assert result.error is None, "an incomplete drain is not an execution error"
+    assert result.output_incomplete
+    assert result.exit_code == 0
+    assert "42 tests passed" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_abandoned_drain_reports_the_real_byte_total() -> None:
+    """The abandoned-drain path must keep the true total, or truncation is hidden.
+
+    Reporting len(retained) as the total makes _format_stream's
+    "truncated, N bytes total" note vanish exactly when output was dropped.
+    """
+    import asyncio
+
+    from engine.sandbox.host import MAX_OUTPUT, _read_limited, _StreamBuffer
+
+    stream = asyncio.StreamReader()
+    payload = b"X" * (MAX_OUTPUT * 2)
+    stream.feed_data(payload)
+    buffer = _StreamBuffer()
+    task = asyncio.create_task(_read_limited(stream, buffer))
+    await asyncio.sleep(0)  # let the reader drain what is already buffered
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    retained, total = buffer.value()
+    assert len(retained) <= MAX_OUTPUT
+    assert total == len(payload), f"expected real total {len(payload)}, got {total}"
+    assert total > len(retained), "truncation must remain visible"
+
+
+def test_live_owner_checkpoint_is_kept_not_cleared(tmp_path: Path) -> None:
+    """Refusing to adopt a live run's checkpoint must not delete it.
+
+    The refusal previously fell through to the same clear() as a stale
+    checkpoint, destroying the crash-recovery point of a run still executing.
+    """
+    from engine.execution.orchestration.agent_loop import _apply_crash_checkpoint
+    from engine.execution.orchestration.run_state import RunStateStore
+    from engine.execution.pipeline.checkpoint import SessionCheckpoint, SessionStateManager
+
+    owner = "liveowner00000000000000000000001"
+    RunStateStore(tmp_path).create(owner, agent_id="smith-id", session_id="s-live")
+
+    manager = SessionStateManager(tmp_path)
+    manager.save(SessionCheckpoint(
+        run_id=owner,
+        agent_id="smith-id",
+        session_id="s-live",
+        identity_id="smith",
+        route_id="feature",
+        skill_chain_index=0,
+        context={"user_message": "build a feature"},
+        timestamp="2026-07-28T00:00:00+00:00",
+        working_dir=str(tmp_path.resolve()),
+    ))
+
+    context, start = _apply_crash_checkpoint(
+        {
+            "agent_id": "smith-id",
+            "identity_id": "smith",
+            "session_id": "s-live",
+            "_state_dir": str(tmp_path),
+            "_working_dir": str(tmp_path.resolve()),
+            "_run_id": "otherrun000000000000000000000002",
+        },
+        "feature",
+        "build a feature",
+        2,
+    )
+    assert start == 0, "a live owner's checkpoint must not be adopted"
+    assert manager.restore("s-live") is not None, "the live run's checkpoint was deleted"
+
+
+def test_gitdir_pointer_to_arbitrary_directory_is_ignored(tmp_path: Path) -> None:
+    """An untrusted .git file must not aim the hard-link scan at any path.
+
+    The .git pointer file is covered by no write guard — it arrives with a cloned
+    repo — so following it unvalidated turns every nlink>1 write check into a
+    walk of whatever it names.
+    """
+    from engine.safety.tool_guard import _git_dirs_for
+
+    decoy = tmp_path / "not-a-git-dir"
+    (decoy / "hooks").mkdir(parents=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / ".git").write_text(f"gitdir: {decoy}\n")
+
+    assert _git_dirs_for(work) == [], "a pointer to a non-git directory must be ignored"
+
+    real = tmp_path / "real.git"
+    (real / "hooks").mkdir(parents=True)
+    (real / "HEAD").write_text("ref: refs/heads/main\n")
+    (work / ".git").write_text(f"gitdir: {real}\n")
+    assert _git_dirs_for(work) == [real.resolve()], "a real git dir must still resolve"
 
 
 def test_approval_keeps_ordinary_arguments_readable() -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 MAX_OUTPUT = 10 * 1024
@@ -29,6 +29,11 @@ class CommandResult:
     stderr: str = ""
     timed_out: bool = False
     error: str | None = None
+    # The command ran and exit_code/stdout/stderr are real, but a detached
+    # process kept the pipes open so reading was abandoned.  Deliberately not
+    # folded into ``error``: callers treat that as "the command failed" and
+    # discard the exit code and output along with it.
+    output_incomplete: bool = False
 
 
 @runtime_checkable
@@ -48,24 +53,39 @@ class ExecutionEnvironment(Protocol):
     ) -> CommandResult: ...
 
 
+@dataclass
+class _StreamBuffer:
+    """Live view of one stream, readable after its reader task is abandoned.
+
+    Tracks retained bytes and the real byte count separately: the abandoned-drain
+    path needs the true total, or ``_format_stream`` silently omits its
+    "truncated, N bytes total" note precisely when output *was* dropped.
+    """
+
+    chunks: list[bytes] = field(default_factory=list)
+    total: int = 0
+
+    def value(self) -> tuple[bytes, int]:
+        return b"".join(self.chunks), self.total
+
+
 async def _read_limited(
-    stream: asyncio.StreamReader, sink: list[bytes] | None = None
+    stream: asyncio.StreamReader, buffer: _StreamBuffer | None = None
 ) -> tuple[bytes, int]:
     """Read a stream to EOF, retaining at most ``MAX_OUTPUT`` bytes.
 
-    ``sink`` collects each retained chunk as it arrives, so a caller forced to
-    abandon this task on timeout can still recover whatever was read before the
-    stream stalled.
+    ``buffer`` accumulates as data arrives, so a caller forced to abandon this
+    task on timeout can still recover what was read and how much was produced.
     """
-    chunks: list[bytes] = sink if sink is not None else []
-    retained = total = 0
+    sink = buffer if buffer is not None else _StreamBuffer()
+    retained = 0
     while chunk := await stream.read(_STREAM_CHUNK_SIZE):
-        total += len(chunk)
+        sink.total += len(chunk)
         remaining = MAX_OUTPUT - retained
         if remaining > 0:
-            chunks.append(chunk[:remaining])
+            sink.chunks.append(chunk[:remaining])
             retained += min(len(chunk), remaining)
-    return b"".join(chunks), total
+    return sink.value()
 
 
 def _format_stream(data: bytes, total: int) -> str:
@@ -98,8 +118,8 @@ async def _drain_streams(
     proc: asyncio.subprocess.Process,
     stdout_task: asyncio.Task[tuple[bytes, int]],
     stderr_task: asyncio.Task[tuple[bytes, int]],
-    stdout_sink: list[bytes] | None = None,
-    stderr_sink: list[bytes] | None = None,
+    stdout_buffer: _StreamBuffer | None = None,
+    stderr_buffer: _StreamBuffer | None = None,
 ) -> tuple[tuple[bytes, int], tuple[bytes, int], bool]:
     """Drain both streams, giving up rather than waiting on a stalled pipe.
 
@@ -133,11 +153,10 @@ async def _drain_streams(
                 # A detached grandchild still holds the pipes.  Abandon the read
                 # and surface what we have; blocking here is what wedged the tool.
                 await _cancel_stream_tasks(stdout_task, stderr_task)
-                partial_out = b"".join(stdout_sink or [])
-                partial_err = b"".join(stderr_sink or [])
+                empty = _StreamBuffer()
                 return (
-                    (partial_out, len(partial_out)),
-                    (partial_err, len(partial_err)),
+                    (stdout_buffer or empty).value(),
+                    (stderr_buffer or empty).value(),
                     False,
                 )
 
@@ -174,8 +193,8 @@ class LocalExecutionEnvironment:
         stdout_task: asyncio.Task[tuple[bytes, int]] | None = None
         stderr_task: asyncio.Task[tuple[bytes, int]] | None = None
         # Live buffers, so output already read survives an abandoned drain.
-        stdout_sink: list[bytes] = []
-        stderr_sink: list[bytes] = []
+        stdout_buffer = _StreamBuffer()
+        stderr_buffer = _StreamBuffer()
         try:
             options: dict[str, object] = {
                 "stdout": asyncio.subprocess.PIPE,
@@ -191,8 +210,8 @@ class LocalExecutionEnvironment:
                 assert argv is not None
                 proc = await asyncio.create_subprocess_exec(*argv, **options)
             assert proc.stdout is not None and proc.stderr is not None
-            stdout_task = asyncio.create_task(_read_limited(proc.stdout, stdout_sink))
-            stderr_task = asyncio.create_task(_read_limited(proc.stderr, stderr_sink))
+            stdout_task = asyncio.create_task(_read_limited(proc.stdout, stdout_buffer))
+            stderr_task = asyncio.create_task(_read_limited(proc.stderr, stderr_buffer))
             await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
         except FileNotFoundError:
             binary = argv[0] if argv else str(command)
@@ -215,18 +234,11 @@ class LocalExecutionEnvironment:
 
         assert proc is not None and stdout_task is not None and stderr_task is not None
         (stdout, stdout_total), (stderr, stderr_total), drained = await _drain_streams(
-            proc, stdout_task, stderr_task, stdout_sink, stderr_sink
+            proc, stdout_task, stderr_task, stdout_buffer, stderr_buffer
         )
         return CommandResult(
             exit_code=proc.returncode,
             stdout=_format_stream(stdout, stdout_total) if stdout else "",
             stderr=_format_stream(stderr, stderr_total) if stderr else "",
-            error=(
-                None
-                if drained
-                else (
-                    "output may be incomplete: a detached background process still "
-                    "holds the output pipes"
-                )
-            ),
+            output_incomplete=not drained,
         )

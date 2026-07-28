@@ -59,6 +59,19 @@ def _casefolded(path: Path) -> Path:
 
 
 _HARDLINK_SCAN_SKIP = frozenset({"objects", "node_modules", ".venv", "__pycache__"})
+# Files git always keeps in a real git directory (plain repo, worktree gitdir, or
+# submodule gitdir all carry HEAD).
+_GIT_DIR_MARKERS = ("HEAD", "config", "commondir")
+
+
+def _looks_like_git_dir(path: Path) -> bool:
+    """True when ``path`` is plausibly a git directory rather than any directory."""
+    try:
+        if not path.is_dir():
+            return False
+        return any((path / marker).exists() for marker in _GIT_DIR_MARKERS)
+    except OSError:
+        return False
 
 
 def _git_dirs_for(working_dir: Path) -> list[Path]:
@@ -89,10 +102,15 @@ def _git_dirs_for(working_dir: Path) -> list[Path]:
         return []
     candidates = [pointer]
     # A worktree's gitdir is <main>/.git/worktrees/<id>; hooks live in the common
-    # dir two levels up.
+    # dir two levels up.  (A submodule's is <main>/.git/modules/<name>, which
+    # carries its own hooks/ and must not be lifted.)
     if pointer.parent.name == "worktrees":
         candidates.append(pointer.parent.parent)
-    return [path for path in candidates if path.is_dir()]
+    # Only follow a pointer that actually looks like a git directory.  This file
+    # is not covered by any write guard — it arrives with a cloned repo — so an
+    # unvalidated pointer would let untrusted content aim the walk below at any
+    # path, turning every nlink>1 write check into a scan of, say, /usr.
+    return [path for path in candidates if _looks_like_git_dir(path)]
 
 
 def _shares_inode_with_protected_file(target: Path, working_dir: Path | None) -> bool:

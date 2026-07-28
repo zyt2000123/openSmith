@@ -213,6 +213,22 @@ def _apply_crash_checkpoint(
         checkpoint = manager.restore(session_id)
         if checkpoint is None:
             return context, 0
+        if checkpoint.run_id and _checkpoint_owner_still_running(
+            state_dir, checkpoint.run_id, current_run_id
+        ):
+            # Another run owns this session and has not finished.  Start fresh,
+            # but leave its checkpoint in place: falling through to the clear()
+            # below would delete the crash-recovery point of a run that is still
+            # executing — exactly the state this check exists to protect.  The
+            # same applies when ownership could not be determined, since
+            # _checkpoint_owner_still_running fails closed.
+            logger.info(
+                "session %s: checkpoint owned by live run %s — starting fresh, "
+                "keeping their checkpoint",
+                session_id,
+                checkpoint.run_id,
+            )
+            return context, 0
         if (
             expected_agent_id
             and expected_identity_id
@@ -224,9 +240,6 @@ def _apply_crash_checkpoint(
             and checkpoint.route_id == route_id
             and checkpoint.context.get(CTX_USER_MESSAGE) == user_message
             and 0 <= checkpoint.skill_chain_index < node_count
-            and not _checkpoint_owner_still_running(
-                state_dir, checkpoint.run_id, current_run_id
-            )
         ):
             logger.info(
                 "session %s: resuming crashed chain, skipping %d completed node(s)",
