@@ -368,6 +368,27 @@ def test_working_directory_restricts_relative_and_absolute_tool_paths(tmp_path: 
     assert relative.approval_required
     assert not absolute.allowed
     assert absolute.boundary_block
+    assert absolute.approval_required
+    assert absolute.needs_confirmation
+
+
+def test_working_directory_boundary_never_makes_credential_paths_approvable(tmp_path: Path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    guard = _builtin_guard(tmp_path / "missing-rules.json")
+    guard.set_working_directory(project_dir)
+
+    result = guard.check(
+        ToolCall(
+            id="credential-path",
+            name="list_dir",
+            arguments={"path": str(tmp_path / ".ssh")},
+        )
+    )
+
+    assert not result.allowed
+    assert not result.approval_required
+    assert not result.boundary_block
 
 
 def test_scoped_guard_rejects_unnormalized_optional_directory_paths(tmp_path: Path):

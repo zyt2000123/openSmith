@@ -261,6 +261,22 @@ class FileGuard:
         if any(target.is_relative_to(d) for d in self._allowed):
             return GuardResult(allowed=True)
 
+        if self.is_working_directory_scoped:
+            # A project-scoped run may inspect or change a user-selected
+            # external path only after the live approval flow has bound that
+            # exact normalized call.  This is deliberately narrower than the
+            # sensitive-path blocks above: those remain unapprovable.
+            return GuardResult(
+                allowed=False,
+                reason=(
+                    f"Path {path_str} is outside the active working directory "
+                    "and requires explicit user approval"
+                ),
+                needs_confirmation=True,
+                approval_required=True,
+                boundary_block=True,
+            )
+
         return GuardResult(
             allowed=False,
             reason=f"Path {path_str} outside allowed directories",

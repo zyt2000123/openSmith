@@ -42,6 +42,15 @@ from engine.tool.interface import ToolCall
 from engine.tool.registry import ToolRegistry
 
 
+EMPTY_DURABLE_DOC = (
+    "# Durable Project Memory\n\n"
+    "## Confirmed Facts\n\n"
+    "## Decisions\n\n"
+    "## Reusable Procedures\n\n"
+    "## Known Pitfalls\n"
+)
+
+
 class FakeLLM:
     def __init__(self) -> None:
         self.closed = False
@@ -832,6 +841,15 @@ def test_prepare_runtime_keeps_recent_and_retrieves_only_matching_durable(
     assert layers["durable_retrieval"]["action"] == "loaded"
 
 
+def test_prepare_runtime_initializes_empty_durable_memory(tmp_path: Path) -> None:
+    async def run() -> str:
+        runtime, services, _ = _runtime(tmp_path)
+        await prepare_runtime(EngineRequest(message="hello"), runtime, services)
+        return (runtime.profile_dir / "memory" / "durable.md").read_text(encoding="utf-8")
+
+    assert asyncio.run(run()) == EMPTY_DURABLE_DOC
+
+
 def test_prepare_runtime_injects_engine_owned_runtime_control(tmp_path: Path) -> None:
     async def run() -> str:
         runtime, services, _ = _runtime(tmp_path)
@@ -1389,7 +1407,7 @@ def test_runtime_reuses_llm_for_recent_memory_compilation(tmp_path: Path) -> Non
 
         assert result.had_tools is True
         assert (state_dir / "recent.md").is_file()
-        assert not (state_dir / "durable.md").exists()
+        assert (state_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
         assert (state_dir / ".compile_counter").read_text(encoding="utf-8") == "0"
         return llm
 

@@ -531,7 +531,11 @@ def test_builtin_shell_uses_the_bound_project_dir_when_cwd_is_omitted(tmp_path: 
             MacOSSeatbeltEnvironment(workspace=project_dir)
         )
         call = registry.normalize_call(
-            ToolCall(id="shell", name="shell", arguments={"command": "pwd"})
+            ToolCall(
+                id="shell",
+                name="shell",
+                arguments={"command": "date >/dev/null && ls -d . && pwd"},
+            )
         )
         result = await registry.execute(call)
         return project_dir, result
@@ -540,6 +544,8 @@ def test_builtin_shell_uses_the_bound_project_dir_when_cwd_is_omitted(tmp_path: 
 
     assert not result.is_error
     assert str(project_dir.resolve()) in result.content
+    assert "\n.\n" in result.content
+    assert "/etc/profile" not in result.content
 
 
 def test_load_providers_reads_rich_execution_contract_from_tool_meta():

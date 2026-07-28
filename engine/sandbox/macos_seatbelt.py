@@ -85,6 +85,8 @@ class MacOSSeatbeltEnvironment:
 (deny network*)
 (allow process*)
 (allow file-read* (literal "/private/var/select/sh"))
+(allow file-read-metadata (subpath "/bin"))
+(allow file-read-metadata (subpath "/usr/bin"))
 (allow file-read* (subpath "/Applications/Xcode.app"))
 (allow file-read* (subpath "/Library/Developer"))
 (allow file-read* (literal "/private/var/db/xcode_select_link"))
@@ -251,7 +253,11 @@ class MacOSSeatbeltEnvironment:
             self._profile(),
         ]
         if command is not None:
-            wrapped_argv.extend(["/bin/sh", "-lc", command])
+            # The execution environment is already constructed explicitly in
+            # ``_safe_environment``.  A login shell tries to load host startup
+            # files such as /etc/profile, which Seatbelt correctly denies and
+            # can also replace the minimal PATH before the command runs.
+            wrapped_argv.extend(["/bin/sh", "-c", command])
         else:
             assert argv is not None
             wrapped_argv.extend(argv)
