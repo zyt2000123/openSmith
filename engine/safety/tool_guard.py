@@ -45,6 +45,118 @@ class GuardResult:
 
 # ── Path guard (req #3: symlink, traversal, sensitive files) ──
 
+def _casefolded(path: Path) -> Path:
+    """Lowercase a path, for security comparisons only — never for I/O.
+
+    macOS (APFS) and Windows are case-insensitive but case-preserving, so
+    ``.GIT/hooks/pre-commit`` reaches the very same inode as ``.git/...`` while
+    ``Path.resolve()`` faithfully preserves the caller's casing.  Any guard that
+    compares path components therefore has to fold case first, or the block is
+    bypassable by simply retyping the path.  On case-sensitive filesystems this
+    can only ever over-block, never under-block.
+    """
+    return Path(str(path).lower())
+
+
+_HARDLINK_SCAN_SKIP = frozenset({"objects", "node_modules", ".venv", "__pycache__"})
+# Files git always keeps in a real git directory (plain repo, worktree gitdir, or
+# submodule gitdir all carry HEAD).
+_GIT_DIR_MARKERS = ("HEAD", "config", "commondir")
+
+
+def _looks_like_git_dir(path: Path) -> bool:
+    """True when ``path`` is plausibly a git directory rather than any directory."""
+    try:
+        if not path.is_dir():
+            return False
+        return any((path / marker).exists() for marker in _GIT_DIR_MARKERS)
+    except OSError:
+        return False
+
+
+def _git_dirs_for(working_dir: Path) -> list[Path]:
+    """Resolve ``.git`` whether it is a directory or a worktree/submodule pointer.
+
+    In a ``git worktree`` (and in submodules) ``.git`` is a *file* containing
+    ``gitdir: <path>``, and the hooks that matter live in the main repository —
+    so treating a non-directory ``.git`` as "nothing to scan" left the hard-link
+    check inert for exactly the layout this repository itself uses.
+    """
+    git_path = working_dir / ".git"
+    if git_path.is_dir():
+        return [git_path]
+    if not git_path.is_file():
+        return []
+    try:
+        text = git_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return []
+    if not text.startswith("gitdir:"):
+        return []
+    pointer = Path(text[len("gitdir:"):].strip()).expanduser()
+    if not pointer.is_absolute():
+        pointer = working_dir / pointer
+    try:
+        pointer = pointer.resolve()
+    except OSError:
+        return []
+    candidates = [pointer]
+    # A worktree's gitdir is <main>/.git/worktrees/<id>; hooks live in the common
+    # dir two levels up.  (A submodule's is <main>/.git/modules/<name>, which
+    # carries its own hooks/ and must not be lifted.)
+    if pointer.parent.name == "worktrees":
+        candidates.append(pointer.parent.parent)
+    # Only follow a pointer that actually looks like a git directory.  This file
+    # is not covered by any write guard — it arrives with a cloned repo — so an
+    # unvalidated pointer would let untrusted content aim the walk below at any
+    # path, turning every nlink>1 write check into a scan of, say, /usr.
+    return [path for path in candidates if _looks_like_git_dir(path)]
+
+
+def _shares_inode_with_protected_file(target: Path, working_dir: Path | None) -> bool:
+    """True when ``target`` is a hard link into a protected location.
+
+    A hard link gives one inode a second name, so a harmless-looking path can
+    write straight through to ``.git/hooks/pre-commit``; name-based checks cannot
+    see that.  Rejecting *every* multiply-linked file would be simpler but breaks
+    trees that use hard links normally — pnpm's content-addressed store, ccache,
+    ``cp -al`` backups — so confirm the inode really is reachable from a
+    protected directory before refusing.
+
+    Short-circuits on ``st_nlink == 1``, which covers virtually every write, so
+    the walk below never runs on the hot path.  ``.git/objects`` is skipped:
+    those blobs are content-addressed, immutable and checksum-verified by git.
+    """
+    try:
+        info = os.lstat(target)
+    except OSError:
+        return False
+    if info.st_nlink < 2 or not os.path.isfile(target):
+        return False
+
+    identity = (info.st_dev, info.st_ino)
+    home = Path.home()
+    roots = [home / name for name in FileGuard._ALWAYS_BLOCKED]
+    roots.append(_PLATFORM_DATA_ROOT)
+    if working_dir is not None:
+        roots.extend(_git_dirs_for(working_dir))
+        roots.extend(working_dir / name for name in FileGuard._ALWAYS_BLOCKED)
+
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name not in _HARDLINK_SCAN_SKIP]
+            for filename in filenames:
+                try:
+                    candidate = os.lstat(os.path.join(dirpath, filename))
+                except OSError:
+                    continue
+                if (candidate.st_dev, candidate.st_ino) == identity:
+                    return True
+    return False
+
+
 class FileGuard:
     _ALWAYS_BLOCKED = frozenset({".ssh", ".gnupg", ".aws", ".kube"})
     _SENSITIVE_WRITE = frozenset({".env", ".env.local", ".env.production", ".npmrc", ".pypirc"})
@@ -88,7 +200,7 @@ class FileGuard:
         # ``.ssh``/``.aws`` component and would otherwise slip through.  The
         # sensitive-write branch below already pairs lexical with resolved.
         for part in (*target.parts, *lexical.parts):
-            if part in self._ALWAYS_BLOCKED:
+            if part.lower() in self._ALWAYS_BLOCKED:
                 return GuardResult(allowed=False, reason=f"Access to {part}/ is blocked")
 
         if writing:
@@ -96,15 +208,19 @@ class FileGuard:
             if name in self._SENSITIVE_WRITE or name.startswith(".env"):
                 return GuardResult(allowed=False, reason=f"Write to sensitive file blocked: {name}", needs_confirmation=True)
             for part in target.parts:
-                if part in self._SENSITIVE_DIRS:
+                if part.lower() in self._SENSITIVE_DIRS:
                     return GuardResult(allowed=False, reason=f"Write inside {part}/ is blocked", needs_confirmation=True)
 
             # The runtime owns ~/.agent-smith. Only the three memory views are
             # writable through model-facing file tools; lifecycle code writes
             # its internal checkpoints through the trusted memory service.
             try:
-                lexical_platform = lexical.is_relative_to(_PLATFORM_DATA_ROOT)
-                resolved_platform = target.is_relative_to(_PLATFORM_DATA_ROOT)
+                # Case-fold the *block* test so a retyped ``.Agent-Smith`` cannot
+                # slip past it; the memory allow-list below stays case-exact so
+                # folding never widens the write exemption.
+                folded_root = _casefolded(_PLATFORM_DATA_ROOT)
+                lexical_platform = _casefolded(lexical).is_relative_to(folded_root)
+                resolved_platform = _casefolded(target).is_relative_to(folded_root)
                 lexical_memory = (
                     lexical.is_relative_to(_MEMORY_WRITE_ROOT)
                     and lexical.name in _MEMORY_WRITE_FILES
@@ -126,6 +242,20 @@ class FileGuard:
                         "[platform-protect-001] Platform runtime writes are restricted; "
                         "only controlled memory files may be written."
                     ),
+                )
+
+            # A hard link is a second name for one inode, so a path mentioning
+            # nothing sensitive can still write straight into .git/hooks/ or
+            # .ssh/.  Nothing above catches it: every check so far reasons about
+            # path *names*, never inode identity.
+            if _shares_inode_with_protected_file(target, self._working_dir):
+                return GuardResult(
+                    allowed=False,
+                    reason=(
+                        f"Write to {target.name} blocked: it is a hard link to a "
+                        "protected file, so the write would modify that file."
+                    ),
+                    needs_confirmation=True,
                 )
 
         if any(target.is_relative_to(d) for d in self._allowed):

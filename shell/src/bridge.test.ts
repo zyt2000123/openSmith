@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { NodeBridge, terminalStatusMessage } from "./bridge.js";
+import { errorMessage, NodeBridge, terminalStatusMessage } from "./bridge.js";
 import { MAX_QUEUED_MESSAGES } from "./queue.js";
 import { createAppStore } from "./store.js";
 import { createTurnEntry } from "./transcript-state.js";
+
+test("error messages strip terminal control sequences before UI presentation", () => {
+  const attack = `${String.fromCharCode(27)}]52;c;eA==${String.fromCharCode(7)}server failed`;
+
+  assert.equal(errorMessage(new Error(attack)), "server failed");
+});
 
 test("request errors keep details in the transcript without duplicating them in the status line", () => {
   const store = createAppStore();

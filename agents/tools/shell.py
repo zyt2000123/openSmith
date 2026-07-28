@@ -98,6 +98,14 @@ async def execute(
         output_parts.append(result.stdout)
     if result.stderr:
         output_parts.append(f"[stderr]\n{result.stderr}")
+    if result.output_incomplete:
+        # The command itself ran to completion; only reading its output was cut
+        # short.  Report that alongside the real exit code rather than as an
+        # execution failure, which would discard both exit code and output.
+        output_parts.append(
+            "[warning] output may be incomplete: a detached background process "
+            "still holds the output pipes"
+        )
 
     body = "\n".join(output_parts) if output_parts else "(no output)"
     return f"[exit_code={result.exit_code}]\n{body}"

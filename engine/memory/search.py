@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from pathlib import Path
 
@@ -23,6 +24,65 @@ import aiosqlite
 _SCHEMA_VERSION = "2"
 
 logger = logging.getLogger(__name__)
+
+# The trigram tokenizer produces no tokens below three characters, so a term
+# shorter than this can only be served by the LIKE fallback.
+_TRIGRAM_MIN = 3
+_MAX_TERMS = 16
+# Hiragana, katakana, CJK ideographs and Hangul — the whole reason this index
+# uses the trigram tokenizer.  Covering only ideographs left kana-only Japanese
+# sentences on the unsliced whole-sentence path, i.e. still broken.
+_CJK_CLASS = r"぀-ヿ一-鿿가-힯"
+_CJK_RUN = re.compile(rf"[{_CJK_CLASS}]+")
+_TOKEN_RUN = re.compile(rf"[{_CJK_CLASS}]+|[^\s{_CJK_CLASS}]+")
+# Latin punctuation plus the fullwidth marks Chinese prose is full of.  A stray
+# "，" surviving as a one-character term used to drag the entire query onto the
+# LIKE path and undo the trigram slicing below.
+_STRIP_CHARS = ".,;:!?()[]{}<>\"'`，。、；：！？（）【】「」『』《》〈〉～—…·"
+
+
+def _search_terms(query: str) -> list[str]:
+    """Split a query into terms the trigram index can actually match.
+
+    CJK text carries no spaces, so ``str.split()`` hands back a whole sentence as
+    a single term and the trigram tokenizer then demands that entire sentence
+    appear verbatim in the corpus — which never happens, so every Chinese
+    sentence query matched nothing at all.  Slice long CJK runs into overlapping
+    trigrams so each piece is independently matchable, and let bm25 rank the
+    documents that hit the most pieces.
+
+    Slices are taken round-robin across runs rather than in reading order.  A
+    single 18-character CJK run yields enough trigrams to fill ``_MAX_TERMS`` on
+    its own, which would silently discard every later word in the query — the old
+    whole-sentence term could never hit that cap, so the slicing introduced the
+    truncation risk along with the fix.
+    """
+    groups: list[list[str]] = []
+    for run in _TOKEN_RUN.findall(query):
+        if _CJK_RUN.fullmatch(run):
+            if len(run) <= _TRIGRAM_MIN:
+                groups.append([run])
+            else:
+                groups.append([
+                    run[index:index + _TRIGRAM_MIN]
+                    for index in range(len(run) - _TRIGRAM_MIN + 1)
+                ])
+        else:
+            cleaned = run.strip(_STRIP_CHARS)
+            if cleaned:
+                groups.append([cleaned])
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for index in range(max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if index >= len(group) or group[index] in seen:
+                continue
+            seen.add(group[index])
+            terms.append(group[index])
+            if len(terms) >= _MAX_TERMS:
+                return terms
+    return terms
 
 
 class SearchIndex:
@@ -132,14 +192,18 @@ class SearchIndex:
         stripped = query.strip()
         if not self._db or not stripped:
             return []
-        terms = list(dict.fromkeys(stripped.split()))[:16]
+        terms = _search_terms(stripped)
         if not terms:
             return []
+        matchable = [term for term in terms if len(term) >= _TRIGRAM_MIN]
         try:
-            if any(len(term) < 3 for term in terms):
-                # The trigram tokenizer matches nothing for queries shorter
-                # than 3 characters (common for CJK words) — fall back to an
-                # all-term LIKE scan over the small episode corpus.
+            if not matchable:
+                # The trigram tokenizer matches nothing for terms shorter than 3
+                # characters (common for CJK words) — fall back to an all-term
+                # LIKE scan over the small episode corpus.  Only when *no* term
+                # is long enough: falling back merely because one short token
+                # slipped in (a greeting, a stray fullwidth comma) would re-impose
+                # near-verbatim matching on the rest of the query.
                 escaped_terms = [
                     term.replace("\\", "\\\\")
                     .replace("%", r"\%")
@@ -154,9 +218,12 @@ class SearchIndex:
                     (*[f"%{term}%" for term in escaped_terms], top_k),
                 )
                 return [{"id": r["entry_id"], "score": 0.0} for r in rows]
-            safe_query = " AND ".join(
+            # OR, not AND: this retrieves *relevant* episodes, and a sentence
+            # sliced into trigrams would never have every piece present at once.
+            # bm25 floats the documents matching the most pieces to the top.
+            safe_query = " OR ".join(
                 '"' + term.replace('"', '""') + '"'
-                for term in terms
+                for term in matchable
             )
             rows = await self._db.execute_fetchall(
                 "SELECT entry_id, bm25(memory_fts) AS score "

@@ -1,4 +1,5 @@
 import type { ApprovalDetail, PendingApproval } from "./api.js";
+import { sanitizeTerminalText } from "./sanitize.js";
 import { truncateDisplay } from "./text-layout.js";
 
 const DETAIL_ORDER = ["command", "cwd", "path", "file_path", "timeout"];
@@ -28,7 +29,7 @@ export function oneLine(value: unknown, maxLength = 240): string {
     }
   }
 
-  const compact = text.replace(/\s+/g, " ").trim();
+  const compact = sanitizeTerminalText(text).replace(/\s+/g, " ").trim();
   return truncateDisplay(compact, maxLength);
 }
 

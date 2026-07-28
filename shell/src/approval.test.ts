@@ -45,6 +45,15 @@ test("long approval values are truncated for the terminal prompt", () => {
   assert.equal(oneLine("x".repeat(10), 6), "xxxxx…");
 });
 
+test("approval detail text strips terminal control sequences", () => {
+  const attack = `${String.fromCharCode(27)}]52;c;eA==${String.fromCharCode(7)}`;
+
+  assert.equal(oneLine(`${attack}git status`), "git status");
+  assert.deepEqual(approvalDetails({ ...shellApproval, arguments: { command: `${attack}git status` } }), [
+    { label: "Command", value: "git status" },
+  ]);
+});
+
 test("structured presentation wins over generic frontend tool-name fallbacks", () => {
   const approval = {
     ...shellApproval,

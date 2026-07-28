@@ -73,13 +73,28 @@ def test_smith_identity_routes_git_branch_requests_directly() -> None:
     assert decision.pipeline_id is None
 
 
-def test_smith_identity_routes_coding_work_through_the_shipped_pipeline() -> None:
+def test_coding_identity_owns_shipped_software_change_routes() -> None:
     identities_dir = Path(__file__).resolve().parents[3] / "agents" / "identities"
     catalog = IdentityCatalog.load(identities_dir)
 
-    assert route_task("修复登录报错", catalog).pipeline_id == "coding"
-    assert route_task("新增导出功能", catalog).pipeline_id == "coding"
-    assert route_task("重构用户模块", catalog).pipeline_id == "coding"
+    for message, route_id in (
+        ("修复登录报错", "bugfix"),
+        ("新增一个表单提交功能", "feature"),
+        ("重构用户模块", "refactor"),
+    ):
+        decision = route_task(message, catalog)
+        assert decision.identity_id == "coding"
+        assert decision.route_id == route_id
+        assert decision.pipeline_id == "coding"
+
+
+def test_git_operations_remain_with_the_default_smith_identity() -> None:
+    identities_dir = Path(__file__).resolve().parents[3] / "agents" / "identities"
+    decision = route_task("提交 Git PR 并推送", IdentityCatalog.load(identities_dir))
+
+    assert decision.identity_id == "smith"
+    assert decision.route_id == "git"
+    assert decision.pipeline_id is None
 
 
 def test_eval_sensitive_positive():

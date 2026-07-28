@@ -9,26 +9,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Iterator
 
 
-_SENSITIVE_ARGUMENT_NAMES = frozenset({
-    "access_token",
+# Substring parts, matched against a key stripped of non-alphanumerics, so
+# ``db_password``/``clientSecret``/``auth_token`` redact just like ``password``.
+# Exact full-name matching used to let every such variant through into the
+# approval card and the SSE stream the user sees.
+#
+# Keep in sync with ``_SENSITIVE_ARG_KEY_PARTS`` in engine/safety/tool_guard.py —
+# that module imports this one, so the shared helper cannot live over there.
+_SENSITIVE_ARGUMENT_KEY_PARTS = (
     "apikey",
-    "api_key",
     "authorization",
-    "client_secret",
-    "credentials",
+    "cookie",
     "credential",
+    "passwd",
     "password",
-    "private_key",
-    "refresh_token",
+    "privatekey",
     "secret",
     "token",
-})
+)
+
+
+def _is_sensitive_argument_name(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(part in normalized for part in _SENSITIVE_ARGUMENT_KEY_PARTS)
 _MAX_SUMMARY_ITEMS = 32
 _MAX_SUMMARY_DEPTH = 3
 _MAX_SUMMARY_TEXT = 240
@@ -237,7 +247,7 @@ def _summarize_mapping(arguments: dict, *, depth: int = 0) -> dict[str, object]:
 
 
 def _summarize_value(value: object, *, key: str | None = None, depth: int = 0) -> object:
-    if key is not None and key.lower() in _SENSITIVE_ARGUMENT_NAMES:
+    if key is not None and _is_sensitive_argument_name(key):
         return "***"
     if isinstance(value, str):
         safe = "".join(char if ord(char) >= 32 and char != "\x7f" else " " for char in value)

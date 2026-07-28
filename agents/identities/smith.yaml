@@ -9,23 +9,6 @@ prompt:
 
 routes:
   - id: git
-    keywords: [git, branch, commit, push, merge, rebase, worktree, 分支, 提交, 推送, 合并, 变基, 工作树]
+    keywords: [git, branch, commit, push, merge, rebase, worktree, 分支, 提交代码, "提交 PR", 推送, 合并, 变基, 工作树]
     pipeline: null
     priority: 30
-
-  - id: bugfix
-    keywords: [bug, fix, error, crash, broken, issue, debug, traceback, exception, fail, regression, wrong, 修复, 修改, 报错, 异常, 崩溃, 出错, 排查]
-    examples: ["Traceback (most recent call last)", "stack trace", "报错日志"]
-    pipeline: coding
-    priority: 20
-
-  - id: refactor
-    keywords: [refactor, restructure, cleanup, 重构, 整理代码]
-    pipeline: coding
-    priority: 15
-
-  - id: feature
-    keywords: [add, create, build, implement, new feature, design, develop, integrate, support, enable, 新增, 实现, 开发, 创建, 添加, 搭建, 接入, 支持]
-    examples: ["user story", "acceptance criteria", "用户故事", "验收标准", "需求文档", "PRD"]
-    pipeline: coding
-    priority: 10

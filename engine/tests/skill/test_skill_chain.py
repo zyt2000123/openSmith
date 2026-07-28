@@ -41,7 +41,7 @@ def test_valid_pipeline_still_loads(tmp_path: Path) -> None:
         "    gate: understanding\n"
         "  - skill: architecture\n"
         "    gate: design\n"
-        "    condition: needs_architecture\n",
+        "    condition: coding_needs_architecture\n",
     )
     chain = SkillChain.from_yaml(path)
     assert chain is not None
@@ -60,11 +60,11 @@ def test_shipped_coding_pipeline_loads_gates_and_conditions() -> None:
 
     chain = pipelines["coding"]
     assert [node.skill_name for node in chain.nodes] == [
-        "understanding",
-        "planning",
-        "architecture",
-        "implementation",
-        "validation",
+        "coding-understanding",
+        "coding-planning",
+        "coding-architecture",
+        "coding-implementation",
+        "coding-validation",
     ]
     assert chain.nodes[2].condition is not None
 

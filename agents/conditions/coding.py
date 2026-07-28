@@ -10,13 +10,15 @@ from __future__ import annotations
 import re
 
 
-def needs_architecture(ctx: dict) -> bool:
+def coding_needs_architecture(ctx: dict) -> bool:
     """Skip architecture for small, single-module changes."""
-    plan_output = ctx.get(output_key("planning"), "")
+    # ``load_gate_content`` injects ``output_key`` before this content module
+    # executes.  Keeping that dependency injected avoids importing engine code.
+    plan_output = ctx.get(output_key("coding-planning"), "")  # noqa: F821
     file_refs = re.findall(r'[\w/]+\.\w{1,5}', plan_output)
     return len(set(file_refs)) >= 3
 
 
 CONDITIONS = {
-    "needs_architecture": needs_architecture,
+    "coding_needs_architecture": coding_needs_architecture,
 }

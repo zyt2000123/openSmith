@@ -25,6 +25,26 @@ test("smith-ui payload parser keeps only a bounded declarative component tree", 
   });
 });
 
+test("smith-ui payload parser sanitizes terminal text props", () => {
+  const attack = `${String.fromCharCode(27)}]52;c;eA==${String.fromCharCode(7)}`;
+  const parsed = parseSmithUiPayload({
+    version: 1,
+    spec: {
+      root: "summary",
+      elements: {
+        summary: {
+          type: "Heading",
+          props: { text: `${attack}Deployment`, level: "h1" },
+          children: [],
+        },
+      },
+    },
+    images: [],
+  });
+
+  assert.equal(parsed?.spec.elements.summary?.props.text, "Deployment");
+});
+
 test("smith-ui payload parser rejects remote image sources and non-presentation components", () => {
   assert.equal(
     parseSmithUiPayload({

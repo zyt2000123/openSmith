@@ -791,6 +791,31 @@ async def compact_episode(
         logger.warning("episode output contains injection markers — skipping write")
         return None
 
+    # Compacting the same topic twice, or two topics whose slugs collide after the
+    # 60-character truncation above, used to overwrite the earlier episode with no
+    # backup — and _sync_episode_index then replaced the stale text in the FTS
+    # index too, leaving the old content unrecoverable.  durable.md already keeps a
+    # .bak on update; do the same here, and keep distinct topics in distinct files.
+    if out.is_file():
+        try:
+            existing = out.read_text(encoding="utf-8")
+        except OSError:
+            existing = ""
+        if existing and not existing.startswith(f"# {topic}\n"):
+            # Slug collision between different topics: derive a distinct filename
+            # instead of destroying an unrelated episode.
+            digest = hashlib.sha256(topic.encode("utf-8")).hexdigest()[:8]
+            out = (episodes_dir / f"{slug}-{digest}.md").resolve()
+            if not out.is_relative_to(episodes_root):
+                raise ValueError("episode path escaped its storage directory")
+        if out.is_file():
+            try:
+                atomic_write_text(
+                    out.with_name(f"{out.name}.bak"), out.read_text(encoding="utf-8")
+                )
+            except OSError:
+                logger.warning("failed to back up episode before overwrite: %s", out)
+
     atomic_write_text(out, f"# {topic}\n\n{summary}\n")
     return out
 

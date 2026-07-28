@@ -4,6 +4,8 @@ import { defineCatalog, validateSpec } from "@json-render/core";
 import { standardComponentDefinitions } from "@json-render/ink/catalog";
 import { schema } from "@json-render/ink/schema";
 
+import { sanitizeTerminalText } from "./sanitize.js";
+
 const MAX_ELEMENTS = 64;
 const MAX_DEPTH = 8;
 const MAX_IMAGES = 4;
@@ -224,6 +226,15 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
+/** JSON UI is server-provided; preserve its shape while making every displayed string terminal-safe. */
+function sanitizeSmithUiValue(value: unknown): unknown {
+  if (typeof value === "string") return sanitizeTerminalText(value);
+  if (Array.isArray(value)) return value.map(sanitizeSmithUiValue);
+  const object = record(value);
+  if (!object) return value;
+  return Object.fromEntries(Object.entries(object).map(([key, item]) => [key, sanitizeSmithUiValue(item)]));
+}
+
 function hasDynamicValue(value: unknown, depth = 0): boolean {
   if (depth > MAX_DEPTH) return true;
   if (Array.isArray(value))
@@ -256,7 +267,11 @@ function parseElement(id: string, rawElement: unknown): SmithUiElement | null {
   }
   const children = [...element.children] as string[];
   if (new Set(children).size !== children.length) return null;
-  return { type: element.type as SmithUiElement["type"], props, children };
+  return {
+    type: element.type as SmithUiElement["type"],
+    props: sanitizeSmithUiValue(props) as Record<string, unknown>,
+    children,
+  };
 }
 
 function hasValidGraph(root: string, elements: Record<string, SmithUiElement>, elementCount: number): boolean {
@@ -321,7 +336,7 @@ function parseImage(value: unknown): SmithUiImage | null {
   if (!image || Object.keys(image).some((key) => !["path", "alt", "width", "height"].includes(key))) return null;
   const source = localProjectImagePath(image.path);
   if (!source || typeof image.alt !== "string" || !image.alt || image.alt.length > 500) return null;
-  const parsed: SmithUiImage = { path: source, alt: image.alt };
+  const parsed: SmithUiImage = { path: source, alt: sanitizeTerminalText(image.alt) };
   for (const dimension of ["width", "height"] as const) {
     if (image[dimension] === undefined) continue;
     const size = imageDimension(image[dimension]);

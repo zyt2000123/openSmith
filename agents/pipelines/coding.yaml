@@ -1,23 +1,22 @@
-# The coding route deliberately uses a single, inspectable chain.  Pipeline
-# nodes may fall back to generic ReAct when a matching SKILL.md is not
-# installed, while gates still make the intermediate contract observable and
-# enforceable.
+# The coding identity owns this explicit, inspectable chain.  Every stage name
+# is namespaced so a future domain identity cannot accidentally satisfy this
+# pipeline with an unrelated generic skill.
 route: coding
 
 steps:
-  - skill: understanding
+  - skill: coding-understanding
     gate: understanding
-  - skill: planning
+  - skill: coding-planning
     gate: planning
-  - skill: architecture
+  - skill: coding-architecture
     gate: design
-    condition: needs_architecture
-  - skill: implementation
+    condition: coding_needs_architecture
+  - skill: coding-implementation
     gate: contract_alignment
-  - skill: validation
+  - skill: coding-validation
     gate: validation_llm
 
 backtrack:
-  architecture: planning
-  implementation: planning
-  validation: implementation
+  coding-architecture: coding-planning
+  coding-implementation: coding-planning
+  coding-validation: coding-implementation

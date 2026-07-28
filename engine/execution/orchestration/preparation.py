@@ -13,6 +13,7 @@ from engine.context import PromptAssembler, estimate_tokens, prompt_budget_for_l
 from engine.execution.pipeline.pipeline_context import (
     CTX_AGENT_ID,
     CTX_IDENTITY_ID,
+    CTX_RUN_ID,
     CTX_SESSION_ID,
     CTX_STATE_DIR,
     CTX_WORKING_DIR,
@@ -104,6 +105,7 @@ def runtime_execution_context(
     identity: IdentitySpec,
     state_dir: Path,
     working_dir: Path,
+    run_id: str | None = None,
 ) -> dict[str, str | None]:
     context: dict[str, str | None] = {
         CTX_AGENT_ID: runtime.agent_id,
@@ -111,6 +113,7 @@ def runtime_execution_context(
         CTX_IDENTITY_ID: identity.id,
         CTX_STATE_DIR: str(state_dir),
         CTX_WORKING_DIR: str(working_dir.resolve()),
+        CTX_RUN_ID: run_id or "",
     }
     for key, value in runtime.metadata.items():
         context.setdefault(key, value)

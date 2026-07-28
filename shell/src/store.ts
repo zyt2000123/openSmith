@@ -25,6 +25,7 @@ import { createEmptyConversation } from "./conversation.js";
 import { HISTORY_LIMIT } from "./history.js";
 import type { ModelPickerState } from "./model-picker.js";
 import type { QueuedMessage } from "./queue.js";
+import { sanitizeTerminalText } from "./sanitize.js";
 import { clearTerminal } from "./term.js";
 import type { TokenTab } from "./token-stats.js";
 import {
@@ -386,7 +387,8 @@ export function createAppStore(initialHistory: string[] = []) {
         historyIndex: -1,
         historyDraft: "",
       })),
-    pushSystemLine: (text, tone = "info") => set((s) => appendTranscript(s, createSystemEntry(text, tone))),
+    pushSystemLine: (text, tone = "info") =>
+      set((s) => appendTranscript(s, createSystemEntry(sanitizeTerminalText(text), tone))),
     pushTurn: (userText) =>
       set((s) => ({
         ...appendTranscript(s, createTurnEntry(userText)),

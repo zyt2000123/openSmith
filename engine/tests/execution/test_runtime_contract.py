@@ -13,7 +13,6 @@ from engine.execution.events import EventType, ExecutionEvent, raw_text_delta
 from engine.execution.hooks import HookManager
 from engine.execution.orchestration import lifecycle as lifecycle_module
 from engine.execution.orchestration import preparation as preparation_module
-from engine.execution.orchestration.agent_loop import run_agent_stream
 from engine.execution.orchestration.lifecycle import (
     reply_events_with_runtime,
     reply_with_runtime,
@@ -31,7 +30,6 @@ from engine.execution.orchestration.runtime import (
     RuntimeContext,
     RuntimeServices,
 )
-from engine.execution.pipeline.backtrack import FailureLoopGuard
 from engine.identity import IdentityCatalog
 from engine.llm.client import ChatResponse, ToolCallData
 from engine.llm.contracts import LLMResponseError, ProviderCapabilities
@@ -1467,18 +1465,18 @@ GATES = {"runtime_contract_planning": AlwaysPassGate}
     assert [node.skill_name for node in setup.chain.nodes] == ["planning"]
 
 
-def test_shipped_coding_pipeline_routes_through_gates_and_conditions(tmp_path: Path) -> None:
+def test_shipped_coding_identity_executes_every_declared_stage(tmp_path: Path) -> None:
+    """A shipped coding request must execute the plugin's real skill chain.
+
+    This intentionally uses the public ``run_stream_with_runtime`` seam and
+    the repository's actual ``agents/`` assets.  Do not seed stage skills in
+    the temporary profile: doing so would hide a broken coding identity
+    installation.
+    """
+
     async def run() -> tuple[object, list[ExecutionEvent]]:
         runtime, services, _ = _runtime(tmp_path)
         agents_dir = Path(__file__).resolve().parents[3] / "agents"
-        skills_dir = runtime.profile_dir / "skills"
-        for skill_name in ("understanding", "planning", "architecture", "implementation", "validation"):
-            skill_dir = skills_dir / skill_name
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            (skill_dir / "SKILL.md").write_text(
-                f"---\nname: {skill_name}\ndescription: test workflow step\n---\nPerform this workflow step.",
-                encoding="utf-8",
-            )
         runtime = RuntimeContext(
             agent_id=runtime.agent_id,
             agent_name=runtime.agent_name,
@@ -1490,34 +1488,24 @@ def test_shipped_coding_pipeline_routes_through_gates_and_conditions(tmp_path: P
         llm = CodingPipelineLLM()
         services.llm = llm  # type: ignore[assignment]
         services.gate_llm = LlmGatePassReviewer()  # type: ignore[assignment]
+        services.skill_registry.load_builtin(agents_dir / "skills")
         request = EngineRequest(message="修复登录报错")
-        setup = await prepare_runtime(request, runtime, services)
-        assert setup.chain is not None
-        events = [
-            event
-            async for event in run_agent_stream(
-                llm,
-                setup.system_prompt,
-                request.message,
-                services.tool_registry,
-                services.skill_registry,
-                setup.route,
-                setup.chain,
-                FailureLoopGuard(),
-                gate_llm=services.gate_llm,
-            )
-        ]
-        return setup, events
+        stream = run_stream_with_runtime(request, runtime, services)
+        events = [event async for event in stream.stream_events()]
+        return stream, events
 
-    setup, events = asyncio.run(run())
+    stream, events = asyncio.run(run())
 
-    assert setup.route.pipeline_id == "coding"
+    route = next(event for event in events if event.type is EventType.ROUTE_DECIDED)
+    assert route.data["identity_id"] == "coding"
+    assert route.data["route_id"] == "bugfix"
+    assert route.data["pipeline_id"] == "coding"
     assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
-        "understanding",
-        "planning",
-        "architecture",
-        "implementation",
-        "validation",
+        "coding-understanding",
+        "coding-planning",
+        "coding-architecture",
+        "coding-implementation",
+        "coding-validation",
     ]
     assert [event.data["verdict"] for event in events if event.type is EventType.GATE_RESULT] == [
         "pass",
@@ -1526,7 +1514,10 @@ def test_shipped_coding_pipeline_routes_through_gates_and_conditions(tmp_path: P
         "pass",
         "pass",
     ]
-    assert events[-1].type is EventType.DONE
+    assert all(event.type not in {EventType.BLOCKED, EventType.FAILED} for event in events)
+    assert events[-2].type is EventType.DONE
+    assert events[-1].type is EventType.RUN_FINISHED
+    assert stream.status == "completed"
 
 
 def test_reply_events_with_runtime_emits_decision_reply_and_closes(tmp_path: Path) -> None:

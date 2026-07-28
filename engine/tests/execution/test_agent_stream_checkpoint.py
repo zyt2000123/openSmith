@@ -545,10 +545,19 @@ def _seed_checkpoint(
     working_dir: Path | None = None,
     agent_id: str = "smith-id",
     identity_id: str = "smith",
+    run_id: str = "crashedrun0000000000000000000001",
 ) -> None:
+    """Seed a checkpoint the way a crashed run leaves one.
+
+    ``run_id`` is required for resume — a checkpoint with no owner counts as
+    legacy and is never adopted.  Deliberately no RunState file is written for it:
+    ``RunStateStore.get()`` returning None is what a genuinely crashed run looks
+    like once startup reconciliation has moved it out of RUNNING.
+    """
     from engine.execution.pipeline.checkpoint import SessionCheckpoint, SessionStateManager
 
     SessionStateManager(tmp_path).save(SessionCheckpoint(
+        run_id=run_id,
         agent_id=agent_id,
         session_id=session_id,
         identity_id=identity_id,

@@ -25,6 +25,10 @@ CTX_FORCED_SKILL = "forced_skill"
 CTX_STATE_DIR = "_state_dir"
 CTX_WORKING_DIR = "_working_dir"
 CTX_RETRY_HINT = "_rubric_retry_hint"
+# Recorded as a top-level checkpoint field rather than inside the checkpointed
+# context, so a resuming run can tell which run produced a checkpoint and
+# whether that run is still alive.
+CTX_RUN_ID = "_run_id"
 
 # --- skill-facing feedback --------------------------------------------------
 CTX_RUBRIC_FEEDBACK = "rubric_feedback"

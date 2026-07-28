@@ -550,7 +550,7 @@ async def _run_events_with_runtime(
                 history=request.history,
                 forced_skill=request.forced_skill,
                 execution_context=_runtime_execution_context(
-                    runtime, s.identity, s.state_dir, s.working_dir,
+                    runtime, s.identity, s.state_dir, s.working_dir, run_id,
                 ),
                 gate_llm=services.gate_llm,
                 disabled_skill_names=getattr(s, "disabled_skill_names", frozenset()),
