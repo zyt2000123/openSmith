@@ -399,6 +399,128 @@ async def test_sse_size_cap_still_rejects_one_huge_message() -> None:
             pass
 
 
+# ── Second batch: P1-9 / P1-10 / P1-11 / P1-12 / P1-19 ──
+
+def test_render_ui_rejects_huge_integers_gracefully() -> None:
+    """A huge JSON integer must be refused, not crash the whole turn.
+
+    math.isfinite() converts int to float and raises OverflowError past ~1.8e308,
+    so a hallucinated value escaped smith_ui's "bounded structural validation"
+    and failed the entire run instead of taking the graceful-reject path.
+    """
+    from engine.execution.react.smith_ui import validate_smith_ui_call
+
+    call = {
+        "spec": {
+            "elements": [
+                {"type": "Metric", "props": {"label": "x", "value": 10 ** 400}}
+            ]
+        }
+    }
+    result = validate_smith_ui_call(call, working_dir=None)
+    assert not result.ok, "an unrepresentable number must be rejected"
+    assert result.reason, "rejection must carry a reason"
+
+
+def test_render_ui_still_accepts_ordinary_numbers() -> None:
+    """The overflow guard must not reject normal values."""
+    from engine.execution.react.smith_ui import _is_json_value
+
+    for value in (0, 1, -1, 42, 3.14, 10 ** 18, -(10 ** 18)):
+        assert _is_json_value(value), f"{value!r} should be valid"
+    for value in (float("inf"), float("nan"), 10 ** 400):
+        assert not _is_json_value(value), f"{value!r} should be invalid"
+
+
+def test_openai_stream_surfaces_provider_error_chunk() -> None:
+    """A provider error carried inside the stream must reach the caller.
+
+    Relays report mid-stream failures as a `{"error": {...}}` chunk and then drop
+    the connection; reading only `choices` replaced the real cause with
+    "stream ended before the [DONE] sentinel".
+    """
+    from engine.llm.adapters.openai import _provider_error_message
+
+    assert _provider_error_message(
+        {"error": {"message": "rate limit exceeded", "type": "rate_limit"}}
+    ) == "rate limit exceeded"
+    assert _provider_error_message({"error": "upstream unavailable"}) == "upstream unavailable"
+    assert _provider_error_message({"error": {"code": "content_filter"}}) == "content_filter"
+    assert _provider_error_message({"error": {}}) == "unspecified provider error"
+    # An ordinary content chunk must not be mistaken for a failure.
+    assert _provider_error_message({"choices": [{"delta": {"content": "hi"}}]}) is None
+    assert _provider_error_message({"error": None}) is None
+
+
+def test_openai_non_stream_accepts_either_reasoning_field() -> None:
+    """The non-streaming path must accept `reasoning` like the streaming one does.
+
+    openai.py:167 already handles both spellings; the non-streaming branch read
+    only reasoning_content, so relays using `reasoning` lost the content silently.
+    """
+    import inspect
+
+    from engine.llm.adapters import openai as openai_adapter
+
+    source = inspect.getsource(openai_adapter)
+    non_stream = source.split("async def _stream_response")[0]
+    assert 'choice.get("reasoning")' in non_stream, (
+        "non-streaming path must fall back to the `reasoning` field"
+    )
+
+
+def test_usage_records_whether_the_provider_reported_anything() -> None:
+    """A missing usage payload must be distinguishable from a genuine zero.
+
+    Relays that omit `usage` made real, billed calls show up as 0 tokens and 0
+    cost.  A round-5 review corrected my earlier claim that this needed a
+    cross-layer change: no consumer sums the usage dict blindly, they all read
+    named token keys, so an extra flag is safe.
+    """
+    from engine.llm.usage import USAGE_KEYS, normalize_usage
+
+    absent = normalize_usage(None)
+    assert absent["usage_reported"] == 0, "a missing payload must be flagged"
+
+    real_zero = normalize_usage({"prompt_tokens": 0, "completion_tokens": 0})
+    assert real_zero["usage_reported"] == 1, "a real payload must be flagged reported"
+    assert real_zero["input_tokens"] == 0, "a reported zero stays zero"
+
+    # The flag must stay out of the token key tuple so token-iterating consumers
+    # (projections, token_stats) are unaffected.
+    assert "usage_reported" not in USAGE_KEYS
+
+
+def test_trace_redacts_credentials_embedded_in_values() -> None:
+    """Field-name matching misses secrets carried inside a value.
+
+    TOOL_CALL_START writes the full tool arguments, so a shell command holding a
+    bearer token landed in the trace verbatim — the key is "command", which does
+    not trigger the name-based rule.
+    """
+    from engine.observability.trace_store import _bounded_trace_value
+
+    secret = "sk-ant-api03-must-not-appear"
+    payload = {
+        "name": "shell",
+        "arguments": {
+            "command": f"curl -H 'Authorization: Bearer {secret}' https://example.test",
+        },
+    }
+    rendered = str(_bounded_trace_value(payload))
+    assert secret not in rendered, f"credential leaked into the trace: {rendered}"
+
+
+def test_trace_keeps_ordinary_values_intact() -> None:
+    """Value scanning must not mangle normal command text."""
+    from engine.observability.trace_store import _bounded_trace_value
+
+    payload = {"arguments": {"command": "pytest -q tests/", "cwd": "/repo"}}
+    rendered = _bounded_trace_value(payload)
+    assert rendered["arguments"]["command"] == "pytest -q tests/"
+    assert rendered["arguments"]["cwd"] == "/repo"
+
+
 # ── P1-15: approval redaction is weaker than the audit-log redaction ──
 
 def test_approval_redacts_credential_name_variants() -> None:

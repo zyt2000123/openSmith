@@ -21,6 +21,9 @@ USAGE_KEYS = (
     "cache_write_tokens",
     "reasoning_tokens",
 )
+# Not a token count — 1 when the provider sent a usage payload, 0 when it did not.
+# Kept out of USAGE_KEYS so anything iterating token keys stays unaffected.
+USAGE_REPORTED_KEY = "usage_reported"
 
 
 def _number(value: Any) -> int | None:
@@ -47,9 +50,16 @@ def _first(raw: dict[str, Any], *paths: tuple[str, ...]) -> int:
 
 
 def normalize_usage(raw: object) -> dict[str, int]:
-    """Normalize one provider usage payload into the six internal keys."""
+    """Normalize one provider usage payload into the six internal token keys.
+
+    Also records whether the provider sent a usage payload at all: relays that
+    omit ``usage`` made real, billed calls indistinguishable from genuine zeros,
+    silently skewing cost and cache-hit statistics.  Aggregated across runs the
+    flag reads naturally as "how many calls reported usage" — no consumer sums
+    this dict blindly, they all read named token keys.
+    """
     if not isinstance(raw, dict):
-        return {key: 0 for key in USAGE_KEYS}
+        return dict.fromkeys(USAGE_KEYS, 0) | {USAGE_REPORTED_KEY: 0}
 
     input_tokens = _first(raw, ("prompt_tokens",), ("input_tokens",))
     output_tokens = _first(raw, ("completion_tokens",), ("output_tokens",))
@@ -69,4 +79,5 @@ def normalize_usage(raw: object) -> dict[str, int]:
             raw,
             ("completion_tokens_details", "reasoning_tokens"),
         ),
+        USAGE_REPORTED_KEY: 1,
     }

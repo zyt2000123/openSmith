@@ -20,6 +20,8 @@ def test_openai_style_fields_map_to_all_six_keys() -> None:
         "cache_read_tokens": 64,
         "cache_write_tokens": 0,
         "reasoning_tokens": 12,
+        # Not a token count: the provider did send a usage payload.
+        "usage_reported": 1,
     }
 
 
@@ -77,6 +79,8 @@ def test_invalid_payloads_normalize_to_all_zero() -> None:
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "reasoning_tokens": 0,
+        # No payload arrived at all — distinct from a provider-reported zero.
+        "usage_reported": 0,
     }
     assert normalize_usage({"prompt_tokens": "junk"})["input_tokens"] == 0
     assert normalize_usage({"prompt_tokens_details": "junk"})["cache_read_tokens"] == 0

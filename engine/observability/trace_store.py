@@ -25,6 +25,30 @@ _SAFE_METRIC_KEYS = {
 }
 _MAX_VALUE_CHARS = 4096
 _MAX_DEPTH = 4
+# Name-based redaction cannot see a credential carried *inside* a value, and
+# TOOL_CALL_START writes the full tool arguments — so a shell command holding a
+# bearer token landed here verbatim, under the innocuous key "command".
+# The leading (?<![A-Za-z0-9]) is essential, not decoration: "sk-" occurs inside
+# ordinary kebab-case words — ta*sk-*scheduler, di*sk-*usage, ri*sk-*scoring —
+# and without a boundary the pattern ate whole filenames.  The auth-header branch
+# likewise needs a digit, or "Basic authentication" matched as a credential.
+_SECRET_IN_VALUE = re.compile(
+    r"""(?xi)
+    (?<![A-Za-z0-9])
+    (?: \b(?:bearer|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])
+          [A-Za-z0-9._~+/=-]{16,}                                     # auth headers
+      | sk-[A-Za-z0-9_-]{16,}                                         # OpenAI/Anthropic style
+      | gh[pousr]_[A-Za-z0-9]{20,}                                    # GitHub
+      | AKIA[0-9A-Z]{12,}                                             # AWS key id
+      | xox[abprs]-[A-Za-z0-9-]{10,}                                  # Slack
+      | eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+     # JWT
+    )
+    """
+)
+
+
+def _redact_secrets_in_text(text: str) -> str:
+    return _SECRET_IN_VALUE.sub("[REDACTED]", text)
 
 
 def _bounded_trace_value(value: Any, depth: int = 0) -> Any:
@@ -43,10 +67,10 @@ def _bounded_trace_value(value: Any, depth: int = 0) -> Any:
     if isinstance(value, (list, tuple)):
         return [_bounded_trace_value(item, depth + 1) for item in value[:100]]
     if isinstance(value, str):
-        return value[:_MAX_VALUE_CHARS]
+        return _redact_secrets_in_text(value[:_MAX_VALUE_CHARS])
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)[:_MAX_VALUE_CHARS]
+    return _redact_secrets_in_text(str(value)[:_MAX_VALUE_CHARS])
 
 
 class TraceStore:

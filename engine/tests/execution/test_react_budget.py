@@ -779,6 +779,8 @@ def test_react_event_loop_emits_token_usage():
         "input_tokens": 11,
         "output_tokens": 7,
         "total_tokens": 18,
+        # Flags that the provider reported usage; not forwarded over SSE.
+        "usage_reported": 1,
     }
     context_events = [event for event in events if event.type == EventType.CONTEXT_USAGE]
     context = context_events[-1].data

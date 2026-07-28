@@ -26,6 +26,24 @@ from ._retry import MAX_RETRIES, is_retryable_status, retry_after_seconds
 logger = logging.getLogger(__name__)
 
 
+def _provider_error_message(chunk: dict) -> str | None:
+    """Extract a provider error carried inside a stream chunk, if any.
+
+    OpenAI-compatible relays signal mid-stream failures with an ``error`` member
+    rather than an HTTP status, since the response already returned 200.
+    """
+    error = chunk.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    if isinstance(error, dict):
+        for key in ("message", "type", "code"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "unspecified provider error"
+    return None
+
+
 class OpenAIAdapter(HTTPAdapterMixin):
     """Translate OpenAI Chat Completions HTTP/SSE payloads into internal contracts."""
 
@@ -68,9 +86,19 @@ class OpenAIAdapter(HTTPAdapterMixin):
         text = choice.get("content")
         if text is not None and not isinstance(text, str):
             raise LLMResponseError("LLM response content must be a string or null.")
+        # Both spellings occur in the wild; the streaming path already accepts
+        # either, and reading only reasoning_content here silently dropped the
+        # whole reasoning block for relays that use `reasoning`.
+        #
+        # A non-string value is discarded rather than raised on: some relays
+        # return structured reasoning, and the streaming path (see
+        # _stream_response) already drops those silently.  Raising here would
+        # make the same relay work when streaming and fail when not.
         reasoning = choice.get("reasoning_content")
-        if reasoning is not None and not isinstance(reasoning, str):
-            raise LLMResponseError("LLM response reasoning_content must be a string or null.")
+        if not isinstance(reasoning, str):
+            reasoning = choice.get("reasoning")
+        if not isinstance(reasoning, str):
+            reasoning = None
         served_model = data.get("model")
         return ChatResponse(
             text=text or "",
@@ -144,6 +172,15 @@ class OpenAIAdapter(HTTPAdapterMixin):
                             yield usage_event
                         else:
                             pending_events.append(usage_event)
+
+                    # Relays commonly report a mid-stream failure as an `error`
+                    # object and then drop the connection.  Reading only
+                    # `choices` discarded that and left the caller with
+                    # "stream ended before the [DONE] sentinel", hiding the real
+                    # cause (rate limit, content filter, bad credentials).
+                    provider_error = _provider_error_message(chunk)
+                    if provider_error is not None:
+                        raise LLMResponseError(f"Provider stream error: {provider_error}")
 
                     choices = chunk.get("choices", [])
                     if not isinstance(choices, list) or not choices:
