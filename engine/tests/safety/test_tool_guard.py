@@ -124,11 +124,11 @@ def test_combined_redirect_to_platform_data_blocked():
 
 
 def test_extract_shell_paths_captures_combined_redirect():
-    from engine.safety.tool_guard import _extract_shell_paths
+    from engine.safety.tool_guard import _extract_shell_write_paths
 
-    _, write_paths = _extract_shell_paths("cmd &> ~/.agent-smith/agent/x")
+    write_paths = _extract_shell_write_paths("cmd &> ~/.agent-smith/agent/x")
     assert any(p.endswith("x") for p in write_paths)
-    _, write_paths = _extract_shell_paths("cmd &>> ~/.agent-smith/agent/x")
+    write_paths = _extract_shell_write_paths("cmd &>> ~/.agent-smith/agent/x")
     assert any(p.endswith("x") for p in write_paths)
 
 

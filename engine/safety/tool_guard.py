@@ -83,7 +83,11 @@ class FileGuard:
         except (ValueError, OSError):
             return GuardResult(allowed=False, reason=f"Invalid path: {path_str}")
 
-        for part in target.parts:
+        # Check the literal path as well as the resolved one: a credential
+        # directory that is itself a symlink resolves to a name carrying no
+        # ``.ssh``/``.aws`` component and would otherwise slip through.  The
+        # sensitive-write branch below already pairs lexical with resolved.
+        for part in (*target.parts, *lexical.parts):
             if part in self._ALWAYS_BLOCKED:
                 return GuardResult(allowed=False, reason=f"Access to {part}/ is blocked")
 
@@ -250,24 +254,20 @@ class SessionWhitelist:
 # ── Shell path extraction (req #4: redirects + pipes) ───────
 
 _REDIRECT_RE = re.compile(r"(?:>>?|[12]>>?|&>>?)\s*([^\s;|&]+)")
-_ABS_PATH_RE = re.compile(r"(?<![\w:~])/(?!/)[^\s;|&'\"`$()<>]+")
-_SHELL_CD_RE = re.compile(
-    r"(?:^|[;|&]\s*)cd\s+(?:--\s+)?(?P<path>'[^']*'|\"[^\"]*\"|[^\s;|&]+)"
-)
 
 _PLATFORM_DATA_ROOT = (Path.home() / ".agent-smith").resolve()
 _MEMORY_WRITE_ROOT = _PLATFORM_DATA_ROOT / "agent" / "memory"
 _MEMORY_WRITE_FILES = frozenset({"recent.jsonl", "recent.md", "durable.md"})
 
 
-def _extract_shell_paths(command: str) -> tuple[list[str], list[str]]:
-    read_paths = _ABS_PATH_RE.findall(command)
-    write_paths = [m.strip("'\"") for m in _REDIRECT_RE.findall(command)]
-    for match in _SHELL_CD_RE.finditer(command):
-        path = match.group("path").strip("'\"")
-        if path:
-            read_paths.append(path)
-    return read_paths, write_paths
+def _extract_shell_write_paths(command: str) -> list[str]:
+    """Extract literal redirect targets from a raw shell command.
+
+    Only writes are extracted.  A shell command's read set cannot be derived
+    from a regex, so the boundary for reads is the user approval that every
+    shell call already requires — not a partial pattern match.
+    """
+    return [m.strip("'\"") for m in _REDIRECT_RE.findall(command)]
 
 
 def _rule_match_targets(arguments: dict) -> list[str]:
@@ -301,7 +301,17 @@ class ToolGuard:
     ) -> None:
         self._rules: list[dict] = []
         if rules_path.is_file():
-            self._rules = json.loads(rules_path.read_text(encoding="utf-8"))
+            # Validate the shape here rather than letting every later check()
+            # raise: a mis-edited rules file must fail loudly at load time, not
+            # turn each agent run into an opaque failure.
+            parsed = json.loads(rules_path.read_text(encoding="utf-8"))
+            if not isinstance(parsed, list) or not all(
+                isinstance(rule, dict) for rule in parsed
+            ):
+                raise ValueError(
+                    f"dangerous-command rules must be a list of objects: {rules_path}"
+                )
+            self._rules = parsed
         self.file_guard = FileGuard(allowed_dirs)
         self.audit = AuditLog()
         self.whitelist = SessionWhitelist()
@@ -401,7 +411,7 @@ class ToolGuard:
                         "working-directory boundary is active"
                     ),
                 )
-            _, write_paths = _extract_shell_paths(cmd)
+            write_paths = _extract_shell_write_paths(cmd)
             for wp in write_paths:
                 # A raw shell command cannot be safely parsed into a complete
                 # filesystem access list.  It is therefore always approved by
@@ -469,7 +479,14 @@ class ToolGuard:
             return False
         return True
 
-    def check(self, tool_call: ToolCall) -> GuardResult:
+    def check(self, tool_call: ToolCall, *, audit: bool = True) -> GuardResult:
+        """Evaluate one call.
+
+        ``audit=False`` suppresses the audit record for a re-check of a call
+        that was already evaluated and logged.  The registry runs this guard a
+        second time as an execution backstop; without this the audit trail
+        would report twice the number of tool calls that actually happened.
+        """
         level = self._resolve_permission_level(tool_call.name)
         tool_whitelisted = self.whitelist.is_tool_allowed(tool_call.name)
         approval_context = current_approval_context()
@@ -477,15 +494,20 @@ class ToolGuard:
         if approval_context is not None:
             audit_context["run_id"] = approval_context[1]
 
+        def record(result: GuardResult, **extra: object) -> None:
+            if audit:
+                self.audit.record(
+                    tool_call.name,
+                    tool_call.arguments,
+                    result,
+                    **extra,
+                    **audit_context,
+                )
+
         file_result = self._check_file_paths(tool_call)
         if file_result is not None:
             file_result.level = level
-            self.audit.record(
-                tool_call.name,
-                tool_call.arguments,
-                file_result,
-                **audit_context,
-            )
+            record(file_result)
             return file_result
 
         match_targets = _rule_match_targets(tool_call.arguments)
@@ -515,13 +537,7 @@ class ToolGuard:
                         reason=f"[{rule.get('id', '?')}] {reason}",
                         level=PermissionLevel.DESTRUCTIVE,
                     )
-                    self.audit.record(
-                        tool_call.name,
-                        tool_call.arguments,
-                        result,
-                        rule_id=rule.get("id"),
-                        **audit_context,
-                    )
+                    record(result, rule_id=rule.get("id"))
                     return result
 
         approval_required = self._requires_approval(tool_call)
@@ -531,11 +547,5 @@ class ToolGuard:
             reason=f"Approval required for {tool_call.name}" if approval_required else "",
             approval_required=approval_required,
         )
-        self.audit.record(
-            tool_call.name,
-            tool_call.arguments,
-            result,
-            whitelisted=tool_whitelisted,
-            **audit_context,
-        )
+        record(result, whitelisted=tool_whitelisted)
         return result

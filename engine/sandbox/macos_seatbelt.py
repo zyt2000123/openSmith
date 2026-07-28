@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import sys
@@ -142,8 +143,25 @@ class MacOSSeatbeltEnvironment:
         return environment
 
     def _sensitive_hardlink_error(self) -> str | None:
-        """Reject path aliases that a path-based Seatbelt profile cannot identify."""
+        """Reject path aliases that a path-based Seatbelt profile cannot identify.
+
+        Two distinct aliases matter, and only these two:
+
+        * A link inside the workspace whose inode is also reachable at a
+          protected path (``.env``, ``.git/…``).  The profile denies the
+          protected *path*, but the alias reaches the same *inode*.
+        * A link whose inode has more references than the workspace accounts
+          for.  The extra reference is outside, and nothing here can prove what
+          it points at, so it fails closed.
+
+        A file with several plain links entirely inside the workspace is left
+        alone — that is what package stores and build caches produce, and
+        refusing it would disable shell for the whole workspace.
+        """
         walk_errors: list[OSError] = []
+        # inode -> (paths seen inside the workspace, declared link count)
+        seen: dict[int, tuple[list[Path], int]] = {}
+
         for root, directories, files in os.walk(
             self._workspace,
             followlinks=False,
@@ -163,13 +181,33 @@ class MacOSSeatbeltEnvironment:
                         "sandbox protected-path preflight could not inspect workspace"
                     )
                 if (
-                    not stat.S_ISLNK(metadata.st_mode)
-                    and stat.S_ISREG(metadata.st_mode)
-                    and metadata.st_nlink > 1
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink <= 1
                 ):
-                    return f"sandbox refuses files with hard links: {relative}"
+                    continue
+                paths, _ = seen.setdefault(metadata.st_ino, ([], metadata.st_nlink))
+                paths.append(relative)
+
         if walk_errors:
             return "sandbox protected-path preflight could not inspect workspace"
+
+        for paths, link_count in seen.values():
+            aliases = ", ".join(str(path) for path in sorted(paths, key=str))
+            protected = next(
+                (path for path in paths if _is_hardlink_protected_path(path)), None
+            )
+            if protected is not None:
+                return (
+                    "sandbox refuses files with hard links to a protected path "
+                    f"({protected}): {aliases}"
+                )
+            if link_count > len(paths):
+                return (
+                    "sandbox refuses files with hard links reaching outside the "
+                    f"workspace: {aliases} (copy the file, or re-create it "
+                    "without hard links, to run shell here)"
+                )
         return None
 
     async def run_command(
@@ -198,7 +236,10 @@ class MacOSSeatbeltEnvironment:
         resolved_cwd, error = self._validate_cwd(cwd)
         if error:
             return CommandResult(exit_code=None, error=error)
-        hardlink_error = self._sensitive_hardlink_error()
+        # The preflight walks the whole workspace; on a large repository that
+        # is hundreds of milliseconds of stat calls, which must not block the
+        # event loop and stall every other request in the process.
+        hardlink_error = await asyncio.to_thread(self._sensitive_hardlink_error)
         if hardlink_error:
             return CommandResult(exit_code=None, error=hardlink_error)
 
