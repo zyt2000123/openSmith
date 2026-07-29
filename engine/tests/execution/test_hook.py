@@ -69,3 +69,21 @@ def test_parallel_hook_timeout_is_reported_to_runtime_callers():
         assert result == [False]
 
     asyncio.run(run())
+
+
+def test_series_merge_infers_list_shape_without_an_initial_value() -> None:
+    class First:
+        def tools(self):
+            return [{"name": "first"}]
+
+    class Second:
+        def tools(self):
+            return {"name": "second"}
+
+    manager = HookManager()
+    manager.register(First())
+    manager.register(Second())
+
+    result = asyncio.run(manager.apply("tools", HookType.SERIES_MERGE))
+
+    assert result == [{"name": "first"}, {"name": "second"}]

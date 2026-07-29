@@ -600,6 +600,7 @@ async def _run_events_with_runtime(
         yield done_event
         drained = True
     finally:
+        cancellation: asyncio.CancelledError | None = None
         if (
             drained
             and state_dir is not None
@@ -621,6 +622,9 @@ async def _run_events_with_runtime(
                     _RUNTIME_LEARNING_TIMEOUT_SECONDS,
                     run_id,
                 )
+            except asyncio.CancelledError as exc:
+                memory_persist_failed = True
+                cancellation = exc
             except Exception:
                 memory_persist_failed = True
                 logger.warning("failed to finalize conversation memory", exc_info=True)
@@ -633,11 +637,16 @@ async def _run_events_with_runtime(
             boundary.record(cancelled_event)
         try:
             await services.close()
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
         except Exception:
             logger.warning("failed to close engine runtime services", exc_info=True)
-        if ledger is not None:
-            services.tool_registry.bind_execution_ledger(None)
-        APPROVAL_BROKER.cancel_run(run_id)
+        finally:
+            if ledger is not None:
+                services.tool_registry.bind_execution_ledger(None)
+            APPROVAL_BROKER.cancel_run(run_id)
+        if cancellation is not None:
+            raise cancellation
 
     if drained:
         terminal_data: dict[str, object] = {"run_id": run_id, "status": terminal_status}

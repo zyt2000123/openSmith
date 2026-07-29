@@ -383,6 +383,51 @@ def test_anthropic_retry_discards_pre_content_events(monkeypatch) -> None:
     ]
 
 
+def test_anthropic_retries_pre_content_overloaded_stream_error() -> None:
+    adapter = AnthropicAdapter(_anthropic_config())
+    client = ProviderClient(adapter)
+    calls = {"n": 0}
+
+    async def no_wait(*_args) -> None:
+        return None
+
+    async def fake_send(request, *, stream: bool):
+        calls["n"] += 1
+        chunks = (
+            [
+                b'event: error\ndata: {"type":"error","error":'
+                b'{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+            ]
+            if calls["n"] == 1
+            else [
+                b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+                b'"index":0,"delta":{"type":"text_delta","text":"Recovered"}}\n\n',
+                b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            ]
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_SseStream(chunks),
+        )
+
+    adapter._wait_for_retry = no_wait  # type: ignore[method-assign]
+    adapter._http.send = fake_send  # type: ignore[assignment]
+
+    try:
+        events = asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    assert calls["n"] == 2
+    assert [event.type for event in events] == [
+        ProviderEventType.RESPONSE_CREATED,
+        ProviderEventType.OUTPUT_TEXT_DELTA,
+        ProviderEventType.RESPONSE_COMPLETED,
+    ]
+    assert events[1].data == {"delta": "Recovered"}
+
+
 def test_anthropic_moves_late_system_instruction_into_ordered_user_turn() -> None:
     system, messages = AnthropicAdapter._translate_messages([
         {"role": "system", "content": "Initial guidance."},
@@ -454,6 +499,42 @@ def test_openai_non_string_content_raises() -> None:
     with pytest.raises(_Err, match="content must be a string"):
         asyncio.run(client.chat([{"role": "user", "content": "hi"}]))
     asyncio.run(client.close())
+
+
+@pytest.mark.parametrize("arguments", [None, ""])
+def test_openai_accepts_empty_zero_argument_tool_calls(arguments: object) -> None:
+    client = _openai_client()
+    body = json.dumps({
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "current_time",
+                        "arguments": arguments,
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode()
+
+    async def fake_send(request, *, stream: bool = False):
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_SseStream([body]),
+        )
+
+    client.adapter._http.send = fake_send  # type: ignore[assignment]
+    try:
+        response = asyncio.run(client.chat([{"role": "user", "content": "time"}]))
+    finally:
+        asyncio.run(client.close())
+
+    assert response.tool_calls[0].arguments == {}
 
 
 def test_openai_stream_malformed_delta_raises() -> None:

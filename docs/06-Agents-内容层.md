@@ -241,7 +241,7 @@ async def execute(*, param1: str, param2: int = 0) -> str:
 | `web_fetch` | `url`, `timeout` | 仅允许 http/https，50KB 内容上限，默认 15s 超时（最大 30s），阻止 file/ftp/data scheme |
 | `web_search` | `query`, `max_results` | 网络搜索，返回结构化搜索结果 |
 | `skill_load` | `name` | 按名称加载 `agents/skills/<name>/SKILL.md`，找不到时列出可用技能 |
-| `skill_manage` | `action`, `agent_id`, `skill_name`, ... | 7 个操作：list/get/create/edit/patch/versions/rollback。内置技能只读 |
+| `skill_manage` | `action`, `skill_name`, ... | 7 个操作：list/get/create/edit/patch/versions/rollback。运行时绑定当前 Agent 技能目录；内置技能只读 |
 | `todo` | `action`, `items`, ... | 待办事项管理 |
 | `grep` | `pattern`, `path`, `options` | 按正则/文本模式搜索文件内容 |
 | `glob_files` | `pattern`, `path` | 按 glob 模式查找文件 |
@@ -327,10 +327,12 @@ async def execute(*, param1: str, param2: int = 0) -> str:
 
 | 操作 | 必填参数 | 说明 |
 |------|---------|------|
-| `list` | `agent_id` | 列出所有技能（内置 + Agent），含来源标记 |
-| `get` | `agent_id`, `skill_name` | 读取技能内容（优先 Agent 版本，其次内置） |
-| `create` | `agent_id`, `skill_name`, `content` | 创建新 Agent 技能（不可与内置技能同名） |
-| `edit` | `agent_id`, `skill_name`, `content` | 全文替换 Agent 技能（自动存版本） |
-| `patch` | `agent_id`, `skill_name`, `section`, `section_content` | 按 Markdown 章节局部替换（自动存版本） |
-| `versions` | `agent_id`, `skill_name` | 列出版本快照清单 |
-| `rollback` | `agent_id`, `skill_name`, `version_id` | 回滚到指定版本 |
+| `list` | — | 列出所有技能（内置 + 当前 Agent），含来源标记 |
+| `get` | `skill_name` | 读取技能内容（优先当前 Agent 版本，其次内置） |
+| `create` | `skill_name`, `content` | 创建当前 Agent 技能（不可与内置技能同名） |
+| `edit` | `skill_name`, `content` | 全文替换当前 Agent 技能（自动存版本） |
+| `patch` | `skill_name`, `section`, `section_content` | 按 Markdown 章节局部替换（自动存版本） |
+| `versions` | `skill_name` | 列出版本快照清单 |
+| `rollback` | `skill_name`, `version_id` | 回滚到指定版本 |
+
+`list/get/versions` 是只读操作；`create/edit/patch/rollback` 必须通过当前调用的精确审批。写操作成功后，运行时会刷新当前请求使用的技能目录，并重新应用禁用技能和领域身份 allowlist；因此默认身份可立即读取新技能，显式限制 `skills.enabled` 的身份仍只暴露白名单内技能。

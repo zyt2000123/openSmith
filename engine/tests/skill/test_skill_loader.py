@@ -79,3 +79,56 @@ def test_agent_skill_override_is_reported_as_agent_skill(tmp_path: Path):
     assert not registry.is_builtin("shared")
     assert registry.get_agent_skill_dir("shared") == agent_dir / "shared"
     assert registry.list_summaries()[0]["source"] == "agent"
+
+
+def test_agent_skill_registry_does_not_follow_symlinks_outside_catalog(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    outside_dir = tmp_path / "outside-skill"
+    _write_skill(
+        outside_dir.parent,
+        outside_dir.name,
+        "---\nname: linked-directory\n---\nOutside directory",
+    )
+    (skills_dir / "linked-directory").symlink_to(
+        outside_dir,
+        target_is_directory=True,
+    )
+
+    linked_file_dir = skills_dir / "linked-file"
+    linked_file_dir.mkdir()
+    outside_file = tmp_path / "outside.md"
+    outside_file.write_text(
+        "---\nname: linked-file\n---\nOutside file",
+        encoding="utf-8",
+    )
+    (linked_file_dir / "SKILL.md").symlink_to(outside_file)
+
+    registry = SkillRegistry()
+    registry.load_agent_skills(skills_dir)
+
+    assert registry.get("linked-directory") is None
+    assert registry.get("linked-file") is None
+    assert registry.get_agent_skill_dir("linked-directory") is None
+    assert registry.get_agent_skill_dir("linked-file") is None
+
+
+def test_agent_skill_registry_does_not_follow_symlinked_catalog_root(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-skills"
+    _write_skill(
+        outside,
+        "external",
+        "---\nname: external\n---\nOutside catalog",
+    )
+    linked_catalog = tmp_path / "skills"
+    linked_catalog.symlink_to(outside, target_is_directory=True)
+
+    registry = SkillRegistry()
+    registry.load_agent_skills(linked_catalog)
+
+    assert registry.get("external") is None
+    assert registry.get_agent_skill_dir("external") is None

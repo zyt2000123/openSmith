@@ -14,7 +14,7 @@ import yaml
 
 TOOL_META = {
     "name": "skill_manage",
-    "hidden": True,
+    "hidden": False,
     "description": (
         "Manage agent skills: list, get, create, edit, patch, versions, rollback. "
         "Built-in skills are read-only; only agent-installed skills can be modified."
@@ -66,7 +66,10 @@ _BUILTIN_SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "
 def _agent_skills_dir(agent_skills_dir: str | Path | None) -> Path:
     if agent_skills_dir is None:
         raise RuntimeError("agent skill storage was not provided by the runtime")
-    return Path(agent_skills_dir)
+    path = Path(agent_skills_dir)
+    if path.is_symlink():
+        raise RuntimeError("agent skill storage must not be a symlink")
+    return path
 
 
 def _is_builtin(skill_name: str) -> bool:

@@ -27,3 +27,13 @@ def test_skill_store_rejects_symlinked_skill_directory(tmp_path: Path):
 
     with pytest.raises(ValueError, match="escapes skills root"):
         asyncio.run(store.save_version("linked", "escaped"))
+
+
+def test_skill_store_rejects_symlinked_skills_root(tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    skills = tmp_path / "skills"
+    skills.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="skills root must not be a symlink"):
+        SkillStore(skills)

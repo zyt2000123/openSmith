@@ -42,18 +42,27 @@ class SkillRegistry:
 
     def load_agent_skills(self, agent_skills_dir: Path) -> None:
         """Load agent-specific skills (same layout as builtin)."""
-        self._agent_skills_dir = agent_skills_dir
-        if not agent_skills_dir.is_dir():
+        self._agent_skills_dir = None
+        if agent_skills_dir.is_symlink() or not agent_skills_dir.is_dir():
             return
+        self._agent_skills_dir = agent_skills_dir
+        resolved_root = agent_skills_dir.resolve()
         for child in sorted(agent_skills_dir.iterdir()):
+            if child.is_symlink() or not child.is_dir():
+                continue
             skill_file = child / "SKILL.md"
-            if skill_file.is_file():
-                skill = _parse_or_skip(skill_file)
-                if skill is None:
-                    continue
-                self._agent_names.add(skill.meta.name)
-                self._builtin_names.discard(skill.meta.name)
-                self._skills[skill.meta.name] = skill
+            if (
+                skill_file.is_symlink()
+                or not skill_file.is_file()
+                or not skill_file.resolve().is_relative_to(resolved_root)
+            ):
+                continue
+            skill = _parse_or_skip(skill_file)
+            if skill is None:
+                continue
+            self._agent_names.add(skill.meta.name)
+            self._builtin_names.discard(skill.meta.name)
+            self._skills[skill.meta.name] = skill
 
     def get(self, name: str) -> SkillBody | None:
         return self._skills.get(name)
@@ -66,12 +75,21 @@ class SkillRegistry:
         """Return the path to an agent-installed skill's directory, or None."""
         if self._agent_skills_dir is None:
             return None
-        if name in self._builtin_names:
+        if self._agent_skills_dir.is_symlink():
+            return None
+        if name in self._builtin_names or name not in self._agent_names:
             return None
         if Path(name).name != name:  # reject path traversal (e.g. "../x")
             return None
         skill_dir = self._agent_skills_dir / name
-        if skill_dir.is_dir():
+        skill_file = skill_dir / "SKILL.md"
+        if (
+            skill_dir.is_dir()
+            and not skill_dir.is_symlink()
+            and skill_file.is_file()
+            and not skill_file.is_symlink()
+            and skill_dir.resolve().is_relative_to(self._agent_skills_dir.resolve())
+        ):
             return skill_dir
         return None
 

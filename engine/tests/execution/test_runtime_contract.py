@@ -781,6 +781,58 @@ def test_prepare_runtime_binds_memory_ops_but_keeps_it_hidden(tmp_path: Path) ->
     assert all(schema["function"]["name"] != "memory_ops" for schema in schemas)
 
 
+def test_prepare_runtime_exposes_skill_manage_but_guards_mutations(
+    tmp_path: Path,
+) -> None:
+    async def run():
+        runtime, services, _ = _runtime(tmp_path)
+        tools_dir = runtime.agents_dir / "tools"
+        tools_dir.mkdir(exist_ok=True)
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "tools"
+            / "skill_manage.py"
+        )
+        (tools_dir / "skill_manage.py").write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (runtime.profile_dir / "config.yaml").write_text(
+            "tools:\n  enabled: [skill_manage]\n",
+            encoding="utf-8",
+        )
+        services.tool_guard = ToolGuard(tmp_path / "missing-rules.json")
+
+        await prepare_runtime(EngineRequest(message="manage skills"), runtime, services)
+        schemas = services.tool_registry.get_schemas()
+        listed = await services.tool_registry.execute(ToolCall(
+            id="list-skills",
+            name="skill_manage",
+            arguments={"action": "list"},
+        ))
+        created = await services.tool_registry.execute(ToolCall(
+            id="create-skill",
+            name="skill_manage",
+            arguments={
+                "action": "create",
+                "skill_name": "incident-notes",
+                "content": "# Incident Notes",
+            },
+        ))
+        return schemas, listed, created
+
+    schemas, listed, created = asyncio.run(run())
+
+    assert any(
+        schema["function"]["name"] == "skill_manage"
+        for schema in schemas
+    )
+    assert not listed.is_error
+    assert created.is_error
+    assert created.error_kind == "approval_required"
+
+
 def test_prepare_runtime_excludes_a_disabled_skill_from_the_live_registry(tmp_path: Path) -> None:
     async def run() -> bool:
         runtime, services, _ = _runtime(tmp_path)
@@ -1030,6 +1082,39 @@ def test_run_stream_persists_queued_and_terminal_run_state(tmp_path: Path) -> No
     assert run_id
     assert status is RunStatus.COMPLETED
     assert event_seq > 1
+
+
+def test_run_state_ignores_high_frequency_stream_payloads(tmp_path: Path) -> None:
+    """Token delivery remains observable without rewriting lifecycle state."""
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith")
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-1"}),
+    )
+    started = store.get("run-1")
+    assert started is not None
+
+    for event in (
+        ExecutionEvent(
+            EventType.RAW_RESPONSE_EVENT,
+            {
+                "type": "response.output_text.delta",
+                "data": {"delta": "hel"},
+            },
+        ),
+        ExecutionEvent(
+            EventType.PROVISIONAL_TEXT_DELTA,
+            {"provision_id": "draft-1", "text": "hel"},
+        ),
+    ):
+        project_execution_event(store, "run-1", event)
+
+    after_stream_payloads = store.get("run-1")
+    assert after_stream_payloads is not None
+    assert after_stream_payloads.event_seq == started.event_seq
+    assert after_stream_payloads.last_event_type == EventType.RUN_STARTED.value
 
 
 def test_timeout_settles_waiting_approval_before_terminal_run_state(tmp_path: Path) -> None:
@@ -1372,6 +1457,35 @@ def test_run_stream_bounds_post_run_learning_finalization(
     events = asyncio.run(asyncio.wait_for(collect_events(), timeout=0.2))
 
     assert events[-1].type is EventType.RUN_FINISHED
+
+
+def test_run_stream_closes_services_when_learning_is_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def cancelled_persist(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_persist_runtime_learning",
+        cancelled_persist,
+    )
+
+    async def run() -> bool:
+        runtime, services, llm = _runtime(tmp_path)
+        stream = run_stream_with_runtime(
+            EngineRequest(message="hello"),
+            runtime,
+            services,
+        )
+        try:
+            _ = [event async for event in stream.stream_events()]
+        except asyncio.CancelledError:
+            pass
+        return llm.closed
+
+    assert asyncio.run(run()) is True
 
 
 def test_reply_with_runtime_marks_actual_tool_activity(tmp_path: Path) -> None:

@@ -34,6 +34,9 @@ class SkillStore:
     """Version-controlled skill storage for agent-installed skills."""
 
     def __init__(self, skills_dir: Path) -> None:
+        skills_dir = Path(skills_dir)
+        if skills_dir.is_symlink():
+            raise ValueError("skills root must not be a symlink")
         self._dir = skills_dir.resolve()  # agent profile skills dir: …/<id>/skills/
 
     # ------------------------------------------------------------------

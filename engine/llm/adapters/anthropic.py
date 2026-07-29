@@ -32,6 +32,19 @@ logger = logging.getLogger(__name__)
 
 
 _ANTHROPIC_VERSION = "2023-06-01"
+_RETRYABLE_STREAM_ERROR_TYPES = frozenset({
+    "api_error",
+    "overloaded_error",
+    "rate_limit_error",
+})
+
+
+class _AnthropicStreamError(LLMResponseError):
+    """Typed provider event error so pre-content retries remain bounded."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class AnthropicAdapter(HTTPAdapterMixin):
@@ -219,8 +232,10 @@ class AnthropicAdapter(HTTPAdapterMixin):
                     if event_type == "error":
                         error = event.get("error")
                         message = error.get("message") if isinstance(error, dict) else None
-                        raise LLMResponseError(
-                            f"Anthropic stream error: {message or 'unknown provider error'}"
+                        error_type = error.get("type") if isinstance(error, dict) else None
+                        raise _AnthropicStreamError(
+                            f"Anthropic stream error: {message or 'unknown provider error'}",
+                            retryable=error_type in _RETRYABLE_STREAM_ERROR_TYPES,
                         )
 
                     if event_type == "message_stop":
@@ -244,6 +259,17 @@ class AnthropicAdapter(HTTPAdapterMixin):
                     },
                 )
                 return
+            except _AnthropicStreamError as exc:
+                if (
+                    saw_content_event
+                    or not exc.retryable
+                    or attempt >= MAX_RETRIES - 1
+                ):
+                    raise
+                logger.warning(
+                    "Anthropic stream attempt %d returned a retryable error event, retrying",
+                    attempt + 1,
+                )
             except httpx.HTTPStatusError as exc:
                 if (
                     saw_content_event

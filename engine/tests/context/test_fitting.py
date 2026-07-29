@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from engine.context import ContextFitStatus, fit_request
-from engine.context.budget import estimate_messages_tokens
+from engine.context.budget import estimate_messages_tokens, estimate_tokens
 from engine.llm.contracts import ModelLimits
 
 
@@ -33,6 +33,12 @@ class _CompactingLLM:
         if self.fail:
             raise RuntimeError("summary unavailable")
         return type("Response", (), {"text": "dense summary", "finish_reason": "stop"})()
+
+
+def test_token_estimate_conservatively_bounds_cjk_byte_fallback() -> None:
+    assert estimate_tokens("一") == 3
+    assert estimate_tokens("一a") == 4
+    assert estimate_tokens("abc") == 1
 
 
 def test_fit_request_counts_tool_schemas_before_calling_the_provider() -> None:

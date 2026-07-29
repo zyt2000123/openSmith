@@ -68,6 +68,10 @@ _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
 }
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_HIGH_FREQUENCY_STREAM_EVENTS = frozenset({
+    EventType.RAW_RESPONSE_EVENT,
+    EventType.PROVISIONAL_TEXT_DELTA,
+})
 
 
 def _now() -> str:
@@ -484,6 +488,8 @@ def project_execution_event(
     otherwise valid run.
     """
     if store is None:
+        return
+    if event.type in _HIGH_FREQUENCY_STREAM_EVENTS:
         return
     try:
         event_type = event.type.value

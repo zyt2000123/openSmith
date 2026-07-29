@@ -146,7 +146,7 @@ class ToolExecutionLedger:
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT status, content, is_error, error_kind, side_effect_status "
+                "SELECT status, content, is_error, error_kind, side_effect_status, call_id "
                 "FROM tool_executions WHERE run_id=? AND idempotency_key=?",
                 (self.run_id, idempotency_key),
             ).fetchone()
@@ -160,14 +160,23 @@ class ToolExecutionLedger:
                 connection.commit()
                 return ToolLedgerDecision(claimed=True)
 
-            status, content, is_error, error_kind, side_effect_status = row
-            if status != "completed" and idempotent:
-                # Reclaim inside the same transaction that observed the row, so
-                # two concurrent retries cannot both take the claim.
+            status, content, is_error, error_kind, side_effect_status, owner_call_id = row
+            if status == "uncertain" and idempotent:
+                # Only a settled uncertain attempt may be reclaimed.  A
+                # ``running`` row still has an owner, even for an idempotent
+                # tool, and stealing it would let two executions overlap.
                 reclaimed = connection.execute(
-                    "UPDATE tool_executions SET status=?, call_id=?, updated_at=? "
-                    "WHERE run_id=? AND idempotency_key=? AND status=?",
-                    ("running", call_id, now, self.run_id, idempotency_key, status),
+                    "UPDATE tool_executions SET status=?, call_id=?, content='', "
+                    "is_error=0, error_kind=NULL, side_effect_status='unknown', updated_at=? "
+                    "WHERE run_id=? AND idempotency_key=? AND status='uncertain' AND call_id=?",
+                    (
+                        "running",
+                        call_id,
+                        now,
+                        self.run_id,
+                        idempotency_key,
+                        owner_call_id,
+                    ),
                 ).rowcount
                 connection.commit()
                 if reclaimed:
@@ -221,7 +230,7 @@ class ToolExecutionLedger:
             connection.execute(
                 "UPDATE tool_executions SET status=?, call_id=?, content=?, is_error=?, "
                 "error_kind=?, side_effect_status=?, updated_at=? "
-                "WHERE run_id=? AND idempotency_key=?",
+                "WHERE run_id=? AND idempotency_key=? AND status='running' AND call_id=?",
                 (
                     "completed" if successful else "uncertain",
                     call_id,
@@ -232,6 +241,7 @@ class ToolExecutionLedger:
                     now,
                     self.run_id,
                     idempotency_key,
+                    call_id,
                 ),
             )
             connection.commit()

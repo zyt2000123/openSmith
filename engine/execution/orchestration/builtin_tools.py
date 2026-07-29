@@ -82,19 +82,42 @@ def bind_snapshot_tools(services: RuntimeServices, session_id: str | None) -> No
         services.tool_registry.wrap_tool(tool_name, wrapper)
 
 
-def bind_skill_manage_tool(services: RuntimeServices, state_dir: Path) -> None:
+def bind_skill_manage_tool(
+    services: RuntimeServices,
+    state_dir: Path,
+    *,
+    disabled_skills: frozenset[str] = frozenset(),
+    enabled_skills: tuple[str, ...] | None = None,
+) -> None:
     """Inject profile-local skill storage into the content-layer manager."""
     from engine.skill.store import SkillStore
 
     skills_dir = state_dir / "skills"
     store = SkillStore(skills_dir)
+    mutating_actions = frozenset({"create", "edit", "patch", "rollback"})
 
     def wrapper(func):
         async def execute_with_skill_storage(**kwargs):
+            action = kwargs.get("action")
             kwargs["agent_skills_dir"] = skills_dir
             kwargs["skill_store"] = store
             result = func(**kwargs)
-            return await result if inspect.isawaitable(result) else result
+            output = await result if inspect.isawaitable(result) else result
+            if (
+                action in mutating_actions
+                and isinstance(output, str)
+                and output.startswith("OK:")
+            ):
+                services.skill_registry.load_agent_skills(skills_dir)
+                if disabled_skills:
+                    services.skill_registry.restrict_to([
+                        summary["name"]
+                        for summary in services.skill_registry.list_summaries()
+                        if summary["name"] not in disabled_skills
+                    ])
+                if enabled_skills is not None:
+                    services.skill_registry.restrict_to(enabled_skills)
+            return output
 
         return execute_with_skill_storage
 

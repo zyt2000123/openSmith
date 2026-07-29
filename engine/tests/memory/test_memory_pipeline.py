@@ -1616,6 +1616,7 @@ def test_dream_recovers_cleanup_after_log_replacement_without_replaying_evidence
     )
     (memory_dir / ".compile_offset").write_text("1", encoding="utf-8")
     (memory_dir / ".durable_offset").write_text("1", encoding="utf-8")
+    (memory_dir / ".nudge_offset").write_text("1", encoding="utf-8")
     original_atomic_write = dream_module.atomic_write_text
 
     def fail_compile_offset(path: Path, content: str) -> None:
@@ -1647,6 +1648,7 @@ def test_dream_recovers_cleanup_after_log_replacement_without_replaying_evidence
     assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "0"
     assert (memory_dir / ".durable_offset").read_text(encoding="utf-8") == "0"
     assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "0"
+    assert (memory_dir / ".nudge_offset").read_text(encoding="utf-8") == "0"
 
 
 def test_dream_requires_reviewer_before_replacing_durable(tmp_path: Path) -> None:
@@ -2032,6 +2034,44 @@ def test_dream_cleanup_respects_lagging_durable_offset(tmp_path: Path) -> None:
     assert len(remaining) == 7
     assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "4"
     assert (memory_dir / ".durable_offset").read_text(encoding="utf-8") == "0"
+    assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "7"
+
+
+def test_dream_cleanup_respects_and_rebases_nudge_offset(tmp_path: Path) -> None:
+    """Lines the periodic nudge has not reviewed yet must never be deleted."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    lines = [
+        json.dumps({
+            "task": f"tool-backed work {i}",
+            "summary": f"verified result {i}",
+            "timestamp": "2020-01-01T00:00:00+00:00",
+            "kind": "work",
+            "scope": "project",
+            "evidence": "tool_result",
+        })
+        for i in range(10)
+    ]
+    (memory_dir / "recent.jsonl").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    (memory_dir / ".compile_offset").write_text("7", encoding="utf-8")
+    (memory_dir / ".durable_offset").write_text("7", encoding="utf-8")
+    (memory_dir / ".nudge_offset").write_text("3", encoding="utf-8")
+    (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
+
+    report = asyncio.run(run_dream(memory_dir, StaticLLM()))
+
+    remaining = (memory_dir / "recent.jsonl").read_text(
+        encoding="utf-8",
+    ).strip().splitlines()
+    assert report.log_lines_cleaned == 3
+    assert len(remaining) == 7
+    assert json.loads(remaining[0])["task"] == "tool-backed work 3"
+    assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "4"
+    assert (memory_dir / ".durable_offset").read_text(encoding="utf-8") == "4"
+    assert (memory_dir / ".nudge_offset").read_text(encoding="utf-8") == "0"
     assert (memory_dir / ".dream_offset").read_text(encoding="utf-8") == "7"
 
 

@@ -33,7 +33,7 @@ class ObservabilityReader:
     def read_trace(self, run_id: str, *, limit: int = 300) -> list[dict[str, Any]]:
         if limit < 1:
             return []
-        return self._traces.read(run_id)[-limit:]
+        return self._traces.read(run_id, limit=limit)
 
     def iter_traces(self) -> list[tuple[str, list[dict[str, Any]]]]:
         """Enumerate local traces for aggregate consumers."""

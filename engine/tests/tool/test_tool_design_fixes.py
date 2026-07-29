@@ -11,10 +11,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from engine.execution.orchestration.builtin_tools import MemoryToolApi
+from engine.execution.orchestration.builtin_tools import (
+    MemoryToolApi,
+    bind_skill_manage_tool,
+)
 from engine.execution.orchestration.preparation import enabled_tools_from_config
 from engine.identity import IdentitySpec
 from engine.sandbox import MacOSSeatbeltEnvironment
+from engine.skill import SkillRegistry
 from engine.tool.interface import ToolCall
 from engine.tool.registry import ToolRegistry
 
@@ -133,6 +137,50 @@ def test_skill_manage_uses_the_runtime_selected_agent_storage() -> None:
     parameters = meta["parameters"]
     assert "agent_id" not in parameters["properties"]
     assert parameters["required"] == ["action"]
+    assert meta["hidden"] is False
+    assert meta["approval_policy"] == "policy"
+    assert meta["read_actions"] == ["list", "get", "versions"]
+
+
+def test_skill_manage_refreshes_the_active_runtime_catalog(tmp_path: Path) -> None:
+    tool_registry = ToolRegistry()
+    tool_registry.load_providers(ROOT / "agents" / "tools")
+    skill_registry = SkillRegistry()
+    services = SimpleNamespace(
+        tool_registry=tool_registry,
+        skill_registry=skill_registry,
+    )
+    bind_skill_manage_tool(services, tmp_path)
+
+    content = """\
+---
+name: incident-notes
+description: Capture a verified incident note.
+version: 0.1.0
+---
+
+# Incident Notes
+
+Record only evidence-backed incident outcomes.
+"""
+
+    async def run():
+        return await tool_registry.execute(ToolCall(
+            id="create-skill",
+            name="skill_manage",
+            arguments={
+                "action": "create",
+                "skill_name": "incident-notes",
+                "content": content,
+            },
+        ))
+
+    result = asyncio.run(run())
+    loaded = skill_registry.get("incident-notes")
+
+    assert not result.is_error
+    assert loaded is not None
+    assert "evidence-backed incident outcomes" in loaded.content
 
 
 def test_todo_persists_by_injected_session_file(tmp_path):
@@ -708,7 +756,7 @@ def test_agent_tool_config_hides_internal_and_stale_tools_by_default():
             "",
             {},
             lambda: "OK",
-            hidden=name in {"skill_load", "skill_manage", "memory_ops"},
+            hidden=name in {"skill_load", "memory_ops"},
         )
 
     enabled = enabled_tools_from_config(
@@ -737,7 +785,7 @@ def test_agent_tool_config_hides_internal_and_stale_tools_by_default():
         ),
     )
 
-    assert enabled == ["read_file", "todo"]
+    assert enabled == ["read_file", "skill_manage", "todo"]
 
 
 def test_skill_load_uses_the_injected_runtime_catalog() -> None:

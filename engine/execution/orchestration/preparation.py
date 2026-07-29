@@ -178,7 +178,6 @@ async def prepare_runtime(
         )
     bind_snapshot_tools(services, runtime.session_id)
     bind_memory_ops_tool(services, state_dir)
-    bind_skill_manage_tool(services, state_dir)
     bind_todo_tool(services, state_dir, runtime.session_id)
     profile_config = await _load_profile_config(runtime)
     await _register_mcp_tools(profile_config, runtime, services)
@@ -214,6 +213,12 @@ async def prepare_runtime(
         )
     if identity.enabled_skills is not None:
         services.skill_registry.restrict_to(identity.enabled_skills)
+    bind_skill_manage_tool(
+        services,
+        state_dir,
+        disabled_skills=frozenset(disabled_skills),
+        enabled_skills=identity.enabled_skills,
+    )
     bind_skill_load_tool(services)
 
     from engine.memory.compile import assemble_memory, ensure_durable_template
