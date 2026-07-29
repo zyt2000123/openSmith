@@ -226,9 +226,7 @@ async def execute(*, param1: str, param2: int = 0) -> str:
 
 `engine/tool/registry.py` 中的 `ToolRegistry.load_providers()` 扫描 `agents/tools/` 目录下所有 `.py` 文件（跳过 `_` 开头的），自动注册发现的工具。无需手动注册。
 
-### 14 个活跃工具
-
-> `_search_knowledge.py.disabled` 已停用，不参与自动发现。
+### 主要活跃工具
 
 | 工具 | 关键参数 | 行为特征 |
 |------|---------|---------|
