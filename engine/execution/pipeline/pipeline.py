@@ -133,9 +133,8 @@ async def run_pipeline(
                         skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
                     elif attempt == 2:
                         skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
-                    messages = [{"role": "user", "content": user_message}]
                     event_stream = execute_skill_events(
-                        skill, llm, tool_registry, messages, skill_context,
+                        skill, llm, tool_registry, base_messages, skill_context,
                         max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
                         react_event_loop_fn=react_event_loop,
                         prefix_cache_key=prefix_cache_key,
