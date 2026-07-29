@@ -28,5 +28,14 @@ common = "."
 "agent_smith_common/builtin_skills/coding-validation/references" = ["../agents/skills/coding-validation/references/evals.md"]
 "agent_smith_common/builtin_skills/grill-me" = ["../agents/skills/grill-me/SKILL.md"]
 "agent_smith_common/builtin_skills/research" = ["../agents/skills/research/SKILL.md"]
-"agent_smith_common/builtin_skills/teach" = ["../agents/skills/teach/SKILL.md"]
-"agent_smith_common/builtin_skills/writing-great-skills" = ["../agents/skills/writing-great-skills/SKILL.md"]
+"agent_smith_common/builtin_skills/teach" = [
+    "../agents/skills/teach/SKILL.md",
+    "../agents/skills/teach/GLOSSARY-FORMAT.md",
+    "../agents/skills/teach/LEARNING-RECORD-FORMAT.md",
+    "../agents/skills/teach/MISSION-FORMAT.md",
+    "../agents/skills/teach/RESOURCES-FORMAT.md",
+]
+"agent_smith_common/builtin_skills/writing-great-skills" = [
+    "../agents/skills/writing-great-skills/SKILL.md",
+    "../agents/skills/writing-great-skills/GLOSSARY.md",
+]
