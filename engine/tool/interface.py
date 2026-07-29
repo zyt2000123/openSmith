@@ -22,6 +22,9 @@ class ToolDefinition:
     # An opaque command string needs path extraction and explicit approval;
     # shell is currently the only provider that declares this capability.
     opaque_command: bool = False
+    # A provider that opens network connections. Network capability is always
+    # approved even when the operation otherwise looks read-only.
+    network_access: bool = False
     # Security metadata — the runtime policy resolves permissions and approval
     # from these declarations. Path-policy compatibility fallbacks remain in
     # the guard only for legacy direct callers that have not bound a registry.

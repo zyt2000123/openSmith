@@ -69,10 +69,14 @@ def test_react_loop_executes_a_guarded_tool_only_after_approval(tmp_path: Path) 
     assert approval_events[0].data["presentation"] == {
         "title": "Write a file",
         "summary": f"Write to {target}",
-        "details": [
-            {"label": "Path", "value": str(target)},
-            {"label": "Content preview", "value": "approved"},
-        ],
+            "details": [
+                {"label": "Path", "value": str(target)},
+                {"label": "Content preview", "value": "approved"},
+                {
+                    "label": "Access scope",
+                    "value": "Access limited to this exact approved request",
+                },
+            ],
         "reason": "This will change file contents.",
     }
     assert any(event.type is EventType.TEXT_DELTA and event.data.get("text") == "done" for event in events)
@@ -171,6 +175,16 @@ def test_react_loop_executes_external_directory_listing_only_after_approval(tmp_
 
     assert len(approval_events) == 1
     assert approval_events[0].data["arguments"] == {"path": str(external_dir)}
+    assert approval_events[0].data["scope"] == {
+        "kind": "path",
+        "target": str(external_dir),
+        "access": ["read"],
+        "high_risk": False,
+    }
+    assert approval_events[0].data["presentation"]["details"][-1] == {
+        "label": "Access scope",
+        "value": "Read access to the requested path",
+    }
     assert len(completed_events) == 1
     assert "README.md" in completed_events[0].data["content"]
 

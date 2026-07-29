@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from engine.safety.approval import ApprovalScope
 from engine.safety.fact_gate import FactGate
 from engine.safety.tool_guard import PermissionLevel
 from engine.tool.interface import ToolCall
@@ -28,6 +29,7 @@ class ToolPolicyDecision:
     needs_confirmation: bool = False
     approval_required: bool = False
     challenged: bool = False
+    approval_scope: ApprovalScope | None = None
 
     @property
     def observation(self) -> str:
@@ -65,12 +67,14 @@ class _ToolGuardAdapter:
                 level=result.level,
                 needs_confirmation=True,
                 approval_required=True,
+                approval_scope=result.approval_scope,
             )
         return ToolPolicyDecision(
             allowed=result.allowed,
             reason=result.reason,
             level=result.level,
             needs_confirmation=result.needs_confirmation,
+            approval_scope=result.approval_scope,
         )
 
 
@@ -134,6 +138,7 @@ class ToolPolicy:
                         needs_confirmation=decision.needs_confirmation,
                         approval_required=True,
                         challenged=decision.challenged,
+                        approval_scope=decision.approval_scope,
                     )
                     continue
                 return ToolPolicyDecision(
@@ -143,6 +148,7 @@ class ToolPolicy:
                     needs_confirmation=decision.needs_confirmation,
                     approval_required=decision.approval_required,
                     challenged=decision.challenged,
+                    approval_scope=decision.approval_scope,
                 )
             # Carry forward the most specific permission level seen so far.
             if _LEVEL_ORDER.get(decision.level, 0) > _LEVEL_ORDER.get(level, 0):

@@ -12,6 +12,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from engine.safety.approval import ApprovalScope
 from engine.sandbox import ExecutionEnvironment, LocalExecutionEnvironment
 
 from .interface import ToolCall, ToolDefinition, ToolResult
@@ -90,7 +91,9 @@ class ToolRegistry:
         self._wants_environment: set[str] = set()
         self._serial_locks: dict[str, asyncio.Lock] = {}
         self._tool_guard: ToolGuard | None = None
-        self._authorized_call: ContextVar[tuple[str, str | None] | None] = ContextVar(
+        self._authorized_call: ContextVar[
+            tuple[str, str | None, ApprovalScope | None] | None
+        ] = ContextVar(
             f"agent_smith_authorized_tool_call_{id(self)}",
             default=None,
         )
@@ -104,6 +107,7 @@ class ToolRegistry:
         *,
         hidden: bool = False,
         opaque_command: bool = False,
+        network_access: bool = False,
         path_args: Sequence[str] = (),
         list_path_args: Sequence[str] = (),
         is_write_tool: bool = False,
@@ -123,6 +127,8 @@ class ToolRegistry:
             raise ValueError(f"Tool {name} hidden must be a boolean")
         if not isinstance(opaque_command, bool):
             raise ValueError(f"Tool {name} opaque_command must be a boolean")
+        if not isinstance(network_access, bool):
+            raise ValueError(f"Tool {name} network_access must be a boolean")
         if permission_level and permission_level not in _VALID_PERMISSION_LEVELS:
             raise ValueError(
                 f"Tool {name} has invalid permission_level: {permission_level!r} "
@@ -179,6 +185,7 @@ class ToolRegistry:
             parameters=parameters,
             hidden=hidden,
             opaque_command=opaque_command,
+            network_access=network_access,
             path_args=tuple(path_args),
             list_path_args=tuple(list_path_args),
             is_write_tool=bool(is_write_tool or resolved_side_effect != "none"),
@@ -201,7 +208,7 @@ class ToolRegistry:
 
         Each file should define a TOOL_META dict and an execute function.
         TOOL_META keys: name, description, parameters (JSON Schema dict).
-        Optional metadata keys: hidden, opaque_command, path_args, list_path_args,
+        Optional metadata keys: hidden, opaque_command, network_access, path_args, list_path_args,
         is_write_tool, permission_level, approval_policy, read_actions — propagated onto the
         ToolDefinition so safety modules can use them instead of hardcoded
         lookup tables.
@@ -238,6 +245,7 @@ class ToolRegistry:
                         func=execute_fn,
                         hidden=meta.get("hidden", False),
                         opaque_command=meta.get("opaque_command", False),
+                        network_access=meta.get("network_access", False),
                         path_args=_meta_str_tuple(meta, "path_args", py_file),
                         list_path_args=_meta_str_tuple(meta, "list_path_args", py_file),
                         is_write_tool=bool(meta.get("is_write_tool", False)),
@@ -346,6 +354,7 @@ class ToolRegistry:
         call: ToolCall,
         *,
         approval_id: str | None = None,
+        approval_scope: ApprovalScope | None = None,
     ) -> Iterator[None]:
         """Seal one normalized call after the runtime policy has approved it.
 
@@ -358,7 +367,7 @@ class ToolRegistry:
 
         normalized = self.normalize_call(call)
         token = self._authorized_call.set(
-            (_call_fingerprint(normalized), approval_id)
+            (_call_fingerprint(normalized), approval_id, approval_scope)
         )
         try:
             yield
@@ -590,6 +599,8 @@ class ToolRegistry:
             )
 
         defn, func = entry
+        approval_granted = False
+        approval_scope: ApprovalScope | None = None
         if self._tool_guard is not None:
             # The ReAct loop already evaluated and audited this call; this is a
             # backstop for internal callers, so it must not log a second time.
@@ -602,7 +613,9 @@ class ToolRegistry:
             approval_granted = (
                 authorized
                 and bool(authorization[1])
+                and authorization[2] == decision.approval_scope
             )
+            approval_scope = decision.approval_scope
             # A project-boundary result is intentionally ``allowed=False``
             # until the approval broker grants the exact normalized call.  Do
             # not turn a bare approval id into a general bypass: the
@@ -643,6 +656,23 @@ class ToolRegistry:
                 is_error=True,
                 error_kind="environment_unavailable",
             )
+        if (
+            approval_granted
+            and approval_scope is not None
+            and approval_scope.grants_host_execution
+        ):
+            scoped_environment = getattr(environment, "with_approval_scope", None)
+            if not callable(scoped_environment):
+                return ToolResult(
+                    call_id=call.id,
+                    content=(
+                        "Error: the bound sandbox cannot apply the approved host "
+                        "access scope"
+                    ),
+                    is_error=True,
+                    error_kind="environment_unavailable",
+                )
+            environment = scoped_environment(approval_scope)
         if defn.concurrency == "serial":
             lock = self._serial_locks.setdefault(tool_name, asyncio.Lock())
             async with lock:

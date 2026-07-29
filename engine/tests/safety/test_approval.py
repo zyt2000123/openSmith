@@ -5,6 +5,7 @@ import asyncio
 from engine.safety.approval import (
     ApprovalBroker,
     ApprovalRequest,
+    ApprovalScope,
     ApprovalTimeoutError,
     build_approval_presentation,
     summarize_arguments,
@@ -118,3 +119,34 @@ def test_approval_presentation_uses_custom_tool_description_as_fallback() -> Non
     assert presentation.title == "Use Mcp deploy"
     assert presentation.summary == "Deploy the current project to an environment."
     assert presentation.details[0].to_dict() == {"label": "Environment", "value": "staging"}
+
+
+def test_approval_scope_is_visible_and_describes_one_host_command() -> None:
+    scope = ApprovalScope.host_command("cat ~/Downloads/report.txt")
+    request = ApprovalRequest(
+        approval_id="approval-scope",
+        run_id="run-1",
+        tool_name="shell",
+        level="execute",
+        reason="Host access requires approval",
+        arguments_summary={"command": "cat ~/Downloads/report.txt"},
+        scope=scope,
+    )
+    presentation = build_approval_presentation(
+        "shell",
+        "execute",
+        request.reason,
+        request.arguments_summary,
+        scope=scope,
+    )
+
+    assert request.to_dict()["scope"] == {
+        "kind": "host_command",
+        "target": "cat ~/Downloads/report.txt",
+        "access": ["filesystem", "network", "process"],
+        "high_risk": False,
+    }
+    assert presentation.details[-1].to_dict() == {
+        "label": "Access scope",
+        "value": "Host filesystem, network, and process access for this exact command",
+    }

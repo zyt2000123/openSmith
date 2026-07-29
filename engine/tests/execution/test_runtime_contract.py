@@ -612,7 +612,7 @@ def test_run_stream_executes_shell_only_after_approval_through_sandbox(
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
-def test_approved_shell_cannot_read_a_globbed_workspace_secret(
+def test_approved_shell_can_read_user_owned_sensitive_data_for_that_exact_command(
     tmp_path: Path,
 ) -> None:
     async def run() -> tuple[list[ExecutionEvent], Path]:
@@ -675,8 +675,8 @@ def test_approved_shell_cannot_read_a_globbed_workspace_secret(
         and event.data.get("approval_outcome") == "granted"
     )
     assert result_event.data["blocked"] is False
-    assert "must-not-leak" not in str(result_event.data["content"])
-    assert "[exit_code=1]" in str(result_event.data["content"])
+    assert "must-not-leak" in str(result_event.data["content"])
+    assert "[exit_code=0]" in str(result_event.data["content"])
     assert (project_dir / ".env").read_text(encoding="utf-8") == (
         "SMITH_SECRET=must-not-leak\n"
     )
@@ -685,7 +685,7 @@ def test_approved_shell_cannot_read_a_globbed_workspace_secret(
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
-def test_approved_shell_cannot_write_globbed_git_metadata(
+def test_approved_shell_can_write_user_owned_git_metadata_for_that_exact_command(
     tmp_path: Path,
 ) -> None:
     async def run() -> tuple[list[ExecutionEvent], Path]:
@@ -713,7 +713,7 @@ def test_approved_shell_cannot_write_globbed_git_metadata(
         )
         services.tool_guard = ToolGuard(rules)
         services.llm = RetryingShellCallingLLM(  # type: ignore[assignment]
-            command="printf compromised > .gi?/config"
+            command="printf compromised > .git/config"
         )
 
         stream = run_stream_with_runtime(
@@ -754,8 +754,8 @@ def test_approved_shell_cannot_write_globbed_git_metadata(
         and event.data.get("approval_outcome") == "granted"
     )
     assert result_event.data["blocked"] is False
-    assert "[exit_code=1]" in str(result_event.data["content"])
-    assert git_config.read_text(encoding="utf-8") == "original\n"
+    assert "[exit_code=0]" in str(result_event.data["content"])
+    assert git_config.read_text(encoding="utf-8") == "compromised"
     assert events[-1].type is EventType.RUN_FINISHED
     assert events[-1].data["status"] == "completed"
 

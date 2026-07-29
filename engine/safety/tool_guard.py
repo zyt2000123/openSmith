@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from engine.safety.approval import current_approval_context
+from engine.safety.approval import ApprovalScope, current_approval_context
 from engine.tool.interface import ToolCall, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -36,11 +36,13 @@ class GuardResult:
     # True when the call passed hard safety checks but must wait for a user
     # approval before the provider is invoked.
     approval_required: bool = False
-    # True when the only problem is that the path sits outside the allowed
-    # directories — the one block a session whitelist may override.  Sensitive
-    # blocks (.ssh, .env writes, .git, …) keep this False and are never
-    # bypassable.
+    # True when the only issue is the active working-directory boundary. A
+    # session-level trusted whitelist may extend that boundary; high-risk
+    # approvals remain visible even when a path is otherwise reachable.
     boundary_block: bool = False
+    # The user-visible, one-shot capability requested for this call. It is
+    # carried through the approval broker and re-checked by ToolRegistry.
+    approval_scope: ApprovalScope | None = None
 
 
 # ── Path guard (req #3: symlink, traversal, sensitive files) ──
@@ -183,6 +185,29 @@ class FileGuard:
     def is_working_directory_scoped(self) -> bool:
         return self._working_dir is not None
 
+    @staticmethod
+    def _path_approval(
+        target: Path,
+        *,
+        writing: bool,
+        reason: str,
+        high_risk: bool = False,
+        boundary_block: bool = False,
+    ) -> GuardResult:
+        return GuardResult(
+            allowed=False,
+            reason=reason,
+            level=PermissionLevel.WRITE if writing else PermissionLevel.READ,
+            needs_confirmation=True,
+            approval_required=True,
+            boundary_block=boundary_block,
+            approval_scope=ApprovalScope.path(
+                str(target),
+                writing=writing,
+                high_risk=high_risk,
+            ),
+        )
+
     def check_path(self, path_str: str, writing: bool = False) -> GuardResult:
         try:
             # Shell expands a leading tilde before execution; mirror that here
@@ -195,25 +220,62 @@ class FileGuard:
         except (ValueError, OSError):
             return GuardResult(allowed=False, reason=f"Invalid path: {path_str}")
 
+        if _is_runtime_credential_path(target, lexical):
+            return GuardResult(
+                allowed=False,
+                reason=(
+                    "[runtime-secret-001] Agent runtime credential files are not "
+                    "delegable to model tools"
+                ),
+            )
+        if _shares_inode_with_runtime_credential(target):
+            return GuardResult(
+                allowed=False,
+                reason=(
+                    "[runtime-secret-001] Agent runtime credential files are not "
+                    "delegable through a hard-link alias"
+                ),
+            )
+
         # Check the literal path as well as the resolved one: a credential
         # directory that is itself a symlink resolves to a name carrying no
         # ``.ssh``/``.aws`` component and would otherwise slip through.  The
         # sensitive-write branch below already pairs lexical with resolved.
         for part in (*target.parts, *lexical.parts):
             if part.lower() in self._ALWAYS_BLOCKED:
-                return GuardResult(allowed=False, reason=f"Access to {part}/ is blocked")
+                return self._path_approval(
+                    target,
+                    writing=writing,
+                    high_risk=True,
+                    reason=(
+                        f"Access to {part}/ contains user credentials and requires "
+                        "high-risk approval"
+                    ),
+                )
 
         if writing:
             name = target.name.lower()
             if name in self._SENSITIVE_WRITE or name.startswith(".env"):
-                return GuardResult(allowed=False, reason=f"Write to sensitive file blocked: {name}", needs_confirmation=True)
+                return self._path_approval(
+                    target,
+                    writing=True,
+                    high_risk=True,
+                    reason=f"Write to sensitive file {name} requires high-risk approval",
+                )
             for part in target.parts:
                 if part.lower() in self._SENSITIVE_DIRS:
-                    return GuardResult(allowed=False, reason=f"Write inside {part}/ is blocked", needs_confirmation=True)
+                    return self._path_approval(
+                        target,
+                        writing=True,
+                        high_risk=True,
+                        reason=f"Write inside {part}/ requires high-risk approval",
+                    )
 
-            # The runtime owns ~/.agent-smith. Only the three memory views are
-            # writable through model-facing file tools; lifecycle code writes
-            # its internal checkpoints through the trusted memory service.
+            # Runtime-managed state is high-risk but, unlike the provider
+            # credential files above, belongs to the local user and may be
+            # touched after a visible, exact approval. The controlled memory
+            # files retain their ordinary tool policy so lifecycle maintenance
+            # does not create a second special path.
             try:
                 # Case-fold the *block* test so a retyped ``.Agent-Smith`` cannot
                 # slip past it; the memory allow-list below stays case-exact so
@@ -236,11 +298,13 @@ class FileGuard:
             if (lexical_platform or resolved_platform) and not (
                 lexical_memory and resolved_memory
             ):
-                return GuardResult(
-                    allowed=False,
+                return self._path_approval(
+                    target,
+                    writing=True,
+                    high_risk=True,
                     reason=(
-                        "[platform-protect-001] Platform runtime writes are restricted; "
-                        "only controlled memory files may be written."
+                        "[platform-state-001] Writing Agent-Smith runtime state "
+                        "requires high-risk approval"
                     ),
                 )
 
@@ -252,10 +316,9 @@ class FileGuard:
                 return GuardResult(
                     allowed=False,
                     reason=(
-                        f"Write to {target.name} blocked: it is a hard link to a "
-                        "protected file, so the write would modify that file."
+                        f"[unsafe-alias-001] Cannot safely represent the write to "
+                        f"{target.name}: it is a hard link to a protected file."
                     ),
-                    needs_confirmation=True,
                 )
 
         if any(target.is_relative_to(d) for d in self._allowed):
@@ -264,22 +327,21 @@ class FileGuard:
         if self.is_working_directory_scoped:
             # A project-scoped run may inspect or change a user-selected
             # external path only after the live approval flow has bound that
-            # exact normalized call.  This is deliberately narrower than the
-            # sensitive-path blocks above: those remain unapprovable.
-            return GuardResult(
-                allowed=False,
+            # exact normalized call.
+            return self._path_approval(
+                target,
+                writing=writing,
                 reason=(
                     f"Path {path_str} is outside the active working directory "
                     "and requires explicit user approval"
                 ),
-                needs_confirmation=True,
-                approval_required=True,
                 boundary_block=True,
             )
 
-        return GuardResult(
-            allowed=False,
-            reason=f"Path {path_str} outside allowed directories",
+        return self._path_approval(
+            target,
+            writing=writing,
+            reason=f"Path {path_str} is outside the active directories and requires approval",
             boundary_block=True,
         )
 
@@ -404,6 +466,62 @@ _REDIRECT_RE = re.compile(r"(?:>>?|[12]>>?|&>>?)\s*([^\s;|&]+)")
 _PLATFORM_DATA_ROOT = (Path.home() / ".agent-smith").resolve()
 _MEMORY_WRITE_ROOT = _PLATFORM_DATA_ROOT / "agent" / "memory"
 _MEMORY_WRITE_FILES = frozenset({"recent.jsonl", "recent.md", "durable.md"})
+_RUNTIME_CREDENTIAL_PATHS = frozenset({
+    _PLATFORM_DATA_ROOT / "config.yaml",
+    _PLATFORM_DATA_ROOT / "config.yml",
+    _PLATFORM_DATA_ROOT / "agent" / "config.yaml",
+    _PLATFORM_DATA_ROOT / "agent" / "config.yml",
+})
+
+
+def _is_runtime_credential_path(*paths: Path) -> bool:
+    """Whether a model-facing path would expose a provider/runtime credential."""
+    folded_secrets = {_casefolded(path) for path in _RUNTIME_CREDENTIAL_PATHS}
+    return any(_casefolded(path) in folded_secrets for path in paths)
+
+
+def _shares_inode_with_runtime_credential(target: Path) -> bool:
+    """Reject a hard-link alias of an Agent runtime credential file.
+
+    ``Path.resolve`` catches symlinks but intentionally cannot distinguish a
+    second name for the same inode. The small, explicit credential set makes
+    this comparison cheap enough for every model-facing file read and write.
+    """
+    try:
+        target_info = os.lstat(target)
+    except OSError:
+        return False
+    if target_info.st_nlink < 2 or not os.path.isfile(target):
+        return False
+    identity = (target_info.st_dev, target_info.st_ino)
+    for credential_path in _RUNTIME_CREDENTIAL_PATHS:
+        try:
+            credential_info = os.lstat(credential_path)
+        except OSError:
+            continue
+        if (credential_info.st_dev, credential_info.st_ino) == identity:
+            return True
+    return False
+
+
+def _command_mentions_runtime_credential(command: str) -> bool:
+    """Catch the literal shell spellings of non-delegable runtime config files.
+
+    Shell is intentionally opaque, so this helper is only an early diagnostic;
+    the Seatbelt profile independently denies the resolved runtime-secret paths
+    for variable expansion and other forms this text check cannot parse.
+    """
+    home = str(Path.home())
+    aliases: set[str] = set()
+    for path in _RUNTIME_CREDENTIAL_PATHS:
+        rendered = str(path)
+        aliases.add(rendered)
+        if rendered.startswith(home):
+            suffix = rendered[len(home):]
+            aliases.add(f"~{suffix}")
+            aliases.add(f"$HOME{suffix}")
+            aliases.add(f"${{HOME}}{suffix}")
+    return any(alias in command for alias in aliases)
 
 
 def _extract_shell_write_paths(command: str) -> list[str]:
@@ -562,9 +680,9 @@ class ToolGuard:
                 # A raw shell command cannot be safely parsed into a complete
                 # filesystem access list.  It is therefore always approved by
                 # the user (see the shell metadata), rather than pretending a
-                # partial regex enforces the project boundary.  Preserve the
-                # non-bypassable platform-runtime write protection for literal
-                # paths, which is independent of the project boundary.
+                # partial regex enforces the project boundary. Preserve a
+                # high-risk approval for literal runtime-state writes; provider
+                # credential files remain non-delegable in FileGuard itself.
                 try:
                     candidate = Path(wp).expanduser().resolve()
                 except (ValueError, OSError):
@@ -575,9 +693,8 @@ class ToolGuard:
         for p, writing in paths_to_check:
             result = self.file_guard.check_path(p, writing=writing)
             if not result.allowed:
-                # The session whitelist may extend the directory boundary, but
-                # it never bypasses sensitive-path blocks (.ssh, .env writes,
-                # .git, …) — those return boundary_block=False.
+                # The session whitelist may extend only the ordinary directory
+                # boundary; high-risk paths do not set ``boundary_block``.
                 if result.boundary_block and self.whitelist.is_path_allowed(p):
                     continue
                 return result
@@ -614,16 +731,67 @@ class ToolGuard:
         return "never"
 
     def _requires_approval(self, tool_call: ToolCall) -> bool:
+        definition = self._tool_registry.get(tool_call.name)
+        if definition is not None and getattr(definition, "network_access", False):
+            return True
         policy = self._resolve_approval_policy(tool_call.name)
         if policy == "never":
             return False
         if policy == "always":
             return True
-        definition = self._tool_registry.get(tool_call.name)
         action = str(tool_call.arguments.get("action") or "").lower()
         if definition is not None and action in definition.read_actions:
             return False
         return True
+
+    def _approval_scope_for(
+        self,
+        tool_call: ToolCall,
+        *,
+        high_risk: bool = False,
+    ) -> ApprovalScope:
+        """Describe the smallest capability that can execute this call.
+
+        This is deliberately derived from provider metadata rather than a
+        second table of tool names. Opaque shell text is not safely parseable,
+        so its one approved command receives an explicit host-command scope.
+        """
+        path_args, list_path_args, is_write, opaque_command = self._resolve_path_metadata(
+            tool_call.name
+        )
+        if opaque_command:
+            return ApprovalScope.host_command(
+                str(tool_call.arguments.get("command") or ""),
+                high_risk=high_risk,
+            )
+
+        definition = self._tool_registry.get(tool_call.name)
+        if definition is not None and getattr(definition, "network_access", False):
+            target = (
+                tool_call.arguments.get("url")
+                or tool_call.arguments.get("query")
+                or tool_call.arguments.get("target")
+                or tool_call.name
+            )
+            return ApprovalScope.network(str(target), high_risk=high_risk)
+
+        for argument_name in path_args:
+            value = tool_call.arguments.get(argument_name)
+            if value:
+                return ApprovalScope.path(
+                    str(value),
+                    writing=is_write,
+                    high_risk=high_risk,
+                )
+        for argument_name in list_path_args:
+            values = tool_call.arguments.get(argument_name)
+            if isinstance(values, list) and values:
+                return ApprovalScope.path(
+                    str(values[0]),
+                    writing=is_write,
+                    high_risk=high_risk,
+                )
+        return ApprovalScope.operation(tool_call.name, high_risk=high_risk)
 
     def check(self, tool_call: ToolCall, *, audit: bool = True) -> GuardResult:
         """Evaluate one call.
@@ -650,11 +818,19 @@ class ToolGuard:
                     **audit_context,
                 )
 
-        file_result = self._check_file_paths(tool_call)
-        if file_result is not None:
-            file_result.level = level
-            record(file_result)
-            return file_result
+        if self._resolve_path_metadata(tool_call.name)[3] and _command_mentions_runtime_credential(
+            str(tool_call.arguments.get("command") or "")
+        ):
+            result = GuardResult(
+                allowed=False,
+                reason=(
+                    "[runtime-secret-001] Agent runtime credential files are not "
+                    "delegable to model tools"
+                ),
+                level=level,
+            )
+            record(result)
+            return result
 
         match_targets = _rule_match_targets(tool_call.arguments)
         for rule in self._rules:
@@ -680,11 +856,27 @@ class ToolGuard:
                     reason = rule.get("reason") or rule.get("description") or f"Blocked: {pattern}"
                     result = GuardResult(
                         allowed=False,
-                        reason=f"[{rule.get('id', '?')}] {reason}",
+                        reason=(
+                            f"[{rule.get('id', '?')}] {reason}; high-risk approval "
+                            "is required"
+                        ),
                         level=PermissionLevel.DESTRUCTIVE,
+                        needs_confirmation=True,
+                        approval_required=True,
+                        approval_scope=self._approval_scope_for(tool_call, high_risk=True),
                     )
                     record(result, rule_id=rule.get("id"))
                     return result
+
+        # Classify known high-risk patterns before returning the more general
+        # outside-workspace result. Otherwise ``read_file /etc/shadow`` would
+        # be presented as an ordinary directory-boundary approval rather than
+        # the high-risk credential/system-file access it actually is.
+        file_result = self._check_file_paths(tool_call)
+        if file_result is not None:
+            file_result.level = level
+            record(file_result)
+            return file_result
 
         approval_required = self._requires_approval(tool_call)
         result = GuardResult(
@@ -692,6 +884,7 @@ class ToolGuard:
             level=level,
             reason=f"Approval required for {tool_call.name}" if approval_required else "",
             approval_required=approval_required,
+            approval_scope=(self._approval_scope_for(tool_call) if approval_required else None),
         )
         record(result, whitelisted=tool_whitelisted)
         return result
