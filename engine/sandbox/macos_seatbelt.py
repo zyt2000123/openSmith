@@ -72,6 +72,7 @@ class MacOSSeatbeltEnvironment:
         *,
         workspace: str | Path,
         runtime_secret_paths: Iterable[str | Path] | None = None,
+        non_delegable_write_paths: Iterable[str | Path] = (),
         approved_host_access: bool = False,
     ) -> None:
         self._workspace = Path(workspace).expanduser().resolve()
@@ -98,8 +99,39 @@ class MacOSSeatbeltEnvironment:
             for character in str(path)
         ):
             raise ValueError("runtime secret path contains control characters")
+        self._non_delegable_write_paths = self._resolve_non_delegable_write_paths(
+            non_delegable_write_paths
+        )
         self._approved_host_access = approved_host_access
         self._host = LocalExecutionEnvironment()
+
+    @staticmethod
+    def _resolve_non_delegable_write_paths(
+        paths: Iterable[str | Path],
+    ) -> tuple[Path, ...]:
+        resolved = tuple(Path(path).expanduser().resolve() for path in paths)
+        if any(
+            ord(character) < 32 or ord(character) == 127
+            for path in resolved
+            for character in str(path)
+        ):
+            raise ValueError("non-delegable write path contains control characters")
+        return resolved
+
+    def with_non_delegable_write_paths(
+        self,
+        paths: Iterable[str | Path],
+    ) -> MacOSSeatbeltEnvironment:
+        """Return a copy that preserves runtime-owned paths as read-only.
+
+        This mirrors ``with_approval_scope`` so callers can retain subclasses
+        that add instrumentation or controls but still bind protected roots.
+        """
+        scoped = copy.copy(self)
+        scoped._non_delegable_write_paths = self._resolve_non_delegable_write_paths(
+            paths
+        )
+        return scoped
 
     def with_approval_scope(self, scope: object) -> MacOSSeatbeltEnvironment:
         """Return a one-call environment matching an exact approved host scope.
@@ -118,6 +150,11 @@ class MacOSSeatbeltEnvironment:
         return scoped
 
     def _profile(self) -> str:
+        protected_write_denies = "\n".join(
+            "(deny file-write* "
+            f"(subpath (param \"NON_DELEGABLE_WRITE_{index}\")))"
+            for index, _ in enumerate(self._non_delegable_write_paths)
+        )
         if self._approved_host_access:
             runtime_denies = "\n".join(
                 "(deny file-read* file-write* "
@@ -131,6 +168,7 @@ class MacOSSeatbeltEnvironment:
 (allow network*)
 (allow file-read* file-write*)
 {runtime_denies}
+{protected_write_denies}
 """
         # ``system.sb`` supplies the narrow macOS runtime grants needed by
         # dynamically linked command-line programs.  The enclosing default
@@ -140,7 +178,7 @@ class MacOSSeatbeltEnvironment:
         # WORKSPACE is passed with ``sandbox-exec -D`` rather than interpolated
         # into this source.  ``regex-quote`` keeps every user-controlled path
         # character out of the SBPL grammar and regex language.
-        return r"""(version 1)
+        profile = r"""(version 1)
 (deny default)
 (import "system.sb")
 (deny network*)
@@ -179,6 +217,20 @@ class MacOSSeatbeltEnvironment:
     (regex (string-append "^" (regex-quote (param "WORKSPACE"))
         #"/(.*/)?\.(npmrc|pypirc|netrc|git-credentials)$")))
 """
+        if protected_write_denies:
+            return f"{profile}{protected_write_denies}\n"
+        return profile
+
+    def _is_non_delegable_write_path(self, path: Path) -> bool:
+        """Whether a workspace path is a protected runtime provider path."""
+        folded_path = Path(str(path).lower())
+        for root in self._non_delegable_write_paths:
+            try:
+                if folded_path.is_relative_to(Path(str(root).lower())):
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _validate_cwd(self, cwd: str | None) -> tuple[str | None, str | None]:
         resolved = Path(cwd).expanduser().resolve() if cwd else self._workspace
@@ -260,7 +312,13 @@ class MacOSSeatbeltEnvironment:
         for paths, link_count in seen.values():
             aliases = ", ".join(str(path) for path in sorted(paths, key=str))
             protected = next(
-                (path for path in paths if _is_hardlink_protected_path(path)), None
+                (
+                    path
+                    for path in paths
+                    if _is_hardlink_protected_path(path)
+                    or self._is_non_delegable_write_path(self._workspace / path)
+                ),
+                None,
             )
             if protected is not None:
                 return (
@@ -317,6 +375,11 @@ class MacOSSeatbeltEnvironment:
         ]
         for index, runtime_secret_path in enumerate(self._runtime_secret_paths):
             wrapped_argv[1:1] = ["-D", f"RUNTIME_SECRET_{index}={runtime_secret_path}"]
+        for index, protected_path in enumerate(self._non_delegable_write_paths):
+            wrapped_argv[1:1] = [
+                "-D",
+                f"NON_DELEGABLE_WRITE_{index}={protected_path}",
+            ]
         if command is not None:
             # The execution environment is already constructed explicitly in
             # ``_safe_environment``.  A login shell tries to load host startup

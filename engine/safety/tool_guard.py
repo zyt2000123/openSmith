@@ -115,7 +115,11 @@ def _git_dirs_for(working_dir: Path) -> list[Path]:
     return [path for path in candidates if _looks_like_git_dir(path)]
 
 
-def _shares_inode_with_protected_file(target: Path, working_dir: Path | None) -> bool:
+def _shares_inode_with_protected_file(
+    target: Path,
+    working_dir: Path | None,
+    extra_protected_roots: tuple[Path, ...] = (),
+) -> bool:
     """True when ``target`` is a hard link into a protected location.
 
     A hard link gives one inode a second name, so a harmless-looking path can
@@ -143,6 +147,7 @@ def _shares_inode_with_protected_file(target: Path, working_dir: Path | None) ->
     if working_dir is not None:
         roots.extend(_git_dirs_for(working_dir))
         roots.extend(working_dir / name for name in FileGuard._ALWAYS_BLOCKED)
+    roots.extend(extra_protected_roots)
 
     for root in roots:
         if not root.is_dir():
@@ -166,6 +171,7 @@ class FileGuard:
 
     def __init__(self, allowed_dirs: list[Path] | None = None):
         self._working_dir: Path | None = None
+        self._non_delegable_write_roots: tuple[Path, ...] = ()
         self.set_allowed_dirs(allowed_dirs)
 
     def set_allowed_dirs(self, allowed_dirs: list[Path] | None) -> None:
@@ -181,9 +187,31 @@ class FileGuard:
         self._working_dir = root
         self.set_allowed_dirs([root])
 
+    def set_non_delegable_write_roots(self, roots: list[Path]) -> None:
+        """Configure paths that model tools may read but never modify.
+
+        These roots protect the runtime's executable provider code.  They are
+        checked before ordinary approval handling, so a one-shot user approval
+        cannot turn into server-process code execution on a later request.
+        """
+        self._non_delegable_write_roots = tuple(
+            Path(root).expanduser().resolve() for root in roots
+        )
+
     @property
     def is_working_directory_scoped(self) -> bool:
         return self._working_dir is not None
+
+    def _is_non_delegable_write_target(self, target: Path, lexical: Path) -> bool:
+        for root in self._non_delegable_write_roots:
+            folded_root = _casefolded(root)
+            for candidate in (target, lexical):
+                try:
+                    if _casefolded(candidate).is_relative_to(folded_root):
+                        return True
+                except ValueError:
+                    continue
+        return False
 
     @staticmethod
     def _path_approval(
@@ -234,6 +262,15 @@ class FileGuard:
                 reason=(
                     "[runtime-secret-001] Agent runtime credential files are not "
                     "delegable through a hard-link alias"
+                ),
+            )
+
+        if writing and self._is_non_delegable_write_target(target, lexical):
+            return GuardResult(
+                allowed=False,
+                reason=(
+                    "[runtime-provider-001] Agent runtime tool provider files are "
+                    "not delegable to model tools"
                 ),
             )
 
@@ -312,7 +349,11 @@ class FileGuard:
             # nothing sensitive can still write straight into .git/hooks/ or
             # .ssh/.  Nothing above catches it: every check so far reasons about
             # path *names*, never inode identity.
-            if _shares_inode_with_protected_file(target, self._working_dir):
+            if _shares_inode_with_protected_file(
+                target,
+                self._working_dir,
+                self._non_delegable_write_roots,
+            ):
                 return GuardResult(
                     allowed=False,
                     reason=(
@@ -598,6 +639,10 @@ class ToolGuard:
     def set_working_directory(self, working_dir: Path) -> None:
         """Constrain project-facing file tools to one resolved workspace."""
         self.file_guard.set_working_directory(working_dir)
+
+    def set_non_delegable_write_roots(self, roots: list[Path]) -> None:
+        """Block model writes to runtime-owned executable provider roots."""
+        self.file_guard.set_non_delegable_write_roots(roots)
 
     def _resolve_path_metadata(
         self,

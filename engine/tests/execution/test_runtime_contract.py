@@ -278,6 +278,7 @@ routes: []
         agent_name="Smith",
         profile_dir=profile_dir,
         agents_dir=agents_dir,
+        default_working_dir=tmp_path,
         session_id="sess-1",
         identity_catalog=IdentityCatalog.load(identities_dir),
     )
@@ -305,6 +306,75 @@ def _register_successful_test_tool(runtime: RuntimeContext, services: RuntimeSer
         {"type": "object", "properties": {}},
         execute,
     )
+
+
+def test_prepare_runtime_requires_an_explicit_working_directory_before_loading_tools(
+    tmp_path: Path,
+) -> None:
+    """An unscoped request must not import code from the runtime tool directory."""
+
+    async def run() -> None:
+        runtime, services, _ = _runtime(tmp_path)
+        unscoped_runtime = RuntimeContext(
+            agent_id=runtime.agent_id,
+            agent_name=runtime.agent_name,
+            profile_dir=runtime.profile_dir,
+            agents_dir=runtime.agents_dir,
+            session_id=runtime.session_id,
+            identity_catalog=runtime.identity_catalog,
+        )
+        marker = tmp_path / "provider-imported.txt"
+        (unscoped_runtime.agents_dir / "tools" / "poc.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+            "TOOL_META = {'name': 'poc', 'parameters': {}}\n"
+            "def execute():\n"
+            "    return 'never'\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="working directory must be explicitly provided"):
+            await prepare_runtime(EngineRequest(message="hello"), unscoped_runtime, services)
+
+        assert not marker.exists()
+
+    asyncio.run(run())
+
+
+def test_prepare_runtime_loads_only_declared_builtin_provider_modules(tmp_path: Path) -> None:
+    """Extra Python files beside built-ins are data, never executable providers."""
+
+    async def run() -> tuple[ToolRegistry, Path]:
+        runtime, services, _ = _runtime(tmp_path)
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        marker = tmp_path / "provider-imported.txt"
+        tools_dir = runtime.agents_dir / "tools"
+        (tools_dir / "todo.py").write_text(
+            "TOOL_META = {'name': 'todo', 'parameters': {}}\n"
+            "def execute():\n"
+            "    return 'builtin'\n",
+            encoding="utf-8",
+        )
+        (tools_dir / "poc.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+            "TOOL_META = {'name': 'poc', 'parameters': {}}\n"
+            "def execute():\n"
+            "    return 'never'\n",
+            encoding="utf-8",
+        )
+
+        await prepare_runtime(
+            EngineRequest(message="hello", working_dir=str(project_dir)), runtime, services
+        )
+        return services.tool_registry, marker
+
+    registry, marker = asyncio.run(run())
+
+    assert "todo" in registry.definitions()
+    assert "poc" not in registry.definitions()
+    assert not marker.exists()
 
 
 def test_prepare_runtime_scopes_tool_paths_to_the_request_working_dir(tmp_path: Path) -> None:
@@ -377,7 +447,7 @@ def test_prepare_runtime_routes_sandbox_tools_to_macos_seatbelt(tmp_path: Path) 
         (runtime.profile_dir / "config.yaml").write_text(
             "tools:\n  enabled: [sandbox_probe]\n", encoding="utf-8"
         )
-        (runtime.agents_dir / "tools" / "sandbox_probe.py").write_text(
+        (runtime.agents_dir / "tools" / "todo.py").write_text(
             "TOOL_META = {\n"
             "    'name': 'sandbox_probe',\n"
             "    'parameters': {'type': 'object', 'properties': {}},\n"
@@ -1690,6 +1760,7 @@ GATES = {"runtime_contract_planning": AlwaysPassGate}
             agent_name=runtime.agent_name,
             profile_dir=runtime.profile_dir,
             agents_dir=runtime.agents_dir,
+            default_working_dir=runtime.default_working_dir,
             session_id=runtime.session_id,
             identity_catalog=IdentityCatalog.load(identities_dir),
         )
@@ -1721,6 +1792,7 @@ def test_shipped_coding_identity_executes_every_declared_stage(tmp_path: Path) -
             agent_name=runtime.agent_name,
             profile_dir=runtime.profile_dir,
             agents_dir=agents_dir,
+            default_working_dir=runtime.default_working_dir,
             session_id=runtime.session_id,
             identity_catalog=IdentityCatalog.load(agents_dir / "identities"),
         )

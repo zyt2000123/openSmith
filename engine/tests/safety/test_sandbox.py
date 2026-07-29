@@ -152,6 +152,60 @@ def test_macos_seatbelt_grants_host_access_only_for_an_approved_scope(tmp_path: 
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_approved_macos_seatbelt_keeps_runtime_provider_files_read_only(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    provider_file = workspace / "agents" / "tools" / "todo.py"
+    provider_file.parent.mkdir(parents=True)
+    provider_file.write_text("original\n", encoding="utf-8")
+    environment = MacOSSeatbeltEnvironment(
+        workspace=workspace,
+        non_delegable_write_paths=[provider_file.parent],
+    )
+    approved = environment.with_approval_scope(
+        ApprovalScope.host_command("printf changed > agents/tools/todo.py")
+    )
+
+    result = asyncio.run(
+        approved.run_command(
+            argv=["/bin/sh", "-c", "printf changed > agents/tools/todo.py"],
+            cwd=str(workspace),
+        )
+    )
+
+    assert result.exit_code not in (None, 0)
+    assert provider_file.read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_approved_macos_seatbelt_rejects_a_hardlink_alias_to_runtime_provider(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    provider_file = workspace / "agents" / "tools" / "todo.py"
+    provider_file.parent.mkdir(parents=True)
+    provider_file.write_text("original\n", encoding="utf-8")
+    alias = workspace / "safe-looking.py"
+    os.link(provider_file, alias)
+    environment = MacOSSeatbeltEnvironment(
+        workspace=workspace,
+        non_delegable_write_paths=[provider_file.parent],
+    ).with_approval_scope(ApprovalScope.host_command("printf changed > safe-looking.py"))
+
+    result = asyncio.run(
+        environment.run_command(
+            argv=["/bin/sh", "-c", "printf changed > safe-looking.py"],
+            cwd=str(workspace),
+        )
+    )
+
+    assert result.exit_code is None
+    assert result.error and "hard links" in result.error
+    assert provider_file.read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
 def test_macos_seatbelt_does_not_inherit_parent_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

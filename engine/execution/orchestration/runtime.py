@@ -35,7 +35,12 @@ class EngineRequest:
 
 @dataclass(frozen=True)
 class RuntimeContext:
-    """Runtime identity and filesystem context already resolved by the caller."""
+    """Runtime identity and filesystem context already resolved by the caller.
+
+    ``default_working_dir`` is an optional, caller-supplied fallback for
+    trusted embeddings and tests.  The engine never derives a workspace from
+    its own process current directory.
+    """
 
     agent_id: str
     agent_name: str
@@ -44,6 +49,7 @@ class RuntimeContext:
     session_id: str | None = None
     metadata: Mapping[str, str] = field(default_factory=dict)
     identity_catalog: IdentityCatalog | None = None
+    default_working_dir: Path | None = None
 
 
 @dataclass
