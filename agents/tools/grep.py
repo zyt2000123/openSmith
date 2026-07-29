@@ -1,5 +1,6 @@
 """Grep tool — search file contents using ripgrep (rg) or fallback to grep."""
 
+import asyncio
 import os
 import subprocess
 
@@ -42,7 +43,7 @@ def _has_rg() -> bool:
         return False
 
 
-async def execute(
+def _execute_sync(
     *, pattern: str, path: str = ".", include: str = "",
     ignore_case: bool = False, context_lines: int = 0, files_only: bool = False,
 ) -> str:
@@ -95,3 +96,18 @@ async def execute(
     if total > MAX_RESULTS:
         header += f" (showing {MAX_RESULTS} of {total})"
     return header + "\n" + "\n".join(lines)
+
+
+async def execute(
+    *, pattern: str, path: str = ".", include: str = "",
+    ignore_case: bool = False, context_lines: int = 0, files_only: bool = False,
+) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        pattern=pattern,
+        path=path,
+        include=include,
+        ignore_case=ignore_case,
+        context_lines=context_lines,
+        files_only=files_only,
+    )

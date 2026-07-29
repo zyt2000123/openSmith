@@ -42,6 +42,10 @@ class RunStateTransitionError(RunStateError):
     """Raised when a run tries to skip or leave an invalid lifecycle state."""
 
 
+class RunScopeMismatchError(RunStateError):
+    """Raised when a resume request does not belong to the persisted run."""
+
+
 _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.QUEUED: frozenset({
         RunStatus.RUNNING,
@@ -238,6 +242,64 @@ class RunState:
         )
 
 
+@dataclass(frozen=True)
+class RunScope:
+    """Identity and request coordinates that one persisted run is bound to."""
+
+    agent_id: str
+    session_id: str | None = None
+    message_id: str | None = None
+    identity_id: str | None = None
+    working_dir: str | None = None
+    forced_skill: str | None = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        agent_id: str,
+        session_id: str | None = None,
+        message_id: str | None = None,
+        identity_id: str | None = None,
+        working_dir: str | None = None,
+        forced_skill: str | None = None,
+    ) -> "RunScope":
+        return cls(
+            agent_id=_bounded_text(agent_id) or "unknown",
+            session_id=_bounded_text(session_id),
+            message_id=_bounded_text(message_id),
+            identity_id=_bounded_text(identity_id),
+            working_dir=_bounded_text(working_dir, limit=1024),
+            forced_skill=_bounded_text(forced_skill),
+        )
+
+    @classmethod
+    def from_state(cls, state: RunState) -> "RunScope":
+        return cls(
+            agent_id=state.agent_id,
+            session_id=state.session_id,
+            message_id=state.message_id,
+            identity_id=state.identity_id,
+            working_dir=state.working_dir,
+            forced_skill=state.forced_skill,
+        )
+
+    def mismatched_fields(self, state: RunState) -> list[str]:
+        persisted = self.from_state(state)
+        return [
+            field_name
+            for field_name in (
+                "agent_id",
+                "session_id",
+                "message_id",
+                "identity_id",
+                "working_dir",
+                "forced_skill",
+            )
+            if getattr(persisted, field_name) != getattr(self, field_name)
+        ]
+
+
 class RunStateStore:
     """Atomic, private JSON persistence for run metadata."""
 
@@ -281,9 +343,21 @@ class RunStateStore:
         self.save(state)
         return state
 
-    def resume(self, run_id: str) -> RunState:
-        """Resume a recoverable run without allowing completed work to rerun."""
+    def validate_resume(
+        self,
+        run_id: str,
+        *,
+        scope: RunScope | None = None,
+    ) -> RunState:
+        """Validate resume ownership and status without changing persisted state."""
         state = self._require(run_id)
+        if scope is not None:
+            mismatches = scope.mismatched_fields(state)
+            if mismatches:
+                raise RunScopeMismatchError(
+                    f"Run {run_id!r} does not match resume scope fields: "
+                    f"{', '.join(mismatches)}"
+                )
         if state.status not in {
             RunStatus.INCOMPLETE,
             RunStatus.FAILED,
@@ -292,8 +366,30 @@ class RunStateStore:
             raise RunStateTransitionError(
                 f"Run {run_id!r} is not resumable from {state.status.value!r}"
             )
+        return state
+
+    def resume(self, run_id: str, *, scope: RunScope | None = None) -> RunState:
+        """Resume a recoverable run without allowing completed work to rerun."""
+        state = self.validate_resume(run_id, scope=scope)
         state.transition(RunStatus.RUNNING, reason="resumed")
         state.record_event("run_resumed")
+        self.save(state)
+        return state
+
+    def bind_identity(self, run_id: str, identity_id: str) -> RunState:
+        """Persist the identity selected during runtime preparation."""
+        state = self._require(run_id)
+        normalized = _bounded_text(identity_id)
+        if normalized is None:
+            raise ValueError("identity id is required")
+        if state.identity_id not in {None, normalized}:
+            raise RunScopeMismatchError(
+                f"Run {run_id!r} is already bound to a different identity"
+            )
+        if state.identity_id == normalized:
+            return state
+        state.identity_id = normalized
+        state.updated_at = _now()
         self.save(state)
         return state
 

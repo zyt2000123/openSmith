@@ -1,5 +1,6 @@
 """Glob tool — find files by pattern."""
 
+import asyncio
 import fnmatch
 import os
 from pathlib import Path
@@ -122,7 +123,7 @@ def _safe_glob(base: Path, pattern: str) -> list[Path]:
     return matches
 
 
-async def execute(*, pattern: str, path: str = ".") -> str:
+def _execute_sync(*, pattern: str, path: str = ".") -> str:
     if not _is_relative_pattern(pattern):
         return "Error: glob pattern must be relative to the requested directory"
 
@@ -146,3 +147,7 @@ async def execute(*, pattern: str, path: str = ".") -> str:
     if total > MAX_RESULTS:
         header += f" (showing {MAX_RESULTS} of {total})"
     return header + "\n" + "\n".join(filtered)
+
+
+async def execute(*, pattern: str, path: str = ".") -> str:
+    return await asyncio.to_thread(_execute_sync, pattern=pattern, path=path)

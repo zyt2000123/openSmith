@@ -9,10 +9,12 @@ Aligned with engine/memory pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 EpisodeRunner = Callable[[Path, str, list[dict]], Awaitable[Path | None]]
 
@@ -131,7 +133,7 @@ async def execute(
     if memory_api is None:
         return "Error: memory runtime capability was not provided"
     mem_dir = _memory_dir(memory_dir)
-    mem_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(mem_dir.mkdir, parents=True, exist_ok=True)
 
     if action == "search":
         if not query:
@@ -160,7 +162,16 @@ async def execute(
         rejection = _check_sensitive(content, memory_api) or _check_sensitive(evidence, memory_api)
         if rejection:
             return rejection
-        return _append_event(mem_dir, content, evidence, kind, scope, evidence_type, memory_api)
+        return await asyncio.to_thread(
+            _append_event,
+            mem_dir,
+            content,
+            evidence,
+            kind,
+            scope,
+            evidence_type,
+            memory_api,
+        )
 
     elif action == "episode":
         if not topic:
@@ -178,7 +189,13 @@ async def execute(
         rejection = _check_sensitive(content, memory_api)
         if rejection:
             return rejection
-        return _update_episode(mem_dir, episode_id, content, memory_api)
+        return await asyncio.to_thread(
+            _update_episode,
+            mem_dir,
+            episode_id,
+            content,
+            memory_api,
+        )
 
     elif action == "remove":
         if not episode_id:
@@ -214,7 +231,7 @@ def _append_event(
     return "OK: candidate evidence recorded for policy review; it is not durable memory"
 
 
-async def _search(mem_dir: Path, query: str, memory_api: Any) -> str:
+def _search_sync(mem_dir: Path, query: str, memory_api: Any) -> str:
     safe_query = _sanitize_for_tool_output(query, memory_api)
     keywords = safe_query.lower().split()
     if not keywords:
@@ -262,6 +279,10 @@ async def _search(mem_dir: Path, query: str, memory_api: Any) -> str:
     return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
 
 
+async def _search(mem_dir: Path, query: str, memory_api: Any) -> str:
+    return await asyncio.to_thread(_search_sync, mem_dir, query, memory_api)
+
+
 async def _create_episode(
     mem_dir: Path,
     topic: str,
@@ -269,21 +290,26 @@ async def _create_episode(
     episode_runner: EpisodeRunner | None = None,
 ) -> str:
     recent_file = mem_dir / "recent.jsonl"
-    if not recent_file.is_file():
-        return "Error: no recent events to summarize"
+    def load_related() -> list[dict] | None:
+        if not recent_file.is_file():
+            return None
+        topic_keywords = topic.lower().split()
+        related_events: list[dict] = []
+        for line in recent_file.read_text(encoding="utf-8").strip().splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            text = f"{entry.get('task', '')} {entry.get('summary', '')}".lower()
+            if any(kw in text for kw in topic_keywords):
+                related_events.append(entry)
+        return related_events
 
-    topic_keywords = topic.lower().split()
-    related: list[dict] = []
-    for line in recent_file.read_text(encoding="utf-8").strip().splitlines():
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        text = f"{entry.get('task', '')} {entry.get('summary', '')}".lower()
-        if any(kw in text for kw in topic_keywords):
-            related.append(entry)
+    related = await asyncio.to_thread(load_related)
+    if related is None:
+        return "Error: no recent events to summarize"
 
     if not related:
         return f"No events found matching topic '{topic}'"
@@ -315,16 +341,21 @@ def _update_episode(mem_dir: Path, episode_id: str, content: str, memory_api: An
 
 
 async def _remove_episode(mem_dir: Path, episode_id: str, memory_api: Any) -> str:
-    if Path(episode_id).name != episode_id:
-        return "Error: invalid episode_id"
-    ep_path = mem_dir / "episodes" / f"{episode_id}.md"
-    if not ep_path.is_file():
-        return f"Error: episode '{episode_id}' not found"
-    ep_root = (mem_dir / "episodes").resolve()
-    if not ep_path.resolve().is_relative_to(ep_root):
-        return "Error: invalid episode path"
+    def remove_file() -> str | None:
+        if Path(episode_id).name != episode_id:
+            return "Error: invalid episode_id"
+        ep_path = mem_dir / "episodes" / f"{episode_id}.md"
+        if not ep_path.is_file():
+            return f"Error: episode '{episode_id}' not found"
+        ep_root = (mem_dir / "episodes").resolve()
+        if not ep_path.resolve().is_relative_to(ep_root):
+            return "Error: invalid episode path"
+        ep_path.unlink()
+        return None
 
-    ep_path.unlink()
+    error = await asyncio.to_thread(remove_file)
+    if error is not None:
+        return error
     try:
         await memory_api.remove_episode_from_index(mem_dir, episode_id)
     except Exception:

@@ -14,10 +14,10 @@ Only the last 10 versions are kept.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 from datetime import datetime, timezone
 from pathlib import Path
-
 
 _MAX_VERSIONS = 10
 
@@ -75,7 +75,7 @@ class SkillStore:
     # Public API
     # ------------------------------------------------------------------
 
-    async def save_version(self, skill_name: str, content: str) -> str:
+    def _save_version_sync(self, skill_name: str, content: str) -> str:
         """Save current SKILL.md as a numbered version, return version id.
 
         *content* is the text that is about to be replaced (the old version).
@@ -98,7 +98,10 @@ class SkillStore:
         self._prune(skill_name)
         return version_id
 
-    async def rollback(self, skill_name: str, version_id: str) -> bool:
+    async def save_version(self, skill_name: str, content: str) -> str:
+        return await asyncio.to_thread(self._save_version_sync, skill_name, content)
+
+    def _rollback_sync(self, skill_name: str, version_id: str) -> bool:
         """Restore a previous version of a skill."""
         safe_vid = Path(version_id).name
         if not version_id or safe_vid != version_id or safe_vid in {".", ".."}:
@@ -113,13 +116,16 @@ class SkillStore:
 
         # Save current as a version before rolling back
         current = skill_file.read_text(encoding="utf-8")
-        await self.save_version(skill_name, current)
+        self._save_version_sync(skill_name, current)
 
         # Restore
         skill_file.write_text(snapshot.read_text(encoding="utf-8"), encoding="utf-8")
         return True
 
-    async def list_versions(self, skill_name: str) -> list[dict]:
+    async def rollback(self, skill_name: str, version_id: str) -> bool:
+        return await asyncio.to_thread(self._rollback_sync, skill_name, version_id)
+
+    def _list_versions_sync(self, skill_name: str) -> list[dict]:
         """List available versions with timestamps."""
         vdir = self._versions_dir(skill_name)
         if not vdir.is_dir():
@@ -134,7 +140,10 @@ class SkillStore:
             })
         return result
 
-    async def diff(self, skill_name: str, v1: str, v2: str) -> str:
+    async def list_versions(self, skill_name: str) -> list[dict]:
+        return await asyncio.to_thread(self._list_versions_sync, skill_name)
+
+    def _diff_sync(self, skill_name: str, v1: str, v2: str) -> str:
         """Show unified diff between two versions.
 
         v1/v2 can be version ids or the special value "current" for the
@@ -162,3 +171,6 @@ class SkillStore:
         )
         result = "".join(diff_lines)
         return result if result else "(no differences)"
+
+    async def diff(self, skill_name: str, v1: str, v2: str) -> str:
+        return await asyncio.to_thread(self._diff_sync, skill_name, v1, v2)

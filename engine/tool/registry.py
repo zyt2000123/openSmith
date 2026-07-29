@@ -565,7 +565,7 @@ class ToolRegistry:
                 side_effect_status="unknown" if defn.side_effect != "none" else "none",
             )
 
-        result = self._finalize_result(result, tool_name)
+        result = await asyncio.to_thread(self._finalize_result, result, tool_name)
         if ledger is not None and claimed:
             ledger.finish(
                 call_id=call.id,

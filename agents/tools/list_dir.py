@@ -1,5 +1,6 @@
 """List directory tool — tree-style directory listing."""
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -28,7 +29,7 @@ MAX_ENTRIES = 300
 EXCLUDED = {".git", "node_modules", "__pycache__", ".venv", "dist", ".build", ".DS_Store", ".egg-info"}
 
 
-async def execute(*, path: str = ".", max_depth: int = 2) -> str:
+def _execute_sync(*, path: str = ".", max_depth: int = 2) -> str:
     base = os.path.realpath(path)
     if not os.path.isdir(base):
         return f"Error: not a directory: {base}"
@@ -89,3 +90,11 @@ async def execute(*, path: str = ".", max_depth: int = 2) -> str:
     if count >= MAX_ENTRIES:
         lines.append(f"\n...truncated at {MAX_ENTRIES} entries")
     return "\n".join(lines)
+
+
+async def execute(*, path: str = ".", max_depth: int = 2) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        path=path,
+        max_depth=max_depth,
+    )

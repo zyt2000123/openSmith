@@ -1,5 +1,6 @@
 """Skill loader tool provider — reads the runtime's registered skill catalog."""
 
+import asyncio
 from collections.abc import Callable
 
 TOOL_META = {
@@ -25,7 +26,7 @@ TOOL_META = {
 SkillLoader = Callable[[str], tuple[str | None, list[str]]]
 
 
-async def execute(*, name: str, skill_loader: SkillLoader | None = None) -> str:
+def _execute_sync(*, name: str, skill_loader: SkillLoader | None = None) -> str:
     safe_name = name.strip()
     if not safe_name or "/" in safe_name or "\\" in safe_name:
         return "Error: invalid skill name"
@@ -37,3 +38,11 @@ async def execute(*, name: str, skill_loader: SkillLoader | None = None) -> str:
         available_str = ", ".join(available) if available else "(none found)"
         return f"Error: skill '{safe_name}' not found\nAvailable skills: {available_str}"
     return f"# Skill: {safe_name}\n\n{content}"
+
+
+async def execute(*, name: str, skill_loader: SkillLoader | None = None) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        name=name,
+        skill_loader=skill_loader,
+    )

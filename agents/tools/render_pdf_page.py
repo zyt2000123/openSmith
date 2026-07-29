@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -51,7 +52,7 @@ def _find_pdftoppm() -> str | None:
     return shutil.which("pdftoppm")
 
 
-async def execute(*, path: str, page: int = 1, dpi: int = 144) -> str:
+def _execute_sync(*, path: str, page: int = 1, dpi: int = 144) -> str:
     resolved = os.path.realpath(path)
     if not os.path.isfile(resolved):
         return f"Error: PDF file not found: {resolved}"
@@ -109,3 +110,12 @@ async def execute(*, path: str, page: int = 1, dpi: int = 144) -> str:
         return "Error: rendered page exceeds the 25 MB safety limit"
 
     return f"Rendered PDF page {page} at {dpi} DPI: {output_path} ({size} bytes)"
+
+
+async def execute(*, path: str, page: int = 1, dpi: int = 144) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        path=path,
+        page=page,
+        dpi=dpi,
+    )

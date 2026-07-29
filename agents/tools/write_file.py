@@ -1,5 +1,6 @@
 """Write file tool provider — writes content to a file within the work directory."""
 
+import asyncio
 import os
 from collections.abc import Callable
 
@@ -41,7 +42,7 @@ def _is_within_workdir(path: str, work_dir: str) -> bool:
     return resolved.startswith(work_resolved + os.sep) or resolved == work_resolved
 
 
-async def execute(
+def _execute_sync(
     *,
     path: str,
     content: str,
@@ -83,3 +84,21 @@ async def execute(
     action = "appended to" if append else "wrote"
     size = len(content.encode("utf-8"))
     return f"OK: {action} {resolved} ({size} bytes)"
+
+
+async def execute(
+    *,
+    path: str,
+    content: str,
+    append: bool = False,
+    _work_dir: str = "",
+    _snapshot_tracker: Callable[[str], object] | None = None,
+) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        path=path,
+        content=content,
+        append=append,
+        _work_dir=_work_dir,
+        _snapshot_tracker=_snapshot_tracker,
+    )

@@ -6,6 +6,7 @@ Built-in skills (under agents/skills/) are READ-ONLY.
 Only Smith-installed skills (under ~/.agent-smith/agent/skills/) can be modified.
 """
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -95,8 +96,26 @@ def _parse_frontmatter(raw: str) -> dict:
     if raw.startswith("---"):
         parts = raw.split("---", 2)
         if len(parts) >= 3:
-            return yaml.safe_load(parts[1]) or {}
+            loaded = yaml.safe_load(parts[1])
+            return loaded if isinstance(loaded, dict) else {}
     return {}
+
+
+def _validate_skill_content_name(skill_name: str, raw: str) -> str | None:
+    try:
+        meta = _parse_frontmatter(raw)
+    except yaml.YAMLError as exc:
+        return f"invalid YAML frontmatter: {exc}"
+    declared = meta.get("name")
+    if declared is None:
+        return None
+    declared_name = str(declared)
+    if declared_name != skill_name:
+        return (
+            f"frontmatter name '{declared_name}' must match "
+            f"skill_name '{skill_name}'"
+        )
+    return None
 
 
 def _list_all_skills(agent_skills_dir: Path) -> list[dict]:
@@ -225,7 +244,7 @@ async def execute(
     # list
     # ------------------------------------------------------------------
     if action == "list":
-        skills = _list_all_skills(resolved_skills_dir)
+        skills = await asyncio.to_thread(_list_all_skills, resolved_skills_dir)
         if not skills:
             return "No skills found."
         lines = [f"Found {len(skills)} skill(s):\n"]
@@ -240,7 +259,11 @@ async def execute(
     if action == "get":
         if not skill_name:
             return "Error: 'skill_name' is required for get action"
-        raw, source = _get_skill_content(resolved_skills_dir, skill_name)
+        raw, source = await asyncio.to_thread(
+            _get_skill_content,
+            resolved_skills_dir,
+            skill_name,
+        )
         if not raw:
             return f"Error: skill '{skill_name}' not found"
         return f"# Skill: {skill_name} [{source}]\n\n{raw}"
@@ -255,6 +278,9 @@ async def execute(
             return "Error: 'content' is required for create action"
         if _is_builtin(skill_name):
             return f"Error: '{skill_name}' is a built-in skill name. Choose a different name."
+        content_error = _validate_skill_content_name(skill_name, content)
+        if content_error:
+            return f"Error: {content_error}"
 
         try:
             skill_dir = _agent_skill_dir(resolved_skills_dir, skill_name)
@@ -266,8 +292,8 @@ async def execute(
         if skill_file.is_file():
             return f"Error: skill '{skill_name}' already exists. Use 'edit' to modify it."
 
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        skill_file.write_text(content, encoding="utf-8")
+        await asyncio.to_thread(skill_dir.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(skill_file.write_text, content, encoding="utf-8")
         return f"OK: created skill '{skill_name}' at {skill_file}"
 
     # ------------------------------------------------------------------
@@ -280,6 +306,9 @@ async def execute(
             return "Error: 'content' is required for edit action"
         if _is_builtin(skill_name):
             return "Error: built-in skills are read-only. Cannot edit."
+        content_error = _validate_skill_content_name(skill_name, content)
+        if content_error:
+            return f"Error: {content_error}"
 
         try:
             skill_file = _agent_skill_dir(resolved_skills_dir, skill_name) / "SKILL.md"
@@ -291,10 +320,13 @@ async def execute(
             return f"Error: skill '{skill_name}' not found in agent skills. Use 'create' first."
 
         # Auto-save version before editing
-        old_content = skill_file.read_text(encoding="utf-8")
+        old_content = await asyncio.to_thread(
+            skill_file.read_text,
+            encoding="utf-8",
+        )
         vid = await store.save_version(skill_name, old_content)
 
-        skill_file.write_text(content, encoding="utf-8")
+        await asyncio.to_thread(skill_file.write_text, content, encoding="utf-8")
         return f"OK: edited skill '{skill_name}' (previous version saved as {vid})"
 
     # ------------------------------------------------------------------
@@ -319,7 +351,10 @@ async def execute(
         if not skill_file.is_file():
             return f"Error: skill '{skill_name}' not found in agent skills"
 
-        old_content = skill_file.read_text(encoding="utf-8")
+        old_content = await asyncio.to_thread(
+            skill_file.read_text,
+            encoding="utf-8",
+        )
 
         # Auto-save version before patching
         vid = await store.save_version(skill_name, old_content)
@@ -329,7 +364,11 @@ async def execute(
         except ValueError as e:
             return f"Error: {e}"
 
-        skill_file.write_text(new_content, encoding="utf-8")
+        await asyncio.to_thread(
+            skill_file.write_text,
+            new_content,
+            encoding="utf-8",
+        )
         return f"OK: patched section '{section}' in skill '{skill_name}' (previous version saved as {vid})"
 
     # ------------------------------------------------------------------

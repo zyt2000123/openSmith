@@ -81,6 +81,51 @@ def test_agent_skill_override_is_reported_as_agent_skill(tmp_path: Path):
     assert registry.list_summaries()[0]["source"] == "agent"
 
 
+def test_agent_skill_refresh_replaces_stale_entries_and_restores_builtins(
+    tmp_path: Path,
+) -> None:
+    builtin_dir = tmp_path / "builtin"
+    agent_dir = tmp_path / "agent"
+    _write_skill(builtin_dir, "shared", "---\nname: shared\n---\nBuiltin")
+    shared_file = _write_skill(agent_dir, "shared", "---\nname: shared\n---\nAgent")
+    _write_skill(agent_dir, "old-name", "---\nname: old-name\n---\nOld")
+
+    registry = SkillRegistry()
+    registry.load_builtin(builtin_dir)
+    registry.load_agent_skills(agent_dir)
+    assert registry.get("shared").content == "Agent"  # type: ignore[union-attr]
+    assert registry.get("old-name") is not None
+
+    shared_file.unlink()
+    (agent_dir / "old-name" / "SKILL.md").unlink()
+    _write_skill(agent_dir, "new-name", "---\nname: new-name\n---\nNew")
+    registry.load_agent_skills(agent_dir)
+
+    assert registry.get("shared").content == "Builtin"  # type: ignore[union-attr]
+    assert registry.is_builtin("shared")
+    assert registry.get("old-name") is None
+    assert registry.get("new-name").content == "New"  # type: ignore[union-attr]
+
+
+def test_agent_skill_registry_rejects_directory_frontmatter_name_mismatch(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(
+        skills_dir,
+        "directory-name",
+        "---\nname: declared-name\n---\nBody",
+    )
+
+    registry = SkillRegistry()
+    registry.load_agent_skills(skills_dir)
+
+    assert registry.get("directory-name") is None
+    assert registry.get("declared-name") is None
+    assert registry.get_agent_skill_dir("directory-name") is None
+    assert registry.get_agent_skill_dir("declared-name") is None
+
+
 def test_agent_skill_registry_does_not_follow_symlinks_outside_catalog(
     tmp_path: Path,
 ) -> None:

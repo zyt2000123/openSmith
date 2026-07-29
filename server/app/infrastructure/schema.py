@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import aiosqlite
 
-
 APP_SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_profiles (
     id TEXT PRIMARY KEY,
@@ -84,6 +83,14 @@ CREATE TABLE IF NOT EXISTS token_usage_events (
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_session_time
     ON token_usage_events(session_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS observability_trace_cursors (
+    run_id TEXT PRIMARY KEY,
+    byte_offset INTEGER NOT NULL DEFAULT 0,
+    project_path TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT 'unknown',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 CREATE TABLE IF NOT EXISTS llm_generations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

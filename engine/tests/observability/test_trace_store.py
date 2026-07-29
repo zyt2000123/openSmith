@@ -103,3 +103,48 @@ def test_trace_store_recovers_sequence_without_reading_the_whole_file(
     with (tmp_path / "traces" / "run-resume.jsonl").open(encoding="utf-8") as handle:
         records = [json.loads(line) for line in handle]
     assert [record["seq"] for record in records] == [1, 2]
+
+
+def test_trace_store_reads_only_records_appended_after_a_byte_cursor(tmp_path):
+    store = TraceStore(tmp_path)
+    store.append("run-cursor", ExecutionEvent(EventType.RUN_STARTED, {}))
+    store.append(
+        "run-cursor",
+        ExecutionEvent(EventType.TOKEN_USAGE, {"total_tokens": 10}),
+    )
+
+    first_records, cursor = store.read_from("run-cursor")
+    store.append(
+        "run-cursor",
+        ExecutionEvent(EventType.TOKEN_USAGE, {"total_tokens": 20}),
+    )
+    new_records, next_cursor = store.read_from("run-cursor", offset=cursor)
+
+    assert [record["seq"] for record in first_records] == [1, 2]
+    assert [record["seq"] for record in new_records] == [3]
+    assert next_cursor > cursor
+
+
+def test_trace_store_cursor_does_not_advance_past_an_incomplete_record(tmp_path):
+    store = TraceStore(tmp_path)
+    store.append("run-partial", ExecutionEvent(EventType.RUN_STARTED, {}))
+    path = tmp_path / "traces" / "run-partial.jsonl"
+    complete_size = path.stat().st_size
+    with path.open("ab") as handle:
+        handle.write(b'{"seq":2')
+
+    first_records, cursor = store.read_from("run-partial")
+
+    assert [record["seq"] for record in first_records] == [1]
+    assert cursor == complete_size
+
+    with path.open("ab") as handle:
+        handle.write(b',"type":"token_usage","data":{"total_tokens":10}}\n')
+
+    appended_records, next_cursor = store.read_from(
+        "run-partial",
+        offset=cursor,
+    )
+
+    assert [record["seq"] for record in appended_records] == [2]
+    assert next_cursor == path.stat().st_size

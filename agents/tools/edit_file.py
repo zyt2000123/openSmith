@@ -1,5 +1,6 @@
 """Edit file tool — precise string replacement without full rewrite."""
 
+import asyncio
 import os
 from collections.abc import Callable
 
@@ -40,7 +41,7 @@ def _is_within_workdir(path: str, work_dir: str) -> bool:
     return resolved.startswith(work_resolved + os.sep) or resolved == work_resolved
 
 
-async def execute(
+def _execute_sync(
     *, path: str, old_string: str, new_string: str, replace_all: bool = False,
     _work_dir: str = "", _snapshot_tracker: Callable[[str], object] | None = None,
 ) -> str:
@@ -90,3 +91,18 @@ async def execute(
 
     replacements = count if replace_all else 1
     return f"OK: edited {resolved} ({replacements} replacement{'s' if replacements > 1 else ''})"
+
+
+async def execute(
+    *, path: str, old_string: str, new_string: str, replace_all: bool = False,
+    _work_dir: str = "", _snapshot_tracker: Callable[[str], object] | None = None,
+) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        path=path,
+        old_string=old_string,
+        new_string=new_string,
+        replace_all=replace_all,
+        _work_dir=_work_dir,
+        _snapshot_tracker=_snapshot_tracker,
+    )

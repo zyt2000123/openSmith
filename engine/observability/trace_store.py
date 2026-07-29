@@ -11,9 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
-
 from engine.execution.events import EventType, ExecutionEvent
-
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization)", re.I)
 _SAFE_METRIC_KEYS = {
@@ -162,6 +160,51 @@ class TraceStore:
                 if isinstance(value, dict):
                     records.append(value)
         return list(records)
+
+    def read_from(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Read records appended after a previously returned byte offset."""
+        path = self._path(run_id)
+        if not path.is_file():
+            return [], 0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return [], 0
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("trace offset must be a non-negative integer")
+        if offset > size:
+            offset = 0
+
+        records: list[dict[str, Any]] = []
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            next_offset = offset
+            while line := handle.readline():
+                line_start = next_offset
+                next_offset = handle.tell()
+                if not line.endswith(b"\n"):
+                    next_offset = line_start
+                    break
+                try:
+                    value = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    records.append(value)
+        return records, next_offset
+
+    def list_run_ids(self) -> list[str]:
+        """List trace identifiers without parsing trace payloads."""
+        return sorted(
+            path.stem
+            for path in self.root.glob("*.jsonl")
+            if path.stem and path.stem not in {".", ".."}
+        )
 
     def iter_runs(self) -> list[tuple[str, list[dict[str, Any]]]]:
         """Return all valid traces without exposing the on-disk layout."""
