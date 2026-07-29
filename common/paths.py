@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import shutil
 import sysconfig
+from dataclasses import dataclass
+from pathlib import Path
 
 PROJECT_ROOT_ENV = "AGENT_SMITH_PROJECT_ROOT"
 PRIVATE_DIR_MODE = 0o700
@@ -116,7 +116,27 @@ class AppPaths:
             child.name for child in source.iterdir() if (child / "SKILL.md").is_file()
         )
         for name in shipped:
-            shutil.copytree(source / name, target / name, dirs_exist_ok=True)
+            source_skill = source / name
+            target_skill = target / name
+            shutil.copytree(source_skill, target_skill, dirs_exist_ok=True)
+
+            # ``dirs_exist_ok`` updates and adds files, but never removes files
+            # deleted by a newer bundled skill. Prune only after a successful
+            # copy so a failed update leaves the previous builtin intact.
+            stale_paths = sorted(
+                (
+                    path
+                    for path in target_skill.rglob("*")
+                    if not (source_skill / path.relative_to(target_skill)).exists()
+                ),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            )
+            for path in stale_paths:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
 
         for child in target.iterdir():
             if child.is_dir() and child.name not in shipped:

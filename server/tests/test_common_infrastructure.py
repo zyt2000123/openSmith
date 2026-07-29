@@ -3,16 +3,17 @@ from __future__ import annotations
 import asyncio
 import stat
 import sys
-import tomllib
 from pathlib import Path
 
 import pytest
+import tomllib
 from fastapi import HTTPException
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.services.config_service import ConfigService  # noqa: E402
+
 from common import database  # noqa: E402
 from common.paths import AppPaths  # noqa: E402
 from common.yaml_utils import YamlConfigError, load_yaml, save_yaml  # noqa: E402
@@ -64,30 +65,58 @@ def test_app_paths_installs_shipped_skills_separately_from_user_skills(tmp_path:
     assert not (paths.agent_dir / "skills").exists()
 
 
-def test_wheel_data_files_declare_every_bundled_skill() -> None:
-    """A non-editable install ships skills through ``data-files``.
+def test_app_paths_reconciles_existing_builtin_skill_directory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project_root = tmp_path / "project"
+    source_skill = project_root / "agents" / "skills" / "demo"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    obsolete_source_file = source_skill / "obsolete.md"
+    obsolete_source_file.write_text("old instruction", encoding="utf-8")
+    monkeypatch.setattr(
+        "common.paths.sysconfig.get_path", lambda _name: str(tmp_path / "no-data")
+    )
 
-    ``bundled_skills_dir`` prefers that installed copy, so a skill missing from
-    the declaration is absent from a wheel install while still working from a
-    source checkout.  Nested reference material may add extra data-file
-    targets, so compare their skill roots with the directories that ship a
-    ``SKILL.md``.
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=project_root)
+    paths.ensure_base_dirs()
+    obsolete_target_file = paths.builtin_skills_dir / "demo" / "obsolete.md"
+    assert obsolete_target_file.is_file()
+
+    obsolete_source_file.unlink()
+    paths.ensure_base_dirs()
+
+    assert not obsolete_target_file.exists()
+
+
+def test_wheel_data_files_reproduce_every_bundled_skill_file() -> None:
+    """A non-editable install reproduces every file from each shipped skill.
+
+    ``bundled_skills_dir`` prefers the wheel's data-files directory.  The
+    manifest must therefore preserve both every file and its relative directory
+    inside a skill, not merely the top-level ``SKILL.md`` entry file.
     """
     repo_root = Path(__file__).resolve().parents[2]
     pyproject = tomllib.loads(
         (repo_root / "common" / "pyproject.toml").read_text(encoding="utf-8")
     )
+    skills_root = repo_root / "agents" / "skills"
     prefix = "agent_smith_common/builtin_skills/"
     declared = {
-        target[len(prefix) :].split("/", 1)[0]
-        for target in pyproject["tool"]["setuptools"]["data-files"]
+        target: set(files)
+        for target, files in pyproject["tool"]["setuptools"]["data-files"].items()
         if target.startswith(prefix)
     }
-    shipped = {
-        child.name
-        for child in (repo_root / "agents" / "skills").iterdir()
-        if (child / "SKILL.md").is_file()
-    }
+    shipped: dict[str, set[str]] = {}
+    for skill_dir in skills_root.iterdir():
+        if not (skill_dir / "SKILL.md").is_file():
+            continue
+        for source_file in skill_dir.rglob("*"):
+            if not source_file.is_file():
+                continue
+            relative = source_file.relative_to(skills_root)
+            target = f"{prefix}{relative.parent.as_posix()}"
+            shipped.setdefault(target, set()).add(f"../agents/skills/{relative.as_posix()}")
 
     assert shipped, "no shipped skill was discovered"
     assert declared == shipped
