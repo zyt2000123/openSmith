@@ -3,11 +3,14 @@ node_modules/
 dist/
 build/
 *.log
+.coverage
 .claude/
+.playwright-cli/
 .codegraph/
 .agents/
 _old_*/
 .build/
+output/
 __pycache__/
 *.pyc
 *.egg-info/
