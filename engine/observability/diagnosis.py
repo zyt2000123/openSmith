@@ -80,6 +80,15 @@ def _failure_node(incident: RunIncident, trace: list[dict[str, Any]]) -> str:
         return "routing"
     if incident.category == "budget_exhausted":
         return "execution_budget"
+    if incident.category == "run_failed":
+        kind = incident.evidence.get("kind")
+        error_type = incident.evidence.get("type")
+        if (isinstance(kind, str) and kind.startswith("provider_")) or error_type == "LLMResponseError":
+            provider = incident.evidence.get("provider")
+            return f"llm:{provider}" if isinstance(provider, str) else "llm"
+        stage = incident.evidence.get("stage")
+        if isinstance(stage, str):
+            return f"execution:{stage}"
     return "run"
 
 
@@ -101,11 +110,25 @@ def _evidence(incident: RunIncident, trace: list[dict[str, Any]]) -> list[str]:
 
 
 def _recommendation(incident: RunIncident) -> str:
+    if incident.category == "run_failed":
+        kind = incident.evidence.get("kind")
+        if kind == "provider_http":
+            return "Check the LLM provider HTTP status, credentials, and rate limits before retrying."
+        if kind == "provider_transport":
+            return "Check LLM provider endpoint reachability and network timeouts before retrying."
+        if kind == "provider_protocol":
+            return "Review the LLM provider compatibility and response format before retrying."
+        if incident.evidence.get("type") == "LLMResponseError":
+            return (
+                "Check the LLM provider configuration and availability before retrying; "
+                "this trace cannot distinguish the provider failure type."
+            )
+        return "Inspect the retained trace evidence and address the failing execution dependency before retrying."
+
     recommendations = {
         "budget_exhausted": "Review the skill plan or tool policy to reduce repeated calls before increasing the budget.",
         "tool_timeout": "Review the affected tool's timeout and retry policy; validate the target before retrying.",
         "repeated_backtracks": "Review routing rules and the skill's exit criteria to avoid cycling between steps.",
-        "run_failed": "Inspect the retained trace evidence and address the failing execution dependency before retrying.",
         "run_cancelled": "Resume only when the user still expects the incomplete work to continue.",
         "run_incomplete": "Review the terminal reason and resume the run only if its prerequisites are still valid.",
         "run_blocked": "Resolve the blocking approval or prerequisite, then retry through the normal approval gate.",

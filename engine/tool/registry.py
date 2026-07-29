@@ -251,6 +251,14 @@ class ToolRegistry:
                         concurrency=meta.get("concurrency", "safe"),
                         execution_environment=meta.get("execution_environment", "host"),
                     )
+            except ValueError as exc:
+                # A contract violation — malformed TOOL_META, or a name already
+                # taken by an earlier file — means this tool is simply absent from
+                # the registry: the model never sees it and gets no error, and on a
+                # duplicate the name silently stays with whichever file sorted
+                # first.  Say so at ERROR with the consequence spelled out, rather
+                # than burying it in a traceback among genuine import failures.
+                log.error("Tool provider rejected, tool unavailable: %s (%s)", py_file.name, exc)
             except Exception:
                 log.exception("Failed to load tool provider: %s", py_file)
 
@@ -595,7 +603,13 @@ class ToolRegistry:
                 authorized
                 and bool(authorization[1])
             )
-            blocked_by_policy = not decision.allowed
+            # A project-boundary result is intentionally ``allowed=False``
+            # until the approval broker grants the exact normalized call.  Do
+            # not turn a bare approval id into a general bypass: the
+            # fingerprint check above binds this exception to one call only.
+            blocked_by_policy = not decision.allowed and not (
+                decision.approval_required and approval_granted
+            )
             approval_required = decision.approval_required and not approval_granted
             if blocked_by_policy or approval_required:
                 reason = decision.reason or (

@@ -84,6 +84,82 @@ def test_observability_service_derives_tool_timeout_incidents(tmp_path: Path) ->
     assert proposal.approval_required is True
 
 
+def test_observability_service_explains_current_and_legacy_llm_failures(tmp_path: Path) -> None:
+    current = RunObservation.start(RunObservationContext(
+        run_id="run-provider-http", agent_id="smith-id", profile_dir=tmp_path,
+        created_at="2026-07-19T00:00:00+00:00",
+    ))
+    details = {
+        "kind": "provider_http",
+        "stage": "agent_execution",
+        "type": "LLMResponseError",
+        "provider": "openai",
+        "http_status": 429,
+        "retryable": True,
+        "message": "api_key=must-not-be-exposed",
+    }
+    current.record(ExecutionEvent(EventType.FAILED, {
+        "reason": "execution_error", "error": details,
+    }))
+    current.record(ExecutionEvent(EventType.RUN_FINISHED, {
+        "status": "failed", "reason": "execution_error", "error": details,
+    }))
+
+    legacy = RunObservation.start(RunObservationContext(
+        run_id="run-legacy-llm", agent_id="smith-id", profile_dir=tmp_path,
+        created_at="2026-07-19T00:00:01+00:00",
+    ))
+    legacy.record(ExecutionEvent(EventType.TEXT_DELTA, {
+        "text": "⚠️ 执行失败：LLMResponseError（详情见服务端日志）",
+    }))
+    legacy.record(ExecutionEvent(EventType.FAILED, {"reason": "execution_error"}))
+    legacy.record(ExecutionEvent(EventType.RUN_FINISHED, {
+        "status": "failed", "reason": "execution_error",
+    }))
+
+    service = ObservabilityService(ObservabilityReader(tmp_path))
+    incidents = {incident.run_id: incident for incident in service.list_incidents("smith-id", limit=10)}
+
+    provider_incident = incidents["run-provider-http"]
+    assert provider_incident.message == "LLM provider request failed with HTTP 429."
+    assert provider_incident.evidence == {
+        "event_count": 2,
+        "kind": "provider_http",
+        "stage": "agent_execution",
+        "type": "LLMResponseError",
+        "provider": "openai",
+        "http_status": 429,
+        "retryable": "true",
+    }
+    assert "must-not-be-exposed" not in str(provider_incident)
+
+    legacy_incident = incidents["run-legacy-llm"]
+    assert legacy_incident.message == (
+        "LLM request failed, but this trace did not retain the provider error classification."
+    )
+    assert legacy_incident.evidence == {"event_count": 3, "type": "LLMResponseError"}
+
+    provider_diagnosis = service.get_diagnosis("smith-id", "run-provider-http")
+    assert provider_diagnosis.failure_node == "llm:openai"
+    assert provider_diagnosis.evidence == [
+        "event_count=2",
+        "http_status=429",
+        "kind=provider_http",
+        "provider=openai",
+        "retryable=true",
+        "stage=agent_execution",
+        "type=LLMResponseError",
+        "reason=execution_error",
+    ]
+
+    legacy_diagnosis = service.get_diagnosis("smith-id", "run-legacy-llm")
+    assert legacy_diagnosis.failure_node == "llm"
+    assert legacy_diagnosis.recommendation == (
+        "Check the LLM provider configuration and availability before retrying; "
+        "this trace cannot distinguish the provider failure type."
+    )
+
+
 def test_observability_service_does_not_expose_another_agents_run(tmp_path: Path) -> None:
     service = _service_with_run(tmp_path)
 

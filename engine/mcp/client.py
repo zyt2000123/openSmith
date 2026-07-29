@@ -492,6 +492,7 @@ async def register_mcp_tools_with_prefix(
     tools = tools if tools is not None else await client.list_tools()
     count = 0
     safe_prefix = _safe_tool_name_part(prefix) or "mcp"
+    taken: set[str] = set()
     for tool in tools:
         # 闭包捕获 — 使用默认参数绑定当前迭代值
         async def _execute(*, _client: MCPClient = client, _name: str = tool.name, **kwargs: Any) -> str:
@@ -503,7 +504,9 @@ async def register_mcp_tools_with_prefix(
             continue
         # Cap the joined name, not the two halves: a provider applies its
         # 64-character limit to what it actually receives.
-        registered_name = _safe_tool_name_part(f"{safe_prefix}_{tool_part}")
+        registered_name = _deduplicate_tool_name(
+            _safe_tool_name_part(f"{safe_prefix}_{tool_part}"), tool.name, taken
+        )
         try:
             registry.register(
                 name=registered_name,
@@ -519,6 +522,7 @@ async def register_mcp_tools_with_prefix(
                 side_effect="external",
                 concurrency="serial",
             )
+            taken.add(registered_name)
             count += 1
         except ValueError as exc:
             log.warning("Skipping MCP tool %s: %s", tool.name, exc)
@@ -607,6 +611,23 @@ def _safe_tool_name_part(value: str) -> str:
         return normalized
     digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
     head = normalized[: MAX_TOOL_NAME_LENGTH - len(digest) - 1].rstrip("_")
+    return f"{head}_{digest}"
+
+
+def _deduplicate_tool_name(registered_name: str, original: str, taken: set[str]) -> str:
+    """Give a colliding registered name a distinct suffix.
+
+    Cleaning is intentionally lossy — ``safe-tool`` is meant to become
+    ``safe_tool`` — but two server-side names can fold onto one registered name
+    (``search-docs`` and ``search_docs``), and the loser used to hit
+    ``register()``'s duplicate-name error and vanish from the session behind a
+    warning.  Suffix only the actual collision, so names that do not collide keep
+    their exact spelling.
+    """
+    if registered_name not in taken:
+        return registered_name
+    digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:8]
+    head = registered_name[: MAX_TOOL_NAME_LENGTH - len(digest) - 1].rstrip("_")
     return f"{head}_{digest}"
 
 

@@ -399,6 +399,245 @@ async def test_sse_size_cap_still_rejects_one_huge_message() -> None:
             pass
 
 
+# ── Second batch: P1-9 / P1-10 / P1-11 / P1-12 / P1-19 ──
+
+def test_render_ui_rejects_huge_integers_gracefully() -> None:
+    """A huge JSON integer must be refused, not crash the whole turn.
+
+    math.isfinite() converts int to float and raises OverflowError past ~1.8e308,
+    so a hallucinated value escaped smith_ui's "bounded structural validation"
+    and failed the entire run instead of taking the graceful-reject path.
+    """
+    from engine.execution.react.smith_ui import validate_smith_ui_call
+
+    call = {
+        "spec": {
+            "elements": [
+                {"type": "Metric", "props": {"label": "x", "value": 10 ** 400}}
+            ]
+        }
+    }
+    result = validate_smith_ui_call(call, working_dir=None)
+    assert not result.ok, "an unrepresentable number must be rejected"
+    assert result.reason, "rejection must carry a reason"
+
+
+def test_render_ui_still_accepts_ordinary_numbers() -> None:
+    """The overflow guard must not reject normal values."""
+    from engine.execution.react.smith_ui import _is_json_value
+
+    for value in (0, 1, -1, 42, 3.14, 10 ** 18, -(10 ** 18)):
+        assert _is_json_value(value), f"{value!r} should be valid"
+    for value in (float("inf"), float("nan"), 10 ** 400):
+        assert not _is_json_value(value), f"{value!r} should be invalid"
+
+
+def test_openai_stream_surfaces_provider_error_chunk() -> None:
+    """A provider error carried inside the stream must reach the caller.
+
+    Relays report mid-stream failures as a `{"error": {...}}` chunk and then drop
+    the connection; reading only `choices` replaced the real cause with
+    "stream ended before the [DONE] sentinel".
+    """
+    from engine.llm.adapters.openai import _provider_error_message
+
+    assert _provider_error_message(
+        {"error": {"message": "rate limit exceeded", "type": "rate_limit"}}
+    ) == "rate limit exceeded"
+    assert _provider_error_message({"error": "upstream unavailable"}) == "upstream unavailable"
+    assert _provider_error_message({"error": {"code": "content_filter"}}) == "content_filter"
+    assert _provider_error_message({"error": {}}) == "unspecified provider error"
+    # An ordinary content chunk must not be mistaken for a failure.
+    assert _provider_error_message({"choices": [{"delta": {"content": "hi"}}]}) is None
+    assert _provider_error_message({"error": None}) is None
+
+
+def test_openai_non_stream_accepts_either_reasoning_field() -> None:
+    """The non-streaming path must accept `reasoning` like the streaming one does.
+
+    openai.py:167 already handles both spellings; the non-streaming branch read
+    only reasoning_content, so relays using `reasoning` lost the content silently.
+    """
+    import inspect
+
+    from engine.llm.adapters import openai as openai_adapter
+
+    source = inspect.getsource(openai_adapter)
+    non_stream = source.split("async def _stream_response")[0]
+    assert 'choice.get("reasoning")' in non_stream, (
+        "non-streaming path must fall back to the `reasoning` field"
+    )
+
+
+def test_usage_records_whether_the_provider_reported_anything() -> None:
+    """A missing usage payload must be distinguishable from a genuine zero.
+
+    Relays that omit `usage` made real, billed calls show up as 0 tokens and 0
+    cost.  A round-5 review corrected my earlier claim that this needed a
+    cross-layer change: no consumer sums the usage dict blindly, they all read
+    named token keys, so an extra flag is safe.
+    """
+    from engine.llm.usage import USAGE_KEYS, normalize_usage
+
+    absent = normalize_usage(None)
+    assert absent["usage_reported"] == 0, "a missing payload must be flagged"
+
+    real_zero = normalize_usage({"prompt_tokens": 0, "completion_tokens": 0})
+    assert real_zero["usage_reported"] == 1, "a real payload must be flagged reported"
+    assert real_zero["input_tokens"] == 0, "a reported zero stays zero"
+
+    # The flag must stay out of the token key tuple so token-iterating consumers
+    # (projections, token_stats) are unaffected.
+    assert "usage_reported" not in USAGE_KEYS
+
+
+def test_trace_redacts_credentials_embedded_in_values() -> None:
+    """Field-name matching misses secrets carried inside a value.
+
+    TOOL_CALL_START writes the full tool arguments, so a shell command holding a
+    bearer token landed in the trace verbatim — the key is "command", which does
+    not trigger the name-based rule.
+    """
+    from engine.observability.trace_store import _bounded_trace_value
+
+    secret = "sk-ant-api03-must-not-appear"
+    payload = {
+        "name": "shell",
+        "arguments": {
+            "command": f"curl -H 'Authorization: Bearer {secret}' https://example.test",
+        },
+    }
+    rendered = str(_bounded_trace_value(payload))
+    assert secret not in rendered, f"credential leaked into the trace: {rendered}"
+
+
+def test_trace_keeps_ordinary_values_intact() -> None:
+    """Value scanning must not mangle normal command text."""
+    from engine.observability.trace_store import _bounded_trace_value
+
+    payload = {"arguments": {"command": "pytest -q tests/", "cwd": "/repo"}}
+    rendered = _bounded_trace_value(payload)
+    assert rendered["arguments"]["command"] == "pytest -q tests/"
+    assert rendered["arguments"]["cwd"] == "/repo"
+
+
+# ── Third batch: P1-2 / P1-16 / P1-17 ──
+
+def test_colliding_mcp_tool_names_are_all_registered() -> None:
+    """Names that fold together must all survive registration.
+
+    `search-docs` and `search_docs` both clean to `search_docs`, and the loser hit
+    register()'s duplicate-name error and vanished from the session behind a
+    warning — the model silently lost a tool.  Cleaning stays lossy on purpose
+    (`safe-tool` is meant to become `safe_tool`); only the collision is suffixed.
+    """
+    import asyncio
+
+    from engine.mcp.client import MAX_TOOL_NAME_LENGTH, MCPTool, register_mcp_tools_with_prefix
+    from engine.tool.registry import ToolRegistry
+
+    class FakeClient:
+        async def list_tools(self):
+            return [MCPTool("search-docs", "", {}), MCPTool("search_docs", "", {})]
+
+        async def call_tool(self, name, arguments):
+            return name
+
+    async def run():
+        registry = ToolRegistry()
+        count = await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp")
+        return count, sorted(tool.name for tool in registry.list_tools())
+
+    count, names = asyncio.run(run())
+    assert count == 2, f"both tools must register, got {count}: {names}"
+    assert len(set(names)) == 2, f"names must stay distinct: {names}"
+    assert "mcp_search_docs" in names, f"the first name keeps its spelling: {names}"
+    assert all(len(name) <= MAX_TOOL_NAME_LENGTH for name in names), names
+
+
+def test_non_colliding_mcp_tool_name_keeps_its_spelling() -> None:
+    """Dedup must not disturb the ordinary case (existing contract)."""
+    import asyncio
+
+    from engine.mcp.client import MCPTool, register_mcp_tools_with_prefix
+    from engine.tool.registry import ToolRegistry
+
+    class FakeClient:
+        async def list_tools(self):
+            return [MCPTool("safe-tool", "", {})]
+
+        async def call_tool(self, name, arguments):
+            return name
+
+    async def run():
+        registry = ToolRegistry()
+        await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp_docs")
+        return [tool.name for tool in registry.list_tools()]
+
+    assert asyncio.run(run()) == ["mcp_docs_safe_tool"]
+
+
+def test_backtrack_event_carries_the_failure_reason() -> None:
+    """Backtracking must tell the target node why it was sent back.
+
+    Without it the target re-runs against the original request with no signal
+    about what failed, so it reproduces the same output — and FailureLoopGuard
+    counts per skill without resetting, so that is the only correction the
+    pipeline ever gets.
+
+    Source-level assertion, not behavioural: driving a real double-gate-failure
+    backtrack needs a chain plus stub LLM and gates. Stated plainly so nobody
+    mistakes this for proof that the hint reaches the target node.
+    """
+    import inspect
+
+    from engine.execution.pipeline import pipeline as pipeline_module
+
+    lines = inspect.getsource(pipeline_module).splitlines()
+    backtrack_at = next(
+        index for index, line in enumerate(lines) if "EventType.BACKTRACK" in line
+    )
+    emitted = "\n".join(lines[backtrack_at:backtrack_at + 6])
+    assert '"reason"' in emitted, f"BACKTRACK must carry the gate reason:\n{emitted}"
+
+    # The hint must be assigned *before* the jump, mirroring the retry branch.
+    hint_assignments = [
+        index
+        for index, line in enumerate(lines)
+        if "CTX_RETRY_HINT] = gate_result.retry_hint" in line
+    ]
+    assert hint_assignments, "no retry-hint assignment found at all"
+    assert any(index < backtrack_at for index in hint_assignments), (
+        "the retry hint is only set on the retry path, so a backtrack still runs blind"
+    )
+
+
+def test_tool_provider_contract_error_is_logged_visibly(tmp_path: Path, caplog) -> None:
+    """A duplicate tool name must not disappear with only a debug-level trace."""
+    import logging
+
+    from engine.tool.registry import ToolRegistry
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    body = (
+        'TOOL_META = {{"name": "dup_tool", "description": "d", "parameters": {{}}}}\n'
+        "async def execute(**kwargs):\n"
+        "    return {!r}\n"
+    )
+    (tools / "a_first.py").write_text(body.format("first"))
+    (tools / "b_second.py").write_text(body.format("second"))
+
+    registry = ToolRegistry()
+    with caplog.at_level(logging.ERROR):
+        registry.load_providers(tools)
+
+    assert any(
+        "unavailable" in record.message or "unavailable" in record.getMessage()
+        for record in caplog.records
+    ), f"the dropped tool must be reported at ERROR: {[r.getMessage() for r in caplog.records]}"
+
+
 # ── P1-15: approval redaction is weaker than the audit-log redaction ──
 
 def test_approval_redacts_credential_name_variants() -> None:

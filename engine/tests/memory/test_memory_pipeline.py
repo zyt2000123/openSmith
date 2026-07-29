@@ -59,6 +59,17 @@ DURABLE_DOC = """# Durable Project Memory
 ## Known Pitfalls
 """
 
+EMPTY_DURABLE_DOC = """# Durable Project Memory
+
+## Confirmed Facts
+
+## Decisions
+
+## Reusable Procedures
+
+## Known Pitfalls
+"""
+
 CONTEXT_DOC = """# Smith Context
 
 ## Confirmed Preferences
@@ -632,7 +643,7 @@ def test_compile_durable_rejects_oversize_output_without_replacing_memory(tmp_pa
     with pytest.raises(MemoryPolicyError, match="exceeded"):
         asyncio.run(compile_durable(memory_dir, llm, PassReviewer()))
 
-    assert not (memory_dir / "durable.md").exists()
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
     assert not (memory_dir / ".fp_durable").exists()
     assert not (memory_dir / ".durable_offset").exists()
 
@@ -1134,7 +1145,7 @@ def test_save_conversation_memory_compiles_recent_without_promoting_generic_work
 
     memory_dir = tmp_path / "memory"
     assert (memory_dir / "recent.md").is_file()
-    assert not (memory_dir / "durable.md").exists()
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
     assert (memory_dir / ".compile_counter").read_text(encoding="utf-8") == "0"
 
 

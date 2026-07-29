@@ -481,6 +481,33 @@ def _fallback_durable_document(existing: str, entries: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _empty_view_document(policy: MemoryPolicy, view: MemoryViewName) -> str:
+    """Render a policy-valid empty Markdown view without inventing content."""
+    spec = policy.view(view)
+    parts = [f"# {spec.title}"]
+    for section in spec.sections:
+        parts.extend(("", f"## {section}"))
+    return "\n".join(parts) + "\n"
+
+
+def ensure_durable_template(memory_dir: Path) -> bool:
+    """Create the canonical empty durable view when a profile has none yet."""
+    policy = _MEMORY_POLICY
+    out = resolve_view_path(policy, memory_dir.parent, "durable")
+    if out.is_file():
+        return False
+    _commit_view(
+        policy,
+        "durable",
+        memory_dir,
+        existing="",
+        draft=_empty_view_document(policy, "durable"),
+        review_rounds=0,
+        status="initialized",
+    )
+    return True
+
+
 def _can_use_compilation_fallback(exc: Exception) -> bool:
     """Fallback only for transient/review-loop failures, never policy violations."""
     if isinstance(exc, TimeoutError):
@@ -659,6 +686,7 @@ async def compile_durable(
 
     out = resolve_view_path(policy, memory_dir.parent, "durable")
     fp_file = memory_dir / ".fp_durable"
+    ensure_durable_template(memory_dir)
 
     if not entries:
         if all_entries:

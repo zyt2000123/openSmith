@@ -216,9 +216,13 @@ async def prepare_runtime(
         services.skill_registry.restrict_to(identity.enabled_skills)
     bind_skill_load_tool(services)
 
-    from engine.memory.compile import assemble_memory
+    from engine.memory.compile import assemble_memory, ensure_durable_template
     from engine.memory.store import retrieve_relevant_memory
 
+    try:
+        ensure_durable_template(state_dir / "memory")
+    except Exception:
+        logger.warning("failed to initialize durable memory template", exc_info=True)
     retrieved = await retrieve_relevant_memory(state_dir, request.message)
     memory_text = assemble_memory(state_dir / "memory", include_durable=False)
     eval_guidance = (

@@ -250,7 +250,18 @@ async def run_pipeline(
                     })
                     yield ExecutionEvent(EventType.DONE, {})
                     return
-                yield ExecutionEvent(EventType.BACKTRACK, {"from": node.skill_name, "to": target})
+                # 回溯同样要把失败原因带到目标节点。否则 planning 重跑时
+                # messages 仍是最初的原始需求，模型拿不到"为什么被打回"的任何
+                # 信号，大概率复现同一份产出 —— 而 FailureLoopGuard 按 skill
+                # 累计、不因回溯重置，等于整条流水线只有一次纠错机会，且这次
+                # 机会因无信息传递而大概率无效。下方 retry 分支早已这么做。
+                if gate_result.retry_hint:
+                    context[CTX_RETRY_HINT] = gate_result.retry_hint
+                yield ExecutionEvent(EventType.BACKTRACK, {
+                    "from": node.skill_name,
+                    "to": target,
+                    "reason": gate_result.reason,
+                })
                 node_idx = target_idx
                 continue
 

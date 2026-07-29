@@ -63,6 +63,17 @@ DURABLE_DOC = """# Durable Project Memory
 - **Free-form summaries**: 避免 appending raw answers；原因：they pollute recall。
 """
 
+EMPTY_DURABLE_DOC = """# Durable Project Memory
+
+## Confirmed Facts
+
+## Decisions
+
+## Reusable Procedures
+
+## Known Pitfalls
+"""
+
 
 class StaticLLM:
     def __init__(self, text: str) -> None:
@@ -243,6 +254,15 @@ def test_compile_recent_writes_only_policy_structured_markdown(tmp_path: Path) -
     assert "Smith Memory Policy" in reviewer.calls[0][-1]["content"]
 
 
+def test_compile_durable_creates_empty_template_without_events(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    generator = StaticLLM(DURABLE_DOC)
+
+    assert asyncio.run(compile_durable(memory_dir, generator, PassReviewer())) is False
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
+    assert generator.calls == []
+
+
 def test_generic_work_events_never_become_durable_memory_candidates(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _write_event(memory_dir, kind="work", scope="project")
@@ -250,7 +270,7 @@ def test_generic_work_events_never_become_durable_memory_candidates(tmp_path: Pa
     assert asyncio.run(
         compile_durable(memory_dir, StaticLLM(DURABLE_DOC), PassReviewer())
     ) is False
-    assert not (memory_dir / "durable.md").exists()
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
 
 
 def test_explicit_stable_decision_remains_a_durable_memory_candidate(tmp_path: Path) -> None:

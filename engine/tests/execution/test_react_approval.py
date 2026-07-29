@@ -16,6 +16,8 @@ from engine.safety.approval import (
 from engine.safety.tool_guard import ToolGuard
 from engine.tool.registry import ToolRegistry
 
+ROOT = Path(__file__).resolve().parents[3]
+
 
 def test_react_loop_executes_a_guarded_tool_only_after_approval(tmp_path: Path) -> None:
     async def run():
@@ -123,6 +125,56 @@ def test_react_loop_emits_granted_outcome_on_approved_tool_call(tmp_path: Path) 
     assert granted_events[0].data["blocked"] is False
 
 
+def test_react_loop_executes_external_directory_listing_only_after_approval(tmp_path: Path) -> None:
+    async def run():
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        external_dir = tmp_path / "external"
+        external_dir.mkdir()
+        (external_dir / "README.md").write_text("approved external content", encoding="utf-8")
+        registry = ToolRegistry()
+        registry.load_providers(ROOT / "agents" / "tools")
+        registry.bind_working_directory(project_dir)
+        guard = ToolGuard(
+            tmp_path / "missing-rules.json",
+            tool_registry=registry.definitions(),
+        )
+        guard.set_working_directory(project_dir)
+        registry.bind_tool_guard(guard)
+        events = []
+
+        with use_approval_context(APPROVAL_BROKER, "run-external-read"):
+            async for event in react_event_loop(
+                _ExternalListDirLLM(external_dir),
+                [{"role": "user", "content": "list the external directory"}],
+                registry,
+                guard,
+                max_iters=3,
+            ):
+                events.append(event)
+                if event.type is EventType.TOOL_CALL_RESULT and event.data.get("approval_required"):
+                    assert APPROVAL_BROKER.resolve(
+                        "run-external-read", str(event.data["approval_id"]), True
+                    )
+        return events, external_dir
+
+    events, external_dir = asyncio.run(run())
+    approval_events = [
+        event for event in events
+        if event.type is EventType.TOOL_CALL_RESULT and event.data.get("approval_required")
+    ]
+    completed_events = [
+        event for event in events
+        if event.type is EventType.TOOL_CALL_RESULT
+        and event.data.get("approval_outcome") == "granted"
+    ]
+
+    assert len(approval_events) == 1
+    assert approval_events[0].data["arguments"] == {"path": str(external_dir)}
+    assert len(completed_events) == 1
+    assert "README.md" in completed_events[0].data["content"]
+
+
 def test_react_loop_treats_approval_timeout_as_blocked_without_executing_tool(tmp_path: Path) -> None:
     class TimedOutBroker(ApprovalBroker):
         async def wait(self, request, *, timeout_seconds=300.0):
@@ -180,6 +232,26 @@ class _ApprovalLLM:
                         id="tool-1",
                         name="write_file",
                         arguments={"path": str(self.target), "content": "approved"},
+                    )
+                ]
+            )
+        return ChatResponse(text="done")
+
+
+class _ExternalListDirLLM:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, prefix_cache_key=None):
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResponse(
+                tool_calls=[
+                    ToolCallData(
+                        id="external-read",
+                        name="list_dir",
+                        arguments={"path": str(self.path)},
                     )
                 ]
             )

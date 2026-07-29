@@ -93,7 +93,16 @@ def _is_json_value(value: Any, depth: int = 0) -> bool:
     if isinstance(value, str):
         return len(value) <= _MAX_STRING_LENGTH
     if isinstance(value, (int, float)):
-        return not isinstance(value, bool) and math.isfinite(value)
+        if isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            # JSON puts no bound on integer size, but math.isfinite() converts to
+            # float and raises past ~1.8e308.  Uncaught that escaped this module's
+            # bounded-validation contract and failed the entire turn, instead of
+            # the graceful reject every other malformed spec receives.
+            return False
     if isinstance(value, list):
         return len(value) <= _MAX_ELEMENTS and all(_is_json_value(item, depth + 1) for item in value)
     if isinstance(value, dict):
