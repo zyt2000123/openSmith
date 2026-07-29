@@ -11,7 +11,7 @@ from app.infrastructure.repositories.auto_task_repo import AutoTaskRepo
 
 
 @pytest.mark.asyncio
-async def test_auto_task_schema_migrates_retry_and_lease_columns(
+async def test_auto_task_schema_migrates_retry_lease_and_working_directory_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = await aiosqlite.connect(":memory:")
@@ -40,7 +40,13 @@ async def test_auto_task_schema_migrates_retry_and_lease_columns(
     async with db.execute("PRAGMA table_info(auto_tasks)") as cursor:
         columns = {row[1] for row in await cursor.fetchall()}
 
-    assert {"retry_count", "max_retries", "lease_until", "lease_token"} <= columns
+    assert {
+        "working_dir",
+        "retry_count",
+        "max_retries",
+        "lease_until",
+        "lease_token",
+    } <= columns
     await db.close()
 
 
@@ -63,6 +69,7 @@ async def test_auto_task_claim_uses_a_lease_to_prevent_duplicate_workers(
         {
             "title": "probe",
             "instruction": "check",
+            "working_dir": "/tmp/project",
             "trigger_type": "interval",
             "trigger_config": "60",
             "next_run_at": datetime.now(timezone.utc).isoformat(),
@@ -103,6 +110,7 @@ async def test_stale_lease_cannot_overwrite_retry_state_after_reclaim(
         {
             "title": "probe",
             "instruction": "check",
+            "working_dir": "/tmp/project",
             "retry_count": 2,
         },
     )

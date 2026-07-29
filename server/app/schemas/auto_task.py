@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 TriggerType = Literal["manual", "cron", "interval"]
 
@@ -11,6 +11,7 @@ class AutoTaskCreate(BaseModel):
     trigger_type: TriggerType = "manual"
     trigger_config: str = ""
     instruction: str
+    working_dir: str = Field(min_length=1)
     enabled: bool = True
     max_retries: int = 2
 
@@ -32,6 +33,13 @@ class AutoTaskCreate(BaseModel):
                 raise ValueError("interval trigger_config must be a positive integer")
         return self
 
+    @field_validator("working_dir")
+    @classmethod
+    def _validate_working_dir(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("working_dir must not be blank")
+        return value.strip()
+
 
 class AutoTaskUpdate(BaseModel):
     title: str | None = None
@@ -39,6 +47,7 @@ class AutoTaskUpdate(BaseModel):
     trigger_type: TriggerType | None = None
     trigger_config: str | None = None
     instruction: str | None = None
+    working_dir: str | None = None
     enabled: bool | None = None
     max_retries: int | None = None
 
@@ -49,6 +58,13 @@ class AutoTaskUpdate(BaseModel):
             raise ValueError("max_retries must be non-negative")
         return value
 
+    @field_validator("working_dir")
+    @classmethod
+    def _validate_working_dir(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("working_dir must not be blank")
+        return value.strip() if value is not None else None
+
 
 class AutoTaskOut(BaseModel):
     id: str
@@ -58,6 +74,7 @@ class AutoTaskOut(BaseModel):
     trigger_type: str
     trigger_config: str
     instruction: str
+    working_dir: str
     enabled: bool
     status: str
     last_run_at: str | None = None

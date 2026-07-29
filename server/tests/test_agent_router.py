@@ -205,7 +205,7 @@ def test_stream_route_returns_preflight_errors_before_opening_sse() -> None:
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
             "/api/agent/sessions/missing/messages/stream",
-            json={"content": "hello"},
+            json={"content": "hello", "working_dir": "/tmp/project"},
         )
 
     assert response.status_code == 404

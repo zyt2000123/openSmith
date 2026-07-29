@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS auto_tasks (
     trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual', 'cron', 'interval')),
     trigger_config TEXT NOT NULL DEFAULT '',
     instruction TEXT NOT NULL,
+    working_dir TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle', 'running', 'completed', 'failed')),
     last_run_at TEXT,
@@ -155,10 +156,14 @@ async def _ensure_unique_profile_index(db: aiosqlite.Connection) -> None:
 
 
 async def _ensure_auto_task_columns(db: aiosqlite.Connection) -> None:
-    """Migrate databases created before retry/lease fields existed."""
+    """Migrate databases created before execution-scope and lease fields existed."""
     async with db.execute("PRAGMA table_info(auto_tasks)") as cur:
         columns = {row[1] for row in await cur.fetchall()}
     for name, definition in (
+        # Existing tasks do not have an implicit workspace.  The empty value
+        # preserves the row while causing execution to fail closed until a user
+        # explicitly updates its working_dir.
+        ("working_dir", "TEXT NOT NULL DEFAULT ''"),
         ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
         ("max_retries", "INTEGER NOT NULL DEFAULT 2"),
         ("lease_until", "TEXT"),

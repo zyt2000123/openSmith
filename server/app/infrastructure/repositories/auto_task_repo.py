@@ -17,9 +17,10 @@ class AutoTaskRepo:
         await db.execute(
             "INSERT INTO auto_tasks "
             "(id, agent_id, title, description, trigger_type, trigger_config, "
-            "instruction, enabled, status, next_run_at, run_count, retry_count, "
+            "instruction, working_dir, enabled, status, next_run_at, run_count, "
+            "retry_count, "
             "max_retries, lease_until, lease_token, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 tid,
                 agent_id,
@@ -28,6 +29,7 @@ class AutoTaskRepo:
                 data.get("trigger_type", "manual"),
                 data.get("trigger_config", ""),
                 data["instruction"],
+                data["working_dir"],
                 int(data.get("enabled", True)),
                 "idle",
                 data.get("next_run_at"),
@@ -70,7 +72,7 @@ class AutoTaskRepo:
 
         for field in (
             "title", "description", "trigger_type", "trigger_config",
-            "instruction", "status", "last_run_at", "next_run_at",
+            "instruction", "working_dir", "status", "last_run_at", "next_run_at",
             "retry_count", "max_retries", "lease_until", "lease_token",
         ):
             if field in updates and updates[field] is not None:

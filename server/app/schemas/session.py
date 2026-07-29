@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SessionCreate(BaseModel):
@@ -35,7 +35,14 @@ class MessageCreate(BaseModel):
     context: str | None = Field(default=None, max_length=50_000)
     skill_name: str | None = None
     identity_id: str | None = None
-    working_dir: str | None = None
+    working_dir: str = Field(min_length=1)
+
+    @field_validator("working_dir")
+    @classmethod
+    def _validate_working_dir(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("working_dir must not be blank")
+        return value.strip()
 
 
 class MessageOut(BaseModel):

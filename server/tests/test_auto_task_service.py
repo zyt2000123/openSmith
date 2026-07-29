@@ -21,6 +21,7 @@ def _task(task_id: str = "task-1", **overrides) -> dict:
         "agent_id": "smith-id",
         "title": "日报",
         "instruction": "生成日报",
+        "working_dir": "/tmp/project",
         "trigger_type": "manual",
         "trigger_config": "",
         "run_count": 0,
@@ -242,6 +243,7 @@ async def test_auto_task_writes_reject_a_trigger_the_scheduler_can_never_fire() 
                 AutoTaskCreate(
                     title="t",
                     instruction="i",
+                    working_dir="/tmp/project",
                     trigger_type="cron",
                     trigger_config=bad,
                 ),
@@ -256,6 +258,11 @@ async def test_auto_task_writes_reject_a_trigger_the_scheduler_can_never_fire() 
     assert AutoTaskService._require_next_run("cron", "*/5 * * * *") is not None
     assert AutoTaskService._require_next_run("cron", "0 9 * * 1-5") is not None
     assert AutoTaskService._require_next_run("manual", "") is None
+
+
+def test_auto_task_create_requires_a_nonempty_working_directory() -> None:
+    with pytest.raises(ValueError, match="working_dir"):
+        AutoTaskCreate(title="t", instruction="i", working_dir="   ")
 
 
 @pytest.mark.asyncio
@@ -289,6 +296,7 @@ async def test_auto_task_pins_its_generated_session_to_the_resolved_identity(
         "agent_id": "smith-id",
         "title": "合同检查",
         "instruction": "审查这份合同",
+        "working_dir": "/workspace/contracts",
         "trigger_type": "manual",
         "trigger_config": "",
         "run_count": 0,
@@ -299,6 +307,7 @@ async def test_auto_task_pins_its_generated_session_to_the_resolved_identity(
     assert finished["status"] == "completed"
     assert session_repo.created == [("smith-id", "[自动] 合同检查", "legal")]
     assert captured["request"].identity_id == "legal"
+    assert captured["request"].working_dir == "/workspace/contracts"
 
 
 @pytest.mark.asyncio
@@ -323,6 +332,7 @@ async def test_failed_scheduled_auto_task_is_requeued_with_retry_state(
         "agent_id": "smith-id",
         "title": "定时检查",
         "instruction": "检查服务",
+        "working_dir": "/tmp/project",
         "trigger_type": "interval",
         "trigger_config": "3600",
         "run_count": 0,
@@ -367,6 +377,7 @@ async def test_exhausted_retry_chain_resets_before_next_schedule(
         "agent_id": "smith-id",
         "title": "定时检查",
         "instruction": "检查服务",
+        "working_dir": "/tmp/project",
         "trigger_type": "interval",
         "trigger_config": "3600",
         "retry_count": 2,

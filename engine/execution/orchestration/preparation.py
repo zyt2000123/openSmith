@@ -162,19 +162,24 @@ async def prepare_runtime(
     route = route_task(request.message, catalog, identity_id=request.identity_id)
     identity = route.identity
     state_dir = _identity_state_dir(runtime)
-    working_dir = (
-        Path(request.working_dir).expanduser().resolve()
-        if request.working_dir
-        else Path.cwd().resolve()
-    )
+    requested_working_dir = request.working_dir or runtime.default_working_dir
+    if requested_working_dir is None:
+        raise ValueError("working directory must be explicitly provided by the caller")
+    working_dir = Path(requested_working_dir).expanduser().resolve()
     if not working_dir.is_dir():
         raise ValueError(f"working directory does not exist: {working_dir}")
 
-    services.tool_registry.load_providers(runtime.agents_dir / "tools")
+    provider_dir = runtime.agents_dir / "tools"
+    if services.tool_guard is not None:
+        services.tool_guard.set_working_directory(working_dir)
+        services.tool_guard.set_non_delegable_write_roots([provider_dir])
+
+    services.tool_registry.load_builtin_providers(provider_dir)
     services.tool_registry.bind_working_directory(working_dir)
     if sys.platform == "darwin":
+        environment = MacOSSeatbeltEnvironment(workspace=working_dir)
         services.tool_registry.bind_execution_environment(
-            MacOSSeatbeltEnvironment(workspace=working_dir)
+            environment.with_non_delegable_write_paths([provider_dir])
         )
     bind_snapshot_tools(services, runtime.session_id)
     bind_memory_ops_tool(services, state_dir)
@@ -193,7 +198,6 @@ async def prepare_runtime(
         )
 
     if services.tool_guard is not None:
-        services.tool_guard.set_working_directory(working_dir)
         services.tool_guard.bind_definitions(services.tool_registry.definitions())
     services.tool_registry.bind_tool_guard(services.tool_guard)
 

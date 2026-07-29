@@ -161,6 +161,11 @@ class AutoTaskService:
         try:
             profile = await self.agent_profile_repo.get(agent_id)
             profile_name = profile["name"] if profile else "Agent"
+            working_dir = task.get("working_dir")
+            if not isinstance(working_dir, str) or not working_dir.strip():
+                raise RuntimeError(
+                    "auto task has no working directory; update the task before running it"
+                )
 
             identity_id = load_runtime_identity_catalog().resolve(
                 task["instruction"]
@@ -184,6 +189,7 @@ class AutoTaskService:
                 EngineRequest(
                     message=task["instruction"],
                     identity_id=identity_id,
+                    working_dir=working_dir,
                 ),
                 runtime,
                 services,

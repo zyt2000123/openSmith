@@ -373,6 +373,54 @@ def test_working_directory_restricts_relative_and_absolute_tool_paths(tmp_path: 
     assert absolute.needs_confirmation
 
 
+def test_runtime_provider_files_are_non_delegable_write_targets(tmp_path: Path):
+    project_dir = tmp_path / "project"
+    provider_dir = project_dir / "agents" / "tools"
+    provider_dir.mkdir(parents=True)
+    provider_file = provider_dir / "todo.py"
+    provider_file.write_text("original\n", encoding="utf-8")
+    guard = _builtin_guard(tmp_path / "missing-rules.json")
+    guard.set_working_directory(project_dir)
+    guard.set_non_delegable_write_roots([provider_dir])
+
+    result = guard.check(
+        ToolCall(
+            id="provider-write",
+            name="write_file",
+            arguments={"path": str(provider_file), "content": "changed"},
+        )
+    )
+
+    assert not result.allowed
+    assert not result.approval_required
+    assert "runtime-provider-001" in result.reason
+
+
+def test_runtime_provider_hardlink_alias_is_non_delegable_write_target(tmp_path: Path):
+    project_dir = tmp_path / "project"
+    provider_dir = project_dir / "agents" / "tools"
+    provider_dir.mkdir(parents=True)
+    provider_file = provider_dir / "todo.py"
+    provider_file.write_text("original\n", encoding="utf-8")
+    alias = project_dir / "safe-looking.py"
+    os.link(provider_file, alias)
+    guard = _builtin_guard(tmp_path / "missing-rules.json")
+    guard.set_working_directory(project_dir)
+    guard.set_non_delegable_write_roots([provider_dir])
+
+    result = guard.check(
+        ToolCall(
+            id="provider-alias-write",
+            name="write_file",
+            arguments={"path": str(alias), "content": "changed"},
+        )
+    )
+
+    assert not result.allowed
+    assert not result.approval_required
+    assert "unsafe-alias-001" in result.reason
+
+
 def test_working_directory_turns_user_credential_paths_into_high_risk_approval(tmp_path: Path):
     project_dir = tmp_path / "project"
     project_dir.mkdir()

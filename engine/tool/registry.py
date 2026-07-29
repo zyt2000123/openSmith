@@ -34,6 +34,31 @@ _VALID_APPROVAL_POLICIES = frozenset({"never", "policy", "always"})
 _VALID_SIDE_EFFECTS = frozenset({"none", "write", "external", "destructive"})
 _VALID_CONCURRENCY = frozenset({"safe", "serial"})
 _VALID_EXECUTION_ENVIRONMENTS = frozenset({"host", "sandbox", "either"})
+# Tool providers are executable server-side code.  Runtime setup may import
+# only these shipped modules; the generic ``load_providers`` API intentionally
+# remains available for explicit extension/test hosts.
+_BUILTIN_PROVIDER_FILENAMES = frozenset(
+    {
+        "edit_file.py",
+        "git_ops.py",
+        "glob_files.py",
+        "grep.py",
+        "list_dir.py",
+        "memory_ops.py",
+        "read_file.py",
+        "read_pdf.py",
+        "render_pdf_page.py",
+        "render_ui.py",
+        "shell.py",
+        "skill_load.py",
+        "skill_manage.py",
+        "todo.py",
+        "web_crawl.py",
+        "web_fetch.py",
+        "web_search.py",
+        "write_file.py",
+    }
+)
 log = logging.getLogger(__name__)
 
 
@@ -203,7 +228,12 @@ class ToolRegistry:
         if accepts_environment:
             self._wants_environment.add(name)
 
-    def load_providers(self, tools_dir: Path) -> None:
+    def load_providers(
+        self,
+        tools_dir: Path,
+        *,
+        allowed_filenames: frozenset[str] | None = None,
+    ) -> None:
         """Auto-discover tool providers from a directory of .py files.
 
         Each file should define a TOOL_META dict and an execute function.
@@ -215,7 +245,15 @@ class ToolRegistry:
         """
         if not tools_dir.is_dir():
             return
-        for py_file in sorted(tools_dir.glob("*.py")):
+        if allowed_filenames is None:
+            provider_files = sorted(tools_dir.glob("*.py"))
+        else:
+            provider_files = [
+                tools_dir / filename
+                for filename in sorted(allowed_filenames)
+                if (tools_dir / filename).is_file()
+            ]
+        for py_file in provider_files:
             if py_file.name.startswith("_"):
                 continue
             try:
@@ -269,6 +307,18 @@ class ToolRegistry:
                 log.error("Tool provider rejected, tool unavailable: %s (%s)", py_file.name, exc)
             except Exception:
                 log.exception("Failed to load tool provider: %s", py_file)
+
+    def load_builtin_providers(self, tools_dir: Path) -> None:
+        """Load only shipped runtime provider modules from ``tools_dir``.
+
+        A runtime directory is mutable project data in some deployments, so
+        discovering every ``*.py`` file here would execute model-writable code
+        in the server process on the next request.
+        """
+        self.load_providers(
+            tools_dir,
+            allowed_filenames=_BUILTIN_PROVIDER_FILENAMES,
+        )
 
     def get_schemas(self, enabled: list[str] | None = None) -> list[dict]:
         """Return OpenAI-compatible tool schemas."""

@@ -134,11 +134,12 @@
       **验收**：定义 PreToolUse / PostToolUse / SessionStart 一类生命周期点并对外可注册；
       memory 生命周期改为通过该机制注册，`agent_loop` 不再硬编码。
 
-- [ ] **技能节点上下文交接**（原 R2，确认仍在）
-      `skill/executor.py:_skill_conversation` 用 SKILL.md 顶替整个 system prompt，身份、记忆、
-      工具策略、已装技能清单全部丢失；前序节点输出以 `Context: {context}` 的 dict repr 无预算灌入。
-      **验收**：技能节点复用 `context/assembler.py` 的层叠结果（SKILL.md 作为 Workflow 层叠加，
-      不是替换）；前序输出走预算裁剪；补"技能节点仍能看到身份与记忆"的断言。
+- [x] **技能节点上下文交接**（原 R2）
+      `pipeline` 传递已装配的 `base_messages`；`skill/executor.py:_skill_conversation` 通过
+      `PromptLayer` 追加 SKILL.md Workflow 层，不替换身份、记忆或工具策略。前序 `*_output`
+      与 gate feedback 以有界、带不可信参考围栏的 handoff 传递，不再序列化整个内部 context。
+      回归：`test_skill_context_handoff.py` 断言第二个技能节点仍能看到身份、记忆、工具策略和
+      Workflow 内容，且前序输出被截断、`_state_dir` 不泄露。
 
 - [ ] **Gate 判据不接执行事实**（原 R4 残余）
       LLMGate 的异常静默通过与 retry_hint 丢弃都已修（异常现在 fail，retry_hint 经
