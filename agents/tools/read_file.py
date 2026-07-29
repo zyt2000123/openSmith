@@ -1,5 +1,6 @@
 """Read file tool provider — reads local file content with safety limits."""
 
+import asyncio
 import os
 
 TOOL_META = {
@@ -36,7 +37,7 @@ MAX_READ_BYTES = 50 * 1024  # 50KB preview budget per call
 MAX_LIMIT = 2000
 
 
-async def execute(*, path: str, offset: int = 0, limit: int = 500) -> str:
+def _execute_sync(*, path: str, offset: int = 0, limit: int = 500) -> str:
     resolved = os.path.realpath(path)
 
     if not os.path.exists(resolved):
@@ -97,3 +98,12 @@ async def execute(*, path: str, offset: int = 0, limit: int = 500) -> str:
     elif len(selected) >= limit:
         header += f" — stopped at {limit} line limit"
     return header + "\n" + "\n".join(numbered)
+
+
+async def execute(*, path: str, offset: int = 0, limit: int = 500) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        path=path,
+        offset=offset,
+        limit=limit,
+    )

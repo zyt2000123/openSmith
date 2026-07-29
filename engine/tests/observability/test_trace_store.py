@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
+
+import pytest
 
 from engine.execution.events import EventType, ExecutionEvent
 from engine.observability import TraceStore
@@ -42,3 +46,105 @@ def test_trace_store_keeps_non_secret_token_metrics(tmp_path):
         "output_tokens": 25,
         "total_tokens": 125,
     }
+
+
+def test_trace_store_reads_only_the_requested_tail(tmp_path):
+    store = TraceStore(tmp_path)
+    for index in range(5):
+        store.append(
+            "run-tail",
+            ExecutionEvent(EventType.TEXT_DELTA, {"text": str(index)}),
+        )
+
+    records = store.read("run-tail", limit=2)
+
+    assert [record["data"]["text"] for record in records] == ["3", "4"]
+
+
+def test_trace_store_defers_sync_for_high_frequency_stream_events(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sync_calls: list[int] = []
+    monkeypatch.setattr(os, "fsync", sync_calls.append)
+    store = TraceStore(tmp_path)
+
+    store.append(
+        "run-sync",
+        ExecutionEvent(EventType.RAW_RESPONSE_EVENT, {"data": {"delta": "raw"}}),
+    )
+    store.append(
+        "run-sync",
+        ExecutionEvent(EventType.PROVISIONAL_TEXT_DELTA, {"text": "draft"}),
+    )
+    store.append("run-sync", ExecutionEvent(EventType.RUN_FINISHED, {}))
+
+    assert len(sync_calls) == 1
+
+
+def test_trace_store_recovers_sequence_without_reading_the_whole_file(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    TraceStore(tmp_path).append(
+        "run-resume",
+        ExecutionEvent(EventType.RUN_STARTED, {}),
+    )
+
+    def reject_read_text(_path: Path, *args, **kwargs):
+        raise AssertionError("sequence recovery must stream the trace")
+
+    monkeypatch.setattr(Path, "read_text", reject_read_text)
+    TraceStore(tmp_path).append(
+        "run-resume",
+        ExecutionEvent(EventType.RUN_FINISHED, {}),
+    )
+
+    with (tmp_path / "traces" / "run-resume.jsonl").open(encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle]
+    assert [record["seq"] for record in records] == [1, 2]
+
+
+def test_trace_store_reads_only_records_appended_after_a_byte_cursor(tmp_path):
+    store = TraceStore(tmp_path)
+    store.append("run-cursor", ExecutionEvent(EventType.RUN_STARTED, {}))
+    store.append(
+        "run-cursor",
+        ExecutionEvent(EventType.TOKEN_USAGE, {"total_tokens": 10}),
+    )
+
+    first_records, cursor = store.read_from("run-cursor")
+    store.append(
+        "run-cursor",
+        ExecutionEvent(EventType.TOKEN_USAGE, {"total_tokens": 20}),
+    )
+    new_records, next_cursor = store.read_from("run-cursor", offset=cursor)
+
+    assert [record["seq"] for record in first_records] == [1, 2]
+    assert [record["seq"] for record in new_records] == [3]
+    assert next_cursor > cursor
+
+
+def test_trace_store_cursor_does_not_advance_past_an_incomplete_record(tmp_path):
+    store = TraceStore(tmp_path)
+    store.append("run-partial", ExecutionEvent(EventType.RUN_STARTED, {}))
+    path = tmp_path / "traces" / "run-partial.jsonl"
+    complete_size = path.stat().st_size
+    with path.open("ab") as handle:
+        handle.write(b'{"seq":2')
+
+    first_records, cursor = store.read_from("run-partial")
+
+    assert [record["seq"] for record in first_records] == [1]
+    assert cursor == complete_size
+
+    with path.open("ab") as handle:
+        handle.write(b',"type":"token_usage","data":{"total_tokens":10}}\n')
+
+    appended_records, next_cursor = store.read_from(
+        "run-partial",
+        offset=cursor,
+    )
+
+    assert [record["seq"] for record in appended_records] == [2]
+    assert next_cursor == path.stat().st_size

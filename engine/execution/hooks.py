@@ -103,14 +103,15 @@ class HookManager:
             return result
 
         if hook_type == HookType.SERIES_MERGE:
-            result = initial if initial is not None else {}
-            is_list = isinstance(result, list)
+            result = initial
             for fn in handlers:
                 try:
                     partial = await _call_with_timeout(fn, self._timeout_seconds, *args)
                     if partial is None:
                         continue
-                    if is_list:
+                    if result is None:
+                        result = [] if isinstance(partial, list) else {}
+                    if isinstance(result, list):
                         result = result + (partial if isinstance(partial, list) else [partial])
                     elif isinstance(result, dict) and isinstance(partial, dict):
                         merged = dict(result)

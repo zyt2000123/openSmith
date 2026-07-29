@@ -1,5 +1,6 @@
 """Todo tool — track tasks during a session."""
 
+import asyncio
 import json
 import os
 import tempfile
@@ -95,7 +96,7 @@ def _fmt(todos: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def execute(
+def _execute_sync(
     *, action: str, text: str = "", index: int = 0, status: str = "pending",
     todo_file: str | Path | None = None,
 ) -> str:
@@ -132,3 +133,17 @@ async def execute(
         _save_todos(todos, todo_file)
         return f"Cleared {n} task(s)."
     return f"Error: unknown action '{action}'"
+
+
+async def execute(
+    *, action: str, text: str = "", index: int = 0, status: str = "pending",
+    todo_file: str | Path | None = None,
+) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        action=action,
+        text=text,
+        index=index,
+        status=status,
+        todo_file=todo_file,
+    )

@@ -41,7 +41,6 @@ from engine.skill.registry import SkillRegistry
 from engine.tool.interface import ToolCall
 from engine.tool.registry import ToolRegistry
 
-
 EMPTY_DURABLE_DOC = (
     "# Durable Project Memory\n\n"
     "## Confirmed Facts\n\n"
@@ -781,6 +780,58 @@ def test_prepare_runtime_binds_memory_ops_but_keeps_it_hidden(tmp_path: Path) ->
     assert all(schema["function"]["name"] != "memory_ops" for schema in schemas)
 
 
+def test_prepare_runtime_exposes_skill_manage_but_guards_mutations(
+    tmp_path: Path,
+) -> None:
+    async def run():
+        runtime, services, _ = _runtime(tmp_path)
+        tools_dir = runtime.agents_dir / "tools"
+        tools_dir.mkdir(exist_ok=True)
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "tools"
+            / "skill_manage.py"
+        )
+        (tools_dir / "skill_manage.py").write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (runtime.profile_dir / "config.yaml").write_text(
+            "tools:\n  enabled: [skill_manage]\n",
+            encoding="utf-8",
+        )
+        services.tool_guard = ToolGuard(tmp_path / "missing-rules.json")
+
+        await prepare_runtime(EngineRequest(message="manage skills"), runtime, services)
+        schemas = services.tool_registry.get_schemas()
+        listed = await services.tool_registry.execute(ToolCall(
+            id="list-skills",
+            name="skill_manage",
+            arguments={"action": "list"},
+        ))
+        created = await services.tool_registry.execute(ToolCall(
+            id="create-skill",
+            name="skill_manage",
+            arguments={
+                "action": "create",
+                "skill_name": "incident-notes",
+                "content": "# Incident Notes",
+            },
+        ))
+        return schemas, listed, created
+
+    schemas, listed, created = asyncio.run(run())
+
+    assert any(
+        schema["function"]["name"] == "skill_manage"
+        for schema in schemas
+    )
+    assert not listed.is_error
+    assert created.is_error
+    assert created.error_kind == "approval_required"
+
+
 def test_prepare_runtime_excludes_a_disabled_skill_from_the_live_registry(tmp_path: Path) -> None:
     async def run() -> bool:
         runtime, services, _ = _runtime(tmp_path)
@@ -928,6 +979,25 @@ def test_run_stream_persists_a_terminal_summary(tmp_path: Path) -> None:
     assert record.summary.event_count > 0
 
 
+def test_auto_routed_identity_is_persisted_in_state_and_summary(
+    tmp_path: Path,
+) -> None:
+    async def run():
+        runtime, services, _ = _runtime(tmp_path)
+        stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
+        events = [event async for event in stream.stream_events()]
+        return runtime.profile_dir, stream.run_id, events
+
+    profile_dir, run_id, events = asyncio.run(run())
+    route = next(event for event in events if event.type is EventType.ROUTE_DECIDED)
+    state = RunStateStore(profile_dir).get(run_id)
+    summary = RunSummaryStore(profile_dir).get(run_id)
+
+    assert route.data["identity_id"] == "smith"
+    assert state is not None and state.identity_id == "smith"
+    assert summary is not None and summary.metadata.identity_id == "smith"
+
+
 def test_run_stream_is_not_failed_by_an_observer_adapter(tmp_path: Path) -> None:
     class FailingObserver:
         def record(self, event: ExecutionEvent) -> None:
@@ -1030,6 +1100,39 @@ def test_run_stream_persists_queued_and_terminal_run_state(tmp_path: Path) -> No
     assert run_id
     assert status is RunStatus.COMPLETED
     assert event_seq > 1
+
+
+def test_run_state_ignores_high_frequency_stream_payloads(tmp_path: Path) -> None:
+    """Token delivery remains observable without rewriting lifecycle state."""
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith")
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-1"}),
+    )
+    started = store.get("run-1")
+    assert started is not None
+
+    for event in (
+        ExecutionEvent(
+            EventType.RAW_RESPONSE_EVENT,
+            {
+                "type": "response.output_text.delta",
+                "data": {"delta": "hel"},
+            },
+        ),
+        ExecutionEvent(
+            EventType.PROVISIONAL_TEXT_DELTA,
+            {"provision_id": "draft-1", "text": "hel"},
+        ),
+    ):
+        project_execution_event(store, "run-1", event)
+
+    after_stream_payloads = store.get("run-1")
+    assert after_stream_payloads is not None
+    assert after_stream_payloads.event_seq == started.event_seq
+    assert after_stream_payloads.last_event_type == EventType.RUN_STARTED.value
 
 
 def test_timeout_settles_waiting_approval_before_terminal_run_state(tmp_path: Path) -> None:
@@ -1172,11 +1275,96 @@ def test_resume_setup_failure_is_exposed_as_terminal_stream(
     assert llm.closed is True
 
 
+def test_resume_rejects_a_request_from_a_different_run_scope(tmp_path: Path) -> None:
+    runtime, services, llm = _runtime(tmp_path)
+    store = RunStateStore(runtime.profile_dir)
+    store.create(
+        "run-1",
+        agent_id=runtime.agent_id,
+        session_id=runtime.session_id,
+        message_id="message-1",
+        identity_id="smith",
+        working_dir="/project/original",
+        forced_skill="review",
+    )
+    store.transition("run-1", RunStatus.RUNNING)
+    store.transition("run-1", RunStatus.INCOMPLETE)
+
+    async def collect():
+        stream = resume_stream_with_runtime(
+            EngineRequest(
+                message="resume",
+                message_id="different-message",
+                identity_id="different-identity",
+                working_dir="/project/other",
+                forced_skill="different-skill",
+            ),
+            runtime,
+            services,
+            "run-1",
+        )
+        return [event async for event in stream.stream_events()]
+
+    events = asyncio.run(collect())
+    persisted = RunStateStore(runtime.profile_dir).get("run-1")
+
+    assert events[-1].data == {
+        "run_id": "run-1",
+        "status": "failed",
+        "reason": "resume_scope_mismatch",
+    }
+    assert persisted is not None
+    assert persisted.status is RunStatus.INCOMPLETE
+    assert persisted.event_seq == 0
+    assert llm.closed is True
+
+
+def test_resume_ledger_failure_does_not_activate_the_persisted_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, services, _ = _runtime(tmp_path)
+    store = RunStateStore(runtime.profile_dir)
+    store.create(
+        "run-1",
+        agent_id=runtime.agent_id,
+        session_id=runtime.session_id,
+    )
+    store.transition("run-1", RunStatus.RUNNING)
+    store.transition("run-1", RunStatus.INCOMPLETE)
+
+    class FailingLedger:
+        def __init__(self, *_args, **_kwargs):
+            raise OSError("ledger unavailable")
+
+    monkeypatch.setattr(lifecycle_module, "ToolExecutionLedger", FailingLedger)
+
+    async def collect():
+        stream = resume_stream_with_runtime(
+            EngineRequest(message="resume"),
+            runtime,
+            services,
+            "run-1",
+        )
+        return [event async for event in stream.stream_events()]
+
+    events = asyncio.run(collect())
+    persisted = RunStateStore(runtime.profile_dir).get("run-1")
+
+    assert events[-1].data["reason"] == "resume_setup_failed"
+    assert persisted is not None
+    assert persisted.status is RunStatus.INCOMPLETE
+
+
 def test_resume_stream_cleans_up_when_closed_before_first_event(tmp_path: Path) -> None:
     async def run():
         runtime, services, llm = _runtime(tmp_path)
         store = RunStateStore(runtime.profile_dir)
-        store.create("run-1", agent_id=runtime.agent_id)
+        store.create(
+            "run-1",
+            agent_id=runtime.agent_id,
+            session_id=runtime.session_id,
+        )
         store.transition("run-1", RunStatus.RUNNING)
         store.transition("run-1", RunStatus.INCOMPLETE)
 
@@ -1200,7 +1388,11 @@ def test_resume_stream_enables_ledger_replay_for_new_provider_call_ids(
 ) -> None:
     runtime, services, _ = _runtime(tmp_path)
     store = RunStateStore(runtime.profile_dir)
-    store.create("run-1", agent_id=runtime.agent_id)
+    store.create(
+        "run-1",
+        agent_id=runtime.agent_id,
+        session_id=runtime.session_id,
+    )
     store.transition("run-1", RunStatus.RUNNING)
     store.transition("run-1", RunStatus.INCOMPLETE)
     captured: dict[str, object] = {}
@@ -1372,6 +1564,35 @@ def test_run_stream_bounds_post_run_learning_finalization(
     events = asyncio.run(asyncio.wait_for(collect_events(), timeout=0.2))
 
     assert events[-1].type is EventType.RUN_FINISHED
+
+
+def test_run_stream_closes_services_when_learning_is_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def cancelled_persist(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_persist_runtime_learning",
+        cancelled_persist,
+    )
+
+    async def run() -> bool:
+        runtime, services, llm = _runtime(tmp_path)
+        stream = run_stream_with_runtime(
+            EngineRequest(message="hello"),
+            runtime,
+            services,
+        )
+        try:
+            _ = [event async for event in stream.stream_events()]
+        except asyncio.CancelledError:
+            pass
+        return llm.closed
+
+    assert asyncio.run(run()) is True
 
 
 def test_reply_with_runtime_marks_actual_tool_activity(tmp_path: Path) -> None:
@@ -1569,6 +1790,37 @@ def test_runtime_services_close_closes_the_gate_client(tmp_path: Path) -> None:
     assert llm.closed is True
     assert gate_llm.closed is True
     assert background_llm.closed is True
+
+
+def test_runtime_services_finish_all_cleanup_before_propagating_cancellation(
+    tmp_path: Path,
+) -> None:
+    runtime, services, llm = _runtime(tmp_path)
+
+    class CancellingClient:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+            raise asyncio.CancelledError()
+
+    class RemainingClient:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    cancelling = CancellingClient()
+    remaining = RemainingClient()
+    services.mcp_clients = [remaining, cancelling]
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(services.close())
+
+    assert runtime.agent_id == "smith"
+    assert cancelling.closed is True
+    assert remaining.closed is True
+    assert llm.closed is True
 
 
 def test_runtime_services_close_leaves_borrowed_llm_clients_open(tmp_path: Path) -> None:

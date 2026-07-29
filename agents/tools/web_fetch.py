@@ -7,9 +7,9 @@ import http.client
 import ipaddress
 import re
 import socket
+import ssl
 import time
 import urllib.parse
-import ssl
 from html.parser import HTMLParser
 from typing import Any
 
@@ -225,11 +225,10 @@ async def execute(*, url: str, timeout: int = 30) -> str:
         return "Error: timeout must be an integer"
     timeout = min(max(1, timeout), MAX_TIMEOUT)
 
-    validation_error = _validate_url(url)
-    if validation_error:
-        return f"Error: {validation_error}"
-
     async with _FETCH_CONCURRENCY:
+        validation_error = await asyncio.to_thread(_validate_url, url)
+        if validation_error:
+            return f"Error: {validation_error}"
         try:
             return await asyncio.wait_for(_fetch_plain(url, timeout), timeout=timeout)
         except asyncio.TimeoutError:

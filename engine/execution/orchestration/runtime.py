@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -69,19 +70,36 @@ class RuntimeServices:
     async def close(self) -> None:
         # 逐资源隔离：第一个 close 抛异常不许掐断其余资源的清理，
         # 否则 MCP 子进程/LLM 连接会在长期运行的进程里泄漏。
+        cancellation: asyncio.CancelledError | None = None
+
+        async def close_resource(resource: object, resource_type: str) -> None:
+            nonlocal cancellation
+            try:
+                close = getattr(resource, "close", None)
+                if close is None:
+                    return
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                logger.warning(
+                    "cleanup of %s %s was cancelled; continuing remaining cleanup",
+                    resource_type,
+                    type(resource).__name__,
+                )
+            except Exception:
+                logger.warning(
+                    "failed to close %s %s",
+                    resource_type,
+                    type(resource).__name__,
+                    exc_info=True,
+                )
+
         if self.owns_mcp_clients:
             for client in reversed(self.mcp_clients):
-                try:
-                    close = getattr(client, "close", None)
-                    if close is None:
-                        continue
-                    result = close()
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception:
-                    logger.warning(
-                        "failed to close MCP client %s", type(client).__name__, exc_info=True,
-                    )
+                await close_resource(client, "MCP client")
 
         if self.owns_llm_clients:
             closed_llms: set[int] = set()
@@ -89,17 +107,10 @@ class RuntimeServices:
                 if llm is None or id(llm) in closed_llms:
                     continue
                 closed_llms.add(id(llm))
-                try:
-                    close_llm = getattr(llm, "close", None)
-                    if close_llm is None:
-                        continue
-                    result = close_llm()
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception:
-                    logger.warning(
-                        "failed to close LLM client %s", type(llm).__name__, exc_info=True,
-                    )
+                await close_resource(llm, "LLM client")
+
+        if cancellation is not None:
+            raise cancellation
 
 
 @dataclass(frozen=True)

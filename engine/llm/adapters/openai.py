@@ -359,7 +359,11 @@ class OpenAIAdapter(HTTPAdapterMixin):
             raise LLMResponseError("LLM response tool call is missing a function name.")
 
         raw_arguments = function.get("arguments", "{}")
-        if isinstance(raw_arguments, str):
+        if raw_arguments is None or (
+            isinstance(raw_arguments, str) and not raw_arguments.strip()
+        ):
+            arguments = {}
+        elif isinstance(raw_arguments, str):
             try:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as exc:

@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .budget import estimate_tokens
+
 if TYPE_CHECKING:
     from engine.skill.registry import SkillRegistry
     from engine.tool.registry import ToolRegistry
@@ -175,14 +177,6 @@ class AssembledPrompt:
     manifest: PromptManifest
     prefix_cache_key: str
     plan: PromptPlan
-
-
-def _estimate_tokens(text: str) -> int:
-    """Conservative estimate aligned with execution context accounting."""
-    if not text:
-        return 0
-    cjk = sum(1 for char in text if "一" <= char <= "鿿")
-    return cjk + (len(text) - cjk) // 3
 
 
 def build_team_context(
@@ -594,7 +588,7 @@ class PromptAssembler:
 
     @staticmethod
     def _layer_token_cost(layer: PromptLayer) -> int:
-        return _estimate_tokens(PromptAssembler._render_layer(layer)) if layer.content.strip() else 0
+        return estimate_tokens(PromptAssembler._render_layer(layer)) if layer.content.strip() else 0
 
     @staticmethod
     def _trim_to_budget(

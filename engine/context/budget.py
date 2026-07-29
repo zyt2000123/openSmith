@@ -33,11 +33,15 @@ class ContextBudget:
 
 
 def estimate_tokens(text: str) -> int:
-    """Conservatively estimate mixed CJK and non-CJK text."""
+    """Conservatively estimate mixed CJK and non-CJK text.
+
+    A CJK ideograph is three UTF-8 bytes, which is the stable fallback upper
+    bound when a provider tokenizer has no merged token for that character.
+    """
     if not text:
         return 0
     cjk = sum(1 for char in text if "一" <= char <= "鿿")
-    return cjk + (len(text) - cjk + 2) // 3
+    return (3 * cjk) + (len(text) - cjk + 2) // 3
 
 
 def _estimate_json(value: Any) -> int:

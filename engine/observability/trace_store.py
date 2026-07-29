@@ -5,14 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
-
-from engine.execution.events import ExecutionEvent
-
+from engine.execution.events import EventType, ExecutionEvent
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization)", re.I)
 _SAFE_METRIC_KEYS = {
@@ -25,6 +24,10 @@ _SAFE_METRIC_KEYS = {
 }
 _MAX_VALUE_CHARS = 4096
 _MAX_DEPTH = 4
+_DEFERRED_SYNC_EVENTS = {
+    EventType.RAW_RESPONSE_EVENT,
+    EventType.PROVISIONAL_TEXT_DELTA,
+}
 # Name-based redaction cannot see a credential carried *inside* a value, and
 # TOOL_CALL_START writes the full tool arguments — so a shell command holding a
 # bearer token landed here verbatim, under the innocuous key "command".
@@ -91,23 +94,39 @@ class TraceStore:
         if run_id not in self._next_seq:
             current = 0
             if path.is_file():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        current = max(current, int(json.loads(line).get("seq", 0)))
-                    except (ValueError, TypeError, json.JSONDecodeError):
-                        continue
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            current = max(
+                                current,
+                                int(json.loads(line).get("seq", 0)),
+                            )
+                        except (ValueError, TypeError, json.JSONDecodeError):
+                            continue
             self._next_seq[run_id] = current
         self._next_seq[run_id] += 1
         return self._next_seq[run_id]
 
     def append(self, run_id: str, event: ExecutionEvent) -> None:
-        self._append_record(run_id, event.type.value, event.data)
+        self._append_record(
+            run_id,
+            event.type.value,
+            event.data,
+            sync=event.type not in _DEFERRED_SYNC_EVENTS,
+        )
 
     def append_prompt_manifest(self, run_id: str, manifest: dict[str, Any]) -> None:
         """Persist a redacted prompt-provenance receipt without prompt text."""
         self._append_record(run_id, "prompt_manifest", manifest)
 
-    def _append_record(self, run_id: str, record_type: str, data: dict[str, Any]) -> None:
+    def _append_record(
+        self,
+        run_id: str,
+        record_type: str,
+        data: dict[str, Any],
+        *,
+        sync: bool = True,
+    ) -> None:
         path = self._path(run_id)
         record = {
             "seq": self._sequence(run_id, path),
@@ -120,24 +139,72 @@ class TraceStore:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
         try:
             os.write(fd, payload)
-            os.fsync(fd)
+            if sync:
+                os.fsync(fd)
         finally:
             os.close(fd)
         path.chmod(PRIVATE_FILE_MODE)
 
-    def read(self, run_id: str) -> list[dict[str, Any]]:
+    def read(self, run_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        path = self._path(run_id)
+        if not path.is_file() or (limit is not None and limit < 1):
+            return []
+        records: list[dict[str, Any]] | deque[dict[str, Any]]
+        records = [] if limit is None else deque(maxlen=limit)
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    records.append(value)
+        return list(records)
+
+    def read_from(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Read records appended after a previously returned byte offset."""
         path = self._path(run_id)
         if not path.is_file():
-            return []
+            return [], 0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return [], 0
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("trace offset must be a non-negative integer")
+        if offset > size:
+            offset = 0
+
         records: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                records.append(value)
-        return records
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            next_offset = offset
+            while line := handle.readline():
+                line_start = next_offset
+                next_offset = handle.tell()
+                if not line.endswith(b"\n"):
+                    next_offset = line_start
+                    break
+                try:
+                    value = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    records.append(value)
+        return records, next_offset
+
+    def list_run_ids(self) -> list[str]:
+        """List trace identifiers without parsing trace payloads."""
+        return sorted(
+            path.stem
+            for path in self.root.glob("*.jsonl")
+            if path.stem and path.stem not in {".", ".."}
+        )
 
     def iter_runs(self) -> list[tuple[str, list[dict[str, Any]]]]:
         """Return all valid traces without exposing the on-disk layout."""

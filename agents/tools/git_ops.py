@@ -71,6 +71,7 @@ TOOL_META = {
 }
 
 MAX_OUTPUT = 10 * 1024  # 10KB
+_SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 
 # Branch/tag name validation: alphanumeric, dash, underscore, dot, slash
 _SAFE_REF = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,200}$")
@@ -103,6 +104,29 @@ def _validate_ref(name: str) -> str | None:
     return None
 
 
+def _safe_environment(cwd: str | None) -> dict[str, str]:
+    """Return a minimal environment for model-requested Git processes.
+
+    Git may execute repository-controlled hooks, filters, and helpers.  Those
+    subprocesses must not inherit provider credentials or other service
+    secrets owned by the Agent-Smith runtime.
+    """
+    home = os.path.abspath(cwd) if cwd else os.getcwd()
+    environment = {
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "HOME": home,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "Never",
+    }
+    for key in _SAFE_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
 async def _run_git(
     args: list[str], cwd: str | None = None, timeout: int = 30, environment=None
 ) -> tuple[int, str, str]:
@@ -110,7 +134,10 @@ async def _run_git(
     if environment is None:
         return -1, "", "no execution environment is available for git"
     result = await environment.run_command(
-        argv=["git", *args], cwd=cwd, timeout_seconds=timeout
+        argv=["git", *args],
+        cwd=cwd,
+        timeout_seconds=timeout,
+        env=_safe_environment(cwd),
     )
     if result.timed_out:
         return -1, "", f"git command timed out after {timeout}s"

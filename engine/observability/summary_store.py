@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,11 +15,16 @@ from uuid import uuid4
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
 
+from .index import (
+    IndexedRun,
+    ObservabilityIndex,
+    ObservabilityRetentionPolicy,
+)
 from .projections import RunSummary
-
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -117,23 +124,53 @@ def _non_negative_int(value: object) -> int:
 class RunSummaryStore:
     """Store and list aggregate run outcomes under the local profile directory."""
 
-    def __init__(self, profile_dir: Path) -> None:
-        self.root = Path(profile_dir) / "runs"
+    def __init__(
+        self,
+        profile_dir: Path,
+        *,
+        retention: ObservabilityRetentionPolicy | None = None,
+    ) -> None:
+        self.profile_dir = Path(profile_dir)
+        self.root = self.profile_dir / "runs"
+        self.trace_root = self.profile_dir / "traces"
         self.root.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
         self.root.chmod(PRIVATE_DIR_MODE)
+        self._retention = retention or ObservabilityRetentionPolicy.from_environment()
+        try:
+            self._index: ObservabilityIndex | None = ObservabilityIndex(
+                self.profile_dir
+            )
+        except (OSError, sqlite3.Error):
+            logger.warning("failed to initialize observability index", exc_info=True)
+            self._index = None
 
     def save(self, metadata: RunMetadata, summary: RunSummary) -> RunSummaryRecord:
         """Atomically persist a terminal summary, merging earlier resumptions."""
         self._validate_metadata(metadata, summary)
+        self._ensure_index()
         previous = self.get(metadata.run_id)
         merged = _merge_summaries(previous.summary, summary) if previous is not None else summary
         record = RunSummaryRecord(
             schema_version=_SCHEMA_VERSION,
-            metadata=previous.metadata if previous is not None else metadata,
+            metadata=(
+                _merge_metadata(previous.metadata, metadata)
+                if previous is not None
+                else metadata
+            ),
             finished_at=_now(),
             summary=merged,
         )
         self._write(record)
+        if self._index is not None:
+            try:
+                self._index.upsert(self._index_entry(record))
+                self._apply_retention()
+            except (OSError, sqlite3.Error):
+                logger.warning(
+                    "failed to update observability index (run=%s)",
+                    metadata.run_id,
+                    exc_info=True,
+                )
         return record
 
     def get(self, run_id: str) -> RunSummaryRecord | None:
@@ -149,12 +186,73 @@ class RunSummaryStore:
     def list(self, agent_id: str, *, limit: int = 50) -> list[RunSummaryRecord]:
         if limit < 1:
             return []
+        self._ensure_index()
+        if self._index is not None:
+            try:
+                records = [
+                    record
+                    for run_id in self._index.list_run_ids(agent_id, limit=limit)
+                    if (record := self.get(run_id)) is not None
+                ]
+                return records[:limit]
+            except (OSError, sqlite3.Error):
+                logger.warning("failed to query observability index", exc_info=True)
         records = [
             record
             for path in self.root.glob("*.summary.json")
             if (record := self._read_path(path)) is not None and record.metadata.agent_id == agent_id
         ]
         return sorted(records, key=lambda record: record.finished_at, reverse=True)[:limit]
+
+    def _ensure_index(self) -> None:
+        if self._index is None:
+            return
+        try:
+            if self._index.is_bootstrapped():
+                return
+            entries = [
+                self._index_entry(record)
+                for path in self.root.glob("*.summary.json")
+                if (record := self._read_path(path)) is not None
+            ]
+            self._index.bootstrap(entries)
+        except (OSError, sqlite3.Error):
+            logger.warning("failed to bootstrap observability index", exc_info=True)
+            self._index = None
+
+    def _index_entry(self, record: RunSummaryRecord) -> IndexedRun:
+        summary_path = self._path(record.metadata.run_id)
+        trace_path = self.trace_root / f"{record.metadata.run_id}.jsonl"
+        size_bytes = 0
+        for path in (summary_path, trace_path):
+            try:
+                size_bytes += path.stat().st_size
+            except OSError:
+                continue
+        return IndexedRun(
+            run_id=record.metadata.run_id,
+            agent_id=record.metadata.agent_id,
+            session_id=record.metadata.session_id,
+            identity_id=record.metadata.identity_id,
+            created_at=record.metadata.created_at,
+            finished_at=record.finished_at,
+            size_bytes=size_bytes,
+        )
+
+    def _apply_retention(self) -> None:
+        if self._index is None:
+            return
+        for run_id in self._index.retention_candidates(self._retention):
+            try:
+                self._path(run_id).unlink(missing_ok=True)
+                (self.trace_root / f"{run_id}.jsonl").unlink(missing_ok=True)
+                self._index.remove(run_id)
+            except (OSError, sqlite3.Error, ValueError):
+                logger.warning(
+                    "failed to prune observed run %s",
+                    run_id,
+                    exc_info=True,
+                )
 
     def _read_path(self, path: Path) -> RunSummaryRecord | None:
         try:
@@ -203,6 +301,19 @@ def _merge_summaries(previous: RunSummary, current: RunSummary) -> RunSummary:
         token_usage=_sum_maps(previous.token_usage, current.token_usage),
         outcome=current.outcome,
         reason=current.reason,
+    )
+
+
+def _merge_metadata(previous: RunMetadata, current: RunMetadata) -> RunMetadata:
+    """Preserve the original scope while filling metadata resolved after start."""
+    return RunMetadata(
+        run_id=previous.run_id,
+        agent_id=previous.agent_id,
+        created_at=previous.created_at,
+        session_id=previous.session_id or current.session_id,
+        identity_id=previous.identity_id or current.identity_id,
+        working_dir=previous.working_dir or current.working_dir,
+        forced_skill=previous.forced_skill or current.forced_skill,
     )
 
 

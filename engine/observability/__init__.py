@@ -7,13 +7,14 @@ code uses ``ObservabilityReader``. Neither needs to know the trace or summary
 storage layout.
 """
 
-from .diagnosis import RunDiagnosis, RunDiagnoser
+from .diagnosis import RunDiagnoser, RunDiagnosis
 from .health import AgentHealth, HealthCalculator
 from .incidents import IncidentDetector, RunIncident
+from .index import ObservabilityRetentionPolicy
 from .projections import RunSummary, RunSummaryProjection
 from .proposals import ImprovementProposer, RunImprovementProposal
-from .recorder import RunEventRecorder
 from .reader import ObservabilityReader
+from .recorder import RunEventRecorder
 from .runtime import RunObservation
 from .summary_store import RunMetadata, RunSummaryRecord, RunSummaryStore
 from .trace_store import TraceStore
@@ -36,4 +37,5 @@ __all__ = (
     "RunSummaryStore",
     "TraceStore",
     "ObservabilityReader",
+    "ObservabilityRetentionPolicy",
 )

@@ -16,8 +16,6 @@ from pathlib import Path
 from typing import AsyncGenerator
 from uuid import uuid4
 
-from engine.llm.observability import generation_context, llm_purpose
-from engine.llm.contracts import LLMResponseError
 from engine.execution.events import (
     EventType,
     ExecutionEvent,
@@ -25,20 +23,34 @@ from engine.execution.events import (
     RunObservationContext,
     raw_text_delta,
 )
-from engine.safety.fact_gate import FactGate, FactGateContext, use_fact_gate
 from engine.execution.pipeline.backtrack import FailureLoopGuard
 from engine.execution.react.react_loop import IncompleteAgentRunError
-from .run_state import RunStateError, RunStateStore, RunStatus, project_execution_event
-from .run_stream import AgentRunStream
-from .runtime import EngineRequest, EngineResult, RuntimeContext, RuntimeServices
-from engine.tool.ledger import ToolExecutionLedger
+from engine.llm.contracts import LLMResponseError
+from engine.llm.observability import generation_context, llm_purpose
 from engine.safety.approval import APPROVAL_BROKER, use_approval_context
+from engine.safety.fact_gate import FactGate, FactGateContext, use_fact_gate
+from engine.tool.ledger import ToolExecutionLedger
+
 from .agent_loop import run_agent_stream
 from .preparation import (
     merge_request_context as _merge_context,
+)
+from .preparation import (
     prepare_runtime,
+)
+from .preparation import (
     runtime_execution_context as _runtime_execution_context,
 )
+from .run_state import (
+    RunScope,
+    RunScopeMismatchError,
+    RunStateError,
+    RunStateStore,
+    RunStatus,
+    project_execution_event,
+)
+from .run_stream import AgentRunStream
+from .runtime import EngineRequest, EngineResult, RuntimeContext, RuntimeServices
 
 __all__ = (
     "run_stream_with_runtime",
@@ -287,6 +299,28 @@ class _RunEventBoundary:
                     exc_info=True,
                 )
 
+    def bind_identity(self, identity_id: str) -> None:
+        if self.state_store is not None:
+            try:
+                self.state_store.bind_identity(self.run_id, identity_id)
+            except Exception:
+                logger.warning(
+                    "failed to bind run identity in state (run=%s)",
+                    self.run_id,
+                    exc_info=True,
+                )
+        if self.observer is not None:
+            bind_identity = getattr(self.observer, "bind_identity", None)
+            if bind_identity is not None:
+                try:
+                    bind_identity(identity_id)
+                except Exception:
+                    logger.warning(
+                        "run observer rejected identity binding (run=%s)",
+                        self.run_id,
+                        exc_info=True,
+                    )
+
 
 def _start_event_boundary(
     services: RuntimeServices,
@@ -403,11 +437,17 @@ async def _cancel_unstarted_run(
         "reason": "consumer_disconnected",
     })
     event_boundary.record(cancelled_event)
+    cancellation: asyncio.CancelledError | None = None
     try:
         await services.close()
+    except asyncio.CancelledError as exc:
+        cancellation = exc
     except Exception:
         logger.warning("failed to close engine runtime services", exc_info=True)
-    APPROVAL_BROKER.cancel_run(run_id)
+    finally:
+        APPROVAL_BROKER.cancel_run(run_id)
+    if cancellation is not None:
+        raise cancellation
 
 
 def _failed_setup_stream(
@@ -462,8 +502,24 @@ def resume_stream_with_runtime(
     """
     try:
         state_store = RunStateStore(runtime.profile_dir)
+        scope = RunScope.create(
+            agent_id=runtime.agent_id,
+            session_id=runtime.session_id,
+            message_id=request.message_id,
+            identity_id=request.identity_id,
+            working_dir=request.working_dir,
+            forced_skill=request.forced_skill,
+        )
+        state_store.validate_resume(run_id, scope=scope)
         ledger = ToolExecutionLedger(runtime.profile_dir, run_id, replay_existing=True)
-        state_store.resume(run_id)
+        state_store.resume(run_id, scope=scope)
+    except RunScopeMismatchError:
+        logger.warning("rejected mismatched resume scope (run=%s)", run_id)
+        return _failed_setup_stream(
+            run_id,
+            services,
+            "resume_scope_mismatch",
+        )
     except Exception:
         logger.warning("failed to resume run (run=%s)", run_id, exc_info=True)
         return _failed_setup_stream(
@@ -533,6 +589,7 @@ async def _run_events_with_runtime(
         boundary.record(run_started)
         yield run_started
         s = await prepare_runtime(request, runtime, services)
+        boundary.bind_identity(s.identity.id)
         execution_stage = "agent_execution"
         state_dir = s.state_dir
         if hasattr(s, "prompt_manifest"):
@@ -600,6 +657,7 @@ async def _run_events_with_runtime(
         yield done_event
         drained = True
     finally:
+        cancellation: asyncio.CancelledError | None = None
         if (
             drained
             and state_dir is not None
@@ -621,6 +679,9 @@ async def _run_events_with_runtime(
                     _RUNTIME_LEARNING_TIMEOUT_SECONDS,
                     run_id,
                 )
+            except asyncio.CancelledError as exc:
+                memory_persist_failed = True
+                cancellation = exc
             except Exception:
                 memory_persist_failed = True
                 logger.warning("failed to finalize conversation memory", exc_info=True)
@@ -633,11 +694,16 @@ async def _run_events_with_runtime(
             boundary.record(cancelled_event)
         try:
             await services.close()
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
         except Exception:
             logger.warning("failed to close engine runtime services", exc_info=True)
-        if ledger is not None:
-            services.tool_registry.bind_execution_ledger(None)
-        APPROVAL_BROKER.cancel_run(run_id)
+        finally:
+            if ledger is not None:
+                services.tool_registry.bind_execution_ledger(None)
+            APPROVAL_BROKER.cancel_run(run_id)
+        if cancellation is not None:
+            raise cancellation
 
     if drained:
         terminal_data: dict[str, object] = {"run_id": run_id, "status": terminal_status}

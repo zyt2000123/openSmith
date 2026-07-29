@@ -5,7 +5,7 @@ Runs every ~50 qualifying memory turns. Responsibilities:
   2. Reconcile: compare durable.md with recent.jsonl evidence since .dream_offset
   3. Review: require policy-based reviewer approval before durable replacement
   4. Checkpoint: advance only after a successful reconciliation
-  5. Cleanup: reclaim only evidence consumed by compile, durable, and Dream
+  5. Cleanup: reclaim only evidence consumed by compile, durable, Nudge, and Dream
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ _MEMORY_POLICY = load_memory_policy()
 _DREAM_OFFSET_FILE = ".dream_offset"
 _DREAM_COMMIT_FILE = ".dream_commit.json"
 _DREAM_CLEANUP_FILE = ".dream_cleanup.json"
+_NUDGE_OFFSET_FILE = ".nudge_offset"
 # Absolute per-batch budget. A producer-valid oversized event is compacted with
 # an explicit marker instead of wedging Dream at the same JSONL line forever.
 MAX_DREAM_EVIDENCE_SOURCE_CHARS = 20_000
@@ -113,6 +114,8 @@ class DreamCleanup:
     durable_offset: int
     durable_offset_present: bool
     dream_offset: int
+    nudge_offset: int
+    nudge_offset_present: bool
 
 
 def dream_report_completed(report: DreamReport) -> bool:
@@ -329,6 +332,25 @@ def _write_dream_offset(memory_dir: Path, offset: int) -> None:
     atomic_write_text(path, str(max(0, offset)))
 
 
+def _read_optional_nudge_offset(memory_dir: Path) -> tuple[int, bool]:
+    """Read the Nudge checkpoint when that maintenance lane is active."""
+    path = memory_dir / _NUDGE_OFFSET_FILE
+    if not path.exists() and not path.is_symlink():
+        return 0, False
+    if path.is_symlink():
+        raise OSError("Nudge offset is unavailable or unsafe")
+    safe_path = safe_file_in_dir(memory_dir, path)
+    if safe_path is None:
+        raise OSError("Nudge offset is unavailable or unsafe")
+    try:
+        offset = int(safe_path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OSError("Nudge offset is unavailable or unsafe") from exc
+    if offset < 0:
+        raise OSError("Nudge offset is unavailable or unsafe")
+    return offset, True
+
+
 def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -414,6 +436,8 @@ def _write_dream_cleanup(memory_dir: Path, cleanup: DreamCleanup) -> None:
                 "durable_offset": cleanup.durable_offset,
                 "durable_offset_present": cleanup.durable_offset_present,
                 "dream_offset": cleanup.dream_offset,
+                "nudge_offset": cleanup.nudge_offset,
+                "nudge_offset_present": cleanup.nudge_offset_present,
             },
             sort_keys=True,
         ),
@@ -442,6 +466,17 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
     durable_offset = payload.get("durable_offset")
     durable_offset_present = payload.get("durable_offset_present")
     dream_offset = payload.get("dream_offset")
+    nudge_offset = payload.get("nudge_offset")
+    nudge_offset_present = payload.get("nudge_offset_present")
+    if nudge_offset is None and nudge_offset_present is None:
+        try:
+            current_nudge_offset, current_nudge_offset_present = (
+                _read_optional_nudge_offset(memory_dir)
+            )
+        except OSError as exc:
+            return None, str(exc)
+        nudge_offset = max(0, current_nudge_offset - cleaned) if isinstance(cleaned, int) else 0
+        nudge_offset_present = current_nudge_offset_present
     if (
         isinstance(cleaned, bool)
         or not isinstance(cleaned, int)
@@ -460,17 +495,23 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
         or isinstance(dream_offset, bool)
         or not isinstance(dream_offset, int)
         or dream_offset < 0
+        or isinstance(nudge_offset, bool)
+        or not isinstance(nudge_offset, int)
+        or nudge_offset < 0
+        or not isinstance(nudge_offset_present, bool)
     ):
         return None, "Dream cleanup has invalid fields"
     return (
         DreamCleanup(
-            cleaned,
-            old_recent_hash,
-            new_recent_hash,
-            compile_offset,
-            durable_offset,
-            durable_offset_present,
-            dream_offset,
+            cleaned=cleaned,
+            old_recent_hash=old_recent_hash,
+            new_recent_hash=new_recent_hash,
+            compile_offset=compile_offset,
+            durable_offset=durable_offset,
+            durable_offset_present=durable_offset_present,
+            dream_offset=dream_offset,
+            nudge_offset=nudge_offset,
+            nudge_offset_present=nudge_offset_present,
         ),
         None,
     )
@@ -486,6 +527,8 @@ def _write_dream_cleanup_offsets(memory_dir: Path, cleanup: DreamCleanup) -> Non
     if cleanup.durable_offset_present:
         atomic_write_text(memory_dir / ".durable_offset", str(cleanup.durable_offset))
     _write_dream_offset(memory_dir, cleanup.dream_offset)
+    if cleanup.nudge_offset_present:
+        atomic_write_text(memory_dir / _NUDGE_OFFSET_FILE, str(cleanup.nudge_offset))
 
 
 def _recover_dream_cleanup(memory_dir: Path) -> str | None:
@@ -850,8 +893,12 @@ def _cleanup_log(
 
     compile_offset = _read_offset(memory_dir)
     durable_offset = _read_durable_offset(memory_dir)
-    # Never delete lines the durable merge has not consumed yet.
-    offset = min(compile_offset, durable_offset, max(0, audited_offset))
+    nudge_offset, nudge_offset_present = _read_optional_nudge_offset(memory_dir)
+    consumed_offsets = [compile_offset, durable_offset, max(0, audited_offset)]
+    if nudge_offset_present:
+        consumed_offsets.append(nudge_offset)
+    # Never delete lines another memory lane has not consumed yet.
+    offset = min(consumed_offsets)
 
     if offset <= 0:
         return 0
@@ -899,6 +946,8 @@ def _cleanup_log(
         durable_offset=max(0, durable_offset - safe_offset),
         durable_offset_present=durable_offset_file.is_file(),
         dream_offset=max(0, audited_offset - safe_offset),
+        nudge_offset=max(0, nudge_offset - safe_offset),
+        nudge_offset_present=nudge_offset_present,
     )
     _write_dream_cleanup(memory_dir, cleanup)
     atomic_write_text(recent, remaining_text)

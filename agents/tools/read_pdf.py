@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from collections.abc import Iterable
@@ -132,7 +133,7 @@ def _extract_with_pdfplumber(
     return result
 
 
-async def execute(
+def _execute_sync(
     *,
     path: str,
     pages: str = "",
@@ -208,3 +209,19 @@ async def execute(
         current_length += len(block)
 
     return "\n".join(output)
+
+
+async def execute(
+    *,
+    path: str,
+    pages: str = "",
+    max_chars: int = DEFAULT_MAX_CHARS,
+    password: str | None = None,
+) -> str:
+    return await asyncio.to_thread(
+        _execute_sync,
+        path=path,
+        pages=pages,
+        max_chars=max_chars,
+        password=password,
+    )

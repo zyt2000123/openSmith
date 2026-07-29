@@ -28,8 +28,8 @@ def test_needs_compaction_stays_false_for_small_conversations() -> None:
 
 
 def test_needs_compaction_accounts_for_cjk_density() -> None:
-    # 90k 中文字符 ≈ 90k tokens，超过 84k（120k×0.7）阈值。
-    # 旧 len//3 估成 30k 会漏判 → compact 迟迟不触发，超窗口后才醒。
+    # CJK uses the three-byte fallback upper bound, so this must compact well
+    # before a provider-specific tokenizer can reject the request.
     conversation = [{"role": "user", "content": "证" * 90_000}]
 
     assert needs_compaction(conversation, context_limit=120_000)
@@ -60,8 +60,8 @@ def test_compress_reserves_output_before_triggering_for_large_declared_windows()
 
     budget, trigger_ratio = compaction_policy_for_llm(LargeWindowLLM())
     threshold = math.ceil(budget * trigger_ratio)
-    below_limit = [{"role": "user", "content": "证" * (threshold - 1)}]
-    at_limit = [{"role": "user", "content": "证" * threshold}]
+    below_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1))}]
+    at_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1) + 1)}]
 
     assert asyncio.run(compress(below_limit, LargeWindowLLM())) is below_limit
     assert asyncio.run(compress(at_limit, LargeWindowLLM())) is not at_limit
@@ -77,8 +77,8 @@ def test_compress_uses_safe_budget_when_window_is_undeclared() -> None:
 
     budget, trigger_ratio = compaction_policy_for_llm(UnconfiguredLLM())
     threshold = math.ceil(budget * trigger_ratio)
-    below_limit = [{"role": "user", "content": "证" * (threshold - 1)}]
-    at_limit = [{"role": "user", "content": "证" * threshold}]
+    below_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1))}]
+    at_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1) + 1)}]
 
     assert asyncio.run(compress(below_limit, UnconfiguredLLM())) is below_limit
     assert asyncio.run(compress(at_limit, UnconfiguredLLM())) is not at_limit

@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .diagnosis import RunDiagnosis, RunDiagnoser
+from .diagnosis import RunDiagnoser, RunDiagnosis
 from .health import AgentHealth, HealthCalculator
-from .proposals import ImprovementProposer, RunImprovementProposal
 from .incidents import IncidentDetector, RunIncident
+from .proposals import ImprovementProposer, RunImprovementProposal
 from .summary_store import RunSummaryRecord, RunSummaryStore
 from .trace_store import TraceStore
 
@@ -33,7 +33,20 @@ class ObservabilityReader:
     def read_trace(self, run_id: str, *, limit: int = 300) -> list[dict[str, Any]]:
         if limit < 1:
             return []
-        return self._traces.read(run_id)[-limit:]
+        return self._traces.read(run_id, limit=limit)
+
+    def read_trace_from(
+        self,
+        run_id: str,
+        *,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Read only trace records appended after a durable byte cursor."""
+        return self._traces.read_from(run_id, offset=offset)
+
+    def list_trace_run_ids(self) -> list[str]:
+        """List trace ids without loading event records."""
+        return self._traces.list_run_ids()
 
     def iter_traces(self) -> list[tuple[str, list[dict[str, Any]]]]:
         """Enumerate local traces for aggregate consumers."""

@@ -37,6 +37,20 @@ _FRAMING_BROKEN_MESSAGE = (
 )
 
 
+def _require_json_object(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} must be a JSON object")
+    return value
+
+
+def _parse_json_object(payload: str, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(payload)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise RuntimeError(f"{label} contains invalid JSON") from exc
+    return _require_json_object(value, label=label)
+
+
 @dataclass
 class MCPTool:
     """A tool discovered from an MCP server."""
@@ -173,7 +187,10 @@ class StdioMCPTransport:
                     raise RuntimeError("MCP stdio response exceeds maximum size") from exc
                 if not line:
                     raise RuntimeError("MCP server closed stdout unexpectedly")
-                resp = json.loads(line.decode())
+                resp = _parse_json_object(
+                    line.decode(),
+                    label="MCP stdio response",
+                )
                 if resp.get("id") != request_id:
                     log.debug("Ignoring MCP message while waiting for id %s: %s", request_id, resp)
                     continue
@@ -181,7 +198,10 @@ class StdioMCPTransport:
 
         if "error" in resp:
             raise RuntimeError(f"MCP error: {resp['error']}")
-        return resp.get("result", {})
+        return _require_json_object(
+            resp.get("result", {}),
+            label="MCP result",
+        )
 
     async def send_notification(self, method: str, params: dict) -> None:
         if self._process is None or self._process.stdin is None:
@@ -289,14 +309,20 @@ class StreamableHTTPMCPTransport:
             if content_type == "text/event-stream":
                 resp = await _response_from_sse_stream(response, request_id)
             else:
-                resp = json.loads((await _read_bounded_response(response)).decode())
+                resp = _parse_json_object(
+                    (await _read_bounded_response(response)).decode(),
+                    label="MCP HTTP response",
+                )
 
         if resp.get("id") != request_id:
             raise RuntimeError(f"MCP HTTP response id mismatch: {resp.get('id')!r} != {request_id!r}")
         if "error" in resp:
             raise RuntimeError(f"MCP error: {resp['error']}")
 
-        result = resp.get("result", {})
+        result = _require_json_object(
+            resp.get("result", {}),
+            label="MCP result",
+        )
         if method == "initialize":
             protocol_version = result.get("protocolVersion")
             if isinstance(protocol_version, str) and protocol_version in SUPPORTED_PROTOCOL_VERSIONS:
@@ -553,7 +579,7 @@ async def _response_from_sse_stream(response: Any, request_id: int) -> dict:
     async for payload in _iter_sse_data_stream(response):
         if not payload:
             continue
-        message = json.loads(payload)
+        message = _parse_json_object(payload, label="MCP SSE response")
         if message.get("id") == request_id:
             return message
         log.debug("Ignoring MCP SSE message while waiting for id %s: %s", request_id, message)

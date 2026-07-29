@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -227,23 +228,38 @@ class TokenStatsService:
         if not runs_dir.is_dir():
             return await self._sync_message_estimates(await self._db_provider())
 
-        run_sessions: dict[str, str] = {}
-        for path in runs_dir.glob("*.json"):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            run_id = payload.get("run_id") or path.stem
-            session_id = payload.get("session_id")
-            if isinstance(run_id, str) and isinstance(session_id, str) and session_id:
-                run_sessions[run_id] = session_id
+        def load_run_sessions() -> dict[str, str]:
+            result: dict[str, str] = {}
+            for path in runs_dir.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                run_id = payload.get("run_id") or path.stem
+                session_id = payload.get("session_id")
+                if isinstance(run_id, str) and isinstance(session_id, str) and session_id:
+                    result[run_id] = session_id
+            return result
+
+        run_sessions = await asyncio.to_thread(load_run_sessions)
 
         if not run_sessions:
             return await self._sync_message_estimates(await self._db_provider())
 
         db = await self._db_provider()
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS observability_trace_cursors (
+                run_id TEXT PRIMARY KEY,
+                byte_offset INTEGER NOT NULL DEFAULT 0,
+                project_path TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT 'unknown',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
         # Old traces may reference sessions deleted since; importing them would
         # violate the sessions FK, so they are skipped up front.
         try:
@@ -251,13 +267,55 @@ class TokenStatsService:
         except aiosqlite.OperationalError:
             session_rows = []
         known_sessions = {str(row["id"]) for row in session_rows}
+        cursor_rows = await db.execute_fetchall(
+            """
+            SELECT run_id, byte_offset, project_path, model
+            FROM observability_trace_cursors
+            """
+        )
+        cursors = {
+            str(row["run_id"]): {
+                "byte_offset": max(0, int(row["byte_offset"] or 0)),
+                "project_path": str(row["project_path"] or ""),
+                "model": str(row["model"] or "unknown"),
+            }
+            for row in cursor_rows
+        }
+        available_trace_ids = set(
+            await asyncio.to_thread(self._observability.list_trace_run_ids)
+        )
+        eligible_run_ids = [
+            run_id
+            for run_id, session_id in run_sessions.items()
+            if session_id in known_sessions and run_id in available_trace_ids
+        ]
+        stale_cursor_ids = set(cursors).difference(available_trace_ids)
+        if stale_cursor_ids:
+            await db.executemany(
+                "DELETE FROM observability_trace_cursors WHERE run_id=?",
+                [(run_id,) for run_id in stale_cursor_ids],
+            )
+
+        def read_new_trace_records():
+            batches = []
+            for run_id in eligible_run_ids:
+                cursor = cursors.get(run_id, {})
+                records, next_offset = self._observability.read_trace_from(
+                    run_id,
+                    offset=int(cursor.get("byte_offset") or 0),
+                )
+                batches.append((run_id, records, next_offset))
+            return batches
+
+        trace_batches = await asyncio.to_thread(read_new_trace_records)
         imported = 0
-        for run_id, records in self._observability.iter_traces():
+        for run_id, records, next_offset in trace_batches:
             session_id = run_sessions.get(run_id)
             if not session_id or session_id not in known_sessions:
                 continue
-            project_path = ""
-            model = "unknown"
+            cursor_state = cursors.get(run_id, {})
+            project_path = str(cursor_state.get("project_path") or "")
+            model = str(cursor_state.get("model") or "unknown")
             for line_number, record in enumerate(records, start=1):
                 event_type = record.get("type")
                 data = record.get("data")
@@ -310,6 +368,19 @@ class TokenStatsService:
                     ),
                 )
                 imported += max(cursor.rowcount, 0)
+            await db.execute(
+                """
+                INSERT INTO observability_trace_cursors (
+                    run_id, byte_offset, project_path, model, updated_at
+                ) VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(run_id) DO UPDATE SET
+                    byte_offset=excluded.byte_offset,
+                    project_path=excluded.project_path,
+                    model=excluded.model,
+                    updated_at=excluded.updated_at
+                """,
+                (run_id, max(0, next_offset), project_path, model),
+            )
         await db.commit()
         return imported + await self._sync_message_estimates(db)
 

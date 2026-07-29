@@ -434,6 +434,65 @@ def test_streamable_http_transport_accepts_sse_request_response():
     assert asyncio.run(run()) == []
 
 
+@pytest.mark.parametrize("payload", [None, []])
+def test_streamable_http_transport_rejects_non_object_jsonrpc_response(
+    payload: object,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        if payload is None:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=b"null",
+            )
+        return httpx.Response(200, json=payload)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as http_client:
+            transport = StreamableHTTPMCPTransport(
+                "https://mcp.example.test/mcp",
+                http_client=http_client,
+            )
+            try:
+                await transport.send_request("tools/list", {})
+            finally:
+                await transport.close()
+
+    with pytest.raises(RuntimeError, match="response must be a JSON object"):
+        asyncio.run(run())
+
+
+def test_streamable_http_transport_rejects_non_object_mcp_result() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        request_id = json.loads(request.content.decode())["id"]
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": request_id, "result": None},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as http_client:
+            transport = StreamableHTTPMCPTransport(
+                "https://mcp.example.test/mcp",
+                http_client=http_client,
+            )
+            try:
+                await transport.send_request("tools/list", {})
+            finally:
+                await transport.close()
+
+    with pytest.raises(RuntimeError, match="result must be a JSON object"):
+        asyncio.run(run())
+
+
 def test_streamable_http_transport_rejects_oversized_json_response():
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content.decode())

@@ -21,6 +21,7 @@ tools:
     - grep
     - shell
     - git_ops
+    - skill_manage
     - todo
     - web_search
     - web_fetch

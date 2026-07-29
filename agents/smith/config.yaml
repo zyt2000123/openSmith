@@ -24,5 +24,6 @@ tools:
     - web_fetch
     - web_crawl
     - git_ops
+    - skill_manage
     - todo
     - render_ui

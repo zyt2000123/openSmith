@@ -454,7 +454,11 @@ route_decided → skill_start → tool_call_start/tool_call_result …
 → gate_result → skill_end | backtrack | blocked → text_delta → done
 ```
 
-设计点：**引擎产出结构化事件，翻译和留存由观测层处理**。执行层仅通过 `RunObservation` 写入事件与 prompt manifest；它内部以 best-effort 方式写入 owner-only 的 JSONL trace，在终态以原子文件保存不含原始 payload 的 `RunSummary`，并将事件投影给执行控制面的 `RunStateStore`。服务层仅通过 `ObservabilityReader` 查询摘要、trace、`Run Incident`、结构化 RCA、跨 Run 的健康度和改进提案；IncidentDetector 根据摘要和脱敏 trace 归类预算耗尽、运行失败、重复回退及工具超时等可行动信号，RunDiagnoser 则返回失败节点、证据和保守建议，HealthCalculator 汇总成功率、工具成功率、回退和 token 成本，ImprovementProposer 只生成必须经 approval gate 批准的建议，绝不自动改配置。`reply_stream` 把事件翻成文本标记（`[⚙ planning]`、`[门禁: pass]`、`[↩ 回退: …]`）供纯文本客户端；SSE 端点可以原样透传给富客户端渲染进度树。
+设计点：**引擎产出结构化事件，翻译和留存由观测层处理**。执行层仅通过 `RunObservation` 写入事件与 prompt manifest；它内部以 best-effort 方式写入 owner-only 的 JSONL trace，在终态以原子文件保存不含原始 payload 的 `RunSummary`，并将事件投影给执行控制面的 `RunStateStore`。`observability/index.py` 用轻量 SQLite 索引保存已完成 Run 的查询元数据，列表查询先由索引选出 Run，再读取对应摘要，避免随着历史增长反复扫描并反序列化全部文件。Token 统计使用持久化的 trace 字节游标，只导入上次游标之后的新事件。
+
+摘要和 trace 默认最多保留 2,000 个已完成 Run、90 天和 512 MiB；可分别通过 `AGENT_SMITH_OBSERVABILITY_MAX_RUNS`、`AGENT_SMITH_OBSERVABILITY_MAX_AGE_DAYS`、`AGENT_SMITH_OBSERVABILITY_MAX_BYTES` 调整，设为 `0` 可关闭对应上限。容量策略至少保留最新一条诊断证据；清理范围仅限已完成 Run 的摘要与 trace，不删除运行状态和执行账本。
+
+服务层仅通过 `ObservabilityReader` 查询摘要、trace、`Run Incident`、结构化 RCA、跨 Run 的健康度和改进提案；IncidentDetector 根据摘要和脱敏 trace 归类预算耗尽、运行失败、重复回退及工具超时等可行动信号，RunDiagnoser 则返回失败节点、证据和保守建议，HealthCalculator 汇总成功率、工具成功率、回退和 token 成本，ImprovementProposer 只生成必须经 approval gate 批准的建议，绝不自动改配置。`reply_stream` 把事件翻成文本标记（`[⚙ planning]`、`[门禁: pass]`、`[↩ 回退: …]`）供纯文本客户端；SSE 端点可以原样透传给富客户端渲染进度树。
 
 ---
 
@@ -753,6 +757,7 @@ from engine.execution import (
 | 可观测性 | `engine/observability/recorder.py` | — | 记录边界与执行控制投影扇出 |
 | 可观测性 | `engine/observability/runtime.py` | — | 由组合根注入的 RunObservation Adapter |
 | 可观测性 | `engine/observability/reader.py` | — | 服务层唯一查询门面 ObservabilityReader |
+| 可观测性 | `engine/observability/index.py` | — | 已完成 Run 的 SQLite 元数据索引与保留策略 |
 | 可观测性 | `engine/observability/incidents.py` | — | 从摘要与脱敏 trace 派生 Run Incident |
 | 可观测性 | `engine/observability/diagnosis.py` | — | 结构化 RCA：失败节点、证据和建议 |
 | 可观测性 | `engine/observability/health.py` | — | 跨 Run 健康度与成本指标 |

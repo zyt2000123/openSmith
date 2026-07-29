@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
 import json
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
 import pytest
 import pytest_asyncio
-
 from app.services.token_stats_service import TokenStatsService
 
 
@@ -235,10 +234,34 @@ async def test_sync_from_traces_imports_exact_usage_once(tmp_path: Path) -> None
 
     service = TokenStatsService(db_provider, trace_root=tmp_path)
     assert await service.sync_from_traces() == 1
+    cursor_row = await db.execute_fetchall(
+        """
+        SELECT byte_offset, project_path, model
+        FROM observability_trace_cursors
+        WHERE run_id='run-1'
+        """
+    )
+    assert len(cursor_row) == 1
+    assert cursor_row[0]["byte_offset"] > 0
+    assert cursor_row[0]["project_path"] == "/tmp/demo-project"
+    assert cursor_row[0]["model"] == "gpt-test"
+
+    with (traces / "run-1.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({
+                "seq": 4,
+                "timestamp": "2026-07-14T10:00:03+00:00",
+                "type": "token_usage",
+                "data": {"input_tokens": 40, "output_tokens": 10, "total_tokens": 50},
+            })
+            + "\n"
+        )
+
+    assert await service.sync_from_traces() == 1
     assert await service.sync_from_traces() == 0
 
     stats = await service.get_stats("agent-1", year=2026)
-    assert stats["total_tokens"] == 125
+    assert stats["total_tokens"] == 175
     assert stats["favorite_model"] == "gpt-test"
     async with db.execute("SELECT project_name, project_path FROM token_usage_events") as cursor:
         row = await cursor.fetchone()

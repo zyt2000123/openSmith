@@ -6,15 +6,20 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from engine.execution.orchestration.builtin_tools import MemoryToolApi
+from engine.execution.orchestration.builtin_tools import (
+    MemoryToolApi,
+    bind_skill_manage_tool,
+)
 from engine.execution.orchestration.preparation import enabled_tools_from_config
 from engine.identity import IdentitySpec
 from engine.sandbox import MacOSSeatbeltEnvironment
+from engine.skill import SkillRegistry
 from engine.tool.interface import ToolCall
 from engine.tool.registry import ToolRegistry
 
@@ -133,6 +138,82 @@ def test_skill_manage_uses_the_runtime_selected_agent_storage() -> None:
     parameters = meta["parameters"]
     assert "agent_id" not in parameters["properties"]
     assert parameters["required"] == ["action"]
+    assert meta["hidden"] is False
+    assert meta["approval_policy"] == "policy"
+    assert meta["read_actions"] == ["list", "get", "versions"]
+
+
+def test_skill_manage_refreshes_the_active_runtime_catalog(tmp_path: Path) -> None:
+    tool_registry = ToolRegistry()
+    tool_registry.load_providers(ROOT / "agents" / "tools")
+    skill_registry = SkillRegistry()
+    services = SimpleNamespace(
+        tool_registry=tool_registry,
+        skill_registry=skill_registry,
+    )
+    bind_skill_manage_tool(services, tmp_path)
+
+    content = """\
+---
+name: incident-notes
+description: Capture a verified incident note.
+version: 0.1.0
+---
+
+# Incident Notes
+
+Record only evidence-backed incident outcomes.
+"""
+
+    async def run():
+        return await tool_registry.execute(ToolCall(
+            id="create-skill",
+            name="skill_manage",
+            arguments={
+                "action": "create",
+                "skill_name": "incident-notes",
+                "content": content,
+            },
+        ))
+
+    result = asyncio.run(run())
+    loaded = skill_registry.get("incident-notes")
+
+    assert not result.is_error
+    assert loaded is not None
+    assert "evidence-backed incident outcomes" in loaded.content
+
+
+def test_skill_manage_rejects_content_declared_under_another_name(
+    tmp_path: Path,
+) -> None:
+    tool_registry = ToolRegistry()
+    tool_registry.load_providers(ROOT / "agents" / "tools")
+    skill_registry = SkillRegistry()
+    services = SimpleNamespace(
+        tool_registry=tool_registry,
+        skill_registry=skill_registry,
+    )
+    bind_skill_manage_tool(services, tmp_path)
+
+    async def run():
+        return await tool_registry.execute(ToolCall(
+            id="create-mismatched-skill",
+            name="skill_manage",
+            arguments={
+                "action": "create",
+                "skill_name": "requested-name",
+                "content": "---\nname: declared-name\n---\nBody",
+            },
+        ))
+
+    result = asyncio.run(run())
+
+    assert result.is_error
+    assert "must match skill_name 'requested-name'" in result.content
+    assert not (tmp_path / "skills" / "requested-name").exists()
+    assert skill_registry.get("requested-name") is None
+    assert skill_registry.get("declared-name") is None
 
 
 def test_todo_persists_by_injected_session_file(tmp_path):
@@ -224,6 +305,120 @@ def test_git_worktree_creation_stays_under_the_selected_repository(tmp_path, mon
     expected = repo_dir / ".agent-smith-worktrees" / "feature_demo"
     assert str(expected) in result
     assert recorded[-1] == (["worktree", "add", str(expected), "-b", "feature/demo"], str(repo_dir))
+
+
+def test_git_operations_do_not_delegate_runtime_secrets(tmp_path, monkeypatch):
+    git_ops = _load_tool_module("git_ops")
+    monkeypatch.setenv("AGENT_SMITH_PROVIDER_SECRET", "must-not-reach-git")
+    environments: list[dict[str, str] | None] = []
+
+    class RecordingEnvironment:
+        async def run_command(
+            self,
+            command=None,
+            *,
+            argv=None,
+            cwd=None,
+            timeout_seconds=30.0,
+            env=None,
+        ):
+            environments.append(env)
+            return SimpleNamespace(
+                timed_out=False,
+                error=None,
+                exit_code=0,
+                stdout="",
+                stderr="",
+            )
+
+    result = asyncio.run(
+        git_ops.execute(
+            action="status",
+            cwd=str(tmp_path),
+            environment=RecordingEnvironment(),
+        )
+    )
+
+    assert result.startswith("[exit_code=0]")
+    assert environments
+    assert all(environment is not None for environment in environments)
+    assert all(
+        "AGENT_SMITH_PROVIDER_SECRET" not in environment
+        for environment in environments
+        if environment is not None
+    )
+    assert all(
+        environment["HOME"] == str(tmp_path)
+        and environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        for environment in environments
+        if environment is not None
+    )
+
+
+def test_blocking_search_does_not_stall_the_engine_event_loop(tmp_path, monkeypatch):
+    grep_tool = _load_tool_module("grep")
+
+    def slow_subprocess(*args, **kwargs):
+        time.sleep(0.25)
+        return SimpleNamespace(returncode=0, stdout="sample.py:1:match\n", stderr="")
+
+    monkeypatch.setattr(grep_tool.subprocess, "run", slow_subprocess)
+    registry = ToolRegistry()
+    registry.register(
+        "grep",
+        "",
+        grep_tool.TOOL_META["parameters"],
+        grep_tool.execute,
+    )
+
+    async def run():
+        call = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    id="grep-1",
+                    name="grep",
+                    arguments={"pattern": "match", "path": str(tmp_path)},
+                )
+            )
+        )
+        started = time.monotonic()
+        await asyncio.sleep(0.05)
+        heartbeat_elapsed = time.monotonic() - started
+        return heartbeat_elapsed, await call
+
+    heartbeat_elapsed, result = asyncio.run(run())
+
+    assert heartbeat_elapsed < 0.15
+    assert not result.is_error
+    assert "sample.py:1:match" in result.content
+
+
+def test_web_fetch_validation_does_not_stall_the_engine_event_loop(monkeypatch):
+    web_fetch_tool = _load_tool_module("web_fetch")
+
+    def slow_validation(url: str) -> None:
+        time.sleep(0.25)
+        return None
+
+    async def successful_fetch(url: str, timeout: int) -> str:
+        return "OK"
+
+    monkeypatch.setattr(web_fetch_tool, "_validate_url", slow_validation)
+    monkeypatch.setattr(web_fetch_tool, "_fetch_plain", successful_fetch)
+
+    async def run():
+        call = asyncio.create_task(
+            web_fetch_tool.execute(url="https://example.com", timeout=1)
+        )
+        started = time.monotonic()
+        await asyncio.sleep(0.05)
+        heartbeat_elapsed = time.monotonic() - started
+        return heartbeat_elapsed, await call
+
+    heartbeat_elapsed, result = asyncio.run(run())
+
+    assert heartbeat_elapsed < 0.15
+    assert result == "OK"
 
 
 
@@ -708,7 +903,7 @@ def test_agent_tool_config_hides_internal_and_stale_tools_by_default():
             "",
             {},
             lambda: "OK",
-            hidden=name in {"skill_load", "skill_manage", "memory_ops"},
+            hidden=name in {"skill_load", "memory_ops"},
         )
 
     enabled = enabled_tools_from_config(
@@ -737,7 +932,7 @@ def test_agent_tool_config_hides_internal_and_stale_tools_by_default():
         ),
     )
 
-    assert enabled == ["read_file", "todo"]
+    assert enabled == ["read_file", "skill_manage", "todo"]
 
 
 def test_skill_load_uses_the_injected_runtime_catalog() -> None:
