@@ -130,10 +130,11 @@ class AgentService:
     def memory_maintenance(self) -> MemoryMaintenanceOut:
         """Report deferred memory maintenance so a client can show it.
 
-        Compilation and dreaming are scheduled as background tasks that outlive
-        the turn scheduling them, so no per-run event stream can carry their
-        state. Intentionally synchronous and LLM-free: reading a few marker
-        files must not build provider clients.
+        Compilation, periodic candidate curation, and dreaming are scheduled
+        as background tasks that outlive the turn scheduling them, so no
+        per-run event stream can carry their state. Intentionally synchronous
+        and LLM-free: reading a few marker files must not build provider
+        clients.
         """
         from engine.memory import memory_maintenance_status
 

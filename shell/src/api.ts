@@ -129,6 +129,7 @@ export type MaintenanceState = "idle" | "pending" | "running";
 
 export type MemoryMaintenance = {
   compile: MaintenanceState;
+  nudge: MaintenanceState;
   dream: MaintenanceState;
 };
 
@@ -466,8 +467,9 @@ export async function listSkills(baseUrl: string): Promise<SkillSummary[]> {
 /**
  * Deferred memory maintenance state.
  *
- * Compilation and dreaming run as background tasks that outlive the turn that
- * scheduled them, so no per-run SSE stream can carry their state — it is polled.
+ * Compilation, periodic candidate curation, and dreaming run as background
+ * tasks that outlive the turn that scheduled them, so no per-run SSE stream
+ * can carry their state — it is polled.
  */
 export async function fetchMemoryMaintenance(baseUrl: string): Promise<MemoryMaintenance> {
   return request<MemoryMaintenance>(baseUrl, "/api/agent/memory/status");

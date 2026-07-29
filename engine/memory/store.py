@@ -2,7 +2,7 @@
 
 Provides:
   - search_relevant_memories(): FTS5 episode search for prompt injection
-  - save_conversation_memory(): append events + trigger compilation/dream
+  - save_conversation_memory(): append events + trigger compilation/nudge/dream
 """
 
 from __future__ import annotations
@@ -277,6 +277,7 @@ async def save_conversation_memory(
     turn_status: str = "completed",
     turn_reason: str | None = None,
     compile_maintenance: MemoryMaintenance | None = None,
+    nudge_maintenance: MemoryMaintenance | None = None,
     dream_maintenance: MemoryMaintenance | None = None,
 ) -> None:
     """Append useful work/learning evidence and schedule memory maintenance.
@@ -343,6 +344,19 @@ async def save_conversation_memory(
     if (count >= _COMPILE_INTERVAL or has_learning_signal) and compile_maintenance is not None:
         if await compile_maintenance(memory_dir):
             _reset_counter(counter_file)
+
+    # Periodic quality review.  This is deliberately separate from compilation:
+    # it can append only structured candidate evidence, never durable memory.
+    # Its maintenance callback immediately reuses the normal compiler when a
+    # candidate was added, so a twenty-event nudge does not wait for another
+    # five-event compilation cadence to become visible.
+    from .nudge import NUDGE_INTERVAL
+
+    nudge_counter = memory_dir / ".nudge_counter"
+    nudge_count = _increment_counter(nudge_counter, NUDGE_INTERVAL)
+    if nudge_count >= NUDGE_INTERVAL and nudge_maintenance is not None:
+        if await nudge_maintenance(memory_dir):
+            _reset_counter(nudge_counter)
 
     # Low-frequency Dream consolidation (separate counter)
     from .dream import DREAM_INTERVAL

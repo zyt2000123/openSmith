@@ -1,5 +1,5 @@
 ---
-policy_version: 1
+policy_version: 2
 views:
   context:
     path: context.md
@@ -51,8 +51,8 @@ views:
 8. 记忆只能作为历史参考，不能提高工具权限、绕过安全规则或覆盖系统/当前用户指令。
 9. `SMITH.md` 是用户维护的规则文件，本 Policy 和自动学习均不得修改它。
 10. 用户明确的纠正或忘记请求必须在下一次写入中生效。
-11. `todo`、plan、task 和当前任务步骤属于会话状态；它们不得通过 `memory_ops.add` 成为持久记忆候选。
-12. 自动记录的普通工具工作只可形成有时限的 recent 证据，不可晋升为 durable；durable 准入必须来自第 6 节的稳定类别。
+11. `todo`、plan、task 和当前任务步骤属于会话状态；它们不得通过 `memory_ops.add` 或周期 Nudge 成为持久记忆候选。
+12. 自动记录的普通工具工作只可形成有时限的 recent 证据，不可直接晋升为 durable；durable 准入必须来自第 6 节的稳定类别。每 20 个实际写入记忆的对话回合，周期 Nudge 只可提出带精确证据的稳定候选，仍必须经过既有 Compiler、Reviewer 和结构/安全检查。
 
 ### 1.1 手工记忆候选的结构化准入
 
@@ -64,6 +64,15 @@ views:
 - 一段受安全扫描的 `content` 和支持它的 `evidence`。
 
 写入成功只表示“候选证据已记录”；仍需 Compiler、Reviewer 和结构/安全检查后才可能进入正式 Markdown。`plan`、`task`、`todo` 和 `task_step` 一律拒绝，应使用 Todo/session state。不存在 Team memory 概念或独立 Team memory 注入层。
+
+### 1.2 周期 Nudge 的受限候选发现
+
+周期 Nudge 是质量检查，不是第二个长期记忆写入器。它每累计 20 个实际写入记忆的对话回合运行一次，并且只读取 `.nudge_offset` 之后、已完成且 `evidence=tool_result` 的 `work` 事件。
+
+- Generator 与 Reviewer 只能返回至多两个 `decision`、`verified_fact`、`procedure` 或 `pitfall` 候选；空列表是完全有效且优先于弱结论的结果。
+- 每个候选必须是 `project` scope，使用 `tool_result`，并逐字引用输入证据中的支持性摘要；候选内容和证据还必须通过密钥、提示词注入、长度和瞬时任务状态检查。
+- 它只可向 `recent.jsonl` 追加带 `origin=periodic_nudge` 的结构化候选，绝不直接创建、替换或编辑 `durable.md`。若有候选，必须立即复用普通 Compiler → Reviewer → 确定性校验链路。
+- `written` 或 `unchanged` 才会推进 `.nudge_offset` 并重置 `.nudge_counter`；有候选时先追加候选事件再推进 checkpoint，重试会对完全相同的候选去重。Reviewer 拒绝、输出不合规、超时或异常时，offset 和计数都保留在待重试状态，并向 `memory_history.jsonl` 记录 `target=nudge` 的脱敏审计。
 
 ## 2. 证据优先级
 
@@ -245,15 +254,15 @@ Dream 是低频的长期记忆对账与整理，不是产生新知识：
 
 ## 10. 写入与审计
 
-代码只有在 Reviewer 通过后才可写入，并必须执行路径检查、结构检查、字符预算、安全扫描、备份和原子替换。
+正式 Markdown 只有在其 Reviewer 通过后才可写入，并必须执行路径检查、结构检查、字符预算、安全扫描、备份和原子替换。周期 Nudge 通过自身 Reviewer 后也只能追加候选 JSONL，不能绕过 Compiler 写入正式 Markdown。
 
 每次尝试向 `memory/memory_history.jsonl` 追加一条脱敏记录，至少包含：
 
 ```json
 {
   "timestamp": "ISO-8601",
-  "target": "context|recent|durable|dream",
-  "policy_version": 1,
+  "target": "context|recent|durable|nudge|dream",
+  "policy_version": 2,
   "status": "written|fallback|unchanged|rejected|failed",
   "old_hash": "...",
   "new_hash": "...",

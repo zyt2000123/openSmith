@@ -215,7 +215,7 @@ def test_stream_route_returns_preflight_errors_before_opening_sse() -> None:
 def test_memory_status_route_reports_deferred_maintenance() -> None:
     class FakeAgentService:
         def memory_maintenance(self) -> dict:
-            return {"compile": "idle", "dream": "running"}
+            return {"compile": "idle", "nudge": "running", "dream": "running"}
 
     app = FastAPI()
     app.include_router(router)
@@ -225,7 +225,11 @@ def test_memory_status_route_reports_deferred_maintenance() -> None:
         response = client.get("/api/agent/memory/status")
 
     assert response.status_code == 200
-    assert response.json() == {"compile": "idle", "dream": "running"}
+    assert response.json() == {
+        "compile": "idle",
+        "nudge": "running",
+        "dream": "running",
+    }
 
 
 def test_memory_status_rejects_an_unknown_state() -> None:
@@ -233,7 +237,7 @@ def test_memory_status_rejects_an_unknown_state() -> None:
 
     class FakeAgentService:
         def memory_maintenance(self) -> dict:
-            return {"compile": "idle", "dream": "sleepwalking"}
+            return {"compile": "idle", "nudge": "idle", "dream": "sleepwalking"}
 
     app = FastAPI()
     app.include_router(router)

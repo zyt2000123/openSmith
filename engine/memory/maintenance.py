@@ -1,7 +1,8 @@
 """Memory-owned lifecycle maintenance.
 
-This module owns the runtime-facing policy for compilation and dreaming while
-accepting the required LLM clients from the execution composition root.
+This module owns the runtime-facing policy for compilation, periodic candidate
+nudges, and Dream reconciliation while accepting the required LLM clients from
+the execution composition root.
 """
 
 from __future__ import annotations
@@ -22,8 +23,9 @@ logger = logging.getLogger(__name__)
 # work when the runtime owns shared LLM clients.
 _MEMORY_MAINTENANCE_TIMEOUT_SECONDS = 900.0
 _COMPILE_PENDING_FILE = ".compile_pending"
+_NUDGE_PENDING_FILE = ".nudge_pending"
 _DREAM_PENDING_FILE = ".dream_pending"
-MAINTENANCE_KINDS: tuple[str, ...] = ("compile", "dream")
+MAINTENANCE_KINDS: tuple[str, ...] = ("compile", "nudge", "dream")
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,11 @@ class MemoryMaintenanceService:
                     if self.defer_maintenance
                     else self._run_dream_unlocked
                 )
+                nudge_maintenance = (
+                    self._schedule_nudge
+                    if self.defer_maintenance
+                    else self._run_nudge_and_compile_unlocked
+                )
                 await save_conversation_memory(
                     agent_dir,
                     user_message,
@@ -73,6 +80,7 @@ class MemoryMaintenanceService:
                     turn_status=turn_status,
                     turn_reason=turn_reason,
                     compile_maintenance=compile_maintenance,
+                    nudge_maintenance=nudge_maintenance,
                     dream_maintenance=dream_maintenance,
                 )
                 return True
@@ -96,11 +104,24 @@ class MemoryMaintenanceService:
                 self._mark_completed("dream", memory_dir)
             return completed
 
+    async def run_nudge(self, memory_dir: Path) -> bool:
+        """Run one periodic candidate-discovery cycle explicitly."""
+        async with self._operation_lock(memory_dir):
+            completed = await self._run_nudge_and_compile_unlocked(memory_dir)
+            if completed:
+                self._mark_completed("nudge", memory_dir)
+            return completed
+
     async def run_idle_maintenance(self, memory_dir: Path) -> bool:
         """Retry only maintenance that was due or previously left pending."""
         async with self._operation_lock(memory_dir):
             compiled = True
+            nudged = True
             dreamed = True
+            if self._is_pending("nudge", memory_dir):
+                nudged = await self._run_nudge_and_compile_unlocked(memory_dir)
+                if nudged:
+                    self._mark_completed("nudge", memory_dir)
             if self._is_pending("compile", memory_dir):
                 compiled = await self._run_compilation_unlocked(memory_dir)
                 if compiled:
@@ -109,7 +130,7 @@ class MemoryMaintenanceService:
                 dreamed = await self._run_dream_unlocked(memory_dir)
                 if dreamed:
                     self._mark_completed("dream", memory_dir)
-            return compiled and dreamed
+            return compiled and nudged and dreamed
 
     async def _run_compilation_unlocked(self, memory_dir: Path) -> bool:
         try:
@@ -140,6 +161,11 @@ class MemoryMaintenanceService:
         self._schedule_background("compile", memory_dir)
         return False
 
+    async def _schedule_nudge(self, memory_dir: Path) -> bool:
+        self._mark_pending("nudge", memory_dir)
+        self._schedule_background("nudge", memory_dir)
+        return False
+
     async def _schedule_dream(self, memory_dir: Path) -> bool:
         self._mark_pending("dream", memory_dir)
         self._schedule_background("dream", memory_dir)
@@ -151,11 +177,12 @@ class MemoryMaintenanceService:
         if existing is not None and not existing.done():
             return
 
-        runner = (
-            self._run_background_compilation
-            if kind == "compile"
-            else self._run_background_dream
-        )
+        runners = {
+            "compile": self._run_background_compilation,
+            "nudge": self._run_background_nudge,
+            "dream": self._run_background_dream,
+        }
+        runner = runners[kind]
         task = asyncio.create_task(runner(memory_dir))
         self._background_tasks[key] = task
 
@@ -175,10 +202,55 @@ class MemoryMaintenanceService:
             if await self._run_compilation_unlocked(memory_dir):
                 self._mark_completed("compile", memory_dir)
 
+    async def _run_background_nudge(self, memory_dir: Path) -> None:
+        async with self._operation_lock(memory_dir):
+            if await self._run_nudge_and_compile_unlocked(memory_dir):
+                self._mark_completed("nudge", memory_dir)
+
     async def _run_background_dream(self, memory_dir: Path) -> None:
         async with self._operation_lock(memory_dir):
             if await self._run_dream_unlocked(memory_dir):
                 self._mark_completed("dream", memory_dir)
+
+    async def _run_nudge_and_compile_unlocked(self, memory_dir: Path) -> bool:
+        """Discover candidates, then reuse the normal compiler if any were found.
+
+        The nudge owns only candidate discovery.  It marks compilation pending
+        and invokes the existing compiler; no code in this method writes a
+        durable view directly.
+        """
+        try:
+            from engine.memory.nudge import run_nudge
+
+            report = await asyncio.wait_for(
+                run_nudge(memory_dir, self.llm, reviewer=self.reviewer),
+                timeout=_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
+            )
+            if not report.completed:
+                reason = report.error or report.status
+                logger.warning("periodic memory nudge did not complete: %s", reason)
+                return False
+            if report.candidates_written:
+                self._mark_pending("compile", memory_dir)
+                if await self._run_compilation_unlocked(memory_dir):
+                    self._mark_completed("compile", memory_dir)
+            return True
+        except Exception as exc:
+            try:
+                from engine.memory.history import append_memory_history
+                from engine.memory.policy import load_memory_policy
+
+                append_memory_history(
+                    memory_dir,
+                    target="nudge",
+                    policy_version=load_memory_policy().version,
+                    status="failed",
+                    error=f"maintenance: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                logger.warning("could not audit periodic nudge failure", exc_info=True)
+            logger.warning("periodic memory nudge failed", exc_info=True)
+            return False
 
     async def wait_for_pending_tasks(self, memory_dir: Path) -> None:
         """Wait for currently scheduled maintenance; primarily useful to callers/tests."""
@@ -237,6 +309,8 @@ class MemoryMaintenanceService:
     def _pending_path(kind: str, memory_dir: Path) -> Path:
         if kind == "compile":
             return memory_dir / _COMPILE_PENDING_FILE
+        if kind == "nudge":
+            return memory_dir / _NUDGE_PENDING_FILE
         if kind == "dream":
             return memory_dir / _DREAM_PENDING_FILE
         raise ValueError(f"unknown memory maintenance kind: {kind}")
@@ -288,6 +362,10 @@ class MemoryMaintenanceService:
                 from engine.memory.store import _COMPILE_INTERVAL
 
                 threshold = _COMPILE_INTERVAL
+            elif kind == "nudge":
+                from engine.memory.nudge import NUDGE_INTERVAL
+
+                threshold = NUDGE_INTERVAL
             elif kind == "dream":
                 from engine.memory.dream import DREAM_INTERVAL
 
