@@ -920,6 +920,7 @@ async def react_event_loop(
                             decision.reason,
                             arguments_summary,
                             tool_description=definition.description if definition else "",
+                            scope=decision.approval_scope,
                         )
                         approval_request = broker.open(
                             ApprovalRequest(
@@ -929,6 +930,7 @@ async def react_event_loop(
                                 level=decision.level.value,
                                 reason=decision.reason,
                                 arguments_summary=arguments_summary,
+                                scope=decision.approval_scope,
                                 presentation=presentation,
                             )
                         )
@@ -945,6 +947,11 @@ async def react_event_loop(
                             "tool": approval_request.tool_name,
                             "arguments": approval_request.arguments_summary,
                             "presentation": presentation.to_dict(),
+                            "scope": (
+                                approval_request.scope.to_dict()
+                                if approval_request.scope is not None
+                                else None
+                            ),
                         })
                         try:
                             approved = await broker.wait(approval_request)
@@ -1017,6 +1024,7 @@ async def react_event_loop(
             with tool_registry.authorize_execution(
                 call,
                 approval_id=granted_approval_id,
+                approval_scope=decision.approval_scope,
             ):
                 result = await tool_registry.execute(call)
             conversation.append({"role": "tool", "tool_call_id": result.call_id, "content": result.content})

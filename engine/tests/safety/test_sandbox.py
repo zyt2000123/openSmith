@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from engine.safety.approval import ApprovalScope
 from engine.sandbox import (
     CommandResult,
     ExecutionEnvironment,
@@ -93,6 +94,61 @@ def test_macos_seatbelt_rejects_a_working_directory_outside_the_workspace(
 
     assert result.exit_code is None
     assert result.error and "escapes workspace" in result.error
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_macos_seatbelt_grants_host_access_only_for_an_approved_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "report.txt").write_text("approved host file\n", encoding="utf-8")
+    runtime = tmp_path / "agent-runtime"
+    runtime.mkdir()
+    (runtime / "config.yaml").write_text("api_key: must-not-leak\n", encoding="utf-8")
+    git_config = workspace / ".git" / "config"
+    git_config.parent.mkdir()
+    git_config.write_text("original\n", encoding="utf-8")
+
+    environment = MacOSSeatbeltEnvironment(
+        workspace=workspace,
+        runtime_secret_paths=[runtime / "config.yaml"],
+    )
+    approved = environment.with_approval_scope(
+        ApprovalScope.host_command("/bin/cat report.txt")
+    )
+
+    denied = asyncio.run(
+        environment.run_command(
+            argv=["/bin/cat", "report.txt"], cwd=str(external)
+        )
+    )
+    allowed = asyncio.run(
+        approved.run_command(
+            argv=["/bin/cat", "report.txt"], cwd=str(external)
+        )
+    )
+    secret = asyncio.run(
+        approved.run_command(
+            argv=["/bin/cat", str(runtime / "config.yaml")], cwd=str(external)
+        )
+    )
+    git_write = asyncio.run(
+        approved.run_command(
+            argv=["/bin/sh", "-c", "printf approved > .git/config"],
+            cwd=str(workspace),
+        )
+    )
+
+    assert denied.exit_code is None
+    assert denied.error and "escapes workspace" in denied.error
+    assert allowed.exit_code == 0, allowed.stderr or allowed.error
+    assert allowed.stdout == "approved host file\n"
+    assert secret.exit_code not in (None, 0)
+    assert "must-not-leak" not in secret.stdout
+    assert git_write.exit_code == 0, git_write.stderr or git_write.error
+    assert git_config.read_text(encoding="utf-8") == "approved"
+    assert "(allow network*)" in approved._profile()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")

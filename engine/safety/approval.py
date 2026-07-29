@@ -10,11 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator
-
 
 # Substring parts, matched against a key stripped of non-alphanumerics, so
 # ``db_password``/``clientSecret``/``auth_token`` redact just like ``password``.
@@ -47,6 +46,91 @@ DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300.0
 
 class ApprovalTimeoutError(TimeoutError):
     """Raised when a run waits too long for an approval decision."""
+
+
+@dataclass(frozen=True)
+class ApprovalScope:
+    """One-time authority requested for an exact normalized tool call.
+
+    The scope is deliberately descriptive rather than a reusable ACL.  The
+    registry binds it to the call fingerprint and approval id before it reaches
+    an execution environment.  This keeps an approved ``shell`` command from
+    becoming a standing host-wide permission for a later model turn.
+    """
+
+    kind: str
+    target: str
+    access: tuple[str, ...]
+    high_risk: bool = False
+
+    @classmethod
+    def host_command(cls, command: str, *, high_risk: bool = False) -> ApprovalScope:
+        return cls(
+            kind="host_command",
+            target=command,
+            access=("filesystem", "network", "process"),
+            high_risk=high_risk,
+        )
+
+    @classmethod
+    def path(
+        cls,
+        target: str,
+        *,
+        writing: bool,
+        high_risk: bool = False,
+    ) -> ApprovalScope:
+        return cls(
+            kind="path",
+            target=target,
+            access=(("read", "write") if writing else ("read",)),
+            high_risk=high_risk,
+        )
+
+    @classmethod
+    def network(cls, target: str, *, high_risk: bool = False) -> ApprovalScope:
+        return cls(
+            kind="network",
+            target=target,
+            access=("network",),
+            high_risk=high_risk,
+        )
+
+    @classmethod
+    def operation(
+        cls,
+        tool_name: str,
+        *,
+        high_risk: bool = False,
+    ) -> ApprovalScope:
+        return cls(
+            kind="tool_operation",
+            target=tool_name,
+            access=("tool",),
+            high_risk=high_risk,
+        )
+
+    @property
+    def grants_host_execution(self) -> bool:
+        return self.kind == "host_command"
+
+    @property
+    def description(self) -> str:
+        if self.kind == "host_command":
+            return "Host filesystem, network, and process access for this exact command"
+        if self.kind == "network":
+            return "Network access to the requested destination"
+        if self.kind == "path":
+            return f"{', '.join(self.access).capitalize()} access to the requested path"
+        return "Access limited to this exact approved request"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "target": self.target,
+            "access": list(self.access),
+            "high_risk": self.high_risk,
+        }
 
 _DETAIL_LABELS = {
     "action": "Action",
@@ -120,7 +204,8 @@ class ApprovalRequest:
     level: str
     reason: str
     arguments_summary: dict[str, object]
-    presentation: "ApprovalPresentation | None" = None
+    scope: ApprovalScope | None = None
+    presentation: ApprovalPresentation | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -131,6 +216,8 @@ class ApprovalRequest:
             "reason": self.reason,
             "arguments": self.arguments_summary,
         }
+        if self.scope is not None:
+            payload["scope"] = self.scope.to_dict()
         if self.presentation is not None:
             payload["presentation"] = self.presentation.to_dict()
         return payload
@@ -290,7 +377,12 @@ def _specific_reason(reason: str, fallback: str) -> str:
     return fallback
 
 
-def _approval_details(tool_name: str, arguments: dict[str, object]) -> tuple[ApprovalDetail, ...]:
+def _approval_details(
+    tool_name: str,
+    arguments: dict[str, object],
+    *,
+    scope: ApprovalScope | None = None,
+) -> tuple[ApprovalDetail, ...]:
     order = {key: index for index, key in enumerate(_DETAIL_ORDER.get(tool_name, ()))}
     entries = [
         (key, value)
@@ -302,6 +394,8 @@ def _approval_details(tool_name: str, arguments: dict[str, object]) -> tuple[App
     for key, value in entries:
         label = _DETAIL_LABELS.get(key, _humanize_name(key))
         details.append(ApprovalDetail(label=label, value=_display_value(value)))
+    if scope is not None:
+        details.append(ApprovalDetail(label="Access scope", value=scope.description))
     return tuple(details)
 
 
@@ -312,6 +406,7 @@ def build_approval_presentation(
     arguments: dict[str, object],
     *,
     tool_description: str = "",
+    scope: ApprovalScope | None = None,
 ) -> ApprovalPresentation:
     """Build a user-facing description from safe, bounded tool arguments."""
     action = str(arguments.get("action") or "").strip().lower()
@@ -356,7 +451,7 @@ def build_approval_presentation(
     return ApprovalPresentation(
         title=title,
         summary=summary,
-        details=_approval_details(tool_name, arguments),
+        details=_approval_details(tool_name, arguments, scope=scope),
         reason=_specific_reason(reason, fallback_reason),
     )
 

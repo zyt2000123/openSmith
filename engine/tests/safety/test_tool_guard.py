@@ -1,6 +1,7 @@
 """platform-protect-001：pip/uv 安装只在涉及平台路径时拦截，用户项目内放行。"""
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -372,7 +373,7 @@ def test_working_directory_restricts_relative_and_absolute_tool_paths(tmp_path: 
     assert absolute.needs_confirmation
 
 
-def test_working_directory_boundary_never_makes_credential_paths_approvable(tmp_path: Path):
+def test_working_directory_turns_user_credential_paths_into_high_risk_approval(tmp_path: Path):
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     guard = _builtin_guard(tmp_path / "missing-rules.json")
@@ -387,8 +388,11 @@ def test_working_directory_boundary_never_makes_credential_paths_approvable(tmp_
     )
 
     assert not result.allowed
-    assert not result.approval_required
+    assert result.approval_required
     assert not result.boundary_block
+    assert result.approval_scope is not None
+    assert result.approval_scope.high_risk
+    assert result.approval_scope.target == str(tmp_path / ".ssh")
 
 
 def test_scoped_guard_rejects_unnormalized_optional_directory_paths(tmp_path: Path):
@@ -525,7 +529,7 @@ def test_working_directory_disables_unconfined_host_shell_execution(tmp_path: Pa
     assert all("requires a sandbox" in result.reason for result in attempts)
 
 
-def test_sensitive_write_remains_hard_blocked_and_not_approvable(tmp_path: Path):
+def test_sensitive_user_write_becomes_high_risk_approval(tmp_path: Path):
     guard = _builtin_guard(tmp_path / "missing-rules.json", allowed_dirs=[tmp_path])
 
     result = guard.check(
@@ -538,7 +542,87 @@ def test_sensitive_write_remains_hard_blocked_and_not_approvable(tmp_path: Path)
 
     assert not result.allowed
     assert result.needs_confirmation
+    assert result.approval_required
+    assert result.approval_scope is not None
+    assert result.approval_scope.high_risk
+
+
+def test_dangerous_command_becomes_high_risk_approval_not_a_policy_denial():
+    result = _check("rm -rf ./generated")
+
+    assert not result.allowed
+    assert result.approval_required
+    assert result.needs_confirmation
+    assert result.level is PermissionLevel.DESTRUCTIVE
+    assert result.approval_scope is not None
+    assert result.approval_scope.kind == "host_command"
+    assert result.approval_scope.high_risk
+
+
+def test_sensitive_system_file_is_classified_before_generic_path_boundary():
+    result = _check_tool("read_file", {"path": "/etc/shadow"})
+
+    assert not result.allowed
+    assert result.approval_required
+    assert result.approval_scope is not None
+    assert result.approval_scope.high_risk
+    assert "sens-file-001" in result.reason
+
+
+def test_runtime_provider_configuration_is_non_delegable_even_after_user_approval(tmp_path: Path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    guard = _builtin_guard(tmp_path / "missing-rules.json")
+    guard.set_working_directory(project_dir)
+
+    result = guard.check(
+        ToolCall(
+            id="runtime-config",
+            name="read_file",
+            arguments={"path": str(Path.home() / ".agent-smith" / "config.yaml")},
+        )
+    )
+
+    assert not result.allowed
     assert not result.approval_required
+    assert "runtime credential" in result.reason.lower()
+
+
+def test_runtime_provider_configuration_hardlink_alias_is_not_approvable(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import engine.safety.tool_guard as tool_guard_module
+
+    runtime_config = tmp_path / "agent-runtime" / "config.yaml"
+    runtime_config.parent.mkdir()
+    runtime_config.write_text("api_key: must-not-delegate\n", encoding="utf-8")
+    alias = tmp_path / "apparently-user-owned.txt"
+    os.link(runtime_config, alias)
+    monkeypatch.setattr(
+        tool_guard_module,
+        "_RUNTIME_CREDENTIAL_PATHS",
+        frozenset({runtime_config.resolve()}),
+    )
+    guard = _builtin_guard(tmp_path / "missing-rules.json", allowed_dirs=[tmp_path])
+
+    result = guard.check(
+        ToolCall(id="runtime-alias", name="read_file", arguments={"path": str(alias)})
+    )
+
+    assert not result.allowed
+    assert not result.approval_required
+    assert "hard-link alias" in result.reason
+
+
+def test_network_tools_request_an_exact_user_approval():
+    result = _check_tool("web_fetch", {"url": "https://example.com/report"})
+
+    assert result.allowed
+    assert result.approval_required
+    assert result.approval_scope is not None
+    assert result.approval_scope.kind == "network"
+    assert result.approval_scope.target == "https://example.com/report"
 
 
 def test_dollar_anchored_rule_patterns_match_raw_argument_values():

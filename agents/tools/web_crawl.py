@@ -44,6 +44,7 @@ TOOL_META = {
     },
     "path_args": ["state_path"],
     "permission_level": "write",
+    "network_access": True,
     "approval_policy": "policy",
     "side_effect": "write",
     "execution_environment": "host",

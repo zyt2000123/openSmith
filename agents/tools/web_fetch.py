@@ -36,6 +36,7 @@ TOOL_META = {
         "required": ["url"]
     },
     "permission_level": "read",
+    "network_access": True,
     "approval_policy": "never",
     "side_effect": "none",
     "execution_environment": "host",

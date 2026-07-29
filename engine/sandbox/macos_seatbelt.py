@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 import stat
 import sys
+from collections.abc import Iterable
 from itertools import pairwise
 from pathlib import Path
 
@@ -19,6 +21,12 @@ _CREDENTIAL_DIRECTORIES = frozenset(
 _CREDENTIAL_CONFIGS = frozenset({".npmrc", ".pypirc", ".netrc", ".git-credentials"})
 _PRIVATE_KEY_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx"})
 _PRIVATE_KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
+_DEFAULT_RUNTIME_SECRET_PATHS = (
+    Path.home() / ".agent-smith" / "config.yaml",
+    Path.home() / ".agent-smith" / "config.yml",
+    Path.home() / ".agent-smith" / "agent" / "config.yaml",
+    Path.home() / ".agent-smith" / "agent" / "config.yml",
+)
 
 
 def _is_sensitive_data_path(path: Path) -> bool:
@@ -48,16 +56,24 @@ def _is_hardlink_protected_path(path: Path) -> bool:
 class MacOSSeatbeltEnvironment:
     """Run commands under a deny-by-default Seatbelt profile.
 
-    The workspace is the only writable location, with credential data and Git
-    metadata protected even inside it. Network access is explicitly denied.
-    A preflight rejects hard-link aliases that a path-based profile cannot
-    distinguish. This backend fails closed on a non-macOS host or when
-    ``sandbox-exec`` is unavailable.
+    By default the workspace is the only writable location, credential data
+    and Git metadata remain protected, and network access is denied. A matching
+    approved host-command capability creates a copy with temporary host access
+    while still denying Agent-Smith runtime credential paths and inherited
+    service credentials. A preflight rejects hard-link aliases that a
+    path-based profile cannot distinguish. This backend fails closed on a
+    non-macOS host or when ``sandbox-exec`` is unavailable.
     """
 
     name = "sandbox"
 
-    def __init__(self, *, workspace: str | Path) -> None:
+    def __init__(
+        self,
+        *,
+        workspace: str | Path,
+        runtime_secret_paths: Iterable[str | Path] | None = None,
+        approved_host_access: bool = False,
+    ) -> None:
         self._workspace = Path(workspace).expanduser().resolve()
         if any(
             ord(character) < 32 or ord(character) == 127
@@ -68,9 +84,54 @@ class MacOSSeatbeltEnvironment:
             raise ValueError(
                 f"sandbox workspace is inside a protected directory: {self._workspace}"
             )
+        configured_secrets = (
+            _DEFAULT_RUNTIME_SECRET_PATHS
+            if runtime_secret_paths is None
+            else tuple(runtime_secret_paths)
+        )
+        self._runtime_secret_paths = tuple(
+            Path(path).expanduser().resolve() for path in configured_secrets
+        )
+        if any(
+            ord(character) < 32 or ord(character) == 127
+            for path in self._runtime_secret_paths
+            for character in str(path)
+        ):
+            raise ValueError("runtime secret path contains control characters")
+        self._approved_host_access = approved_host_access
         self._host = LocalExecutionEnvironment()
 
+    def with_approval_scope(self, scope: object) -> MacOSSeatbeltEnvironment:
+        """Return a one-call environment matching an exact approved host scope.
+
+        ToolRegistry calls this only after binding *scope* to a normalized call
+        and a broker-issued approval id. This method turns that verified
+        capability into an OS profile without mutating the default sandbox.
+        """
+        if not bool(getattr(scope, "grants_host_execution", False)):
+            return self
+        # Preserve subclasses used by alternate backends and contract tests.
+        # Reconstructing ``MacOSSeatbeltEnvironment`` directly would silently
+        # discard their instrumentation or additional execution controls.
+        scoped = copy.copy(self)
+        scoped._approved_host_access = True
+        return scoped
+
     def _profile(self) -> str:
+        if self._approved_host_access:
+            runtime_denies = "\n".join(
+                "(deny file-read* file-write* "
+                f"(literal (param \"RUNTIME_SECRET_{index}\")))"
+                for index, _ in enumerate(self._runtime_secret_paths)
+            )
+            return f"""(version 1)
+(deny default)
+(import "system.sb")
+(allow process*)
+(allow network*)
+(allow file-read* file-write*)
+{runtime_denies}
+"""
         # ``system.sb`` supplies the narrow macOS runtime grants needed by
         # dynamically linked command-line programs.  The enclosing default
         # deny still blocks arbitrary files, writes, and networking; the
@@ -121,6 +182,8 @@ class MacOSSeatbeltEnvironment:
 
     def _validate_cwd(self, cwd: str | None) -> tuple[str | None, str | None]:
         resolved = Path(cwd).expanduser().resolve() if cwd else self._workspace
+        if self._approved_host_access:
+            return str(resolved), None
         try:
             resolved.relative_to(self._workspace)
         except ValueError:
@@ -131,7 +194,7 @@ class MacOSSeatbeltEnvironment:
         """Build the complete child environment; never inherit server secrets."""
         environment = {
             "PATH": os.defpath,
-            "HOME": str(self._workspace),
+            "HOME": str(Path.home() if self._approved_host_access else self._workspace),
             "TMPDIR": str(self._workspace),
             "GIT_CONFIG_GLOBAL": os.devnull,
             "PIP_CONFIG_FILE": os.devnull,
@@ -252,6 +315,8 @@ class MacOSSeatbeltEnvironment:
             "-p",
             self._profile(),
         ]
+        for index, runtime_secret_path in enumerate(self._runtime_secret_paths):
+            wrapped_argv[1:1] = ["-D", f"RUNTIME_SECRET_{index}={runtime_secret_path}"]
         if command is not None:
             # The execution environment is already constructed explicitly in
             # ``_safe_environment``.  A login shell tries to load host startup
