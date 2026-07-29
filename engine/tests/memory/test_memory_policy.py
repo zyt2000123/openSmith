@@ -110,7 +110,7 @@ def _write_event(memory_dir: Path, **overrides: object) -> None:
 def test_memory_policy_loads_one_canonical_three_view_contract(tmp_path: Path) -> None:
     policy = load_memory_policy()
 
-    assert policy.version == 1
+    assert policy.version == 2
     assert set(policy.views) == {"context", "recent", "durable"}
     assert resolve_view_path(policy, tmp_path, "context") == tmp_path / "context.md"
     assert resolve_view_path(policy, tmp_path, "recent") == tmp_path / "memory" / "recent.md"

@@ -20,10 +20,14 @@ Smith 是唯一运行中的 Agent。记忆模块的目标不是保存更多聊�
 对话结束
   → agent_loop 提取工具活动和学习信号
   → store 将已清洗证据追加到 recent.jsonl
-  → Compiler 按 MemoryPolicy 生成一个完整 Markdown 草稿
-  → Reviewer 按同一份 MemoryPolicy、旧文件和证据审核
-  → 通过：确定性代码校验、备份并原子替换
-  → 拒绝/超时/异常：保留旧文件并记录审计结果
+  → 每 5 个有效记忆回合（或显式学习信号）：Compiler 按 MemoryPolicy 生成完整 Markdown 草稿
+      → Reviewer 按同一份 MemoryPolicy、旧文件和证据审核
+      → 通过：确定性代码校验、备份并原子替换
+      → 拒绝/超时/异常：保留旧文件并记录审计结果
+  → 每 20 个有效记忆回合：Nudge 只审阅已完成的工具证据
+      → 无候选：记录 nudge=unchanged，不修改正式记忆
+      → 有受限候选：追加候选事件，再复用 Compiler → Reviewer → 确定性写入链路
+      → 拒绝/超时/异常：保留计数与 checkpoint，记录 nudge 审计后重试
   → 后续对话固定加载 context、加载 recent、按问题召回 durable/episodes
   → 用户纠正、忘记请求和新任务结果再次进入证据流
 ```
@@ -46,6 +50,8 @@ Compiler 和 Reviewer 是两个模型角色。生产运行时分别使用 `Runti
 | `memory/durable.md` | 稳定项目事实、决定、流程和陷阱 | 仅查询命中时加载 |
 | `memory/episodes/*.md` | 可检索的任务经历 | 仅查询命中时加载 |
 | `memory/memory_history.jsonl` | 编译、审核和写入审计 | 不进入回答 Prompt |
+| `memory/.nudge_counter` / `.nudge_offset` | 20 回合质量检查的待触发计数与已审阅证据 checkpoint | 不进入回答 Prompt |
+| `memory/.nudge_pending` | 延迟运行时尚未完成的 Nudge 标记 | 不进入回答 Prompt |
 
 `context.md` 位于 profile 根目录，是因为它属于 Smith 与用户之间的常驻协作上下文；项目记忆位于 `memory/`，便于独立维护、清理和检索。Policy 位于 Python 包内并作为 package data 发布，确保源码运行和 wheel 安装使用同一份规则。
 
@@ -62,6 +68,8 @@ Compiler 和 Reviewer 是两个模型角色。生产运行时分别使用 `Runti
 普通闲聊、一次性问答和没有未来价值的纯聊天不会进入证据日志。
 
 明确学习信号会立即触发一次编译；普通工具工作仍沿用每 5 个有效 turn 编译一次。写入失败时，学习器不会确认信号，下次观察会继续重试。
+
+同一类有效记忆回合每累计 20 次还会触发一次 Nudge。它只从已完成的 `work/tool_result` 证据中寻找可复用的项目结论；空候选是正常结果，候选本身也不能直接改写 `durable.md`。
 
 ### 4.2 事件格式
 
@@ -81,6 +89,8 @@ Compiler 和 Reviewer 是两个模型角色。生产运行时分别使用 `Runti
 
 事件字段超过 16K 字符时保留首尾并显式标记截断。密钥和已知提示词注入行在写入前删除。`recent.jsonl` 是编译证据源，不是直接给回答模型读取的记忆。
 
+周期 Nudge 产生的候选使用普通的稳定 `kind`，并额外标记 `origin: "periodic_nudge"`。它的 `summary` 只保存已验证工具结果中的精确支持性摘录；没有这条摘录、含密钥/注入、或表示当前任务状态的候选都会被拒绝。
+
 ## 5. 三个正式记忆视图
 
 三份 Markdown 的标题、章节、准入规则、字符预算和冲突处理全部定义在 `MEMORY_POLICY.md`。输出文件只保存结果，不复制规则。
@@ -89,7 +99,7 @@ Compiler 和 Reviewer 是两个模型角色。生产运行时分别使用 `Runti
 |---|---|---|---|
 | `context.md` | `scope=user` 的明确信号与稳定模式 | 用完整用户证据更新当前文件 | 4K 字符 |
 | `recent.md` | 近期 work/decision/correction/remember/forget | 完整重建 3 天窗口；无内容时回退 7 天；仍为空则清除 | 8K 字符 |
-| `durable.md` | durable offset 后的项目事实、决定、纠正、记住和忘记证据 | 增量合并到当前文件 | 10K 字符 |
+| `durable.md` | durable offset 后的项目事实、决定、纠正、记住、忘记和受限周期候选 | 增量合并到当前文件 | 10K 字符 |
 
 用户偏好只进入 `context.md`；近期状态只进入 `recent.md`；稳定项目共识只进入 `durable.md`。同一事实更新原条目，不在文件末尾无限追加。
 
@@ -149,8 +159,27 @@ compile_context → compile_recent → compile_durable
 - `.dream_commit.json`：durable 已审核替换、但对应 `.dream_offset` 尚未确认时的恢复日志；只保存旧/新哈希和行 offset，不保存记忆正文；
 - `.dream_cleanup.json`：`recent.jsonl` 已审计前缀的回收日志，保存旧/新日志哈希和 compile、durable、Dream 的目标 offset；启动时优先完成它，避免日志已截断而 offset 尚未同步时重放证据；
 - `.compile_counter`：普通事件编译计数器。
+- `.nudge_counter`：有效记忆回合的质量检查计数器，达到 20 时触发；成功得到空候选或已记录候选才归零。
+- `.nudge_offset`：已经由 Nudge 审阅过的 `recent.jsonl` 行；拒绝、超时或异常时不前进。
+- `.nudge_pending`：共享 LLM 客户端下延迟执行的待处理标记；维护状态将其作为 `nudge=pending` 报告。
 
 `recent.md` 始终基于完整滚动窗口重建，不从 compile offset 截断；`durable.md` 始终从 durable offset 增量读取。只有成功消费的层才更新自己的指纹或 offset，失败后下次继续重试。
+
+### 6.1 周期 Nudge：20 回合的候选质量门
+
+Nudge 的作用是把重复出现、且有工具结果支撑的工作经验送回已有质量链路，而不是让普通工作自动变成长期事实：
+
+```text
+recent.jsonl[.nudge_offset:] 中的 completed work/tool_result
+  → Generator 提出至多两个 project 候选（也可为空）
+  → Reviewer + 精确证据/安全/瞬时任务状态校验
+  → rejected/failed：审计，counter=20，offset 不动，下一次或 idle tick 重试
+  → unchanged：审计，推进 offset，counter=0
+  → written：追加 origin=periodic_nudge 的 JSONL 候选
+      → 既有 Compiler → Reviewer → durable.md 原子写入
+```
+
+候选只允许 `decision`、`verified_fact`、`procedure` 或 `pitfall`，且必须引用输入摘要中的逐字证据。它不能使用 `memory_ops`，不能直接创建 Markdown，也不能把 Todo、计划、当前状态或下一步写入候选。候选事件会先于 `.nudge_offset` 落盘；若在两者之间中断，重试会对完全相同的候选去重，而不会静默跨过证据。若 Compiler 随后失败，候选和 `compile` pending 标记会保留，由既有重试机制处理；Nudge 本身已经完成，不会丢失该批证据。
 
 ## 7. Dream
 
@@ -195,9 +224,10 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆�
 
 | 模块 | 只负责什么 |
 |---|---|
-| `memory/store.py` | 证据写入、计数器调度、durable/episode 召回 |
+| `memory/store.py` | 证据写入、compile/Nudge/Dream 计数器调度、durable/episode 召回 |
 | `memory/policy.py` | 加载唯一 Policy、解析视图配置、校验 Markdown |
 | `memory/compile.py` | 视图筛选、Compiler/Reviewer 调用、指纹与 offset |
+| `memory/nudge.py` | 每 20 个有效记忆回合的受限候选发现、精确证据和安全校验 |
 | `memory/_review.py` | 通用生成—审核重试协议 |
 | `memory/history.py` | 追加脱敏审计记录 |
 | `memory/dream.py` | 低频清洗、durable 与事件增量对账、checkpoint 和受限日志回收 |
@@ -215,6 +245,8 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆�
 | Reviewer 拒绝或缺失 | 不写文件，保留旧视图，记录 `rejected` |
 | Markdown 结构/预算不合规 | 不写文件，记录 `rejected` |
 | 原子写入失败 | 临时文件清理，旧文件保持，记录 `failed` |
+| Nudge 候选为空 | 记录 `nudge=unchanged`，推进 Nudge checkpoint，不写正式记忆 |
+| Nudge 候选不合规、Reviewer 拒绝或提供方失败 | 不追加候选，不写正式记忆，保留 `.nudge_counter=20` 与 offset 供重试 |
 | durable/episode 检索失败 | 本轮不注入对应记忆，回答继续 |
 | 记忆收尾失败 | 当前对话结果不回滚，后续维护重试 |
 
@@ -235,12 +267,14 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆�
 11. durable 不整份常驻，只按当前问题召回匹配条目。
 12. `SMITH.md` 永远不被自动学习修改。
 13. engine、server 回归测试与 wheel package-data 校验通过。
+14. 20 个有效记忆回合后，Nudge 的空候选不会生成 durable 内容；合格候选必须先以 `origin=periodic_nudge` 进入 JSONL，再经既有 Compiler/Reviewer 链路；拒绝或失败时计数保持待重试。
 
 ## 12. 当前限制
 
 - durable 按需召回目前是有界关键词匹配，不是向量语义检索；同义改写可能漏召回。
 - episodes 仍使用本地 FTS5，适合当前小规模数据；规模增长后再评估混合检索。
 - 事件分类使用小型确定性信号集；复杂隐含偏好只有在重复启发式命中或用户明确表达后才进入正式记忆。
+- Nudge 的“是否足够可复用”仍需要 Generator/Reviewer 的语义判断；精确摘录、稳定 kind、确定性安全检查和可重试审计用于限制误判，而不是把 20 回合周期本身当作事实证据。
 - `.bak` 只保存上一个版本；完整变更轨迹依赖 `memory_history.jsonl` 的哈希和原始证据日志。
 
-当前实现基线：2026-07-28。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/memory/test_memory_policy.py`、`engine/tests/memory/test_memory_pipeline.py` 与 `engine/tests/memory/test_memory_maintenance.py` 为准。
+当前实现基线：2026-07-29。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/memory/test_memory_policy.py`、`engine/tests/memory/test_memory_pipeline.py` 与 `engine/tests/memory/test_memory_maintenance.py` 为准。

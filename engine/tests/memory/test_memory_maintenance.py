@@ -83,6 +83,41 @@ class PassReviewer(StaticLLM):
         )
 
 
+class NudgeLLM(StaticLLM):
+    """Return a strict periodic-nudge decision while retaining compiler fixtures."""
+
+    def __init__(self, decision: str, *, durable_text: str | None = None) -> None:
+        super().__init__()
+        self.decision = decision
+        self.durable_text = durable_text
+
+    async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        prefix_cache_key: str | None = None,
+    ) -> ChatResponse:
+        if "Periodic Memory Nudge" in messages[-1]["content"]:
+            self.messages.append(messages)
+            return ChatResponse(text=self.decision)
+        if self.durable_text is not None and "`memory/durable.md`" in messages[-1]["content"]:
+            self.messages.append(messages)
+            return ChatResponse(text=self.durable_text)
+        return await super().chat(messages, tools, prefix_cache_key)
+
+
+class FailingNudgeLLM(StaticLLM):
+    async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        prefix_cache_key: str | None = None,
+    ) -> ChatResponse:
+        if "Periodic Memory Nudge" in messages[-1]["content"]:
+            raise RuntimeError("nudge provider unavailable")
+        return await super().chat(messages, tools, prefix_cache_key)
+
+
 def _record_turn_in_process(agent_dir: str, start) -> None:
     original_read_text = Path.read_text
 
@@ -190,6 +225,285 @@ def test_explicit_toolless_preference_compiles_context_immediately(tmp_path: Pat
     assert (tmp_path / "memory" / ".compile_counter").read_text(
         encoding="utf-8"
     ) == "0"
+
+
+def test_periodic_nudge_runs_after_twenty_events_and_records_no_candidate(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / ".nudge_counter").write_text("19", encoding="utf-8")
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            NudgeLLM('{"candidates": []}'),
+            reviewer=PassReviewer(),
+        ).record_turn(
+            tmp_path,
+            "Run the project test suite",
+            "pytest -q passed: 141 passed",
+            had_tools=True,
+        )
+    )
+
+    assert result is True
+    assert (memory_dir / ".nudge_counter").read_text(encoding="utf-8") == "0"
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert history[-1]["target"] == "nudge"
+    assert history[-1]["status"] == "unchanged"
+    events = [
+        json.loads(line)
+        for line in (memory_dir / "recent.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert [event["kind"] for event in events] == ["work"]
+    assert not (memory_dir / "durable.md").exists()
+
+
+def test_periodic_nudge_candidate_enters_the_existing_compilation_pipeline(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / ".nudge_counter").write_text("19", encoding="utf-8")
+    evidence = (
+        "Engine memory tests require pytest-asyncio; the scoped suite passed "
+        "when that dependency was present."
+    )
+    decision = json.dumps({
+        "candidates": [{
+            "kind": "procedure",
+            "scope": "project",
+            "content": "Use pytest-asyncio when running the Engine memory tests.",
+            "evidence": evidence,
+            "evidence_type": "tool_result",
+        }],
+    })
+    durable_text = """# Durable Project Memory
+
+## Confirmed Facts
+
+## Decisions
+
+## Reusable Procedures
+- **Engine memory tests**: Use pytest-asyncio when running the Engine memory tests.
+
+## Known Pitfalls
+"""
+    llm = NudgeLLM(decision, durable_text=durable_text)
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            llm,
+            reviewer=PassReviewer(),
+        ).record_turn(
+            tmp_path,
+            "Run the project test suite",
+            evidence,
+            had_tools=True,
+        )
+    )
+
+    assert result is True
+    events = [
+        json.loads(line)
+        for line in (memory_dir / "recent.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    candidate = events[-1]
+    assert candidate["kind"] == "procedure"
+    assert candidate["scope"] == "project"
+    assert candidate["origin"] == "periodic_nudge"
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == durable_text
+    assert (memory_dir / ".nudge_offset").read_text(encoding="utf-8") == "1"
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert any(entry["target"] == "nudge" and entry["status"] == "written" for entry in history)
+    assert any(entry["target"] == "durable" for entry in history)
+
+
+def test_periodic_nudge_retry_deduplicates_a_partially_appended_candidate(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    evidence = "Engine memory tests require pytest-asyncio before the suite can pass."
+    candidate_content = "Use pytest-asyncio when running the Engine memory tests."
+    decision = json.dumps({
+        "candidates": [{
+            "kind": "procedure",
+            "scope": "project",
+            "content": candidate_content,
+            "evidence": evidence,
+            "evidence_type": "tool_result",
+        }],
+    })
+    events = [
+        {
+            "task": "Run the project test suite",
+            "summary": evidence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "work",
+            "scope": "project",
+            "evidence": "tool_result",
+        },
+        {
+            "task": f"[nudge] {candidate_content}",
+            "summary": evidence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "procedure",
+            "scope": "project",
+            "evidence": "tool_result",
+            "evidence_type": "tool_result",
+            "origin": "periodic_nudge",
+        },
+    ]
+    (memory_dir / "recent.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (memory_dir / ".nudge_counter").write_text("20", encoding="utf-8")
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            NudgeLLM(decision),
+            reviewer=PassReviewer(),
+        ).run_idle_maintenance(memory_dir)
+    )
+
+    assert result is True
+    stored = [
+        json.loads(line)
+        for line in (memory_dir / "recent.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert len(stored) == 2
+    assert sum(event.get("origin") == "periodic_nudge" for event in stored) == 1
+    assert (memory_dir / ".nudge_offset").read_text(encoding="utf-8") == "2"
+    assert (memory_dir / ".nudge_counter").read_text(encoding="utf-8") == "0"
+
+
+def test_periodic_nudge_rejects_transient_task_state_even_if_reviewer_passes(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / ".nudge_counter").write_text("19", encoding="utf-8")
+    evidence = "The remaining Engine tests still need to be run before release."
+    decision = json.dumps({
+        "candidates": [{
+            "kind": "procedure",
+            "scope": "project",
+            "content": "Next step: run the remaining Engine tests.",
+            "evidence": evidence,
+            "evidence_type": "tool_result",
+        }],
+    })
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            NudgeLLM(decision),
+            reviewer=PassReviewer(),
+        ).record_turn(
+            tmp_path,
+            "Check the release state",
+            evidence,
+            had_tools=True,
+        )
+    )
+
+    assert result is True
+    assert (memory_dir / ".nudge_counter").read_text(encoding="utf-8") == "20"
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert history[-1]["target"] == "nudge"
+    assert history[-1]["status"] == "rejected"
+    events = [
+        json.loads(line)
+        for line in (memory_dir / "recent.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert [event["kind"] for event in events] == ["work"]
+    assert not (memory_dir / "durable.md").exists()
+
+
+def test_periodic_nudge_failure_keeps_the_due_counter_for_retry(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / ".nudge_counter").write_text("19", encoding="utf-8")
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            FailingNudgeLLM(),
+            reviewer=PassReviewer(),
+        ).record_turn(
+            tmp_path,
+            "Run the project test suite",
+            "pytest -q passed: 141 passed",
+            had_tools=True,
+        )
+    )
+
+    assert result is True
+    assert (memory_dir / ".nudge_counter").read_text(encoding="utf-8") == "20"
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert history[-1]["target"] == "nudge"
+    assert history[-1]["status"] == "failed"
+
+
+def test_periodic_nudge_rejects_an_unsafe_offset_checkpoint(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    external_offset = tmp_path / "outside-offset"
+    external_offset.write_text("0", encoding="utf-8")
+    (memory_dir / ".nudge_offset").symlink_to(external_offset)
+    (memory_dir / ".nudge_counter").write_text("19", encoding="utf-8")
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            NudgeLLM('{"candidates": []}'),
+            reviewer=PassReviewer(),
+        ).record_turn(
+            tmp_path,
+            "Run the project test suite",
+            "pytest -q passed: 141 passed",
+            had_tools=True,
+        )
+    )
+
+    assert result is True
+    assert external_offset.read_text(encoding="utf-8") == "0"
+    assert (memory_dir / ".nudge_counter").read_text(encoding="utf-8") == "20"
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert history[-1]["target"] == "nudge"
+    assert history[-1]["status"] == "failed"
 
 
 def test_memory_idle_hook_uses_same_maintenance_service(tmp_path: Path) -> None:
@@ -559,6 +873,7 @@ def test_maintenance_status_reports_idle_for_a_fresh_memory_dir(tmp_path):
 
     assert memory_maintenance_status(tmp_path / "memory") == {
         "compile": "idle",
+        "nudge": "idle",
         "dream": "idle",
     }
 
@@ -575,6 +890,7 @@ def test_maintenance_status_reports_pending_from_the_marker_file(tmp_path):
 
     assert status["dream"] == "pending"
     assert status["compile"] == "idle"
+    assert status["nudge"] == "idle"
 
 
 @pytest.mark.asyncio
