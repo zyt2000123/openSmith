@@ -25,6 +25,7 @@ class EventType(str, Enum):
     ROUTE_DECIDED = "route_decided"
     BACKTRACK = "backtrack"
     BLOCKED = "blocked"
+    AWAITING_INPUT = "awaiting_input"
     TOKEN_USAGE = "token_usage"
     CONTEXT_USAGE = "context_usage"
     CONTEXT_COMPRESSION_START = "context_compression_start"

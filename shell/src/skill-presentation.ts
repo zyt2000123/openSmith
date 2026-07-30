@@ -8,6 +8,7 @@ export type SkillPresentation = {
 const PRESENTATION: Record<SkillState, SkillPresentation> = {
   running: { heading: "Running Agent...", tone: "warning" },
   retry: { heading: "Retrying Agent...", tone: "warning" },
+  waiting: { heading: "Waiting for your input", tone: "warning" },
   done: { heading: "Agent complete", tone: "success" },
   blocked: { heading: "Agent blocked", tone: "warning" },
   error: { heading: "Agent failed", tone: "error" },

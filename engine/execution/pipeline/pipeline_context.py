@@ -20,6 +20,10 @@ CTX_AGENT_ID = "agent_id"
 CTX_SESSION_ID = "session_id"
 CTX_TASK_TYPE = "task_type"
 CTX_FORCED_SKILL = "forced_skill"
+# The initial request stays stable across an intentional ask/answer pause;
+# `user_message` becomes the current response when the chain resumes.
+CTX_CHAIN_REQUEST = "chain_request"
+CTX_USER_RESPONSE = "user_response"
 
 # --- engine-internal (never checkpointed) ----------------------------------
 CTX_STATE_DIR = "_state_dir"

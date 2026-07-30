@@ -46,6 +46,31 @@ test("blocked runs are not described as model output limits", () => {
   );
 });
 
+test("awaiting user input is described as a continuation point, not a failure", () => {
+  assert.equal(
+    terminalStatusMessage("incomplete", "awaiting_user_input"),
+    "Waiting for your input. Reply to continue the workflow.",
+  );
+});
+
+test("awaiting user input does not add a terminal failure notice", () => {
+  const store = createAppStore();
+  const bridge = new NodeBridge(store);
+  const reportTerminalStatus = (
+    bridge as unknown as {
+      reportTerminalStatus: (
+        terminal: { status: "completed" | "failed" | "incomplete"; reason?: string },
+        signal: AbortSignal,
+      ) => void;
+    }
+  ).reportTerminalStatus.bind(bridge);
+
+  reportTerminalStatus({ status: "incomplete", reason: "awaiting_user_input" }, new AbortController().signal);
+
+  assert.equal(store.getState().statusLine, "Waiting for your input. Reply to continue the workflow.");
+  assert.equal(store.getState().transcript.length, 0);
+});
+
 test("frontend message queue is capped and supports removal and clearing", () => {
   const store = createAppStore();
   const bridge = new NodeBridge(store);

@@ -15,6 +15,7 @@ def validate_execution_assets(
     *,
     agents_dir: Path,
     skill_names: Iterable[str],
+    tool_names: Iterable[str] | None = None,
 ) -> None:
     """Validate every shipped identity's executable asset closure.
 
@@ -25,6 +26,7 @@ def validate_execution_assets(
     skill names are all available together.
     """
     available_skills = set(skill_names)
+    available_tools = set(tool_names) if tool_names is not None else None
     gate_content = load_gate_content(agents_dir)
     pipelines = SkillChain.load_pipelines(
         agents_dir / "pipelines",
@@ -37,6 +39,11 @@ def validate_execution_assets(
         allowed_skills = (
             set(identity.enabled_skills)
             if identity.enabled_skills is not None
+            else None
+        )
+        allowed_tools = (
+            set(identity.enabled_tools)
+            if identity.enabled_tools is not None
             else None
         )
         for route in identity.routes:
@@ -58,6 +65,27 @@ def validate_execution_assets(
                     raise IdentityCatalogError(
                         f"Identity {identity.id!r} route {route.id!r} pipeline "
                         f"{route.pipeline!r} uses skills outside its allowlist: {names}"
+                    )
+            required_tools = {
+                tool_name
+                for node in chain.nodes
+                for tool_name in (node.allowed_tools or ())
+            }
+            if available_tools is not None:
+                missing_tools = required_tools - available_tools
+                if missing_tools:
+                    names = ", ".join(sorted(missing_tools))
+                    raise IdentityCatalogError(
+                        f"Identity {identity.id!r} route {route.id!r} pipeline "
+                        f"{route.pipeline!r} requires unavailable tools: {names}"
+                    )
+            if allowed_tools is not None:
+                undeclared_tools = required_tools - allowed_tools
+                if undeclared_tools:
+                    names = ", ".join(sorted(undeclared_tools))
+                    raise IdentityCatalogError(
+                        f"Identity {identity.id!r} route {route.id!r} pipeline "
+                        f"{route.pipeline!r} uses tools outside its allowlist: {names}"
                     )
 
 

@@ -27,7 +27,21 @@ common = "."
 "agent_smith_common/builtin_skills/coding-validation" = ["../agents/skills/coding-validation/SKILL.md"]
 "agent_smith_common/builtin_skills/coding-validation/references" = ["../agents/skills/coding-validation/references/evals.md"]
 "agent_smith_common/builtin_skills/grill-me" = ["../agents/skills/grill-me/SKILL.md"]
+"agent_smith_common/builtin_skills/grill-me/agents" = ["../agents/skills/grill-me/agents/openai.yaml"]
+"agent_smith_common/builtin_skills/grilling" = ["../agents/skills/grilling/SKILL.md"]
+"agent_smith_common/builtin_skills/grilling/agents" = ["../agents/skills/grilling/agents/openai.yaml"]
 "agent_smith_common/builtin_skills/research" = ["../agents/skills/research/SKILL.md"]
+"agent_smith_common/builtin_skills/research/agents" = ["../agents/skills/research/agents/openai.yaml"]
+"agent_smith_common/builtin_skills/ecc-plan" = ["../agents/skills/ecc-plan/SKILL.md"]
+"agent_smith_common/builtin_skills/diagnosing-bugs" = ["../agents/skills/diagnosing-bugs/SKILL.md"]
+"agent_smith_common/builtin_skills/diagnosing-bugs/agents" = ["../agents/skills/diagnosing-bugs/agents/openai.yaml"]
+"agent_smith_common/builtin_skills/diagnosing-bugs/scripts" = ["../agents/skills/diagnosing-bugs/scripts/hitl-loop.template.sh"]
+"agent_smith_common/builtin_skills/tdd-workflow" = ["../agents/skills/tdd-workflow/SKILL.md"]
+"agent_smith_common/builtin_skills/tdd-workflow/agents" = ["../agents/skills/tdd-workflow/agents/openai.yaml"]
+"agent_smith_common/builtin_skills/verification-loop" = ["../agents/skills/verification-loop/SKILL.md"]
+"agent_smith_common/builtin_skills/verification-loop/agents" = ["../agents/skills/verification-loop/agents/openai.yaml"]
+"agent_smith_common/builtin_skills/code-review" = ["../agents/skills/code-review/SKILL.md"]
+"agent_smith_common/builtin_skills/code-review/agents" = ["../agents/skills/code-review/agents/openai.yaml"]
 "agent_smith_common/builtin_skills/teach" = [
     "../agents/skills/teach/SKILL.md",
     "../agents/skills/teach/GLOSSARY-FORMAT.md",

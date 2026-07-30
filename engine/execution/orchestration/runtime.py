@@ -22,13 +22,23 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class EngineRequest:
-    """A single user request submitted to the engine."""
+    """A single user request submitted to the engine.
+
+    ``identity_id`` is the session's preferred identity for ordinary ReAct
+    execution.  It is deliberately not a routing namespace: explicit
+    SkillChain intents are resolved globally on every turn.
+
+    ``execution_identity_id`` is populated only when resuming a persisted
+    run.  It binds recovery to the identity that actually executed the prior
+    turn, which can differ from the session's ReAct preference.
+    """
 
     message: str
     history: list[dict] | None = None
     context: str | None = None
     forced_skill: str | None = None
     identity_id: str | None = None
+    execution_identity_id: str | None = None
     working_dir: str | None = None
     message_id: str | None = None
 

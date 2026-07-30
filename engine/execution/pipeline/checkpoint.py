@@ -36,6 +36,10 @@ class SessionCheckpoint:
     # adopt a live run's half-finished state.  Empty means a legacy checkpoint
     # and, like working_dir, is not eligible for resume.
     run_id: str = ""
+    # Normal checkpoints are only for crash recovery.  A chain node that has
+    # intentionally asked one user-owned question sets this flag so the next
+    # session message can resume that same node with the answer.
+    awaiting_user_input: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

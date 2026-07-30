@@ -145,6 +145,9 @@ type ProvisionalBatcher = ReturnType<typeof createProvisionalBatcher>;
 type TerminalOutcome = { status: StreamTerminalStatus; reason?: string };
 
 export function terminalStatusMessage(status: StreamTerminalStatus, reason?: string): string {
+  if (status === "incomplete" && reason === "awaiting_user_input") {
+    return "Waiting for your input. Reply to continue the workflow.";
+  }
   if (status === "incomplete" && reason === "model_output_limit") {
     return "Model output limit reached; the answer may be incomplete.";
   }
@@ -1045,6 +1048,11 @@ export class NodeBridge {
     if (!terminal) throw new Error("SSE stream ended before completion.");
     if (terminal.status === "completed") {
       this.s.set({ statusLine: "Ready. Type the next task or /help." });
+      return;
+    }
+
+    if (terminal.status === "incomplete" && terminal.reason === "awaiting_user_input") {
+      this.s.set({ statusLine: terminalStatusMessage(terminal.status, terminal.reason) });
       return;
     }
 

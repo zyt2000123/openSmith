@@ -11,6 +11,7 @@ from engine.execution.pipeline.backtrack import FailureLoopGuard
 from engine.execution.pipeline.pipeline import run_pipeline
 from engine.execution.pipeline.pipeline_context import (
     CTX_AGENT_ID,
+    CTX_CHAIN_REQUEST,
     CTX_FORCED_SKILL,
     CTX_IDENTITY_ID,
     CTX_ROUTE_ID,
@@ -19,6 +20,7 @@ from engine.execution.pipeline.pipeline_context import (
     CTX_STATE_DIR,
     CTX_TASK_TYPE,
     CTX_USER_MESSAGE,
+    CTX_USER_RESPONSE,
     CTX_WORKING_DIR,
 )
 from engine.execution.pipeline.skill_chain import SkillChain
@@ -54,7 +56,16 @@ async def run_agent_stream(
     prefix_cache_key: str | None = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """Route to the selected execution implementation and yield events."""
-    if forced_skill:
+    # Matt's user-facing `grill-me` is an entry wrapper around `grilling`.
+    # In Agent-Smith it enters the full requirements chain rather than
+    # bypassing it as a one-off forced skill invocation.
+    grill_me_chain_entry = (
+        forced_skill == "grill-me"
+        and route.route_id == "requirements-research"
+        and route.pipeline_id == "requirements-research"
+        and skill_chain is not None
+    )
+    if forced_skill and not grill_me_chain_entry:
         async for event in _run_forced_skill_stream(
             llm,
             system_prompt,
@@ -125,6 +136,7 @@ async def run_agent_stream(
 
     context: dict = {
         CTX_USER_MESSAGE: user_message,
+        CTX_CHAIN_REQUEST: user_message,
         CTX_IDENTITY_ID: route.identity_id,
         CTX_ROUTE_ID: route.route_id,
     }
@@ -133,7 +145,7 @@ async def run_agent_stream(
             {key: value for key, value in execution_context.items() if value is not None}
         )
 
-    context, start_node_idx = _apply_crash_checkpoint(
+    context, start_node_idx = _apply_session_checkpoint(
         context,
         route.route_id or "",
         user_message,
@@ -191,13 +203,19 @@ def _checkpoint_owner_still_running(
     }
 
 
-def _apply_crash_checkpoint(
+def _apply_session_checkpoint(
     context: dict,
     route_id: str,
     user_message: str,
     node_count: int,
 ) -> tuple[dict, int]:
-    """Resume a matching crash checkpoint and discard stale state."""
+    """Resume a crash checkpoint or a deliberate user-input pause.
+
+    Crash recovery remains exact-message only.  A checkpoint marked
+    ``awaiting_user_input`` is different: its next session message is the
+    answer to the node's one pending question, so it resumes the same node
+    while preserving the original request under ``chain_request``.
+    """
     session_id = str(context.get(CTX_SESSION_ID) or "")
     state_dir = str(context.get(CTX_STATE_DIR) or "")
     if not session_id or not state_dir:
@@ -229,7 +247,7 @@ def _apply_crash_checkpoint(
                 checkpoint.run_id,
             )
             return context, 0
-        if (
+        same_scope = (
             expected_agent_id
             and expected_identity_id
             and expected_working_dir
@@ -238,8 +256,27 @@ def _apply_crash_checkpoint(
             and checkpoint.identity_id == expected_identity_id
             and checkpoint.working_dir == expected_working_dir
             and checkpoint.route_id == route_id
-            and checkpoint.context.get(CTX_USER_MESSAGE) == user_message
             and 0 <= checkpoint.skill_chain_index < node_count
+        )
+        if checkpoint.awaiting_user_input and same_scope:
+            logger.info(
+                "session %s: resuming node %d with a user response",
+                session_id,
+                checkpoint.skill_chain_index,
+            )
+            restored = {**checkpoint.context, **context}
+            restored[CTX_CHAIN_REQUEST] = checkpoint.context.get(
+                CTX_CHAIN_REQUEST,
+                checkpoint.context.get(CTX_USER_MESSAGE, ""),
+            )
+            restored[CTX_USER_RESPONSE] = user_message
+            return restored, checkpoint.skill_chain_index
+        if (
+            same_scope
+            and checkpoint.context.get(
+                CTX_CHAIN_REQUEST,
+                checkpoint.context.get(CTX_USER_MESSAGE),
+            ) == user_message
         ):
             logger.info(
                 "session %s: resuming crashed chain, skipping %d completed node(s)",

@@ -481,7 +481,9 @@ function SkillMessage({ block, viewMode }: { block: SkillBlock; viewMode: Transc
       {activities.length > 0 ? (
         activities.map((activity) => <SkillActivityMessage key={activity.id} activity={activity} viewMode={viewMode} />)
       ) : (
-        <Text color={BORDER}> waiting for the first action…</Text>
+        <Text color={BORDER}>
+          {block.state === "waiting" ? " waiting for your answer…" : " waiting for the first action…"}
+        </Text>
       )}
       {hiddenCount > 0 ? (
         <Text color={BORDER}>

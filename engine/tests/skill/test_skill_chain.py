@@ -7,6 +7,7 @@ from engine.execution.pipeline.skill_chain import (
     SkillChain,
     load_gate_content,
 )
+from engine.identity import IdentityCatalog
 
 ROOT = Path(__file__).resolve().parents[3]
 load_gate_content(ROOT / "agents")
@@ -49,7 +50,7 @@ def test_valid_pipeline_still_loads(tmp_path: Path) -> None:
     assert chain.nodes[1].condition is not None
 
 
-def test_shipped_coding_pipeline_loads_gates_and_conditions() -> None:
+def test_shipped_coding_skillchains_load_gates_conditions_and_pause_contracts() -> None:
     content = load_gate_content(ROOT / "agents")
 
     pipelines = SkillChain.load_pipelines(
@@ -58,15 +59,66 @@ def test_shipped_coding_pipeline_loads_gates_and_conditions() -> None:
         condition_registry=content.conditions,
     )
 
-    chain = pipelines["coding"]
-    assert [node.skill_name for node in chain.nodes] == [
-        "coding-understanding",
-        "coding-planning",
-        "coding-architecture",
-        "coding-implementation",
-        "coding-validation",
+    assert set(pipelines) == {
+        "requirements-research",
+        "tdd-development",
+        "code-review",
+    }
+    requirements = pipelines["requirements-research"]
+    assert [node.skill_name for node in requirements.nodes] == [
+        "grilling",
+        "research",
+        "ecc-plan",
     ]
-    assert chain.nodes[2].condition is not None
+    assert requirements.nodes[0].await_user_input_marker
+    assert requirements.nodes[0].instructions
+    assert requirements.nodes[2].await_user_input_marker
+    assert requirements.nodes[0].allowed_tools == (
+        "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep",
+    )
+    assert set(requirements.nodes[1].allowed_tools or ()) == {
+        "read_file", "read_pdf", "render_pdf_page", "write_file", "list_dir",
+        "glob_files", "grep", "web_search", "web_fetch",
+    }
+    assert "web_crawl" not in (requirements.nodes[1].allowed_tools or ())
+
+    tdd = pipelines["tdd-development"]
+    assert [node.skill_name for node in tdd.nodes] == [
+        "diagnosing-bugs",
+        "tdd-workflow",
+        "verification-loop",
+    ]
+    assert tdd.nodes[0].condition is not None
+    assert set(tdd.nodes[1].allowed_tools or ()) == {
+        "read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell",
+    }
+    assert "scripts/setup-package-manager.js" in tdd.nodes[1].instructions
+    assert "bare `npx`" in tdd.nodes[1].instructions
+
+    review = pipelines["code-review"]
+    assert [node.skill_name for node in review.nodes] == [
+        "code-review",
+        "verification-loop",
+    ]
+    assert review.nodes[0].await_user_input_marker
+    assert set(review.nodes[0].allowed_tools or ()) == {
+        "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "shell",
+    }
+    assert "write_file" not in (review.nodes[0].allowed_tools or ())
+    assert "web_search" not in (review.nodes[0].allowed_tools or ())
+
+    coding = next(
+        identity
+        for identity in IdentityCatalog.load(ROOT / "agents" / "identities").identities
+        if identity.id == "coding"
+    )
+    node_tools = {
+        tool_name
+        for chain in pipelines.values()
+        for node in chain.nodes
+        for tool_name in (node.allowed_tools or ())
+    }
+    assert set(coding.enabled_tools or ()) == node_tools
 
 
 def test_shipped_gate_and_condition_content_do_not_import_engine_or_common() -> None:
@@ -94,6 +146,45 @@ def test_malformed_pipeline_step_fails_loudly(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match=r"steps\[1\].*skill"):
         SkillChain.from_yaml(path)
+
+
+def test_node_pause_marker_and_instructions_are_parsed(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "steps:\n"
+        "  - skill: interview\n"
+        "    gate: rubric\n"
+        "    await_user_input_marker: '<!-- wait -->'\n"
+        "    instructions: |\n"
+        "      Ask one question.\n",
+    )
+    chain = SkillChain.from_yaml(path)
+    assert chain is not None
+    assert chain.nodes[0].await_user_input_marker == "<!-- wait -->"
+    assert chain.nodes[0].instructions == "Ask one question."
+
+
+def test_node_tool_scope_is_parsed_and_rejects_invalid_values(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "steps:\n"
+        "  - skill: interview\n"
+        "    gate: rubric\n"
+        "    allowed_tools: [read_file, shell]\n",
+    )
+    chain = SkillChain.from_yaml(path)
+    assert chain is not None
+    assert chain.nodes[0].allowed_tools == ("read_file", "shell")
+
+    malformed = _write(
+        tmp_path,
+        "steps:\n"
+        "  - skill: interview\n"
+        "    gate: rubric\n"
+        "    allowed_tools: [read_file, 42]\n",
+    )
+    with pytest.raises(ValueError, match=r"allowed_tools"):
+        SkillChain.from_yaml(malformed)
 
 
 def test_gate_defaults_to_rubric_when_omitted(tmp_path: Path) -> None:

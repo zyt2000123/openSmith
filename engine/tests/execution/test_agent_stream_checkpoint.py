@@ -195,6 +195,121 @@ def test_run_agent_stream_saves_and_clears_checkpoint(tmp_path: Path) -> None:
     assert asyncio.run(run())
 
 
+def test_run_agent_stream_pauses_for_one_user_answer_then_resumes_same_node(tmp_path: Path) -> None:
+    """A deliberate grilling question survives as a continuation, not a crash."""
+
+    class PausingLLM(FakeLLM):
+        def __init__(self) -> None:
+            self.outputs = [
+                "Which user group is primary?\n<!-- agent-smith:await-user-input -->",
+                "Audience and acceptance signal are agreed.\n<!-- agent-smith:grilling-complete -->",
+            ]
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            return ChatResponse(text=self.outputs.pop(0))
+
+    class CompleteGate:
+        async def check(self, output: str, context: dict) -> GateResult:
+            assert context["chain_request"] == "research the onboarding requirement"
+            if "<!-- agent-smith:grilling-complete -->" in output:
+                return GateResult("pass", "shared understanding")
+            return GateResult("retry", "missing completion")
+
+    route = RouteDecision(_SMITH_IDENTITY, "requirements-research", "requirements-research", score=1)
+    chain = SkillChain([
+        SkillNode(
+            "grilling",
+            CompleteGate(),
+            await_user_input_marker="<!-- agent-smith:await-user-input -->",
+        ),
+    ])
+
+    async def collect(message: str, run_id: str) -> list[ExecutionEvent]:
+        events = []
+        async for event in run_agent_stream(
+            llm,
+            "system prompt",
+            message,
+            FakeToolRegistry(),
+            FakeSkillRegistry(),
+            route,
+            chain,
+            FailureLoopGuard(),
+            execution_context={
+                "agent_id": "smith-id",
+                "session_id": "sess-input",
+                "_state_dir": str(tmp_path),
+                "_working_dir": str(tmp_path.resolve()),
+                "_run_id": run_id,
+            },
+        ):
+            events.append(event)
+        return events
+
+    llm = PausingLLM()
+    first = asyncio.run(collect("research the onboarding requirement", "run-first"))
+    from engine.execution.pipeline.checkpoint import SessionStateManager
+
+    checkpoint = SessionStateManager(tmp_path).restore("sess-input")
+    assert checkpoint is not None and checkpoint.awaiting_user_input
+    assert checkpoint.skill_chain_index == 0
+    assert checkpoint.context["grilling_output"].startswith("Which user group")
+    assert EventType.AWAITING_INPUT in [event.type for event in first]
+    assert first[-1].type is EventType.DONE
+
+    second = asyncio.run(collect("Internal support engineers.", "run-second"))
+    assert [event.data["skill"] for event in second if event.type is EventType.SKILL_START] == [
+        "grilling",
+    ]
+    assert [event.data["verdict"] for event in second if event.type is EventType.GATE_RESULT] == [
+        "pass",
+    ]
+    assert EventType.AWAITING_INPUT not in [event.type for event in second]
+    assert SessionStateManager(tmp_path).restore("sess-input") is None
+
+
+def test_forced_grill_me_enters_the_requirements_chain() -> None:
+    """The visible Matt wrapper must not bypass its composed `grilling` node."""
+
+    class CompleteLLM(FakeLLM):
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            return ChatResponse(
+                text="Shared understanding recorded.\n<!-- agent-smith:grilling-complete -->"
+            )
+
+    class CompleteGate:
+        async def check(self, output: str, context: dict) -> GateResult:
+            return GateResult("pass", "complete")
+
+    async def run() -> list[ExecutionEvent]:
+        events = []
+        async for event in run_agent_stream(
+            CompleteLLM(),
+            "system prompt",
+            "clarify onboarding requirements",
+            FakeToolRegistry(),
+            FakeSkillRegistry(),
+            RouteDecision(
+                _SMITH_IDENTITY,
+                "requirements-research",
+                "requirements-research",
+                score=1,
+            ),
+            SkillChain([SkillNode("grilling", CompleteGate())]),
+            FailureLoopGuard(),
+            forced_skill="grill-me",
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+    route = next(event for event in events if event.type is EventType.ROUTE_DECIDED)
+    assert route.data["pipeline_id"] == "requirements-research"
+    assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
+        "grilling",
+    ]
+
+
 def test_run_agent_stream_forwards_provider_events_from_skill_nodes() -> None:
     async def run():
         events = []

@@ -1,0 +1,27 @@
+route: code-review
+
+steps:
+  - skill: code-review
+    gate: review_report
+    await_user_input_marker: "<!-- agent-smith:await-user-input -->"
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, shell]
+    instructions: |
+      This is a read-only review. Resolve the user-supplied fixed point before reviewing; if it is
+      missing or invalid, ask only for that missing input instead of guessing and end with
+      `<!-- agent-smith:await-user-input -->`. The runtime has one resident agent, so run Matt's
+      Standards and Spec axes sequentially while keeping `## Standards` and `## Spec` fully separate.
+      Use only the target repository and user-supplied spec material: do not invoke an Agent tool,
+      `/setup-matt-pocock-skills`, an issue-tracker workflow, another skill, or external network
+      lookup. If no spec is available, report `no spec available` in the Spec axis. Do not edit
+      files, post comments, approve, create a PR, or publish anything. Report the fixed-point and
+      diff evidence, then end with `<!-- agent-smith:review-ready -->`.
+
+  - skill: verification-loop
+    gate: review_verification
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, shell]
+    instructions: |
+      Stay read-only. Run only applicable validation commands for the reviewed diff and preserve the
+      earlier `## Standards` and `## Spec` sections verbatim or faithfully summarized. Append
+      `## Verification` with actual command results and an `Overall:` verdict. Return one consolidated
+      `ReviewReport`; do not rerank the two review axes and do not publish. End with
+      `<!-- agent-smith:review-report-ready -->`.

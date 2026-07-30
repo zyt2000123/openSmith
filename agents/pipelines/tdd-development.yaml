@@ -1,0 +1,43 @@
+route: tdd-development
+
+steps:
+  - skill: diagnosing-bugs
+    gate: red_loop
+    condition: coding_bugfix_needs_diagnosis
+    allowed_tools: [read_file, write_file, edit_file, list_dir, glob_files, grep, shell]
+    instructions: |
+      This is the diagnostic handoff before TDD implementation. Reuse and run an existing
+      red-capable loop if the report already supplies one; otherwise build, run, and minimize a
+      deterministic loop for the user's exact symptom. Prefer a local test or harness; an external
+      service/browser is never a prerequisite. Do not change production code in this node, and do
+      not hand off to another skill.
+      Report the runnable command, observed failing output, why it proves this exact bug, and end
+      with `<!-- agent-smith:red-loop-ready -->`.
+
+  - skill: tdd-workflow
+    gate: tdd_evidence
+    allowed_tools: [read_file, write_file, edit_file, list_dir, glob_files, grep, shell]
+    instructions: |
+      Implement the requested feature or fix using the upstream RED → GREEN → refactor workflow.
+      For a bug, use the prior red-capable loop; for a new feature, write and run a failing behavior
+      test first. Agent-Smith resolves test commands from the target workspace's existing manifests,
+      lock files, CI files, and test configuration. Do not run the upstream ECC host command
+      `node scripts/setup-package-manager.js --detect`, rely on `.claude` or global package-manager
+      settings, invoke a command that can download a package (such as bare `npx`), or install tools.
+      If the workspace does not provide a runnable command, stop and ask the user rather than invent
+      one. Treat 80% coverage as a project-configured goal, never as an invented universal pass
+      condition. Do not publish, start code review, or hand off to another skill.
+      End with a `TddEvidence` handoff containing concrete RED command/output, GREEN command/output,
+      changed tests, and residual risk; end it with `<!-- agent-smith:tdd-implementation-ready -->`.
+
+  - skill: verification-loop
+    gate: tdd_verification
+    allowed_tools: [read_file, list_dir, glob_files, grep, shell]
+    instructions: |
+      Verify the implementation using only commands applicable to this repository. For build, types,
+      lint, tests, security, and diff, report PASS, FAIL, or NOT_APPLICABLE with a reason and actual
+      evidence. Reuse only commands evidenced by the target workspace or the prior TDD handoff; do
+      not install, download, or invoke generic `npx` tooling. Return one consolidated `TddEvidence`
+      containing the `VERIFICATION REPORT`; do not claim readiness if a required applicable check
+      fails. End with
+      `<!-- agent-smith:tdd-evidence-ready -->`.

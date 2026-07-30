@@ -217,6 +217,66 @@ test("workflow retries and blocks settle the active card without claiming succes
   assert.equal(turn.streaming, false);
 });
 
+test("SkillChain lifecycle stays visible while awaiting the user's reply", () => {
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, { type: "skill", name: "grilling", status: "start" });
+  entries = applyStreamEvent(entries, {
+    type: "route_decided",
+    identityId: "coding",
+    identityName: "Coding",
+    routeId: "requirements-research",
+    pipelineId: "requirements-research",
+  });
+  entries = applyStreamEvent(entries, {
+    type: "gate_result",
+    skill: "grilling",
+    verdict: "retry",
+    reason: "Need a target user.",
+  });
+  entries = applyStreamEvent(entries, {
+    type: "backtrack",
+    from: "research",
+    to: "grilling",
+    reason: "Scope is ambiguous.",
+  });
+  entries = applyStreamEvent(entries, {
+    type: "awaiting_input",
+    skill: "grilling",
+    reason: "awaiting_user_input",
+  });
+  entries = applyStreamEvent(entries, {
+    type: "done",
+    status: "incomplete",
+    reason: "awaiting_user_input",
+  });
+
+  const turn = entries.find((entry) => entry.kind === "turn");
+  assert.ok(turn?.kind === "turn");
+  assert.equal(turn.streaming, false);
+  assert.equal(turn.blocks[0]?.type === "skill" && turn.blocks[0].state, "waiting");
+
+  const notices = entries.filter((entry) => entry.kind === "system").map((entry) => entry.text);
+  assert.deepEqual(notices, [
+    "Route: Coding → requirements-research.",
+    "Gate grilling: retry — Need a target user.",
+    "Backtracking research → grilling — Scope is ambiguous.",
+    "Waiting for your input to continue grilling. Reply in chat.",
+  ]);
+});
+
+test("a direct route is presented as ReAct", () => {
+  const entries = applyStreamEvent(freshTurn(), {
+    type: "route_decided",
+    identityId: "smith",
+    identityName: "Smith",
+    routeId: "direct",
+    pipelineId: "",
+  });
+
+  const notice = entries.find((entry) => entry.kind === "system");
+  assert.equal(notice?.kind === "system" && notice.text, "Route: Smith → ReAct.");
+});
+
 test("tool calls remain standalone when no workflow skill is running", () => {
   let entries = freshTurn();
   entries = applyStreamEvent(entries, {

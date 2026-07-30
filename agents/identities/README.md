@@ -14,22 +14,30 @@
 
 ## 已发布的 Coding 身份插件
 
-`coding.yaml` 是第一套完整的领域身份插件：它把软件变更请求路由到
-`coding` pipeline，并将可用能力收束为 `coding-*` 的五个阶段技能。
+`coding.yaml` 内置三条窄意图 SkillChain。普通编码、修复和重构请求不因
+关键词而被劫持，保持普通 ReAct；只有明确意图才进入链。
 
 ```text
 coding identity
-├── coding-understanding
-├── coding-planning
-├── coding-architecture       # 多文件计划时才运行
-├── coding-implementation
-└── coding-validation
+├── requirements-research
+│   └── grilling → research → ecc-plan (each user decision pauses safely)
+├── tdd-development
+│   └── diagnosing-bugs (bug only) → tdd-workflow → verification-loop
+└── code-review
+    └── code-review → verification-loop
 ```
 
-对应的 pipeline、gate 和 condition 仍位于 `agents/` 的同类目录中，但其
-资产名使用 `coding-` 前缀，避免其他身份意外复用。服务启动时会校验：路由
-引用的 pipeline 存在、每个节点的 Skill 已注册、且节点属于该身份的
-`skills.enabled` allowlist；任一项缺失都拒绝启动，不会静默回退到通用 ReAct。
+`grill-me` 是用户可见入口；它按 Matt 的上游定义委派给 `grilling`，因此实际
+链节点是后者。`grilling` 和 ECC `plan` 都可能等待一个用户决策：链会保存当前
+节点，下一条同会话、同工作目录的回答从该节点继续；输入 `cancel` 或 `取消` 则
+放弃等待并回到普通路由。
+
+对应的 pipeline、gate 和 condition 位于 `agents/` 的同类目录中。上游技能的
+锁定来源见 [`agents/skills/SOURCES.md`](../skills/SOURCES.md)。服务启动时会校验：
+路由引用的 pipeline 存在、每个节点的 Skill 已注册、且节点属于该身份的
+`skills.enabled` allowlist。节点的 `allowed_tools` 同时必须属于身份的
+`tools.enabled` allowlist，且必须由内置 provider 实际注册；任一项缺失都拒绝
+启动，不会静默回退到通用 ReAct。
 
 ## 最小格式
 

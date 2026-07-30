@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -398,6 +399,237 @@ class TestDeliveryGate:
         )
 
 
+class GrillingCompleteGate:
+    """Require an explicit shared-understanding handoff after grilling."""
+
+    _COMPLETE = "<!-- agent-smith:grilling-complete -->"
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        if self._COMPLETE in output:
+            return GateResult("pass", "User decisions are ready for research.")
+        return GateResult(
+            "retry",
+            "Grilling must either ask one user question or explicitly record shared understanding.",
+            retry_hint=(
+                "If a decision remains, ask exactly one question and end with "
+                "<!-- agent-smith:await-user-input -->. Otherwise summarize the "
+                "decisions and end with <!-- agent-smith:grilling-complete -->."
+            ),
+        )
+
+
+class ResearchBriefGate:
+    """Require a real, local, source-attributed ResearchBrief artifact."""
+
+    _READY = "<!-- agent-smith:research-brief-ready -->"
+    _PATH = re.compile(r"(?:^|[`\s(])(?P<path>docs/research/[A-Za-z0-9_./-]+\.md)(?:$|[`\s):,])")
+    _HEADINGS = (
+        "## problem",
+        "## evidence",
+        "## assumptions",
+        "## open questions",
+        "## recommendation",
+    )
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        if self._READY not in output:
+            return GateResult(
+                "retry",
+                "Research output is missing its ResearchBrief completion marker.",
+                retry_hint=(
+                    "Write the cited ResearchBrief, report its docs/research path, and end with "
+                    "<!-- agent-smith:research-brief-ready -->."
+                ),
+            )
+        match = self._PATH.search(output)
+        working_dir = context.get("_working_dir")
+        if match is None or not isinstance(working_dir, str) or not working_dir:
+            return GateResult(
+                "retry",
+                "ResearchBrief must report a relative docs/research/*.md artifact path.",
+            )
+        workspace = Path(working_dir).resolve()
+        research_root = (workspace / "docs" / "research").resolve()
+        artifact = (workspace / match.group("path")).resolve()
+        if not artifact.is_relative_to(research_root) or not artifact.is_file():
+            return GateResult(
+                "retry",
+                "Reported ResearchBrief artifact does not exist under docs/research.",
+                retry_hint="Create the cited Markdown file inside docs/research before reporting completion.",
+            )
+        text = artifact.read_text(encoding="utf-8").casefold()
+        missing = [heading for heading in self._HEADINGS if heading not in text]
+        if missing:
+            return GateResult(
+                "retry",
+                f"ResearchBrief is missing required sections: {', '.join(missing)}.",
+            )
+        if "http" not in text:
+            return GateResult(
+                "retry",
+                "ResearchBrief has no source citation link.",
+                retry_hint="Cite the primary source URLs behind the findings.",
+            )
+        return GateResult("pass", f"ResearchBrief verified at {match.group('path')}.")
+
+
+class PlanConfirmedGate:
+    """Do not let a requirements plan advance before explicit confirmation."""
+
+    _CONFIRMED = "<!-- agent-smith:plan-confirmed -->"
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        if self._CONFIRMED in output:
+            return GateResult("pass", "Requirements plan is explicitly confirmed.")
+        return GateResult(
+            "retry",
+            "Plan confirmation is missing.",
+            retry_hint=(
+                "Present the grounded plan and wait with "
+                "<!-- agent-smith:await-user-input -->. After explicit user approval, "
+                "end with <!-- agent-smith:plan-confirmed --> without implementing code."
+            ),
+        )
+
+
+class RedLoopGate:
+    """A bug handoff must prove a runnable, symptom-specific RED loop."""
+
+    _READY = "<!-- agent-smith:red-loop-ready -->"
+    _COMMAND = re.compile(
+        r"(?:^|\n)\s*(?:\$\s*)?(?:uv\s+run|pytest|python(?:3)?\s|npm\s+test|pnpm\s+test|yarn\s+test|"
+        r"bun\s+test|go\s+test|cargo\s+test|curl\s|playwright\s)",
+        re.IGNORECASE,
+    )
+    _RED_RESULT = re.compile(r"\b(?:failed|failure|error|failing|red)\b|失败|报错|异常", re.IGNORECASE)
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        missing = []
+        if self._READY not in output:
+            missing.append("red-loop completion marker")
+        if not self._COMMAND.search(output):
+            missing.append("runnable reproduction command")
+        if not self._RED_RESULT.search(output):
+            missing.append("observed failing result")
+        if not missing:
+            return GateResult("pass", "Bug diagnosis produced a red-capable feedback loop.")
+        return GateResult(
+            "retry",
+            f"Bug diagnosis missing: {', '.join(missing)}.",
+            retry_hint=(
+                "Run and report one deterministic command that exercises the user's exact symptom, "
+                "including its observed failure, then end with <!-- agent-smith:red-loop-ready -->."
+            ),
+        )
+
+
+class TddEvidenceGate:
+    """Require both observed RED and observed GREEN in the implementation handoff."""
+
+    _READY = "<!-- agent-smith:tdd-implementation-ready -->"
+    _RED = re.compile(r"\bRED\b[\s\S]{0,500}\b(?:failed|failure|error|failing)\b|RED[\s\S]{0,500}(?:失败|报错|异常)", re.IGNORECASE)
+    _GREEN = re.compile(r"\bGREEN\b[\s\S]{0,500}\b(?:passed|pass|success)\b|GREEN[\s\S]{0,500}(?:通过|成功)", re.IGNORECASE)
+    _COMMAND = re.compile(r"(?:^|\n)\s*(?:\$\s*)?(?:uv\s+run|pytest|python(?:3)?\s|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|go\s+test|cargo\s+test)", re.IGNORECASE)
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        missing = []
+        if self._READY not in output:
+            missing.append("TddEvidence completion marker")
+        if not self._RED.search(output):
+            missing.append("observed RED result")
+        if not self._GREEN.search(output):
+            missing.append("observed GREEN result")
+        if not self._COMMAND.search(output):
+            missing.append("test command evidence")
+        if not missing:
+            return GateResult("pass", "TddEvidence contains observed RED and GREEN evidence.")
+        return GateResult(
+            "retry",
+            f"TDD implementation handoff missing: {', '.join(missing)}.",
+            retry_hint="Report the actual RED and GREEN command outputs before declaring implementation ready.",
+        )
+
+
+class TddVerificationGate:
+    """Require an evidence-backed final TddEvidence report."""
+
+    _READY = "<!-- agent-smith:tdd-evidence-ready -->"
+    _SECTIONS = ("build:", "types:", "lint:", "tests:", "security:", "diff:", "overall:")
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        lowered = output.casefold()
+        missing = []
+        if self._READY not in output:
+            missing.append("TddEvidence completion marker")
+        missing.extend(section for section in self._SECTIONS if section not in lowered)
+        if missing:
+            return GateResult(
+                "retry",
+                f"Verification handoff missing: {', '.join(missing)}.",
+                retry_hint=(
+                    "Return one consolidated TddEvidence with a VERIFICATION REPORT. Every phase must "
+                    "be PASS, FAIL, or NOT_APPLICABLE with a reason, then end with "
+                    "<!-- agent-smith:tdd-evidence-ready -->."
+                ),
+            )
+        return GateResult("pass", "TddEvidence includes a complete verification report.")
+
+
+class ReviewReportGate:
+    """Keep Matt's Standards and Spec axes separate in the review artifact."""
+
+    _READY = "<!-- agent-smith:review-ready -->"
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        lowered = output.casefold()
+        missing = []
+        if self._READY not in output:
+            missing.append("ReviewReport completion marker")
+        if "## standards" not in lowered:
+            missing.append("Standards axis")
+        if "## spec" not in lowered:
+            missing.append("Spec axis")
+        if not re.search(r"git\s+(?:diff|rev-parse|log)|fixed point|基线", output, re.IGNORECASE):
+            missing.append("resolved fixed-point evidence")
+        if missing:
+            return GateResult(
+                "retry",
+                f"ReviewReport missing: {', '.join(missing)}.",
+                retry_hint=(
+                    "Resolve and report the fixed point, keep ## Standards and ## Spec separate, "
+                    "then end with <!-- agent-smith:review-ready -->."
+                ),
+            )
+        return GateResult("pass", "Two-axis ReviewReport is complete.")
+
+
+class ReviewVerificationGate:
+    """Require verification to be appended without collapsing review axes."""
+
+    _READY = "<!-- agent-smith:review-report-ready -->"
+
+    async def check(self, output: str, context: dict) -> GateResult:
+        lowered = output.casefold()
+        missing = []
+        if self._READY not in output:
+            missing.append("ReviewReport completion marker")
+        for section in ("## standards", "## spec", "## verification"):
+            if section not in lowered:
+                missing.append(section)
+        if "overall:" not in lowered:
+            missing.append("verification verdict")
+        if missing:
+            return GateResult(
+                "retry",
+                f"Verified ReviewReport missing: {', '.join(missing)}.",
+                retry_hint=(
+                    "Preserve the independent ## Standards and ## Spec sections, append ## Verification "
+                    "with actual command results, and end with <!-- agent-smith:review-report-ready -->."
+                ),
+            )
+        return GateResult("pass", "ReviewReport preserves both axes and verification evidence.")
+
+
 GATES = {
     "test": TestGate,
     "validation_llm": ValidationLLMGate,
@@ -406,4 +638,12 @@ GATES = {
     "design": DesignGate,
     "git_worktree": GitWorktreeGate,
     "pr": PRGate,
+    "grilling_complete": GrillingCompleteGate,
+    "research_brief": ResearchBriefGate,
+    "plan_confirmed": PlanConfirmedGate,
+    "red_loop": RedLoopGate,
+    "tdd_evidence": TddEvidenceGate,
+    "tdd_verification": TddVerificationGate,
+    "review_report": ReviewReportGate,
+    "review_verification": ReviewVerificationGate,
 }

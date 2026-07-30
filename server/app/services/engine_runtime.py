@@ -116,13 +116,16 @@ def load_runtime_identity_catalog(*, force: bool = False) -> IdentityCatalog:
     """Load the one catalog and validate its declared assets for every entry point."""
     catalog = load_identity_catalog(BUILTIN_IDENTITIES_DIR, force=force)
     skill_registry = SkillRegistry()
+    tool_registry = ToolRegistry()
     PATHS.ensure_base_dirs()
     skill_registry.load_builtin(BUILTIN_SKILLS_DIR)
     skill_registry.load_agent_skills(AGENT_DIR / "skills")
+    tool_registry.load_builtin_providers(PATHS.project_root / "agents" / "tools")
     validate_execution_assets(
         catalog,
         agents_dir=PATHS.project_root / "agents",
         skill_names=(summary["name"] for summary in skill_registry.list_summaries()),
+        tool_names=tool_registry.list_tool_names(),
     )
     return catalog
 

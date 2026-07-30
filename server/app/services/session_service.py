@@ -122,7 +122,10 @@ class SessionService:
             selected_identity_id = str(pinned_identity_id)
             self._validate_identity(selected_identity_id)
         else:
-            selected_identity_id = self._catalog().resolve(content).identity_id
+            # This is a lasting session preference for direct ReAct, not an
+            # intent router.  SkillChain routing happens independently in the
+            # Engine for every message.
+            selected_identity_id = self._catalog().default.id
 
         if not pinned_identity_id:
             claimed = await self.session_repo.claim_identity(
@@ -309,6 +312,7 @@ class SessionService:
             raise HTTPException(409, f"Run cannot be resumed from {state.status.value}")
         if not state.identity_id:
             raise HTTPException(409, "Run is missing its execution identity")
+        self._validate_identity(state.identity_id)
 
         if not state.message_id:
             raise HTTPException(
@@ -343,11 +347,11 @@ class SessionService:
             state.session_id,
             user_message["content"],
             skill_name=state.forced_skill,
-            identity_id=state.identity_id,
             working_dir=state.working_dir,
             _history_override=history,
             _resume_run_id=run_id,
             _message_id=state.message_id,
+            _execution_identity_id=state.identity_id,
         )
         await self.session_repo.discard_assistant_messages_after_user(
             state.session_id,
@@ -368,6 +372,7 @@ class SessionService:
         _history_override: list[dict] | None = None,
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
+        _execution_identity_id: str | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Validate the session before an HTTP caller commits to an SSE 200."""
         selected_identity_id = await self._resolve_session_identity(
@@ -390,6 +395,7 @@ class SessionService:
             _history_override=_history_override,
             _resume_run_id=_resume_run_id,
             _message_id=_message_id,
+            execution_identity_id=_execution_identity_id,
         )
 
     async def stream_message(
@@ -435,6 +441,7 @@ class SessionService:
         _history_override: list[dict] | None = None,
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
+        execution_identity_id: str | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Yield SSE event dicts. Streams text chunks as they arrive from the engine."""
         if _resume_run_id is None:
@@ -468,6 +475,7 @@ class SessionService:
                 context=context,
                 forced_skill=skill_name,
                 identity_id=selected_identity_id,
+                execution_identity_id=execution_identity_id,
                 working_dir=working_dir,
                 message_id=message_id,
             )
@@ -556,6 +564,30 @@ class SessionService:
                         yield sse("approval_required", approval_payload)
                 elif t in ("skill_start", "skill_end"):
                     yield sse("skill", {"name": ev.data.get("skill", ""), "status": "start" if t == "skill_start" else ev.data.get("status", "end")})
+                elif t == "route_decided":
+                    yield sse("route_decided", {
+                        "identity_id": str(ev.data.get("identity_id") or ""),
+                        "identity_name": str(ev.data.get("identity_name") or ""),
+                        "route_id": str(ev.data.get("route_id") or ""),
+                        "pipeline_id": str(ev.data.get("pipeline_id") or ""),
+                    })
+                elif t == "gate_result":
+                    yield sse("gate_result", {
+                        "skill": str(ev.data.get("skill") or ""),
+                        "verdict": str(ev.data.get("verdict") or ""),
+                        "reason": str(ev.data.get("reason") or ""),
+                    })
+                elif t == "backtrack":
+                    yield sse("backtrack", {
+                        "from": str(ev.data.get("from") or ""),
+                        "to": str(ev.data.get("to") or ""),
+                        "reason": str(ev.data.get("reason") or ""),
+                    })
+                elif t == "awaiting_input":
+                    yield sse("awaiting_input", {
+                        "skill": str(ev.data.get("skill") or ""),
+                        "reason": str(ev.data.get("reason") or "awaiting_user_input"),
+                    })
                 elif t == "blocked":
                     yield sse("message", {"text": f"\n⛔ 已阻断：{ev.data.get('reason', '')}\n"})
                 elif t == "token_usage":
@@ -631,7 +663,7 @@ class SessionService:
                                 )
                             },
                         )
-                # route_decided / gate_result / backtrack / done / run_started：前端暂不展示，跳过
+                # done is folded into the terminal SSE event below.
         except Exception:
             logger.exception("agent SSE execution failed (session=%s)", session_id)
             terminal_status = "failed"
