@@ -50,8 +50,10 @@ def test_resolve_llm_config_loads_builtin_smith_profile_by_default(
 def test_runtime_catalog_validates_the_shipped_coding_pipeline() -> None:
     catalog = engine_runtime.load_runtime_identity_catalog(force=True)
 
-    assert catalog.resolve("修复登录报错").pipeline_id == "coding"
-    assert catalog.resolve("新增导出功能").pipeline_id == "coding"
+    assert catalog.resolve("请做需求调研，给我方案").pipeline_id == "requirements-research"
+    assert catalog.resolve("请用 TDD 修复登录报错").pipeline_id == "tdd-development"
+    assert catalog.resolve("请做代码评审").pipeline_id == "code-review"
+    assert catalog.resolve("修复登录报错").pipeline_id is None
 
 
 def test_resolve_llm_config_selects_model_routes_and_timeout_profiles(tmp_path, monkeypatch) -> None:

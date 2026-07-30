@@ -45,6 +45,34 @@ test("SSE decoder exposes context usage and compression state", () => {
   });
 });
 
+test("SSE decoder exposes the SkillChain lifecycle", () => {
+  assert.deepEqual(
+    decodeSseEvent(
+      'event: route_decided\ndata: {"identity_id":"coding","identity_name":"Coding","route_id":"requirements-research","pipeline_id":"requirements-research"}',
+    ),
+    {
+      type: "route_decided",
+      identityId: "coding",
+      identityName: "Coding",
+      routeId: "requirements-research",
+      pipelineId: "requirements-research",
+    },
+  );
+  assert.deepEqual(
+    decodeSseEvent('event: gate_result\ndata: {"skill":"grilling","verdict":"retry","reason":"Need a target user."}'),
+    { type: "gate_result", skill: "grilling", verdict: "retry", reason: "Need a target user." },
+  );
+  assert.deepEqual(
+    decodeSseEvent('event: backtrack\ndata: {"from":"research","to":"grilling","reason":"Scope is ambiguous."}'),
+    { type: "backtrack", from: "research", to: "grilling", reason: "Scope is ambiguous." },
+  );
+  assert.deepEqual(decodeSseEvent('event: awaiting_input\ndata: {"skill":"grilling","reason":"awaiting_user_input"}'), {
+    type: "awaiting_input",
+    skill: "grilling",
+    reason: "awaiting_user_input",
+  });
+});
+
 test("SSE decoder accepts a validated smith-ui event", () => {
   assert.deepEqual(
     decodeSseEvent(
@@ -623,7 +651,7 @@ test("SSE decoder sanitizes Smith-UI fallback and error event text", () => {
   );
 });
 
-test("SSE decoder sanitizes skill metadata before transcript rendering", () => {
+test("SSE decoder sanitizes skill and SkillChain lifecycle metadata before transcript rendering", () => {
   const attack = `${ESC_BYTE}]52;c;eA==${BEL_BYTE}`;
 
   assert.deepEqual(decodeSseEvent(sseFrame("skill", { name: `${attack}research`, status: `${attack}start` })), {
@@ -631,4 +659,19 @@ test("SSE decoder sanitizes skill metadata before transcript rendering", () => {
     name: "research",
     status: "start",
   });
+  assert.deepEqual(
+    decodeSseEvent(
+      sseFrame("gate_result", {
+        skill: `${attack}grilling`,
+        verdict: `${attack}retry`,
+        reason: `${attack}Need a target user.`,
+      }),
+    ),
+    {
+      type: "gate_result",
+      skill: "grilling",
+      verdict: "retry",
+      reason: "Need a target user.",
+    },
+  );
 });

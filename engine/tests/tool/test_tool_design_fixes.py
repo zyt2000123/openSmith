@@ -857,6 +857,30 @@ def test_tool_allowlist_filters_schema_prompt_and_execution():
     assert "Tool disabled" in disabled.content
 
 
+def test_tool_scope_cannot_expose_or_execute_another_node_capability():
+    calls: list[str] = []
+
+    async def run():
+        registry = ToolRegistry()
+        registry.register("read_file", "", {}, lambda: calls.append("read") or "READ")
+        registry.register("write_file", "", {}, lambda: calls.append("write") or "WRITE")
+        scoped = registry.scoped_to(["read_file"])
+        schemas = scoped.get_schemas()
+        allowed = await scoped.execute(ToolCall(id="1", name="read_file", arguments={}))
+        denied = await scoped.execute(ToolCall(id="2", name="write_file", arguments={}))
+        return schemas, allowed, denied
+
+    schemas, allowed, denied = asyncio.run(run())
+
+    assert [schema["function"]["name"] for schema in schemas] == ["read_file"]
+    assert allowed.content == "READ"
+    assert not allowed.is_error
+    assert denied.is_error
+    assert denied.error_kind == "tool_disabled"
+    assert "pipeline node" in denied.content
+    assert calls == ["read"]
+
+
 def test_web_tool_aliases_execute_canonical_tools():
     async def run():
         registry = ToolRegistry()

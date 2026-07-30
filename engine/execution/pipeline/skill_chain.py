@@ -134,6 +134,18 @@ class SkillNode:
     skill_name: str
     gate: Gate
     condition: Callable[[dict], bool] | None = None  # skip if returns False
+    # A thin, chain-owned compatibility layer for a vendored upstream skill.
+    # Keeping it on the node lets the same source skill remain reusable outside
+    # this pipeline without forking its methodology into another SKILL.md.
+    instructions: str = ""
+    # When this exact marker appears in a node's output, execution commits the
+    # question, persists the current node, and waits for the next user message
+    # instead of treating it as a failed quality gate.
+    await_user_input_marker: str | None = None
+    # ``None`` preserves the identity-wide tool set for legacy pipelines.
+    # An empty tuple deliberately exposes no tools; a populated tuple is a
+    # hard capability boundary for this particular node.
+    allowed_tools: tuple[str, ...] | None = None
 
 
 class SkillChain:
@@ -204,7 +216,49 @@ class SkillChain:
                     )
                 condition = conditions[cond_key]
 
-            nodes.append(SkillNode(skill_name=skill_name, gate=gate, condition=condition))
+            instructions = step.get("instructions", "")
+            if not isinstance(instructions, str):
+                raise ValueError(
+                    f"{path.name}: steps[{index}].instructions must be a string"
+                )
+
+            await_marker = step.get("await_user_input_marker")
+            if await_marker is not None and (
+                not isinstance(await_marker, str) or not await_marker
+            ):
+                raise ValueError(
+                    f"{path.name}: steps[{index}].await_user_input_marker "
+                    "must be a non-empty string when present"
+                )
+
+            allowed_tools_raw = step.get("allowed_tools")
+            allowed_tools: tuple[str, ...] | None = None
+            if allowed_tools_raw is not None:
+                if (
+                    not isinstance(allowed_tools_raw, list)
+                    or not all(
+                        isinstance(tool_name, str) and tool_name
+                        for tool_name in allowed_tools_raw
+                    )
+                ):
+                    raise ValueError(
+                        f"{path.name}: steps[{index}].allowed_tools must be a list "
+                        "of non-empty strings when present"
+                    )
+                if len(set(allowed_tools_raw)) != len(allowed_tools_raw):
+                    raise ValueError(
+                        f"{path.name}: steps[{index}].allowed_tools must not contain duplicates"
+                    )
+                allowed_tools = tuple(allowed_tools_raw)
+
+            nodes.append(SkillNode(
+                skill_name=skill_name,
+                gate=gate,
+                condition=condition,
+                instructions=instructions.strip(),
+                await_user_input_marker=await_marker,
+                allowed_tools=allowed_tools,
+            ))
 
         if not nodes:
             return None

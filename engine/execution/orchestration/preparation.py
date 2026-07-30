@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -36,6 +37,10 @@ from .builtin_tools import (
 from .runtime import EngineRequest, RuntimeContext, RuntimeServices
 
 logger = logging.getLogger(__name__)
+_PENDING_INPUT_CANCEL_RE = re.compile(
+    r"^\s*(?:/cancel|cancel|stop|abort|取消|停止|放弃|不要了)\s*[。.!！]?\s*$",
+    re.IGNORECASE,
+)
 
 
 class AgentSetup(NamedTuple):
@@ -125,6 +130,81 @@ def _identity_state_dir(runtime: RuntimeContext) -> Path:
     return runtime.profile_dir
 
 
+def _route_pending_user_input(
+    request: EngineRequest,
+    runtime: RuntimeContext,
+    catalog: IdentityCatalog,
+    state_dir: Path,
+    working_dir: Path,
+) -> RouteDecision | None:
+    """Recover the route of a chain paused for exactly one user decision.
+
+    This intentionally does not alter ordinary routing.  It activates only
+    for a same-agent, same-workspace checkpoint marked by the pipeline as
+    awaiting input.  Users can abandon it explicitly with ``cancel``/``取消``.
+    """
+    if request.forced_skill or not runtime.session_id:
+        return None
+    try:
+        from engine.execution.pipeline.checkpoint import SessionStateManager
+
+        manager = SessionStateManager(state_dir)
+        checkpoint = manager.restore(runtime.session_id)
+    except Exception:
+        logger.warning("failed to inspect pending user-input checkpoint", exc_info=True)
+        return None
+    if checkpoint is None or not checkpoint.awaiting_user_input:
+        return None
+
+    expected_working_dir = str(working_dir.resolve())
+    if (
+        checkpoint.agent_id != runtime.agent_id
+        or checkpoint.working_dir != expected_working_dir
+        or not checkpoint.identity_id
+        or not checkpoint.route_id
+    ):
+        return None
+    if _PENDING_INPUT_CANCEL_RE.match(request.message):
+        manager.clear(runtime.session_id)
+        return None
+    if (
+        request.execution_identity_id
+        and request.execution_identity_id != checkpoint.identity_id
+    ):
+        return None
+    try:
+        identity = catalog.get(checkpoint.identity_id)
+    except Exception:
+        logger.warning(
+            "pending input checkpoint references unknown identity %r",
+            checkpoint.identity_id,
+        )
+        return None
+    route = next((item for item in identity.routes if item.id == checkpoint.route_id), None)
+    if route is None or route.pipeline is None:
+        logger.warning(
+            "pending input checkpoint references unavailable route %r",
+            checkpoint.route_id,
+        )
+        return None
+    return RouteDecision(identity, route.id, route.pipeline, score=1_000)
+
+
+def _route_grill_me_entry(
+    request: EngineRequest,
+    catalog: IdentityCatalog,
+) -> RouteDecision | None:
+    """Map the user-visible Matt wrapper to its composed requirements chain."""
+    if request.forced_skill != "grill-me":
+        return None
+    for identity in catalog.identities:
+        for route in identity.routes:
+            if route.id == "requirements-research" and route.pipeline == "requirements-research":
+                return RouteDecision(identity, route.id, route.pipeline, score=1_000)
+    logger.warning("grill-me entry requested but no requirements-research route is configured")
+    return None
+
+
 async def _load_profile_config(runtime: RuntimeContext) -> dict:
     from common.yaml_utils import load_yaml
 
@@ -159,8 +239,16 @@ async def prepare_runtime(
     catalog = runtime.identity_catalog or IdentityCatalog.load(
         runtime.agents_dir / "identities"
     )
-    route = route_task(request.message, catalog, identity_id=request.identity_id)
-    identity = route.identity
+    # The session identity only shapes direct ReAct behavior.  Every turn
+    # still checks the complete catalog for an explicit SkillChain intent, so
+    # a conversation that began as ordinary Smith/ReAct work can later enter
+    # one of the Coding chains without changing its saved preference.
+    react_identity = (
+        catalog.get(request.identity_id)
+        if request.identity_id
+        else catalog.default
+    )
+    route = route_task(request.message, catalog)
     state_dir = _identity_state_dir(runtime)
     requested_working_dir = request.working_dir or runtime.default_working_dir
     if requested_working_dir is None:
@@ -168,6 +256,29 @@ async def prepare_runtime(
     working_dir = Path(requested_working_dir).expanduser().resolve()
     if not working_dir.is_dir():
         raise ValueError(f"working directory does not exist: {working_dir}")
+    grill_me_route = _route_grill_me_entry(request, catalog)
+    if grill_me_route is not None:
+        route = grill_me_route
+    else:
+        pending_route = _route_pending_user_input(
+            request,
+            runtime,
+            catalog,
+            state_dir,
+            working_dir,
+        )
+        if pending_route is not None:
+            route = pending_route
+    if route.pipeline_id is None:
+        route = RouteDecision(react_identity, "direct", None)
+    if (
+        request.execution_identity_id
+        and route.identity_id != request.execution_identity_id
+    ):
+        raise ValueError(
+            "resumed run execution identity does not match the resolved route"
+        )
+    identity = route.identity
 
     provider_dir = runtime.agents_dir / "tools"
     if services.tool_guard is not None:

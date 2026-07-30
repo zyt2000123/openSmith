@@ -40,6 +40,41 @@
 
 ## 未闭环
 
+### P0 · 收敛为单一 Smith 身份 + Coding 能力域，并闭合三条 SkillChain 的意图入口
+
+- [ ] **设计已定，尚未实施。** Smith 是唯一常驻的 session identity、人格偏好与记忆归属；
+      Coding 不是第二个会话身份，而是 Smith 之下可路由的能力域。当前
+      `agents/identities/coding.yaml` 与 `smith.yaml` 仍是平级 identity，且
+      `prepare_runtime()` 会在命中链路时把一次 Smith 会话路由为 `coding`，与该模型不符。
+      这项 P0 不恢复常驻多 Agent；未来如需 subagent，也只能继承 Smith 根身份并领取受限的
+      Coding capability profile，不能成为与用户对话竞争的人格。
+
+      **目标契约：**
+      1. `RouteDecision`、session/checkpoint、SSE 与 Shell 都区分 `identity_id=smith`、
+         `domain_id=coding | None`、`pipeline_id`。直接 ReAct 没有 domain/pipeline；进入链路时
+         Smith 身份保持不变，Coding 的工具、skills、gate/condition 只在该能力域内生效。
+      2. Coding 域只暴露三条固定链：需求调研
+         `grill-me → grilling → research → ecc-plan`；TDD 开发（新功能和 bug 修复，按条件先过
+         `diagnosing-bugs`）`→ tdd-workflow → verification-loop`；代码审查
+         `code-review → verification-loop`。不要为普通 ReAct 再造第四条隐式 pipeline。
+      3. 意图入口分层且可解释：显式入口/菜单强制进入指定链；规则命中或高置信语义识别自动进入；
+         歧义或未识别则保留 Smith 的直接 ReAct，并给出不阻塞的可选入口。现有
+         `route_task_with_llm` 不能继续处于无调用方状态：要么作为受声明 route 限制的第二层分类器
+         接入真实运行时并测试，要么删除；不得让模型凭空发明 identity、domain 或 pipeline。
+      4. 一旦开始链路，`awaiting_user_input`、断线重连和重启恢复必须按已保存的
+         `domain_id + pipeline_id + node` 续跑，不能重新识别意图；为历史
+         `identity_id=coding` checkpoint/session 提供显式迁移（到 `smith/coding`）或安全、
+         用户可见的拒绝与重启路径。
+
+      **验收：**
+      - runtime catalog 中只有 Smith 可作为 session identity；普通对话从开始到结束均呈现 Smith。
+      - 三条链均可通过显式入口启动，也可由覆盖同义自然语言的路由测试识别；每条链的事件、
+        transcript 与暂停后续跑均显示 `smith + coding domain`，不再显示身份切换为 `coding`。
+      - 未识别、低置信和混合意图不会中断对话或误启危险链路，稳定退化为直接 ReAct；用户随后
+        选择显式入口仍可进入正确链路。
+      - 覆盖 catalog/schema 迁移、task router、pipeline checkpoint、Engine SSE、Server session
+        持久化与 Shell 展示；旧 checkpoint 的行为有回归测试，三条链不因迁移丢失其内置 skill/tool。
+
 ### 已修 · 真实运行暴露的故障（保留全过程，因为它是 e2e 层价值的唯一实证）
 
 - [x] **工具结果回灌后偶发 HTTP 400** —— 2026-07-25 由 e2e 冒烟抓到并当天闭环。
@@ -205,7 +240,7 @@
 |---|---|---|
 | R1 | `run_agent` / `run_agent_stream` 双实现漂移 | 已收敛，sync 版删除 |
 | R2 | `execute_skill` 顶替整个 system prompt | **仍在** → 见 P1「技能节点上下文交接」 |
-| R3 | `route_task_with_llm` 全仓库零调用方 | **仍在**（死代码，接线或删除二选一） |
+| R3 | `route_task_with_llm` 全仓库零调用方 | **仍在** → 见 P0「单一 Smith 身份 + Coding 能力域」 |
 | R4 | 门禁纯正则 / LLMGate 异常静默通过 / retry_hint 丢弃 | 后两项已修；判据不接执行事实 → 见 P1 |
 | R5 | MCP stdio 每条消息 spawn/断开 | 已修，`mcp/session_pool.py` 按 session 复用 |
 | R6 | checkpoint 只写不读 | 已接线，`_apply_crash_checkpoint` + `run_pipeline(start_node_idx)` |

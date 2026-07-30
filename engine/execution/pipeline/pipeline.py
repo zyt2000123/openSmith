@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncGenerator
@@ -109,6 +110,15 @@ async def run_pipeline(
                 provision_id = f"{node.skill_name}:{node_idx}:{attempt}:{uuid4().hex}"
                 provision_settled = False
                 skill = skill_registry.get(node.skill_name)
+                node_tool_registry = tool_registry
+                if node.allowed_tools is not None:
+                    scoped_to = getattr(tool_registry, "scoped_to", None)
+                    if not callable(scoped_to):
+                        raise RuntimeError(
+                            "pipeline node declares allowed_tools but the runtime tool registry "
+                            "cannot enforce a scoped capability view"
+                        )
+                    node_tool_registry = scoped_to(node.allowed_tools)
 
                 if skill is None:
                     logger.warning(
@@ -123,7 +133,7 @@ async def run_pipeline(
                     elif attempt == 2:
                         messages.append({"role": "user", "content": "Switch strategy: try a completely different approach."})
                     event_stream = react_event_loop(
-                        llm, messages, tool_registry, tool_guard, max_react_iters,
+                        llm, messages, node_tool_registry, tool_guard, max_react_iters,
                         provisional_lifecycle=False,
                         prefix_cache_key=prefix_cache_key,
                     )
@@ -133,8 +143,21 @@ async def run_pipeline(
                         skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
                     elif attempt == 2:
                         skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
+                    # Vendored upstream skills stay source-faithful.  A node
+                    # can supply only the small runtime-specific contract it
+                    # needs (for example, how a one-question interview pauses
+                    # in Agent-Smith) without creating a duplicate skill.
+                    if node.instructions:
+                        skill = replace(
+                            skill,
+                            content=(
+                                f"{skill.content.rstrip()}\n\n"
+                                "## Agent-Smith chain node contract\n\n"
+                                f"{node.instructions}\n"
+                            ),
+                        )
                     event_stream = execute_skill_events(
-                        skill, llm, tool_registry, base_messages, skill_context,
+                        skill, llm, node_tool_registry, base_messages, skill_context,
                         max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
                         react_event_loop_fn=react_event_loop,
                         prefix_cache_key=prefix_cache_key,
@@ -164,6 +187,37 @@ async def run_pipeline(
                     yield ExecutionEvent(EventType.DONE, {})
                     return
                 output = result.text
+
+                if (
+                    node.await_user_input_marker
+                    and node.await_user_input_marker in output
+                ):
+                    # This is a successful, deliberate pause — not a failed
+                    # node.  Persist the question as prior-node context and
+                    # leave the index on this node so the next user response
+                    # re-enters the same upstream skill.
+                    visible_output = output.replace(node.await_user_input_marker, "").rstrip()
+                    yield ExecutionEvent(EventType.PROVISIONAL_COMMIT, {
+                        "provision_id": provision_id,
+                    })
+                    provision_settled = True
+                    context[output_key(node.skill_name)] = visible_output
+                    committed_provisional_output[node.skill_name] = result.was_provisional
+                    _save_checkpoint(context, node_idx, awaiting_user_input=True)
+                    yield ExecutionEvent(EventType.SKILL_END, {
+                        "skill": node.skill_name,
+                        "status": "awaiting_input",
+                    })
+                    data: dict[str, object] = {"text": visible_output}
+                    if result.was_provisional:
+                        data["already_streamed"] = True
+                    yield ExecutionEvent(EventType.TEXT_DELTA, data)
+                    yield ExecutionEvent(EventType.AWAITING_INPUT, {
+                        "skill": node.skill_name,
+                        "reason": "awaiting_user_input",
+                    })
+                    yield ExecutionEvent(EventType.DONE, {})
+                    return
 
                 # 第一层：兜底门禁。为空则本次产出直接进入领域门禁。
                 if not base_gates:
@@ -377,7 +431,12 @@ async def _collect_node_events(
 # ---------------------------------------------------------------------------
 
 
-def _save_checkpoint(context: dict, node_idx: int) -> None:
+def _save_checkpoint(
+    context: dict,
+    node_idx: int,
+    *,
+    awaiting_user_input: bool = False,
+) -> None:
     session_id = str(context.get(CTX_SESSION_ID) or "")
     state_dir = str(context.get(CTX_STATE_DIR) or "")
     if not session_id or not state_dir:
@@ -394,6 +453,7 @@ def _save_checkpoint(context: dict, node_idx: int) -> None:
             timestamp=datetime.now(timezone.utc).isoformat(),
             working_dir=str(context.get(CTX_WORKING_DIR) or ""),
             run_id=str(context.get(CTX_RUN_ID) or ""),
+            awaiting_user_input=awaiting_user_input,
         ))
     except Exception:
         logger.exception("failed to save session checkpoint")

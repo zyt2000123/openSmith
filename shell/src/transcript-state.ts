@@ -8,7 +8,7 @@ import type { Message, StreamEvent } from "./api.js";
 import type { SmithUiPayload } from "./smith-ui-schema.js";
 
 type SystemTone = "info" | "error";
-export type SkillState = "running" | "retry" | "done" | "blocked" | "error" | "cancelled";
+export type SkillState = "running" | "retry" | "waiting" | "done" | "blocked" | "error" | "cancelled";
 export type TranscriptViewMode = "compact" | "transcript";
 
 export function limitTranscript(entries: TranscriptEntry[], limit: number): TranscriptEntry[] {
@@ -157,6 +157,46 @@ function nextSkillState(status: string): SkillState {
   if (status === "blocked") return "blocked";
   if (status === "error" || status === "incomplete") return "error";
   return "done";
+}
+
+function routeNotice(event: Extract<StreamEvent, { type: "route_decided" }>): string {
+  const identity = event.identityName || event.identityId || "Agent";
+  const route = event.pipelineId || (event.routeId === "direct" ? "ReAct" : event.routeId) || "ReAct";
+  return `Route: ${identity} → ${route}.`;
+}
+
+function finishSentence(text: string): string {
+  return /[.!?。！？…]$/.test(text) ? text : `${text}.`;
+}
+
+function gateNotice(event: Extract<StreamEvent, { type: "gate_result" }>): string {
+  const target = event.skill || "workflow";
+  const verdict = event.verdict || "recorded";
+  return finishSentence(`Gate ${target}: ${verdict}${event.reason ? ` — ${event.reason}` : ""}`);
+}
+
+function backtrackNotice(event: Extract<StreamEvent, { type: "backtrack" }>): string {
+  const from = event.from || "current step";
+  const to = event.to || "previous step";
+  return finishSentence(`Backtracking ${from} → ${to}${event.reason ? ` — ${event.reason}` : ""}`);
+}
+
+function awaitingInputNotice(event: Extract<StreamEvent, { type: "awaiting_input" }>): string {
+  return event.skill
+    ? `Waiting for your input to continue ${event.skill}. Reply in chat.`
+    : "Waiting for your input to continue this workflow. Reply in chat.";
+}
+
+function markLatestTurnWaitingForInput(entries: TranscriptEntry[]): TranscriptEntry[] {
+  return updateLastTurn(entries, (turn) => ({
+    ...turn,
+    blocks: finishThinkingBlocks(turn.blocks).map((block) =>
+      block.type === "skill" && (block.state === "running" || block.state === "retry")
+        ? { ...block, state: "waiting" }
+        : block,
+    ),
+    streaming: false,
+  }));
 }
 
 function updateSkillActivity(
@@ -552,6 +592,18 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
         };
       });
 
+    case "route_decided":
+      return [...entries, createSystemEntry(routeNotice(event))];
+
+    case "gate_result":
+      return [...entries, createSystemEntry(gateNotice(event))];
+
+    case "backtrack":
+      return [...entries, createSystemEntry(backtrackNotice(event))];
+
+    case "awaiting_input":
+      return [...markLatestTurnWaitingForInput(entries), createSystemEntry(awaitingInputNotice(event))];
+
     case "token_usage":
       return entries;
 
@@ -565,6 +617,7 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
       // no SKILL_END, and an exception between TOOL_CALL_START and its result
       // is smoothed into done(failed).  Closing the turn without converging
       // those blocks leaves a permanent "running" card burned into <Static>.
+      if (event.reason === "awaiting_user_input") return markLatestTurnWaitingForInput(entries);
       if (event.status === "failed") return interruptLatestTurn(entries, "error");
       return interruptLatestTurn(entries, "cancelled", "Ended without a result.");
   }

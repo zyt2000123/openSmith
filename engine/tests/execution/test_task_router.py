@@ -73,19 +73,29 @@ def test_smith_identity_routes_git_branch_requests_directly() -> None:
     assert decision.pipeline_id is None
 
 
-def test_coding_identity_owns_shipped_software_change_routes() -> None:
+def test_coding_identity_routes_only_the_three_explicit_skillchain_intents() -> None:
     identities_dir = Path(__file__).resolve().parents[3] / "agents" / "identities"
     catalog = IdentityCatalog.load(identities_dir)
 
     for message, route_id in (
-        ("修复登录报错", "bugfix"),
-        ("新增一个表单提交功能", "feature"),
-        ("重构用户模块", "refactor"),
+        ("先做需求调研，再决定方案", "requirements-research"),
+        ("请用 TDD 修复登录报错", "tdd-development"),
+        ("请对这个 diff 做 code review", "code-review"),
     ):
         decision = route_task(message, catalog)
         assert decision.identity_id == "coding"
         assert decision.route_id == route_id
-        assert decision.pipeline_id == "coding"
+        assert decision.pipeline_id == route_id
+
+
+def test_ordinary_coding_requests_stay_on_direct_react() -> None:
+    identities_dir = Path(__file__).resolve().parents[3] / "agents" / "identities"
+    catalog = IdentityCatalog.load(identities_dir)
+
+    for message in ("修复登录报错", "新增一个表单提交功能", "重构用户模块"):
+        decision = route_task(message, catalog)
+        assert decision.route_id == "direct"
+        assert decision.pipeline_id is None
 
 
 def test_git_operations_remain_with_the_default_smith_identity() -> None:

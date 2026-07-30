@@ -222,12 +222,11 @@ class LlmGatePassReviewer(FakeLLM):
 class CodingPipelineLLM(FakeLLM):
     def __init__(self) -> None:
         super().__init__()
+        self.tool_sets: list[set[str]] = []
         self.responses = [
-            "需求：修复登录报错，目标是保证认证恢复正常。边界：不改动注册流程；约束：保持现有 API；风险：兼容旧 token。",
-            "1. 检查 auth/login.py 的错误路径并确认现有契约。\n2. 修改 server/app/auth.py 的验证分支。\n3. 在 shell/src/login.tsx 补充回归测试。\n验证：执行 pytest tests/test_auth.py 确认结果。",
-            "涉及文件 server/app/auth.py、shell/src/login.tsx 和 tests/test_auth.py。数据流：请求 -> 鉴权 -> 响应。依赖：复用现有 token 校验器。",
-            "实现方案与计划一致：按第 1 步定位 auth/login.py，按第 2 步修改 server/app/auth.py，按第 3 步更新 shell/src/login.tsx；整体对齐，无偏差。",
-            "执行 pytest tests/test_auth.py，结果 3 passed, 0 failed。",
+            "## Red-Capable Feedback Loop\n$ pytest tests/test_auth.py\n1 failed: login rejects a valid legacy token.\nThis command exercises the reported login path deterministically.\n<!-- agent-smith:red-loop-ready -->",
+            "# TddEvidence\n## RED\n$ pytest tests/test_auth.py\n1 failed: login rejects a valid legacy token.\n## GREEN\n$ pytest tests/test_auth.py\n1 passed, 0 failed.\nChanged regression coverage in tests/test_auth.py; residual risk: old-token migration fixture coverage.\n<!-- agent-smith:tdd-implementation-ready -->",
+            "# TddEvidence\nVERIFICATION REPORT\nBuild: NOT_APPLICABLE (Python package has no build step)\nTypes: NOT_APPLICABLE (no configured type checker)\nLint: NOT_APPLICABLE (no configured linter)\nTests: PASS (1 passed, 0 failed)\nSecurity: PASS (no secrets found in changed files)\nDiff: PASS (1 intended file changed)\nOverall: READY\n<!-- agent-smith:tdd-evidence-ready -->",
         ]
 
     async def chat(
@@ -237,6 +236,68 @@ class CodingPipelineLLM(FakeLLM):
         prefix_cache_key: str | None = None,
     ) -> ChatResponse:
         self.messages = messages
+        self.tool_sets.append({
+            tool["function"]["name"]
+            for tool in (tools or [])
+        })
+        return ChatResponse(text=self.responses.pop(0))
+
+
+class RequirementsPipelineLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_sets: list[set[str]] = []
+        self.responses = [
+            "Agreed scope: export a CSV report; non-goal: scheduling. "
+            "Acceptance signal: an exported file has the selected columns.\n"
+            "<!-- agent-smith:grilling-complete -->",
+            "ResearchBrief: docs/research/csv-export.md\n"
+            "<!-- agent-smith:research-brief-ready -->",
+            "The user has explicitly confirmed the scoped plan.\n"
+            "<!-- agent-smith:plan-confirmed -->",
+        ]
+
+    async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        prefix_cache_key: str | None = None,
+    ) -> ChatResponse:
+        self.messages = messages
+        self.tool_sets.append({
+            tool["function"]["name"]
+            for tool in (tools or [])
+        })
+        return ChatResponse(text=self.responses.pop(0))
+
+
+class ReviewPipelineLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_sets: list[set[str]] = []
+        self.responses = [
+            "## Standards\nNo standards violation found.\n\n"
+            "## Spec\nno spec available\n\n"
+            "Fixed point: git diff main...HEAD\n"
+            "<!-- agent-smith:review-ready -->",
+            "## Standards\nNo standards violation found.\n\n"
+            "## Spec\nno spec available\n\n"
+            "## Verification\nTests: PASS (targeted suite passed)\n"
+            "Overall: READY\n"
+            "<!-- agent-smith:review-report-ready -->",
+        ]
+
+    async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        prefix_cache_key: str | None = None,
+    ) -> ChatResponse:
+        self.messages = messages
+        self.tool_sets.append({
+            tool["function"]["name"]
+            for tool in (tools or [])
+        })
         return ChatResponse(text=self.responses.pop(0))
 
 
@@ -289,6 +350,32 @@ routes: []
         observation_factory=RunObservation.start,
     )
     return runtime, services, llm
+
+
+def _shipped_coding_runtime(
+    tmp_path: Path,
+    llm: FakeLLM,
+) -> tuple[RuntimeContext, RuntimeServices]:
+    """Create the public runtime seam with the shipped Coding assets enabled."""
+    runtime, services, _ = _runtime(tmp_path)
+    agents_dir = Path(__file__).resolve().parents[3] / "agents"
+    # An empty profile-level allowlist would intentionally hide every tool.
+    # Use the identity's built-in provider set so this test reaches the actual
+    # per-node scopes selected at runtime.
+    (runtime.profile_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+    runtime = RuntimeContext(
+        agent_id=runtime.agent_id,
+        agent_name=runtime.agent_name,
+        profile_dir=runtime.profile_dir,
+        agents_dir=agents_dir,
+        default_working_dir=runtime.default_working_dir,
+        session_id=runtime.session_id,
+        identity_catalog=IdentityCatalog.load(agents_dir / "identities"),
+    )
+    services.llm = llm  # type: ignore[assignment]
+    services.gate_llm = LlmGatePassReviewer()  # type: ignore[assignment]
+    services.skill_registry.load_builtin(agents_dir / "skills")
+    return runtime, services
 
 
 def _register_successful_test_tool(runtime: RuntimeContext, services: RuntimeServices) -> None:
@@ -1389,6 +1476,49 @@ def test_resume_rejects_a_request_from_a_different_run_scope(tmp_path: Path) -> 
     assert llm.closed is True
 
 
+def test_resume_accepts_coding_execution_identity_with_smith_react_preference(
+    tmp_path: Path,
+) -> None:
+    """Resume scopes bind to the prior execution identity, not ReAct preference."""
+
+    async def run() -> tuple[list[ExecutionEvent], Path]:
+        llm = CodingPipelineLLM()
+        runtime, services = _shipped_coding_runtime(tmp_path, llm)
+        store = RunStateStore(runtime.profile_dir)
+        store.create(
+            "run-1",
+            agent_id=runtime.agent_id,
+            session_id=runtime.session_id,
+            message_id="message-1",
+            identity_id="coding",
+            working_dir=str(tmp_path),
+        )
+        store.transition("run-1", RunStatus.RUNNING)
+        store.transition("run-1", RunStatus.INCOMPLETE)
+
+        stream = resume_stream_with_runtime(
+            EngineRequest(
+                message="请用 TDD 修复登录报错",
+                identity_id="smith",
+                execution_identity_id="coding",
+                message_id="message-1",
+                working_dir=str(tmp_path),
+            ),
+            runtime,
+            services,
+            "run-1",
+        )
+        return [event async for event in stream.stream_events()], runtime.profile_dir
+
+    events, profile_dir = asyncio.run(run())
+
+    route = next(event for event in events if event.type is EventType.ROUTE_DECIDED)
+    state = RunStateStore(profile_dir).get("run-1")
+    assert route.data["identity_id"] == "coding"
+    assert events[-1].data["status"] == "completed"
+    assert state is not None and state.identity_id == "coding"
+
+
 def test_resume_ledger_failure_does_not_activate_the_persisted_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1775,8 +1905,83 @@ GATES = {"runtime_contract_planning": AlwaysPassGate}
     assert [node.skill_name for node in setup.chain.nodes] == ["planning"]
 
 
-def test_shipped_coding_identity_executes_every_declared_stage(tmp_path: Path) -> None:
-    """A shipped coding request must execute the plugin's real skill chain.
+def test_pending_user_input_restores_only_the_paused_chain_route(tmp_path: Path) -> None:
+    """A grilling answer continues its chain; an explicit cancel returns to ReAct."""
+    from engine.execution.orchestration.preparation import _route_pending_user_input
+    from engine.execution.pipeline.checkpoint import SessionCheckpoint, SessionStateManager
+
+    agents_dir = Path(__file__).resolve().parents[3] / "agents"
+    profile_dir = tmp_path / "profile"
+    workspace = tmp_path / "workspace"
+    profile_dir.mkdir()
+    workspace.mkdir()
+    SessionStateManager(profile_dir).save(SessionCheckpoint(
+        agent_id="smith-id",
+        session_id="sess-input",
+        identity_id="coding",
+        route_id="requirements-research",
+        skill_chain_index=0,
+        context={"chain_request": "do requirements research"},
+        timestamp="2026-07-30T00:00:00+00:00",
+        working_dir=str(workspace.resolve()),
+        run_id="finished-run",
+        awaiting_user_input=True,
+    ))
+    runtime = RuntimeContext(
+        agent_id="smith-id",
+        agent_name="Smith",
+        profile_dir=profile_dir,
+        agents_dir=agents_dir,
+        session_id="sess-input",
+        default_working_dir=workspace,
+    )
+    catalog = IdentityCatalog.load(agents_dir / "identities")
+
+    resumed = _route_pending_user_input(
+        EngineRequest(
+            message="Internal support engineers.",
+            # This is the session's ReAct preference, not the paused chain's
+            # execution identity.  It must not prevent the chain from resuming.
+            identity_id="smith",
+        ),
+        runtime,
+        catalog,
+        profile_dir,
+        workspace,
+    )
+    assert resumed is not None
+    assert resumed.identity_id == "coding"
+    assert resumed.route_id == "requirements-research"
+    assert resumed.pipeline_id == "requirements-research"
+
+    cancelled = _route_pending_user_input(
+        EngineRequest(message="取消"),
+        runtime,
+        catalog,
+        profile_dir,
+        workspace,
+    )
+    assert cancelled is None
+    assert SessionStateManager(profile_dir).restore("sess-input") is None
+
+
+def test_grill_me_entry_routes_to_requirements_chain_even_without_keyword(tmp_path: Path) -> None:
+    from engine.execution.orchestration.preparation import _route_grill_me_entry
+
+    agents_dir = Path(__file__).resolve().parents[3] / "agents"
+    route = _route_grill_me_entry(
+        EngineRequest(message="a vague product idea", forced_skill="grill-me"),
+        IdentityCatalog.load(agents_dir / "identities"),
+    )
+
+    assert route is not None
+    assert route.identity_id == "coding"
+    assert route.route_id == "requirements-research"
+    assert route.pipeline_id == "requirements-research"
+
+
+def test_shipped_tdd_identity_executes_every_declared_stage(tmp_path: Path) -> None:
+    """An explicit TDD request executes the shipped, vendored skill chain.
 
     This intentionally uses the public ``run_stream_with_runtime`` seam and
     the repository's actual ``agents/`` assets.  Do not seed stage skills in
@@ -1784,51 +1989,148 @@ def test_shipped_coding_identity_executes_every_declared_stage(tmp_path: Path) -
     installation.
     """
 
-    async def run() -> tuple[object, list[ExecutionEvent]]:
-        runtime, services, _ = _runtime(tmp_path)
-        agents_dir = Path(__file__).resolve().parents[3] / "agents"
-        runtime = RuntimeContext(
-            agent_id=runtime.agent_id,
-            agent_name=runtime.agent_name,
-            profile_dir=runtime.profile_dir,
-            agents_dir=agents_dir,
-            default_working_dir=runtime.default_working_dir,
-            session_id=runtime.session_id,
-            identity_catalog=IdentityCatalog.load(agents_dir / "identities"),
-        )
+    async def run() -> tuple[object, list[ExecutionEvent], CodingPipelineLLM, Path]:
         llm = CodingPipelineLLM()
-        services.llm = llm  # type: ignore[assignment]
-        services.gate_llm = LlmGatePassReviewer()  # type: ignore[assignment]
-        services.skill_registry.load_builtin(agents_dir / "skills")
-        request = EngineRequest(message="修复登录报错")
+        runtime, services = _shipped_coding_runtime(tmp_path, llm)
+        request = EngineRequest(
+            message="请用 TDD 修复登录报错",
+            # A session's fixed ReAct preference must not scope SkillChain
+            # recognition.  The actual chain identity is persisted after the
+            # Engine has selected this route.
+            identity_id="smith",
+        )
         stream = run_stream_with_runtime(request, runtime, services)
         events = [event async for event in stream.stream_events()]
-        return stream, events
+        return stream, events, llm, runtime.profile_dir
 
-    stream, events = asyncio.run(run())
+    stream, events, llm, profile_dir = asyncio.run(run())
 
     route = next(event for event in events if event.type is EventType.ROUTE_DECIDED)
     assert route.data["identity_id"] == "coding"
-    assert route.data["route_id"] == "bugfix"
-    assert route.data["pipeline_id"] == "coding"
+    assert route.data["route_id"] == "tdd-development"
+    assert route.data["pipeline_id"] == "tdd-development"
     assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
-        "coding-understanding",
-        "coding-planning",
-        "coding-architecture",
-        "coding-implementation",
-        "coding-validation",
+        "diagnosing-bugs",
+        "tdd-workflow",
+        "verification-loop",
     ]
     assert [event.data["verdict"] for event in events if event.type is EventType.GATE_RESULT] == [
         "pass",
         "pass",
         "pass",
-        "pass",
-        "pass",
     ]
     assert all(event.type not in {EventType.BLOCKED, EventType.FAILED} for event in events)
+    assert llm.tool_sets[:2] == [
+        {"read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell"},
+        {"read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell"},
+    ]
+    assert llm.tool_sets[2] == {
+        "read_file", "list_dir", "glob_files", "grep", "shell",
+    }
     assert events[-2].type is EventType.DONE
     assert events[-1].type is EventType.RUN_FINISHED
     assert stream.status == "completed"
+    state = RunStateStore(profile_dir).get(stream.run_id)
+    assert state is not None and state.identity_id == "coding"
+
+
+def test_shipped_requirements_identity_executes_every_declared_stage(
+    tmp_path: Path,
+) -> None:
+    """The public runtime executes grilling, research, and confirmed planning."""
+    research_brief = tmp_path / "docs" / "research" / "csv-export.md"
+    research_brief.parent.mkdir(parents=True)
+    research_brief.write_text(
+        "# ResearchBrief\n\n"
+        "## Problem\nCSV export is needed.\n\n"
+        "## Evidence\nPrimary documentation: https://example.com/primary\n\n"
+        "## Assumptions\nThe existing export API is available.\n\n"
+        "## Open Questions\nNone.\n\n"
+        "## Recommendation\nImplement the smallest CSV export slice.\n",
+        encoding="utf-8",
+    )
+
+    async def run() -> tuple[object, list[ExecutionEvent], RequirementsPipelineLLM, Path]:
+        llm = RequirementsPipelineLLM()
+        runtime, services = _shipped_coding_runtime(tmp_path, llm)
+        stream = run_stream_with_runtime(
+            EngineRequest(
+                message="请做需求调研；CSV 导出方案已确认",
+                identity_id="smith",
+            ),
+            runtime,
+            services,
+        )
+        events = [event async for event in stream.stream_events()]
+        return stream, events, llm, runtime.profile_dir
+
+    stream, events, llm, profile_dir = asyncio.run(run())
+
+    route = next(event for event in events if event.type is EventType.ROUTE_DECIDED)
+    assert route.data["route_id"] == "requirements-research"
+    assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
+        "grilling",
+        "research",
+        "ecc-plan",
+    ]
+    assert [event.data["verdict"] for event in events if event.type is EventType.GATE_RESULT] == [
+        "pass",
+        "pass",
+        "pass",
+    ]
+    assert llm.tool_sets[0] == {
+        "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep",
+    }
+    assert llm.tool_sets[1] == {
+        "read_file", "read_pdf", "render_pdf_page", "write_file", "list_dir",
+        "glob_files", "grep", "web_search", "web_fetch",
+    }
+    assert llm.tool_sets[2] == llm.tool_sets[0]
+    assert events[-2].type is EventType.DONE
+    assert events[-1].type is EventType.RUN_FINISHED
+    assert stream.status == "completed"
+    state = RunStateStore(profile_dir).get(stream.run_id)
+    assert state is not None and state.identity_id == "coding"
+
+
+def test_shipped_review_identity_executes_every_declared_stage(tmp_path: Path) -> None:
+    """The public runtime preserves review axes through final verification."""
+
+    async def run() -> tuple[object, list[ExecutionEvent], ReviewPipelineLLM, Path]:
+        llm = ReviewPipelineLLM()
+        runtime, services = _shipped_coding_runtime(tmp_path, llm)
+        stream = run_stream_with_runtime(
+            EngineRequest(
+                message="请对这个 diff 做代码评审，固定基线为 main",
+                identity_id="smith",
+            ),
+            runtime,
+            services,
+        )
+        events = [event async for event in stream.stream_events()]
+        return stream, events, llm, runtime.profile_dir
+
+    stream, events, llm, profile_dir = asyncio.run(run())
+
+    route = next(event for event in events if event.type is EventType.ROUTE_DECIDED)
+    assert route.data["route_id"] == "code-review"
+    assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
+        "code-review",
+        "verification-loop",
+    ]
+    assert [event.data["verdict"] for event in events if event.type is EventType.GATE_RESULT] == [
+        "pass",
+        "pass",
+    ]
+    assert llm.tool_sets == [
+        {"read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "shell"},
+        {"read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "shell"},
+    ]
+    assert events[-2].type is EventType.DONE
+    assert events[-1].type is EventType.RUN_FINISHED
+    assert stream.status == "completed"
+    state = RunStateStore(profile_dir).get(stream.run_id)
+    assert state is not None and state.identity_id == "coding"
 
 
 def test_reply_events_with_runtime_emits_decision_reply_and_closes(tmp_path: Path) -> None:

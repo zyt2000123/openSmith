@@ -337,6 +337,22 @@ class ToolRegistry:
         })
         return result
 
+    def scoped_to(self, names: Iterable[str]) -> "ScopedToolRegistry":
+        """Return a non-mutating, per-workflow capability view.
+
+        The identity-wide allowlist remains the outer limit.  A pipeline node
+        can only narrow it; it can never re-enable a tool that identity or
+        profile configuration has disabled.
+        """
+        return ScopedToolRegistry(self, names)
+
+    def unavailable_tool_message(self, name: str) -> str:
+        """Explain why a tool absent from this registry view cannot run."""
+        canonical = _canonical_tool_name(name)
+        if canonical not in self._tools:
+            return f"Unknown tool: {name}"
+        return f"Tool disabled: {canonical}"
+
     def set_enabled(self, enabled: list[str] | None) -> list[str]:
         """Restrict visible/executable tools.
 
@@ -749,6 +765,96 @@ class ToolRegistry:
     def definitions(self) -> dict[str, ToolDefinition]:
         """All registered definitions (incl. disabled) keyed by name, for safety guards."""
         return {name: defn for name, (defn, _) in self._tools.items()}
+
+
+class ScopedToolRegistry:
+    """A non-mutating view that narrows one ``ToolRegistry`` for a skill node."""
+
+    def __init__(self, registry: ToolRegistry, names: Iterable[str]) -> None:
+        self._registry = registry
+        self._allowed = frozenset(
+            _canonical_tool_name(name)
+            for name in names
+            if isinstance(name, str) and name
+        )
+
+    def _active_names(self) -> set[str]:
+        # ``list_tool_names`` already applies the parent identity/profile
+        # allowlist.  Intersecting here prevents a scoped view from widening
+        # that outer boundary through ``get_schemas(enabled=...)``.
+        return self._allowed.intersection(self._registry.list_tool_names())
+
+    @property
+    def working_directory(self) -> Path | None:
+        return self._registry.working_directory
+
+    def get_schemas(self, enabled: list[str] | None = None) -> list[dict]:
+        active = self._active_names()
+        if enabled is not None:
+            active.intersection_update(
+                _canonical_tool_name(name)
+                for name in enabled
+                if isinstance(name, str) and name
+            )
+        return self._registry.get_schemas(sorted(active))
+
+    def list_tools(self) -> list[ToolDefinition]:
+        active = self._active_names()
+        return [
+            tool
+            for tool in self._registry.list_tools()
+            if tool.name in active
+        ]
+
+    def definitions(self) -> dict[str, ToolDefinition]:
+        active = self._active_names()
+        return {
+            name: definition
+            for name, definition in self._registry.definitions().items()
+            if name in active
+        }
+
+    def get(self, name: str) -> ToolDefinition | None:
+        canonical = _canonical_tool_name(name)
+        if canonical not in self._active_names():
+            return None
+        return self._registry.get(canonical)
+
+    def unavailable_tool_message(self, name: str) -> str:
+        """Keep an out-of-scope call out of policy and approval handling."""
+        canonical = _canonical_tool_name(name)
+        if canonical not in self._registry.list_tool_names():
+            return self._registry.unavailable_tool_message(name)
+        return f"Tool disabled for this pipeline node: {canonical}"
+
+    def normalize_call(self, call: ToolCall) -> ToolCall:
+        return self._registry.normalize_call(call)
+
+    @contextmanager
+    def authorize_execution(
+        self,
+        call: ToolCall,
+        *,
+        approval_id: str | None = None,
+        approval_scope: ApprovalScope | None = None,
+    ) -> Iterator[None]:
+        with self._registry.authorize_execution(
+            call,
+            approval_id=approval_id,
+            approval_scope=approval_scope,
+        ):
+            yield
+
+    async def execute(self, call: ToolCall) -> ToolResult:
+        call = self._registry.normalize_call(call)
+        if _canonical_tool_name(call.name) not in self._active_names():
+            return ToolResult(
+                call_id=call.id,
+                content=self.unavailable_tool_message(call.name),
+                is_error=True,
+                error_kind="tool_disabled",
+            )
+        return await self._registry.execute(call)
 
 
 _EXIT_CODE_RE = re.compile(r"^\[exit_code=(-?\d+)\]")

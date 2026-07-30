@@ -158,6 +158,15 @@ routes:
 """.strip(),
         encoding="utf-8",
     )
+    (tmp_path / "coding.yaml").write_text(
+        """
+schema: agentsmith.identity/v1
+id: coding
+name: Coding
+routes: []
+""".strip(),
+        encoding="utf-8",
+    )
     return IdentityCatalog.load(tmp_path)
 
 
@@ -276,6 +285,75 @@ async def test_stream_message_forwards_skill_name_and_blocked_flag(monkeypatch: 
     assert preflight_payload["blocked"] is False
     assert preflight_payload["error"] is False
     assert preflight_payload["summary"] == "present facts and retry"
+
+
+@pytest.mark.asyncio
+async def test_stream_message_forwards_skillchain_lifecycle_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
+
+    async def fake_engine_reply_events(request, runtime, services):
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="route_decided"),
+            data={
+                "identity_id": "coding",
+                "identity_name": "Coding",
+                "route_id": "requirements-research",
+                "pipeline_id": "requirements-research",
+                "score": 1_000,
+            },
+        )
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="gate_result"),
+            data={"skill": "grilling", "verdict": "retry", "reason": "Need a target user."},
+        )
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="backtrack"),
+            data={"from": "research", "to": "grilling", "reason": "Scope is still ambiguous."},
+        )
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="awaiting_input"),
+            data={"skill": "grilling", "reason": "awaiting_user_input"},
+        )
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="run_finished"),
+            data={"run_id": "run-1", "status": "incomplete", "reason": "awaiting_user_input"},
+        )
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_run_stream_with_runtime",
+        _fake_run(fake_engine_reply_events),
+    )
+
+    events = [
+        event
+        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+            "smith-id",
+            "sess-1",
+            "Help me shape this product idea",
+        )
+    ]
+
+    lifecycle = {
+        event["event"]: json.loads(event["data"])
+        for event in events
+        if event["event"] in {"route_decided", "gate_result", "backtrack", "awaiting_input"}
+    }
+    assert lifecycle == {
+        "route_decided": {
+            "identity_id": "coding",
+            "identity_name": "Coding",
+            "route_id": "requirements-research",
+            "pipeline_id": "requirements-research",
+        },
+        "gate_result": {"skill": "grilling", "verdict": "retry", "reason": "Need a target user."},
+        "backtrack": {"from": "research", "to": "grilling", "reason": "Scope is still ambiguous."},
+        "awaiting_input": {"skill": "grilling", "reason": "awaiting_user_input"},
+    }
 
 
 @pytest.mark.asyncio
@@ -423,7 +501,7 @@ async def test_resume_run_reuses_session_scope_and_discards_partial_reply(
         agent_id="smith-id",
         session_id="sess-1",
         message_id="u-current",
-        identity_id="smith",
+        identity_id="coding",
         working_dir="/tmp/project",
         forced_skill="review",
     )
@@ -470,6 +548,8 @@ async def test_resume_run_reuses_session_scope_and_discards_partial_reply(
     assert request.working_dir == "/tmp/project"
     assert request.forced_skill == "review"
     assert request.message_id == "u-current"
+    assert request.identity_id == "smith"
+    assert request.execution_identity_id == "coding"
     assert captured["runtime_session"] == "sess-1"
     assert captured["run_id"] == "run-1"
     assert [message["content"] for message in repo.messages] == ["earlier", "done", "continue audit"]
@@ -550,7 +630,7 @@ async def test_prepare_resume_rejects_a_retired_identity_without_discarding_part
 
 
 @pytest.mark.asyncio
-async def test_first_message_auto_selects_and_pins_identity(tmp_path: Path) -> None:
+async def test_first_message_pins_default_react_identity_not_content_routed_identity(tmp_path: Path) -> None:
     repo = FakeSessionRepo()
     service = SessionService(
         repo,
@@ -571,9 +651,9 @@ async def test_first_message_auto_selects_and_pins_identity(tmp_path: Path) -> N
         None,
     )
 
-    assert selected == "legal"
-    assert follow_up == "legal"
-    assert repo.identity_id == "legal"
+    assert selected == "smith"
+    assert follow_up == "smith"
+    assert repo.identity_id == "smith"
 
 
 @pytest.mark.asyncio

@@ -180,6 +180,10 @@ export type StreamEvent =
   | { type: "tool_call"; id: string; name: string; hint: string }
   | { type: "tool_result"; id: string; error: boolean; blocked: boolean; preflight: boolean; summary: string }
   | { type: "skill"; name: string; status: string }
+  | { type: "route_decided"; identityId: string; identityName: string; routeId: string; pipelineId: string }
+  | { type: "gate_result"; skill: string; verdict: string; reason: string }
+  | { type: "backtrack"; from: string; to: string; reason: string }
+  | { type: "awaiting_input"; skill: string; reason: string }
   | ({ type: "token_usage" } & TokenUsage)
   | ({ type: "context_usage" } & ContextUsage)
   | { type: "compression"; active: boolean }
@@ -727,6 +731,30 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     type: "skill",
     name: terminalText(payload.name),
     status: terminalText(payload.status),
+  }),
+  route_decided: (payload) => ({
+    type: "route_decided",
+    identityId: terminalText(payload.identity_id).slice(0, 120),
+    identityName: terminalText(payload.identity_name).slice(0, 120),
+    routeId: terminalText(payload.route_id).slice(0, 120),
+    pipelineId: terminalText(payload.pipeline_id).slice(0, 120),
+  }),
+  gate_result: (payload) => ({
+    type: "gate_result",
+    skill: terminalText(payload.skill).slice(0, 120),
+    verdict: terminalText(payload.verdict).slice(0, 80),
+    reason: terminalText(payload.reason).slice(0, 500),
+  }),
+  backtrack: (payload) => ({
+    type: "backtrack",
+    from: terminalText(payload.from).slice(0, 120),
+    to: terminalText(payload.to).slice(0, 120),
+    reason: terminalText(payload.reason).slice(0, 500),
+  }),
+  awaiting_input: (payload) => ({
+    type: "awaiting_input",
+    skill: terminalText(payload.skill).slice(0, 120),
+    reason: terminalText(payload.reason).slice(0, 500),
   }),
   token_usage: (payload) => ({
     type: "token_usage",

@@ -1,0 +1,45 @@
+# User-visible /grill-me is an entry alias.  The actual first node is Matt's
+# `grilling` skill because the upstream `grill-me` wrapper delegates to it.
+route: requirements-research
+
+steps:
+  - skill: grilling
+    gate: grilling_complete
+    await_user_input_marker: "<!-- agent-smith:await-user-input -->"
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep]
+    instructions: |
+      You are the upstream grilling skill inside Agent-Smith's requirements-research chain.
+      Facts discoverable in the repository or sources must be looked up rather than asked.
+      Resolve exactly one user-owned decision per reply and give a recommendation.
+      If a decision remains, ask only that one question, do not research yet, and end with
+      `<!-- agent-smith:await-user-input -->`. If shared understanding is complete, summarize
+      the agreed scope, non-goals, constraints, and acceptance signal; end with
+      `<!-- agent-smith:grilling-complete -->`. Do not begin implementation.
+
+  - skill: research
+    gate: research_brief
+    allowed_tools: [read_file, read_pdf, render_pdf_page, write_file, list_dir, glob_files, grep, web_search, web_fetch]
+    instructions: |
+      Execute the upstream primary-source research method within this resident agent run;
+      background subagents are not available in this chain. Use `web_search` only to discover
+      primary-source URLs and `web_fetch` only to read them; never invoke a background agent,
+      `web_crawl`, or another skill. Do not implement code.
+      Write one cited Markdown artifact at `docs/research/YYYY-MM-DD-<slug>.md` titled
+      `ResearchBrief`, with exactly these headings: `## Problem`, `## Evidence`,
+      `## Assumptions`, `## Open Questions`, and `## Recommendation`. Cite primary-source
+      URLs for factual claims. In the final handoff, report the artifact path and end with
+      `<!-- agent-smith:research-brief-ready -->`.
+
+  - skill: ecc-plan
+    gate: plan_confirmed
+    await_user_input_marker: "<!-- agent-smith:await-user-input -->"
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep]
+    instructions: |
+      Use the just-created ResearchBrief as the plan input. Ground the plan in repository
+      patterns and make it explicit that no source code will be changed in this chain. This is
+      inline Markdown-reference mode: do not create `.claude` artifacts, open Plan Canvas, invoke
+      a planner/subagent, or hand off to any slash command or other skill.
+      If user confirmation is still required, present the plan, ask one confirmation question,
+      and end with `<!-- agent-smith:await-user-input -->`. If the user has explicitly
+      confirmed, report the ResearchBrief path plus the confirmed plan boundary, do not implement,
+      and end with `<!-- agent-smith:plan-confirmed -->`.

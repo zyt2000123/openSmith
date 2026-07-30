@@ -431,6 +431,12 @@ async def react_event_loop(
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """ReAct loop: model response, tool calls, results, and next turn in one history."""
     tools = tool_registry.get_schemas() or None
+    visible_tool_names = {
+        schema["function"]["name"]
+        for schema in (tools or [])
+        if isinstance(schema.get("function"), dict)
+        and isinstance(schema["function"].get("name"), str)
+    }
     # 逐条浅拷贝：prune/compress 会原地改写 content，
     # 不复制会污染调用方传入的 history dict（跨请求复用时留脏数据）。
     conversation = [dict(m) for m in messages]
@@ -825,7 +831,7 @@ async def react_event_loop(
             # client-side component tree. The validated event is sent only to
             # clients that explicitly understand the smith-ui contract.
             if call.name == "render_ui":
-                if call.name not in {schema["function"]["name"] for schema in tool_registry.get_schemas()}:
+                if call.name not in visible_tool_names:
                     conversation.append({
                         "role": "tool",
                         "tool_call_id": call.id,
@@ -889,6 +895,66 @@ async def react_event_loop(
                 consecutive_errors = 0
                 last_error_key = None
                 identical_error_count = 0
+                continue
+
+            # A node-scoped registry deliberately hides capabilities that are
+            # not part of this stage.  Reject a hallucinated or disabled call
+            # before ToolPolicy sees it: a capability that cannot execute must
+            # never turn into an approval request merely because it exists in
+            # the broader identity-level registry.
+            if call.name not in visible_tool_names:
+                unavailable_message = getattr(
+                    tool_registry,
+                    "unavailable_tool_message",
+                    None,
+                )
+                content = (
+                    unavailable_message(call.name)
+                    if callable(unavailable_message)
+                    else f"Tool disabled: {call.name}"
+                )
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": content,
+                })
+                yield ExecutionEvent(EventType.TOOL_CALL_START, {
+                    "name": tc.name,
+                    "id": tc.id,
+                    "arguments": call.arguments,
+                })
+                yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                    "id": tc.id,
+                    "error": True,
+                    "blocked": False,
+                    "preflight": False,
+                    "content": content[:200],
+                    "error_kind": "tool_disabled",
+                    "retryable": False,
+                    "timed_out": False,
+                    "side_effect_status": "none",
+                    "metadata": {},
+                })
+                round_had_failure = True
+                consecutive_errors += 1
+                error_key = f"{tc.name}:{content[:120]}"
+                if error_key == last_error_key:
+                    identical_error_count += 1
+                else:
+                    last_error_key = error_key
+                    identical_error_count = 1
+                if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                    yield ExecutionEvent(
+                        EventType.TEXT_DELTA,
+                        {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
+                    )
+                    yield ExecutionEvent(EventType.INCOMPLETE, {
+                        "reason": "identical_tool_error_loop",
+                    })
+                    return
+                if consecutive_errors >= 3:
+                    conversation.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                    consecutive_errors = 0
                 continue
 
             granted_approval_id: str | None = None

@@ -134,16 +134,16 @@ def test_ordinary_dotted_directories_are_still_writable(tmp_path: Path) -> None:
 # ── P1-1: substring keyword matching misroutes English requests ──
 
 def test_latin_keywords_require_word_boundaries() -> None:
-    """'digital' must not match the 'git' keyword and steal the coding pipeline."""
+    """'digital' must not match the 'git' keyword and steal the direct path."""
     decision = _resolve(
         "Please add a digital signature verification feature to the login flow"
     )
-    assert decision.route_id == "feature", f"expected feature, got {decision.route_id}"
-    assert decision.pipeline_id == "coding"
+    assert decision.route_id == "direct", f"expected direct, got {decision.route_id}"
+    assert decision.pipeline_id is None
 
     decision = _resolve("Refactor the legitimate config loader")
-    assert decision.route_id == "refactor", f"expected refactor, got {decision.route_id}"
-    assert decision.pipeline_id == "coding"
+    assert decision.route_id == "direct", f"expected direct, got {decision.route_id}"
+    assert decision.pipeline_id is None
 
 
 def test_git_route_still_matches_real_git_requests() -> None:
@@ -153,21 +153,19 @@ def test_git_route_still_matches_real_git_requests() -> None:
         assert decision.route_id == "git", f"{message!r} should route to git"
 
 
-def test_english_inflections_still_match_keywords() -> None:
-    """A trailing \\b would kill every plural/gerund — only the leading one is asserted.
-
-    ``\\bcommit\\b`` does not match "squash these commits" because the plural "s"
-    is a word character, so asserting both boundaries silently breaks ordinary
-    English phrasing across every route.
-    """
+def test_explicit_skillchain_intents_match_without_capturing_ordinary_coding() -> None:
+    """Explicit chain intents work while ordinary coding stays direct."""
     expected = {
         "squash these commits": "git",
         "delete stale branches": "git",
         "already merged that upstream": "git",
-        "fix the bugs in the parser": "bugfix",
-        "debugging the crash report": "bugfix",
-        "adding a new endpoint": "feature",
-        "refactoring the loader": "refactor",
+        "fix the bugs in the parser": "direct",
+        "debugging the crash report": "direct",
+        "adding a new endpoint": "direct",
+        "refactoring the loader": "direct",
+        "run requirements research first": "requirements-research",
+        "use test-driven development": "tdd-development",
+        "run a code review": "code-review",
     }
     for message, route_id in expected.items():
         decision = _resolve(message)
@@ -230,9 +228,9 @@ def test_stem_plus_consonant_plus_e_does_not_misroute() -> None:
 
 
 def test_adverb_inflection_still_matches() -> None:
-    """Round-3 review: tightening the suffix set dropped "wrongly"."""
+    """An ordinary error description must not silently select a SkillChain."""
     decision = _resolve("the config behaves wrongly")
-    assert decision.route_id == "bugfix", f"got {decision.route_id}"
+    assert decision.route_id == "direct", f"got {decision.route_id}"
 
 
 def test_hardlink_check_covers_git_worktree_layout(tmp_path: Path) -> None:
@@ -759,7 +757,7 @@ def test_live_owner_checkpoint_is_kept_not_cleared(tmp_path: Path) -> None:
     The refusal previously fell through to the same clear() as a stale
     checkpoint, destroying the crash-recovery point of a run still executing.
     """
-    from engine.execution.orchestration.agent_loop import _apply_crash_checkpoint
+    from engine.execution.orchestration.agent_loop import _apply_session_checkpoint
     from engine.execution.orchestration.run_state import RunStateStore
     from engine.execution.pipeline.checkpoint import SessionCheckpoint, SessionStateManager
 
@@ -779,7 +777,7 @@ def test_live_owner_checkpoint_is_kept_not_cleared(tmp_path: Path) -> None:
         working_dir=str(tmp_path.resolve()),
     ))
 
-    context, start = _apply_crash_checkpoint(
+    context, start = _apply_session_checkpoint(
         {
             "agent_id": "smith-id",
             "identity_id": "smith",

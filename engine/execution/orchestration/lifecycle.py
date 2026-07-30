@@ -334,7 +334,7 @@ def _start_event_boundary(
         run_id=run_id,
         agent_id=runtime.agent_id,
         session_id=runtime.session_id,
-        identity_id=request.identity_id,
+        identity_id=request.execution_identity_id,
         working_dir=request.working_dir,
         forced_skill=request.forced_skill,
         profile_dir=runtime.profile_dir,
@@ -367,7 +367,7 @@ def run_stream_with_runtime(
             agent_id=runtime.agent_id,
             session_id=runtime.session_id,
             message_id=request.message_id,
-            identity_id=request.identity_id,
+            identity_id=request.execution_identity_id,
             working_dir=request.working_dir,
             forced_skill=request.forced_skill,
         )
@@ -506,7 +506,10 @@ def resume_stream_with_runtime(
             agent_id=runtime.agent_id,
             session_id=runtime.session_id,
             message_id=request.message_id,
-            identity_id=request.identity_id,
+            # Older direct Engine callers supplied only ``identity_id``.  Keep
+            # that resume contract while Server callers use the explicit
+            # execution identity resolved from persisted run state.
+            identity_id=request.execution_identity_id or request.identity_id,
             working_dir=request.working_dir,
             forced_skill=request.forced_skill,
         )
@@ -627,6 +630,12 @@ async def _run_events_with_runtime(
                 elif event.type == EventType.BLOCKED and terminal_status == "completed":
                     terminal_status = "incomplete"
                     terminal_reason = "blocked"
+                elif event.type == EventType.AWAITING_INPUT and terminal_status == "completed":
+                    # A deliberate user decision point is recoverable but not
+                    # a completed delivery.  The session checkpoint remains
+                    # for the next message to resume the same chain node.
+                    terminal_status = "incomplete"
+                    terminal_reason = "awaiting_user_input"
                 elif _has_successful_tool_evidence(event):
                     had_tools = True
                 boundary.record(event)
@@ -793,3 +802,5 @@ async def reply_stream_with_runtime(
             yield f"\n[↩ 回退: {event.data.get('from', '')} → {event.data.get('to', '')}]\n"
         elif event.type == EventType.BLOCKED:
             yield f"\n[⛔ 阻断: {event.data.get('reason', '')}]\n"
+        elif event.type == EventType.AWAITING_INPUT:
+            yield "\n[⏸ 等待你的输入]\n"
