@@ -239,46 +239,36 @@ def test_todo_persists_by_injected_session_file(tmp_path):
     assert isolated == "No tasks."
 
 
-def test_edit_file_enforces_its_injected_working_directory(tmp_path, monkeypatch):
+def test_write_tools_do_not_take_a_boundary_from_their_arguments(tmp_path):
+    """The workspace boundary belongs to ToolGuard, not to the provider.
+
+    ``edit_file``/``write_file`` used to accept a ``_work_dir`` argument and
+    self-check against it.  Nothing in production ever set it, it was read from
+    the same model-supplied argument dict it was meant to constrain, and — had it
+    ever gone live — it would have blocked writes the approval flow deliberately
+    permits outside the workspace.  Keep it un-acceptable so it cannot come back
+    as a second, weaker boundary.
+    """
     edit_file = _load_tool_module("edit_file")
-    work_dir = tmp_path / "work"
-    work_dir.mkdir()
-    allowed = work_dir / "notes.txt"
-    outside = tmp_path / "outside.txt"
-    allowed.write_text("before", encoding="utf-8")
-    outside.write_text("before", encoding="utf-8")
+    write_file = _load_tool_module("write_file")
+    target = tmp_path / "notes.txt"
+    target.write_text("before", encoding="utf-8")
 
-    class Snapshot:
-        def track(self, path: str) -> None:
-            return None
+    for tool, kwargs in (
+        (edit_file, {"old_string": "before", "new_string": "after"}),
+        (write_file, {"content": "after"}),
+    ):
+        with pytest.raises(TypeError):
+            asyncio.run(
+                tool.execute(path=str(target), _work_dir=str(tmp_path), **kwargs)
+            )
 
-    monkeypatch.setitem(
-        sys.modules,
-        "engine.tool.snapshot",
-        SimpleNamespace(get_snapshot=lambda: Snapshot()),
-    )
-
-    async def run():
-        permitted = await edit_file.execute(
-            path=str(allowed),
-            old_string="before",
-            new_string="after",
-            _work_dir=str(work_dir),
-        )
-        rejected = await edit_file.execute(
-            path=str(outside),
-            old_string="before",
-            new_string="after",
-            _work_dir=str(work_dir),
-        )
-        return permitted, rejected
-
-    permitted, rejected = asyncio.run(run())
-
-    assert permitted.startswith("OK: edited")
-    assert allowed.read_text(encoding="utf-8") == "after"
-    assert "outside the allowed work directory" in rejected
-    assert outside.read_text(encoding="utf-8") == "before"
+    # The ordinary call still works; ToolGuard (exercised in the safety suite)
+    # remains the sole path boundary.
+    assert asyncio.run(
+        edit_file.execute(path=str(target), old_string="before", new_string="after")
+    ).startswith("OK: edited")
+    assert target.read_text(encoding="utf-8") == "after"
 
 
 def test_git_worktree_creation_stays_under_the_selected_repository(tmp_path, monkeypatch):
@@ -352,6 +342,148 @@ def test_git_operations_do_not_delegate_runtime_secrets(tmp_path, monkeypatch):
         and environment["GIT_CONFIG_GLOBAL"] == os.devnull
         for environment in environments
         if environment is not None
+    )
+
+
+def _fake_git_for_commit(git_ops, monkeypatch, *, would_add: str, staged: str):
+    """Drive git_ops.commit with scripted plumbing output; record every argv.
+
+    *would_add* is what ``git add --dry-run`` reports it would stage (already in
+    git's ``add '<path>'`` wire format); *staged* is the existing index.
+    """
+    recorded: list[list[str]] = []
+
+    async def fake_run(args, cwd=None, timeout=30, environment=None):
+        recorded.append(args)
+        if "--dry-run" in args:
+            return 0, would_add, ""
+        if args[:4] == ["diff", "--name-only", "--diff-filter=ACMR", "--cached"]:
+            return 0, staged, ""
+        return 0, "", ""
+
+    monkeypatch.setattr(git_ops, "_run_git", fake_run)
+    return recorded
+
+
+def _run_commit(git_ops, tmp_path, **kwargs):
+    return asyncio.run(
+        git_ops.execute(
+            action="commit",
+            message="work",
+            cwd=str(tmp_path),
+            environment=SimpleNamespace(name="host"),
+            **kwargs,
+        )
+    )
+
+
+def test_commit_expands_the_pathspec_before_scanning_it(tmp_path, monkeypatch):
+    """``files=['*']`` reaches files whose names were never scanned.
+
+    Matching the argument strings is useless here: git treats them as pathspecs,
+    so the scan has to run over what ``add --dry-run`` says they expand to.
+    """
+    git_ops = _load_tool_module("git_ops")
+    recorded = _fake_git_for_commit(
+        git_ops,
+        monkeypatch,
+        would_add="add 'app.py'\nadd 'src/deep/.env'\n",
+        staged="",
+    )
+
+    result = _run_commit(git_ops, tmp_path, files=["*"])
+
+    assert "refusing to stage sensitive files: src/deep/.env" in result
+    # Refused before staging, so the index is left exactly as it was.
+    assert not any(args[:1] == ["commit"] for args in recorded)
+    assert not any(args == ["add", "--"] + ["*"] for args in recorded)
+
+
+def test_commit_refuses_a_secret_already_in_the_index(tmp_path, monkeypatch):
+    """``git commit -m`` commits the whole index, not just this call's files."""
+    git_ops = _load_tool_module("git_ops")
+    recorded = _fake_git_for_commit(
+        git_ops, monkeypatch, would_add="add 'ok.txt'\n", staged=".env\n"
+    )
+
+    result = _run_commit(git_ops, tmp_path, files=["ok.txt"])
+
+    assert "refusing to stage sensitive files: .env" in result
+    assert not any(args[:1] == ["commit"] for args in recorded)
+
+
+def test_commit_ignores_untracked_files_it_will_never_stage(tmp_path, monkeypatch):
+    """A stray untracked .env must not veto an otherwise clean commit."""
+    git_ops = _load_tool_module("git_ops")
+    recorded = _fake_git_for_commit(
+        git_ops, monkeypatch, would_add="add 'app.py'\n", staged=""
+    )
+
+    result = _run_commit(git_ops, tmp_path)
+
+    assert "refusing to stage sensitive" not in result
+    assert ["commit", "-m", "work"] in recorded
+    assert not any(args[:1] == ["ls-files"] for args in recorded)
+
+
+def test_grep_fallback_uses_one_regex_dialect_and_reports_failures(tmp_path, monkeypatch):
+    """POSIX BRE treats `|` literally, so alternation silently found nothing."""
+    grep_tool = _load_tool_module("grep")
+    monkeypatch.setattr(grep_tool, "_has_rg", lambda: False)
+    corpus = tmp_path / "a.txt"
+    corpus.write_text("a cat sat\na dog ran\n", encoding="utf-8")
+
+    matched = asyncio.run(grep_tool.execute(pattern="cat|dog", path=str(tmp_path)))
+    assert "2 results" in matched
+    assert "grep -E" in matched.splitlines()[0]
+
+    # A rejected pattern used to be indistinguishable from an empty result set.
+    failed = asyncio.run(grep_tool.execute(pattern="[", path=str(tmp_path)))
+    assert failed.startswith("Error:")
+    absent = asyncio.run(grep_tool.execute(pattern="absent-xyz", path=str(tmp_path)))
+    assert absent.startswith("No matches")
+
+
+def test_write_tools_report_a_failed_undo_snapshot(tmp_path):
+    """Swallowing the snapshot failure reported success with undo gone."""
+    edit_file = _load_tool_module("edit_file")
+    write_file = _load_tool_module("write_file")
+    target = tmp_path / "f.txt"
+    target.write_text("alpha\n", encoding="utf-8")
+
+    def unwritable_backup(_path):
+        raise OSError("backup directory unwritable")
+
+    edited = asyncio.run(
+        edit_file.execute(
+            path=str(target),
+            old_string="alpha",
+            new_string="beta",
+            _snapshot_tracker=unwritable_backup,
+        )
+    )
+    assert edited.startswith("OK:") and "no undo snapshot" in edited
+    assert target.read_text(encoding="utf-8") == "beta\n"
+
+    written = asyncio.run(
+        write_file.execute(
+            path=str(target), content="gamma\n", _snapshot_tracker=unwritable_backup
+        )
+    )
+    assert "no undo snapshot" in written
+
+
+def test_glob_collapses_chained_globstars_instead_of_recursing(tmp_path):
+    """Each `**` token added a recursion level during pattern parsing alone."""
+    glob_files = _load_tool_module("glob_files")
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+
+    pathological = "/".join(["**"] * 2000) + "/*.txt"
+    assert "a.txt" in asyncio.run(
+        glob_files.execute(pattern=pathological, path=str(tmp_path))
+    )
+    assert "a.txt" in asyncio.run(
+        glob_files.execute(pattern="**/*.txt", path=str(tmp_path))
     )
 
 

@@ -58,7 +58,9 @@ def _execute_sync(
     if use_rg:
         args = ["rg", "--hidden", "--max-columns", str(MAX_LINE_LEN), "--max-count", "50"]
         for e in EXCLUDED:
-            args.extend(["--glob", f"!{e}"])
+            # --iglob, not --glob: on a case-insensitive filesystem the exclusion
+            # list should suppress the directory however it happens to be typed.
+            args.extend(["--iglob", f"!{e}"])
         if ignore_case: args.append("-i")
         if files_only: args.append("-l")
         else:
@@ -68,7 +70,12 @@ def _execute_sync(
         args.extend(["-e", pattern] if pattern.startswith("-") else [pattern])
         args.append(resolved)
     else:
-        args = ["grep", "-r", "--binary-files=without-match"]
+        # -E is not optional.  Without it BSD/GNU grep defaults to POSIX BRE,
+        # where `|` is a literal character, so an alternation like `cat|dog`
+        # reports "no matches" against text containing both — a confidently
+        # wrong answer, in a dialect other than the one ripgrep (this tool's
+        # primary engine) would have used.
+        args = ["grep", "-r", "-E", "--binary-files=without-match"]
         for e in EXCLUDED:
             args.extend(["--exclude-dir", e])
         if ignore_case: args.append("-i")
@@ -85,14 +92,23 @@ def _execute_sync(
     except subprocess.TimeoutExpired:
         return "Error: search timed out. Try a more specific pattern or path."
 
+    # Both engines use exit 1 for "ran fine, matched nothing" and >=2 for a real
+    # failure.  Reading only stdout made an invalid pattern indistinguishable
+    # from an empty result set, so a rejected search read as "not in the codebase".
+    if result.returncode >= 2:
+        detail = (result.stderr or "").strip().splitlines()
+        reason = detail[0][:300] if detail else f"search exited with code {result.returncode}"
+        return f"Error: search failed: {reason}"
+
     output = result.stdout.strip()
     if not output:
         return f"No matches found for: {pattern}"
 
+    engine = "rg" if use_rg else "grep -E"
     lines = output.split("\n")
     total = len(lines)
     lines = [l[:MAX_LINE_LEN] + "…" if len(l) > MAX_LINE_LEN else l for l in lines[:MAX_RESULTS]]
-    header = f"# grep {'(rg)' if use_rg else ''}: {min(total, MAX_RESULTS)} results"
+    header = f"# grep ({engine}): {min(total, MAX_RESULTS)} results"
     if total > MAX_RESULTS:
         header += f" (showing {MAX_RESULTS} of {total})"
     return header + "\n" + "\n".join(lines)

@@ -171,18 +171,31 @@ def _execute_sync(
     except Exception as exc:
         return f"Error reading PDF {resolved}: {type(exc).__name__}: {exc}"
 
-    pypdf_text = _extract_with_pypdf(reader, indexes)
-    text_by_page = pypdf_text
-    extractor = "pypdf"
+    # pdfplumber wins whenever it is available, so try it first: extracting with
+    # pypdf up front only to discard the whole result parsed every page twice.
     try:
-        plumber_text = _extract_with_pdfplumber(resolved, indexes, password)
-    except ImportError:
-        plumber_text = {}
-    except Exception:
-        plumber_text = {}
-    if plumber_text:
-        text_by_page = plumber_text
+        text_by_page = _extract_with_pdfplumber(resolved, indexes, password)
         extractor = "pdfplumber"
+    except Exception:
+        text_by_page = {}
+        extractor = "pypdf"
+    if not text_by_page:
+        text_by_page = _extract_with_pypdf(reader, indexes)
+        extractor = "pypdf"
+
+    # An empty page is legitimate — a scanned PDF has no text layer — but a page
+    # whose extraction *raised* is a failure.  When every requested page failed on
+    # both backends the old code still returned a success-shaped document whose
+    # only content was the per-page failure placeholders.
+    failed = sum(
+        1 for index in indexes
+        if text_by_page.get(index, "").startswith("[text extraction failed")
+    )
+    if indexes and failed == len(indexes):
+        return (
+            f"Error: text extraction failed for every requested page of {resolved} "
+            f"({failed} page(s)); the file may be corrupt or need a password"
+        )
 
     if isinstance(max_chars, bool) or not isinstance(max_chars, int):
         max_chars = DEFAULT_MAX_CHARS
@@ -203,7 +216,10 @@ def _execute_sync(
         if len(block) > remaining:
             if remaining > 80:
                 output.append(block[:remaining].rstrip())
-                output.append("\n...[PDF output truncated; request a smaller page range or a larger max_chars value]")
+            # The marker belongs on every truncated path.  Emitting it only when
+            # a partial page still fit let a tight budget drop pages silently,
+            # leaving the reader no way to tell the output was cut short.
+            output.append("\n...[PDF output truncated; request a smaller page range or a larger max_chars value]")
             break
         output.append(block)
         current_length += len(block)

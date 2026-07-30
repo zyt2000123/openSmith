@@ -165,6 +165,31 @@ def _check_sensitive_files(files: list[str]) -> list[str]:
     return [f for f in files if _SENSITIVE_PATTERNS.search(f)]
 
 
+def _parse_add_dry_run(output: str) -> list[str]:
+    """Extract the paths ``git add --dry-run`` reports it would stage.
+
+    Git prints one ``add '<path>'`` line per file, so this is the only way to
+    learn what a *pathspec* such as ``*`` or ``src/`` actually expands to —
+    matching the argument strings against sensitive-name patterns tells us
+    nothing about the files they reach.  ``remove '<path>'`` lines are ignored:
+    deleting a file cannot publish its contents.
+
+    A line that starts with ``add`` but does not parse is returned raw, so an
+    unexpected format fails closed into the sensitive scan rather than out of it.
+    """
+    paths: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("add "):
+            continue
+        remainder = stripped[4:].strip()
+        if len(remainder) >= 2 and remainder.startswith("'") and remainder.endswith("'"):
+            paths.append(remainder[1:-1])
+        else:
+            paths.append(remainder)
+    return paths
+
+
 def _resolve_cwd(cwd: str | None) -> str:
     """Resolve working directory, default to current directory."""
     if cwd:
@@ -230,42 +255,39 @@ async def execute(
         if not message:
             return "Error: 'message' is required for commit"
 
-        # Determine files to stage
-        if files:
-            # Check for sensitive files in explicit list
-            sensitive = _check_sensitive_files(files)
-            if sensitive:
-                return (
-                    f"Error: refusing to stage sensitive files: {', '.join(sensitive)}. "
-                    f"Remove them from the files list or add them to .gitignore."
-                )
-            rc, out, err_msg = await run(["add", "--"] + files)
-            if rc != 0:
-                return _format_result(rc, out, err_msg)
-        else:
-            # Stage all tracked changes, but check for sensitive files first
-            rc_diff, diff_out, _ = await run(
-                ["diff", "--name-only", "--diff-filter=ACMR"]
-            )
-            rc_untracked, untracked_out, _ = await run(
-                ["ls-files", "--others", "--exclude-standard"]
-            )
-            all_files = []
-            if diff_out.strip():
-                all_files.extend(diff_out.strip().splitlines())
-            if untracked_out.strip():
-                all_files.extend(untracked_out.strip().splitlines())
+        # Scan what this commit will actually contain, and do it BEFORE staging
+        # anything so a refusal leaves the index untouched.  Two sources, both
+        # required:
+        #   1. the paths staging would add — obtained by letting git expand the
+        #      pathspec itself, because ``files=["*"]`` or ``["src/"]`` reaches
+        #      files whose names were never scanned;
+        #   2. whatever is already staged — ``git commit -m`` commits the whole
+        #      index, so a secret staged by any earlier action would ride along
+        #      no matter how narrow this call's own file list looks.
+        stage_args = ["add", "--"] + files if files else ["add", "-u"]
+        rc_dry, dry_out, dry_err = await run(
+            ["-c", "core.quotePath=false", *stage_args[:1], "--dry-run", *stage_args[1:]]
+        )
+        if rc_dry != 0:
+            return _format_result(rc_dry, dry_out, dry_err)
+        _, staged_out, _ = await run(
+            ["diff", "--name-only", "--diff-filter=ACMR", "--cached"]
+        )
 
-            sensitive = _check_sensitive_files(all_files)
-            if sensitive:
-                return (
-                    f"Error: refusing to stage sensitive files: {', '.join(sensitive)}. "
-                    f"Add them to .gitignore or specify files explicitly."
-                )
-            # Stage tracked modifications
-            rc, out, err_msg = await run(["add", "-u"])
-            if rc != 0:
-                return _format_result(rc, out, err_msg)
+        candidates = _parse_add_dry_run(dry_out)
+        if staged_out.strip():
+            candidates.extend(staged_out.strip().splitlines())
+
+        sensitive = _check_sensitive_files(candidates)
+        if sensitive:
+            return (
+                f"Error: refusing to stage sensitive files: {', '.join(sorted(set(sensitive)))}. "
+                f"Add them to .gitignore, unstage them, or name safe files explicitly."
+            )
+
+        rc, out, err_msg = await run(stage_args)
+        if rc != 0:
+            return _format_result(rc, out, err_msg)
 
         # Commit
         rc, out, err_msg = await run(["commit", "-m", message])
@@ -320,38 +342,51 @@ async def execute(
 
     elif action == "discover":
         sections: list[str] = []
+        failures: list[str] = []
 
-        # Current branch
-        rc, out, _ = await run(["branch", "--show-current"])
-        if rc == 0:
-            sections.append(f"Current branch: {out.strip()}")
+        async def probe(label: str, args: list[str]) -> str | None:
+            """Run one discovery sub-command, recording rather than hiding failure.
 
-        # All local branches
-        rc, out, _ = await run(["branch", "--format=%(refname:short)"])
-        if rc == 0 and out.strip():
-            branches = out.strip().splitlines()
+            Dropping a section on a non-zero exit made a failed sub-command look
+            exactly like an empty one — in a repo with no commits, ``git log``
+            genuinely fails and its absence read as a healthy discovery.
+            """
+            rc, out, err = await run(args)
+            if rc == 0:
+                return out
+            detail = (err or "").strip().splitlines()
+            failures.append(f"{label}: {detail[0][:160] if detail else f'exit {rc}'}")
+            return None
+
+        current = await probe("current branch", ["branch", "--show-current"])
+        if current is not None:
+            sections.append(f"Current branch: {current.strip()}")
+
+        branch_list = await probe("local branches", ["branch", "--format=%(refname:short)"])
+        if branch_list and branch_list.strip():
+            branches = branch_list.strip().splitlines()
             sections.append(f"Local branches ({len(branches)}): {', '.join(branches)}")
 
-        # Remotes
-        rc, out, _ = await run(["remote", "-v"])
-        if rc == 0 and out.strip():
-            sections.append(f"Remotes:\n{out.strip()}")
+        remotes = await probe("remotes", ["remote", "-v"])
+        if remotes and remotes.strip():
+            sections.append(f"Remotes:\n{remotes.strip()}")
 
-        # Recent history (last 10 commits, oneline)
-        rc, out, _ = await run(
-            ["log", "--oneline", "-10", "--no-decorate"]
-        )
-        if rc == 0 and out.strip():
-            sections.append(f"Recent commits:\n{out.strip()}")
+        history = await probe("recent commits", ["log", "--oneline", "-10", "--no-decorate"])
+        if history and history.strip():
+            sections.append(f"Recent commits:\n{history.strip()}")
 
-        # Dirty state
-        rc, out, _ = await run(["status", "--short"])
-        if rc == 0:
-            if out.strip():
-                sections.append(f"Working tree ({len(out.strip().splitlines())} changed files):\n{out.strip()}")
+        tree = await probe("working tree", ["status", "--short"])
+        if tree is not None:
+            if tree.strip():
+                sections.append(f"Working tree ({len(tree.strip().splitlines())} changed files):\n{tree.strip()}")
             else:
                 sections.append("Working tree: clean")
 
+        if failures:
+            sections.append(
+                "Incomplete — these probes failed:\n"
+                + "\n".join(f"- {failure}" for failure in failures)
+            )
         return "\n\n".join(sections) if sections else "Error: could not discover repo info"
 
     else:

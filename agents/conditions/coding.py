@@ -10,15 +10,6 @@ from __future__ import annotations
 import re
 
 
-def coding_needs_architecture(ctx: dict) -> bool:
-    """Skip architecture for small, single-module changes."""
-    # ``load_gate_content`` injects ``output_key`` before this content module
-    # executes.  Keeping that dependency injected avoids importing engine code.
-    plan_output = ctx.get(output_key("coding-planning"), "")  # noqa: F821
-    file_refs = re.findall(r'[\w/]+\.\w{1,5}', plan_output)
-    return len(set(file_refs)) >= 3
-
-
 def coding_bugfix_needs_diagnosis(ctx: dict) -> bool:
     """Run the upstream diagnosis loop only for an explicit bug-fix task.
 
@@ -36,6 +27,5 @@ def coding_bugfix_needs_diagnosis(ctx: dict) -> bool:
 
 
 CONDITIONS = {
-    "coding_needs_architecture": coding_needs_architecture,
     "coding_bugfix_needs_diagnosis": coding_bugfix_needs_diagnosis,
 }

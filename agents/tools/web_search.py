@@ -53,6 +53,22 @@ MAX_QUERY_LENGTH = 1_000
 _SEARCH_CONCURRENCY = asyncio.Semaphore(4)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects instead of following them to an unvalidated host.
+
+    Unlike web_fetch, this tool talks to one fixed endpoint that answers a POST
+    with 200 directly.  urllib's default handler would follow a 3xx to any
+    http/https/ftp target — including a private address — with none of
+    web_fetch's URL and resolved-address validation applied.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _decode_ddg_url(href: str) -> str:
     """DDG 结果链接是 //duckduckgo.com/l/?uddg=<encoded> 跳转，解出真实 URL。"""
     if "uddg=" in href:
@@ -92,7 +108,7 @@ async def execute(*, query: str, max_results: int = 5, provider: str = "duckduck
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _OPENER.open(req, timeout=15) as resp:
             return resp.read(512 * 1024).decode("utf-8", errors="replace")
 
     loop = asyncio.get_event_loop()
@@ -108,10 +124,24 @@ async def execute(*, query: str, max_results: int = 5, provider: str = "duckduck
     snippets = [_clean(s) for s in _SNIPPET_RE.findall(page)]
 
     if not links:
+        lowered = page.lower()
         challenge_markers = ("anomaly", "captcha", "unusual traffic")
-        if any(marker in page.lower() for marker in challenge_markers):
+        if any(marker in lowered for marker in challenge_markers):
             return "Error: search provider returned an anti-bot challenge"
-        return f"[UNTRUSTED_EXTERNAL_CONTENT source=\"duckduckgo\"]\nNo results for '{query}'\n[/UNTRUSTED_EXTERNAL_CONTENT]"
+        # A response that mentions "result" nowhere is not a results page at all,
+        # so the scraper no longer understands what came back.  Reporting that as
+        # "no results" turned a parse failure into a confident factual answer.
+        if "result" not in lowered:
+            return (
+                "Error: could not parse search results — the response does not look "
+                f"like a DuckDuckGo results page ({len(page)} bytes received)"
+            )
+        return (
+            f"[UNTRUSTED_EXTERNAL_CONTENT source=\"duckduckgo\"]\n"
+            f"No results for '{query}' (the result list parsed as empty; if that is "
+            "unexpected, the provider's markup may have changed)\n"
+            "[/UNTRUSTED_EXTERNAL_CONTENT]"
+        )
 
     lines = ["[UNTRUSTED_EXTERNAL_CONTENT source=\"duckduckgo\"]", f"Search results for: {query}"]
     for i, (href, title) in enumerate(links[:max_results]):

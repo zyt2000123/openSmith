@@ -1,8 +1,11 @@
 """Write file tool provider — writes content to a file within the work directory."""
 
 import asyncio
+import logging
 import os
 from collections.abc import Callable
+
+log = logging.getLogger(__name__)
 
 TOOL_META = {
     "name": "write_file",
@@ -36,25 +39,19 @@ TOOL_META = {
 }
 
 
-def _is_within_workdir(path: str, work_dir: str) -> bool:
-    resolved = os.path.realpath(path)
-    work_resolved = os.path.realpath(work_dir)
-    return resolved.startswith(work_resolved + os.sep) or resolved == work_resolved
-
-
 def _execute_sync(
     *,
     path: str,
     content: str,
     append: bool = False,
-    _work_dir: str = "",
     _snapshot_tracker: Callable[[str], object] | None = None,
 ) -> str:
-    if _work_dir and not _is_within_workdir(path, _work_dir):
-        return (
-            f"Error: path '{path}' is outside the allowed work directory '{_work_dir}'"
-        )
-
+    # The directory boundary lives in engine/safety/tool_guard.py, which runs
+    # before this provider and is the only layer that knows about approvals — a
+    # user may approve a write outside the workspace, and a provider-level block
+    # would silently defeat that.  A second check here also read its root from
+    # the same model-supplied argument dict it was meant to constrain, so it
+    # could never have been authoritative.
     resolved = os.path.realpath(path) if os.path.isabs(path) else os.path.abspath(path)
 
     parent = os.path.dirname(resolved)
@@ -66,11 +63,20 @@ def _execute_sync(
 
     # The engine injects this runtime capability per session. Content stays
     # portable and never imports engine internals.
+    #
+    # A failed snapshot means the overwritten content is unrecoverable.  The
+    # write still proceeds — the engine owns undo policy — but swallowing the
+    # failure reported plain success with no trace anywhere that undo is gone.
+    snapshot_warning = ""
     if not append and _snapshot_tracker is not None:
         try:
-            _snapshot_tracker(resolved)
-        except Exception:
-            pass
+            if _snapshot_tracker(resolved) is False:
+                snapshot_warning = " [warning] no undo snapshot was recorded"
+        except Exception as e:
+            log.warning("snapshot failed for %s: %s", resolved, e, exc_info=True)
+            snapshot_warning = (
+                f" [warning] no undo snapshot was recorded ({type(e).__name__})"
+            )
 
     mode = "a" if append else "w"
     try:
@@ -83,7 +89,7 @@ def _execute_sync(
 
     action = "appended to" if append else "wrote"
     size = len(content.encode("utf-8"))
-    return f"OK: {action} {resolved} ({size} bytes)"
+    return f"OK: {action} {resolved} ({size} bytes){snapshot_warning}"
 
 
 async def execute(
@@ -91,7 +97,6 @@ async def execute(
     path: str,
     content: str,
     append: bool = False,
-    _work_dir: str = "",
     _snapshot_tracker: Callable[[str], object] | None = None,
 ) -> str:
     return await asyncio.to_thread(
@@ -99,6 +104,5 @@ async def execute(
         path=path,
         content=content,
         append=append,
-        _work_dir=_work_dir,
         _snapshot_tracker=_snapshot_tracker,
     )

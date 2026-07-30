@@ -68,7 +68,13 @@ def _execute_sync(*, path: str, offset: int = 0, limit: int = 500) -> str:
                     if not selected:
                         remaining = max(1, MAX_READ_BYTES - selected_bytes)
                         line = encoded[:remaining].decode("utf-8", errors="replace")
-                        selected.append(line)
+                        # Mark the cut inline. The header's line range alone made
+                        # a mid-token truncation of one very long line (minified
+                        # JS, base64, single-line JSON) look like a line that
+                        # simply ended there.
+                        selected.append(
+                            f"{line}…[line truncated at {remaining} of {line_bytes} bytes]"
+                        )
                         last_line = line_no
                     hit_byte_limit = True
                     break

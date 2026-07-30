@@ -174,35 +174,71 @@ def _get_skill_content(agent_skills_dir: Path, skill_name: str) -> tuple[str, st
     return "", ""
 
 
+def _fence_marker(line: str) -> tuple[str, int] | None:
+    """Return ``(char, length)`` when the line opens or closes a fenced block."""
+    stripped = line.strip()
+    for char in ("`", "~"):
+        if stripped.startswith(char * 3):
+            return char, len(stripped) - len(stripped.lstrip(char))
+    return None
+
+
+def _track_fence(current: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
+    """Advance fenced-block state across one line."""
+    marker = _fence_marker(line)
+    if marker is None:
+        return current
+    if current is None:
+        return marker
+    # A fence closes only on the same character, at least as long as the opener.
+    if marker[0] == current[0] and marker[1] >= current[1]:
+        return None
+    return current
+
+
 def _patch_section(raw: str, section_heading: str, new_content: str) -> str:
     """Replace a markdown section's content, preserving everything else.
 
     *section_heading* should be a heading like '## Process' or '### Step 1'.
+
+    Headings count only outside fenced code blocks.  A SKILL.md that documents
+    its own format naturally contains example blocks holding heading-like lines;
+    treating those as real boundaries ended the replace scope early and left
+    duplicate headings, an unclosed fence, and un-replaced old content behind —
+    while still reporting success.
     """
     # Determine heading level from the target
     match = re.match(r"^(#{1,6})\s+", section_heading)
     if not match:
         raise ValueError(f"Invalid section heading: {section_heading}")
     level = len(match.group(1))
+    target = section_heading.strip()
 
     lines = raw.split("\n")
     result: list[str] = []
     i = 0
     patched = False
+    fence: tuple[str, int] | None = None
 
     while i < len(lines):
         line = lines[i]
+        was_inside_fence = fence is not None
+        fence = _track_fence(fence, line)
         # Check if this line matches the target section heading
-        if not patched and line.strip() == section_heading.strip():
+        if not patched and not was_inside_fence and fence is None and line.strip() == target:
             # Emit the heading
             result.append(line)
             i += 1
             # Skip old content until we hit a heading of same or higher level, or EOF
+            skip_fence: tuple[str, int] | None = None
             while i < len(lines):
                 next_line = lines[i]
-                heading_match = re.match(r"^(#{1,6})\s+", next_line)
-                if heading_match and len(heading_match.group(1)) <= level:
-                    break
+                inside = skip_fence is not None
+                skip_fence = _track_fence(skip_fence, next_line)
+                if not inside and skip_fence is None:
+                    heading_match = re.match(r"^(#{1,6})\s+", next_line)
+                    if heading_match and len(heading_match.group(1)) <= level:
+                        break
                 i += 1
             # Insert new content
             result.append(new_content.rstrip())
@@ -356,13 +392,16 @@ async def execute(
             encoding="utf-8",
         )
 
-        # Auto-save version before patching
-        vid = await store.save_version(skill_name, old_content)
-
         try:
             new_content = _patch_section(old_content, section, section_content)
         except ValueError as e:
             return f"Error: {e}"
+
+        # Save the version only once the patch is known to apply.  Saving first
+        # meant a run of failed patches — a model guessing at section names is
+        # normal — consumed the bounded history and evicted the genuine pre-edit
+        # content, defeating the one thing rollback exists for.
+        vid = await store.save_version(skill_name, old_content)
 
         await asyncio.to_thread(
             skill_file.write_text,

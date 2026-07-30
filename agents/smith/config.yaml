@@ -1,14 +1,18 @@
+# Smith 机器配置：只声明 Smith 有什么，不描述 Smith 怎么想。
+# 自然语言指令写 role/style/workflow/toolbox.md —— 写在这里不进 prompt。
+#
+# ⚠️ llm.*  五层 merge，本文件是第 3 层，改这里生效（model_config.py:366）
+#    tools  只读 ~/.agent-smith/agent/config.yaml，改这里对已有安装不生效（preparation.py:213）
+
 name: 个人助手
-role: personal-assistant
+role: personal-assistant  # 遗留兼容 id = SMITH_TEMPLATE_ID，勿改
 description: 面向个人工作流的常驻本地 Agent，负责理解目标、整理上下文、检索信息、规划执行并交付可落地结果
+
+# null 不覆盖下层（yaml_utils.py:71）。可选子键：routes / models / pricing
 llm:
   model: null
-knowledge:
-  - personal-workflow
-  - local-context
-  - research-and-synthesis
-  - execution-planning
-  - writing-and-communication
+
+# 严格白名单，fail-closed；再与 identity 的 tools 取交集。未列入即调不到（如 memory_ops）
 tools:
   enabled:
     - read_file

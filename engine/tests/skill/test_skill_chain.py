@@ -42,7 +42,7 @@ def test_valid_pipeline_still_loads(tmp_path: Path) -> None:
         "    gate: understanding\n"
         "  - skill: architecture\n"
         "    gate: design\n"
-        "    condition: coding_needs_architecture\n",
+        "    condition: coding_bugfix_needs_diagnosis\n",
     )
     chain = SkillChain.from_yaml(path)
     assert chain is not None

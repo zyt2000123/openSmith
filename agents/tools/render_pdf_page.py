@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import subprocess
@@ -44,6 +45,23 @@ TOOL_META = {
 
 MAX_RENDER_BYTES = 25 * 1024 * 1024
 
+_render_dir: Path | None = None
+
+
+def _render_output_dir() -> Path:
+    """Return one reusable render directory for this process.
+
+    A fresh ``mkdtemp`` per call left a directory and its PNG behind on every
+    render, since the caller still needs the file after ``execute`` returns and
+    nothing ever swept them.  Reusing a single ``mkdtemp`` keeps its 0700 mode
+    and symlink safety while bounding the footprint; deterministic file names
+    below let a repeated render overwrite instead of accumulate.
+    """
+    global _render_dir
+    if _render_dir is None or not _render_dir.is_dir():
+        _render_dir = Path(tempfile.mkdtemp(prefix="smith-pdf-"))
+    return _render_dir
+
 
 def _find_pdftoppm() -> str | None:
     configured = os.environ.get("SMITH_PDFTOPPM", "").strip()
@@ -69,8 +87,20 @@ def _execute_sync(*, path: str, page: int = 1, dpi: int = 144) -> str:
             "SMITH_PDFTOPPM to the pdftoppm executable."
         )
 
-    output_dir = Path(tempfile.mkdtemp(prefix="smith-pdf-"))
-    prefix = output_dir / "page"
+    output_dir = _render_output_dir()
+    try:
+        info = os.stat(resolved)
+    except OSError as exc:
+        return f"Error: cannot inspect PDF: {exc}"
+    # Identity, not just the path: a PDF edited in place must not be served an
+    # image rendered from its previous contents.
+    identity = f"{resolved}\0{info.st_size}\0{info.st_mtime_ns}\0{page}\0{dpi}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    prefix = output_dir / digest
+    # Clear the target before rendering.  Otherwise a failed render leaves an
+    # earlier successful PNG sitting at this exact path, and any caller still
+    # holding that path from prior context reads stale content as fresh.
+    prefix.with_suffix(".png").unlink(missing_ok=True)
     command = [
         executable,
         "-png",

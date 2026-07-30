@@ -56,6 +56,12 @@ def _execute_sync(*, path: str = ".", max_depth: int = 2) -> str:
         try:
             entries = sorted(os.listdir(dir_path))
         except PermissionError:
+            # Returning silently rendered an unreadable directory as an empty
+            # one, so its contents vanished from the tree without a trace.
+            lines.append(f"{prefix}[unreadable: permission denied]")
+            return
+        except OSError as e:
+            lines.append(f"{prefix}[unreadable: {type(e).__name__}]")
             return
 
         dirs = [
@@ -74,7 +80,12 @@ def _execute_sync(*, path: str = ".", max_depth: int = 2) -> str:
         for f in files:
             if count >= MAX_ENTRIES:
                 return
-            size = os.path.getsize(os.path.join(dir_path, f))
+            try:
+                size = os.path.getsize(os.path.join(dir_path, f))
+            except OSError:
+                # The entry disappeared between listdir and stat. Skipping one
+                # transient file beats aborting the whole listing over it.
+                continue
             size_str = f"{size}B" if size < 1024 else f"{size/1024:.1f}K" if size < 1048576 else f"{size/1048576:.1f}M"
             lines.append(f"{prefix}{f}  {size_str}")
             count += 1

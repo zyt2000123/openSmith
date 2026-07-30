@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,10 +84,34 @@ TOOL_META = {
     "execution_environment": "host",
 }
 
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+
+
 def _memory_dir(memory_dir: str | Path | None = None) -> Path:
     if memory_dir is not None:
         return Path(memory_dir).expanduser()
     return Path.home() / ".agent-smith" / "agent" / "memory"
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create ``path`` and every missing ancestor with 0700.
+
+    ``agents/`` cannot import ``common.paths``, so the mode is restated here.
+    Two traps this avoids: ``mkdir(parents=True, mode=...)`` applies the mode
+    only to the final component and lets the ancestors it creates fall back to
+    the process umask, and ``exist_ok=True`` leaves an existing directory's mode
+    untouched — hence walking up, then creating and chmod-ing each level.
+    """
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True, mode=_PRIVATE_DIR_MODE)
+        directory.chmod(_PRIVATE_DIR_MODE)
+    path.chmod(_PRIVATE_DIR_MODE)
 
 
 def _check_sensitive(text: str, memory_api: Any) -> str | None:
@@ -133,7 +158,7 @@ async def execute(
     if memory_api is None:
         return "Error: memory runtime capability was not provided"
     mem_dir = _memory_dir(memory_dir)
-    await asyncio.to_thread(mem_dir.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(_ensure_private_dir, mem_dir)
 
     if action == "search":
         if not query:
@@ -227,6 +252,10 @@ def _append_event(
         "evidence_type": evidence_type,
     }
     with open(recent_file, "a", encoding="utf-8") as f:
+        # Memory holds user evidence, so it carries the runtime's 0600 rule.
+        # fchmod acts on the open descriptor: no path race, and it also repairs
+        # a file an earlier build created with the process umask.
+        os.fchmod(f.fileno(), _PRIVATE_FILE_MODE)
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return "OK: candidate evidence recorded for policy review; it is not durable memory"
 
@@ -358,6 +387,13 @@ async def _remove_episode(mem_dir: Path, episode_id: str, memory_api: Any) -> st
         return error
     try:
         await memory_api.remove_episode_from_index(mem_dir, episode_id)
-    except Exception:
-        return f"OK: removed episode '{episode_id}' (search index update failed — will self-heal)"
+    except Exception as exc:
+        # The file is gone, so this is not a clean failure either — but an "OK:"
+        # prefix told the caller the removal was complete while the search index
+        # still pointed at the deleted episode until the next compilation.
+        return (
+            f"Error: episode '{episode_id}' was deleted but its search index entry "
+            f"could not be removed ({type(exc).__name__}); the index self-heals on "
+            "the next memory compilation"
+        )
     return f"OK: removed episode '{episode_id}'"
