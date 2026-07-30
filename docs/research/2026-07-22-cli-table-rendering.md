@@ -55,7 +55,7 @@ package; the package identifies its upstream homepage as
 
 The installed production artifact is the primary source for this exact version:
 
-- [`dist/codebuddy.js`](/opt/homebrew/lib/node_modules/@tencent-ai/codebuddy-code/dist/codebuddy.js), webpack module `65077` (starts near byte `11,910,185`), defines `Markdown`, `applyMarkdown`, `formatTable`, `renderHorizontalTable`, and `renderVerticalTable`.
+- 本地安装包中的 `dist/codebuddy.js`（原始机器路径不纳入仓库）、webpack module `65077`（起始约 byte `11,910,185`）定义了 `Markdown`、`applyMarkdown`、`formatTable`、`renderHorizontalTable` 和 `renderVerticalTable`。
 - Its package metadata records `ink` `6.3.1`, `marked` `^16.1.1`, and React `~19.1.2`. `Markdown` lexes with `marked`, formats ANSI strings, then returns a single Ink `Text`; the Markdown table branch calls the custom `formatTable`, not the separately bundled `cli-table3`.
 - `formatTable` reads `terminalWidth` from Ink's static context (default `80`), computes minimum/preferred display widths through bundled `string-width` (including wide characters), and wraps cells. If the minimum grid cannot fit, it sets `hardBreak` and splits text further rather than dropping it.
 - It sets a maximum of four wrapped lines per horizontal row. Once a row would exceed that, `renderVerticalTable` emits each field as `Header: full content`. The bundle's Markdown-table formatter contains no ellipsis insertion, cell truncation, or horizontal-scrolling branch.
