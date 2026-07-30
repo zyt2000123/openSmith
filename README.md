@@ -112,6 +112,11 @@ common (paths, YAML, SQLite, filesystem)
 
 Dependencies flow one way: `server → engine → common`. The engine never imports FastAPI.
 
+## Documentation
+
+The documentation landing page separates source-backed implementation contracts
+from historical design and research notes: [docs/README.md](docs/README.md).
+
 ## Development
 
 ```bash
