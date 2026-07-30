@@ -676,6 +676,13 @@ async def execute(
         raise
     except Exception as exc:
         return f"Error: crawl failed: {exc}"
+    if not result["records"]:
+        # Retrieving nothing is a failure, not an empty success.  The engine
+        # decides a tool failed from the "Error:" prefix alone, so without this
+        # the ledger recorded `completed` and the agent reported a crawl that
+        # never fetched a page — with no cue at all in the json format.
+        detail = "; ".join(result["warnings"][:5]) or "no pages matched the crawl scope"
+        return f"Error: crawl retrieved no pages from {result['seed']}: {detail}"
     if output_format == "json":
         return json.dumps(result, ensure_ascii=False)
     return _render_markdown(result)

@@ -27,6 +27,10 @@ TOOL_META = {
 }
 
 MAX_RESULTS = 200
+# MAX_RESULTS bounds the response; this bounds the work. Without it a pattern
+# pointed at a large tree enumerated every entry before the result slice, with
+# no timeout of the kind grep gets from its subprocess.
+MAX_SCAN_ENTRIES = 20_000
 EXCLUDED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "dist", ".build"}
 
 
@@ -51,20 +55,38 @@ def _matches_component(name: str, pattern: str) -> bool:
     return not (name.startswith(".") and not pattern.startswith(".")) and fnmatch.fnmatchcase(name, pattern)
 
 
-def _safe_glob(base: Path, pattern: str) -> list[Path]:
+def _safe_glob(base: Path, pattern: str) -> tuple[list[Path], bool]:
     """Expand a relative glob without following symlinked directories."""
     components = [part for part in pattern.replace("\\", "/").split("/") if part not in {"", "."}]
+    # `**/**` means exactly what `**` means, but `walk` recurses once per token
+    # during pattern parsing — before touching the filesystem — so a chain of
+    # them exhausted the Python stack on input alone.
+    collapsed: list[str] = []
+    for part in components:
+        if part == "**" and collapsed and collapsed[-1] == "**":
+            continue
+        collapsed.append(part)
+    components = collapsed
     matches: list[Path] = []
     visited: set[tuple[Path, int]] = set()
+    scanned = 0
+    truncated = False
 
     def entries(directory: Path):
+        nonlocal scanned, truncated
+        if truncated:
+            return ()
         try:
             if directory.is_symlink() or not _is_within_base(directory, base):
                 return ()
             with os.scandir(directory) as scan:
-                return tuple(sorted(scan, key=lambda entry: entry.name))
+                items = tuple(sorted(scan, key=lambda entry: entry.name))
         except OSError:
             return ()
+        scanned += len(items)
+        if scanned > MAX_SCAN_ENTRIES:
+            truncated = True
+        return items
 
     def add_file(candidate: Path) -> None:
         try:
@@ -120,7 +142,7 @@ def _safe_glob(base: Path, pattern: str) -> list[Path]:
                 continue
 
     walk(base, 0)
-    return matches
+    return matches, truncated
 
 
 def _execute_sync(*, pattern: str, path: str = ".") -> str:
@@ -131,7 +153,7 @@ def _execute_sync(*, pattern: str, path: str = ".") -> str:
     if not os.path.isdir(base):
         return f"Error: directory not found: {base}"
 
-    matches = _safe_glob(Path(base), pattern)
+    matches, scan_truncated = _safe_glob(Path(base), pattern)
     filtered = [
         os.path.relpath(m, base) for m in matches
         if not any(part in EXCLUDED_DIRS for part in m.relative_to(base).parts)
@@ -141,11 +163,20 @@ def _execute_sync(*, pattern: str, path: str = ".") -> str:
     total = len(filtered)
     filtered = filtered[:MAX_RESULTS]
     if not filtered:
+        if scan_truncated:
+            # Reporting "no files" here would state as fact something the scan
+            # never finished checking.
+            return (
+                f"Error: scan stopped after {MAX_SCAN_ENTRIES} directory entries "
+                f"without matching '{pattern}'; narrow the base directory or pattern"
+            )
         return f"No files found matching: {pattern}"
 
     header = f"# {min(total, MAX_RESULTS)} file{'s' if len(filtered) != 1 else ''}"
     if total > MAX_RESULTS:
         header += f" (showing {MAX_RESULTS} of {total})"
+    if scan_truncated:
+        header += f" — scan stopped after {MAX_SCAN_ENTRIES} entries, results may be incomplete"
     return header + "\n" + "\n".join(filtered)
 
 

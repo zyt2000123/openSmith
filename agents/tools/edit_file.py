@@ -1,8 +1,11 @@
 """Edit file tool — precise string replacement without full rewrite."""
 
 import asyncio
+import logging
 import os
 from collections.abc import Callable
+
+log = logging.getLogger(__name__)
 
 TOOL_META = {
     "name": "edit_file",
@@ -35,23 +38,20 @@ TOOL_META = {
 }
 
 
-def _is_within_workdir(path: str, work_dir: str) -> bool:
-    resolved = os.path.realpath(path)
-    work_resolved = os.path.realpath(work_dir)
-    return resolved.startswith(work_resolved + os.sep) or resolved == work_resolved
-
-
 def _execute_sync(
     *, path: str, old_string: str, new_string: str, replace_all: bool = False,
-    _work_dir: str = "", _snapshot_tracker: Callable[[str], object] | None = None,
+    _snapshot_tracker: Callable[[str], object] | None = None,
 ) -> str:
     if old_string == new_string:
         return "Error: new_string must differ from old_string"
 
+    # The directory boundary lives in engine/safety/tool_guard.py, which runs
+    # before this provider and is the only layer that knows about approvals — a
+    # user may approve an edit outside the workspace, and a provider-level block
+    # would silently defeat that.  A second check here also read its root from
+    # the same model-supplied argument dict it was meant to constrain, so it
+    # could never have been authoritative.
     resolved = os.path.realpath(path) if os.path.isabs(path) else os.path.abspath(path)
-
-    if _work_dir and not _is_within_workdir(resolved, _work_dir):
-        return f"Error: path '{path}' is outside the allowed work directory '{_work_dir}'"
 
     if not os.path.isfile(resolved):
         return f"Error: file not found: {resolved}"
@@ -75,11 +75,20 @@ def _execute_sync(
             "Provide more surrounding context to make it unique, or set replace_all=true."
         )
 
+    # A failed pre-edit snapshot means undo is gone.  The edit still proceeds —
+    # the caller asked for it and the engine owns undo policy — but swallowing
+    # the failure reported plain success while the original content became
+    # unrecoverable, with no trace in the result or in any log.
+    snapshot_warning = ""
     if _snapshot_tracker is not None:
         try:
-            _snapshot_tracker(resolved)
-        except Exception:
-            pass
+            if _snapshot_tracker(resolved) is False:
+                snapshot_warning = " [warning] no undo snapshot was recorded"
+        except Exception as e:
+            log.warning("snapshot failed for %s: %s", resolved, e, exc_info=True)
+            snapshot_warning = (
+                f" [warning] no undo snapshot was recorded ({type(e).__name__})"
+            )
 
     updated = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
 
@@ -90,12 +99,15 @@ def _execute_sync(
         return f"Error: permission denied writing: {resolved}"
 
     replacements = count if replace_all else 1
-    return f"OK: edited {resolved} ({replacements} replacement{'s' if replacements > 1 else ''})"
+    return (
+        f"OK: edited {resolved} "
+        f"({replacements} replacement{'s' if replacements > 1 else ''}){snapshot_warning}"
+    )
 
 
 async def execute(
     *, path: str, old_string: str, new_string: str, replace_all: bool = False,
-    _work_dir: str = "", _snapshot_tracker: Callable[[str], object] | None = None,
+    _snapshot_tracker: Callable[[str], object] | None = None,
 ) -> str:
     return await asyncio.to_thread(
         _execute_sync,
@@ -103,6 +115,5 @@ async def execute(
         old_string=old_string,
         new_string=new_string,
         replace_all=replace_all,
-        _work_dir=_work_dir,
         _snapshot_tracker=_snapshot_tracker,
     )
