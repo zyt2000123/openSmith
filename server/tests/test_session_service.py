@@ -1433,3 +1433,65 @@ async def test_stream_message_reports_failed_status_when_persisting_the_reply_fa
         "status": "failed",
         "reason": "reply_persistence_failed",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_stream_lock_map_is_bounded_and_keeps_held_locks() -> None:
+    """The per-session lock map must not leak a lock per session forever.
+
+    Only unlocked locks are evicted once the map grows past the bound; a lock a
+    stream currently holds (or is queued on) must never be dropped, or a new
+    stream for that session could bypass the serialization.
+    """
+    module = session_service_module
+    module._SESSION_STREAM_LOCKS.clear()
+
+    held = module._session_stream_lock("held-session")
+    await held.acquire()
+    try:
+        assert held.locked()
+        for index in range(100):
+            module._session_stream_lock(f"session-{index}")
+        # The map never grows unboundedly after the bound is crossed.
+        assert len(module._SESSION_STREAM_LOCKS) <= module._SESSION_STREAM_LOCKS_MAX
+        # A held lock is never evicted (eviction only removes unlocked entries).
+        assert module._SESSION_STREAM_LOCKS.get("held-session") is held
+    finally:
+        held.release()
+        module._SESSION_STREAM_LOCKS.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_messages_byte_budget_stops_fetching_at_the_cap(monkeypatch) -> None:
+    """max_content_bytes must stop a pathological session from being buffered whole.
+
+    A single oversized message (or a long tail) beyond the byte budget must not
+    be loaded into memory; the fetch returns the prefix that fits.
+    """
+    import importlib
+    import aiosqlite
+
+    from app.infrastructure import schema as schema_module
+    from app.infrastructure.repositories.session_repo import SessionRepo
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await schema_module.ensure_schema(db)
+    repo_module = importlib.import_module("app.infrastructure.repositories.session_repo")
+
+    async def fake_get_app_db():
+        return db
+
+    monkeypatch.setitem(repo_module.SessionRepo.create.__globals__, "get_app_db", fake_get_app_db)
+    repo = SessionRepo()
+    session = await repo.create("smith-id", "probe")
+    for index in range(10):
+        await repo.add_message(session["id"], "user", f"m{index}: " + "x" * (10 * (index + 1)))
+    await db.commit()
+
+    # 60 bytes of content total; a 30-byte budget keeps only the first messages.
+    rows = await repo.get_messages(session["id"], limit=50, max_content_bytes=30)
+    total = sum(len(row["content"]) for row in rows)
+    assert total <= 30
+    assert len(rows) < 10
+    await db.close()

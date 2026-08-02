@@ -698,3 +698,49 @@ async def test_trigger_returns_429_when_at_the_cap(
 
     release.set()
     await _drain_background_runs()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_starts_respect_the_cap_without_a_toctou_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N concurrent start_auto_task calls must not all start when N > cap.
+
+    The cap check used to run before an await (the DB claim), so every
+    concurrent caller saw an empty registry and started a run.  The slot is now
+    reserved synchronously before the first await, closing the TOCTOU window.
+    """
+    release = asyncio.Event()
+    claim_gate = asyncio.Event()
+    claim_count = 0
+
+    class GatedRepo(FakeAutoTaskRepo):
+        async def claim_running(self, task_id: str) -> str | None:
+            nonlocal claim_count
+            claim_count += 1
+            await claim_gate.wait()  # widen the race window
+            return "lease-token"
+
+    async def blocking_reply(request, runtime, services):
+        await release.wait()
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    service = AutoTaskService(GatedRepo(), FakeProfileRepo(), FakeSessionRepo())
+
+    tasks = [
+        asyncio.create_task(
+            service.start_auto_task(_task(task_id=f"task-{index}"))
+        )
+        for index in range(2 * auto_task_service_module._MAX_CONCURRENT_RUNS)
+    ]
+    await asyncio.sleep(0)  # let every task reach (or fail) the slot reservation
+    claim_gate.set()
+    results = await asyncio.gather(*tasks)
+
+    started = [result for result in results if result is not None]
+    assert len(started) <= auto_task_service_module._MAX_CONCURRENT_RUNS
+    assert claim_count <= auto_task_service_module._MAX_CONCURRENT_RUNS
+
+    release.set()
+    await _drain_background_runs()

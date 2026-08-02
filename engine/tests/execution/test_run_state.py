@@ -235,3 +235,42 @@ async def test_run_event_boundary_preserves_stream_order(tmp_path: Path) -> None
     assert verification.ok
     seqs = [int(record["seq"]) for record in records]
     assert seqs == sorted(seqs)
+
+
+def test_run_state_store_serializes_concurrent_writers(tmp_path: Path) -> None:
+    """Concurrent read-modify-write from many threads must not lose updates.
+
+    RunStateStore is written from engine worker threads (offloaded fsync) AND
+    from the server event loop (resolve_approval).  Without the per-root RLock
+    two writers interleave their get->mutate->save and drop events/increments.
+    """
+    import threading
+
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith-id")
+
+    threads = 8
+    events_per_thread = 20
+    barrier = threading.Barrier(threads)
+    errors: list[BaseException] = []
+
+    def worker(worker_id: int) -> None:
+        try:
+            barrier.wait()
+            for _ in range(events_per_thread):
+                store.record_event("run-1", f"event-{worker_id}")
+        except BaseException as exc:  # noqa: BLE001 - test isolation
+            errors.append(exc)
+
+    workers = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+    for thread in workers:
+        thread.start()
+    for thread in workers:
+        thread.join()
+
+    assert not errors
+    restored = store.get("run-1")
+    assert restored is not None
+    # Exactly threads*events_per_thread increments survived; the lock prevents
+    # lost updates from interleaved read-modify-write.
+    assert restored.event_seq == threads * events_per_thread
