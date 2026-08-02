@@ -159,33 +159,11 @@ function nextSkillState(status: string): SkillState {
   return "done";
 }
 
-function routeNotice(event: Extract<StreamEvent, { type: "route_decided" }>): string {
-  const identity = event.identityName || event.identityId || "Agent";
-  const route = event.pipelineId || (event.routeId === "direct" ? "ReAct" : event.routeId) || "ReAct";
-  return `Route: ${identity} → ${route}.`;
-}
-
-function finishSentence(text: string): string {
-  return /[.!?。！？…]$/.test(text) ? text : `${text}.`;
-}
-
-function gateNotice(event: Extract<StreamEvent, { type: "gate_result" }>): string {
-  const target = event.skill || "workflow";
-  const verdict = event.verdict || "recorded";
-  return finishSentence(`Gate ${target}: ${verdict}${event.reason ? ` — ${event.reason}` : ""}`);
-}
-
-function backtrackNotice(event: Extract<StreamEvent, { type: "backtrack" }>): string {
-  const from = event.from || "current step";
-  const to = event.to || "previous step";
-  return finishSentence(`Backtracking ${from} → ${to}${event.reason ? ` — ${event.reason}` : ""}`);
-}
-
-function awaitingInputNotice(event: Extract<StreamEvent, { type: "awaiting_input" }>): string {
-  return event.skill
-    ? `Waiting for your input to continue ${event.skill}. Reply in chat.`
-    : "Waiting for your input to continue this workflow. Reply in chat.";
-}
+// System notices for route / gate / backtrack / awaiting_input used to be
+// pushed into the transcript here, but the workflow step card already
+// reflects running / retry / waiting state, and these notices were just
+// internal pipeline telemetry that polluted the chat. Keep them in the
+// skill block's `state` field; drop the rendered copy.
 
 function markLatestTurnWaitingForInput(entries: TranscriptEntry[]): TranscriptEntry[] {
   return updateLastTurn(entries, (turn) => ({
@@ -593,21 +571,20 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
       });
 
     case "route_decided":
-      // A direct route (pipeline_id empty) is just the default ReAct loop —
-      // announcing it adds noise to the transcript. Only surface routed chains.
-      if (!event.pipelineId) {
-        return entries;
-      }
-      return [...entries, createSystemEntry(routeNotice(event))];
+      // Pipeline telemetry — the workflow step card already reflects which
+      // route is running, no need to also render a system line.
+      return entries;
 
     case "gate_result":
-      return [...entries, createSystemEntry(gateNotice(event))];
+      return entries;
 
     case "backtrack":
-      return [...entries, createSystemEntry(backtrackNotice(event))];
+      return entries;
 
     case "awaiting_input":
-      return [...markLatestTurnWaitingForInput(entries), createSystemEntry(awaitingInputNotice(event))];
+      // Update the skill block's state so the workflow card flips to
+      // "waiting", but skip the duplicate system notice.
+      return markLatestTurnWaitingForInput(entries);
 
     case "token_usage":
       return entries;
