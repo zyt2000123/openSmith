@@ -1,16 +1,48 @@
 from .paths import AppPaths
 
-PATHS = AppPaths.defaults()
+_paths_instance: AppPaths | None = None
 
-DATA_DIR = PATHS.data_dir
-AGENT_DIR = PATHS.agent_dir
-SQLITE_PATH = PATHS.sqlite_path
-SMITH_PROFILE_DIR = PATHS.smith_profile_dir
-BUILTIN_SKILLS_DIR = PATHS.builtin_skills_dir
-BUILTIN_TOOLS_DIR = PATHS.builtin_tools_dir
-BUILTIN_IDENTITIES_DIR = PATHS.builtin_identities_dir
-SAFETY_RULES_PATH = PATHS.safety_rules_path
+
+def _get_paths() -> AppPaths:
+    """Lazy initialization: allows runtime environment changes before first access."""
+    global _paths_instance
+    if _paths_instance is None:
+        _paths_instance = AppPaths.defaults()
+    return _paths_instance
+
+
+def reset_paths(paths: AppPaths | None = None) -> None:
+    """Reset the global paths instance (useful for testing or runtime reconfiguration)."""
+    global _paths_instance
+    _paths_instance = paths
+
+
+# Lazy properties that resolve on first access
+@property
+def PATHS() -> AppPaths:
+    return _get_paths()
+
+
+# Legacy module-level constants for backward compatibility
+# These now resolve lazily through properties
+def __getattr__(name: str):
+    """Lazy module attribute resolution for backward compatibility."""
+    paths = _get_paths()
+    mapping = {
+        "DATA_DIR": paths.data_dir,
+        "AGENT_DIR": paths.agent_dir,
+        "SQLITE_PATH": paths.sqlite_path,
+        "SMITH_PROFILE_DIR": paths.smith_profile_dir,
+        "BUILTIN_SKILLS_DIR": paths.builtin_skills_dir,
+        "BUILTIN_TOOLS_DIR": paths.builtin_tools_dir,
+        "BUILTIN_IDENTITIES_DIR": paths.builtin_identities_dir,
+        "SAFETY_RULES_PATH": paths.safety_rules_path,
+        "PATHS": paths,
+    }
+    if name in mapping:
+        return mapping[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def ensure_dirs() -> None:
-    PATHS.ensure_base_dirs()
+    _get_paths().ensure_base_dirs()
