@@ -20,7 +20,7 @@ from engine.execution.pipeline.pipeline_context import (
     CTX_WORKING_DIR,
 )
 from engine.execution.pipeline.skill_chain import SkillChain, load_gate_content
-from engine.execution.routing.task_router import route_task
+from engine.execution.routing.task_router import route_task, route_task_with_llm
 from engine.execution.runtime_control import initial_runtime_control_prompt
 from engine.identity import IdentityCatalog, IdentitySpec, RouteDecision
 from engine.safety.eval_guard import EVAL_SENSITIVE_GUIDANCE, detect_eval_sensitive
@@ -248,7 +248,11 @@ async def prepare_runtime(
         if request.identity_id
         else catalog.default
     )
-    route = route_task(request.message, catalog)
+    # Keyword/example matching first; when nothing hits, let the LLM pick a
+    # declared route as a paraphrase net. The LLM is constrained to declared
+    # identity:route tokens and falls back to the deterministic decision on
+    # any error, so routing can never invent a new identity or pipeline.
+    route = await route_task_with_llm(request.message, catalog, llm=services.llm)
     state_dir = _identity_state_dir(runtime)
     requested_working_dir = request.working_dir or runtime.default_working_dir
     if requested_working_dir is None:

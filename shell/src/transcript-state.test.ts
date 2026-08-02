@@ -264,7 +264,7 @@ test("SkillChain lifecycle stays visible while awaiting the user's reply", () =>
   ]);
 });
 
-test("a direct route is presented as ReAct", () => {
+test("a direct route produces no route notice", () => {
   const entries = applyStreamEvent(freshTurn(), {
     type: "route_decided",
     identityId: "smith",
@@ -273,8 +273,21 @@ test("a direct route is presented as ReAct", () => {
     pipelineId: "",
   });
 
+  const notices = entries.filter((entry) => entry.kind === "system");
+  assert.equal(notices.length, 0);
+});
+
+test("a routed chain still produces a route notice", () => {
+  const entries = applyStreamEvent(freshTurn(), {
+    type: "route_decided",
+    identityId: "coding",
+    identityName: "Coding",
+    routeId: "requirements-research",
+    pipelineId: "requirements-research",
+  });
+
   const notice = entries.find((entry) => entry.kind === "system");
-  assert.equal(notice?.kind === "system" && notice.text, "Route: Smith → ReAct.");
+  assert.equal(notice?.kind === "system" && notice.text, "Route: Coding → requirements-research.");
 });
 
 test("tool calls remain standalone when no workflow skill is running", () => {

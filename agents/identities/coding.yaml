@@ -37,7 +37,7 @@ skills:
 routes:
   - id: requirements-research
     examples: ["需求调研", "requirements research", "/grill-me"]
-    keywords: [需求调研, 需求研究, requirements research, research requirements, grill-me, 先调研]
+    keywords: [需求调研, 需求研究, requirements research, research requirements, grill-me, 先调研, 调研, 研究一下, 帮我调研, 做调研]
     pipeline: requirements-research
     priority: 30
 
@@ -49,6 +49,6 @@ routes:
 
   - id: code-review
     examples: ["code review", "代码评审", "review this diff"]
-    keywords: [code review, 代码评审, 代码审查, review this diff, review since]
+    keywords: [code review, 代码评审, 代码审查, review this diff, review since, review 一下, 评审一下, 审阅]
     pipeline: code-review
     priority: 10

@@ -240,7 +240,7 @@
 |---|---|---|
 | R1 | `run_agent` / `run_agent_stream` 双实现漂移 | 已收敛，sync 版删除 |
 | R2 | `execute_skill` 顶替整个 system prompt | **仍在** → 见 P1「技能节点上下文交接」 |
-| R3 | `route_task_with_llm` 全仓库零调用方 | **仍在** → 见 P0「单一 Smith 身份 + Coding 能力域」 |
+| R3 | `route_task_with_llm` 全仓库零调用方 | 已接入，`prepare_runtime` 作为关键词未命中时的受声明 route 兜底分类器 + 回归测试 |
 | R4 | 门禁纯正则 / LLMGate 异常静默通过 / retry_hint 丢弃 | 后两项已修；判据不接执行事实 → 见 P1 |
 | R5 | MCP stdio 每条消息 spawn/断开 | 已修，`mcp/session_pool.py` 按 session 复用 |
 | R6 | checkpoint 只写不读 | 已接线，`_apply_crash_checkpoint` + `run_pipeline(start_node_idx)` |

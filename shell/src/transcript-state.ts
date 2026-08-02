@@ -593,6 +593,11 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
       });
 
     case "route_decided":
+      // A direct route (pipeline_id empty) is just the default ReAct loop —
+      // announcing it adds noise to the transcript. Only surface routed chains.
+      if (!event.pipelineId) {
+        return entries;
+      }
       return [...entries, createSystemEntry(routeNotice(event))];
 
     case "gate_result":
