@@ -27,10 +27,16 @@ logger = logging.getLogger(__name__)
 
 
 def _provider_error_message(chunk: dict) -> str | None:
-    """Extract a provider error carried inside a stream chunk, if any.
+    """Detect a provider error carried inside a stream chunk, if any.
 
     OpenAI-compatible relays signal mid-stream failures with an ``error`` member
     rather than an HTTP status, since the response already returned 200.
+
+    The extracted text is used only as a failure signal: provider error bodies
+    echo request content (including the prompt) and must never be surfaced in
+    exceptions or logs, so the value is not interpolated anywhere.  Keeping the
+    extraction intact means a mid-stream ``error`` member stays distinguishable
+    from a plain content chunk.
     """
     error = chunk.get("error")
     if isinstance(error, str) and error.strip():
@@ -186,9 +192,14 @@ class OpenAIAdapter(HTTPAdapterMixin):
                     # `choices` discarded that and left the caller with
                     # "stream ended before the [DONE] sentinel", hiding the real
                     # cause (rate limit, content filter, bad credentials).
-                    provider_error = _provider_error_message(chunk)
-                    if provider_error is not None:
-                        raise LLMResponseError(f"Provider stream error: {provider_error}")
+                    #
+                    # The provider's error text is deliberately NOT carried into
+                    # the exception: relays echo request content (including the
+                    # prompt) into it, and provider error bodies must not
+                    # surface in exceptions or logs (see the boundary enforced
+                    # for HTTP bodies in ``HTTPAdapterMixin._raise_for_status``).
+                    if _provider_error_message(chunk) is not None:
+                        raise LLMResponseError("Provider stream error.")
 
                     choices = chunk.get("choices", [])
                     if not isinstance(choices, list) or not choices:
@@ -348,9 +359,11 @@ class OpenAIAdapter(HTTPAdapterMixin):
             body["tools"] = request.tools
         body["max_tokens"] = self.max_output_tokens
         if request.prefix_cache_key:
-            # This is intentionally adapter-specific: only compatible gateways
-            # that understand ``extra_body`` receive this optimization hint.
-            body["extra_body"] = {"prefix_cache_key": request.prefix_cache_key}
+            # Providers document a top-level ``prefix_cache_key`` field.
+            # ``extra_body`` is an SDK client-side param, not a wire field, and
+            # the adapter serializes the body directly with httpx, so the key
+            # must be merged at the top level or the gateway never sees it.
+            body["prefix_cache_key"] = request.prefix_cache_key
         return body
 
     @staticmethod

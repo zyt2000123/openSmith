@@ -132,12 +132,23 @@ def mcp_tool_prefix_from_config(config: dict) -> str:
 
 
 def mcp_server_log_summary(config: dict) -> dict[str, object]:
-    """Build a safe-to-log summary of an MCP server config (no secret values)."""
+    """Build a safe-to-log summary of an MCP server config (no secret values).
+
+    ``command`` reduces to its executable name and ``url`` strips any query
+    string and embedded credentials: command arguments and URL query
+    parameters routinely carry tokens that must never reach a log.
+    """
     summary: dict[str, object] = {}
-    for key in ("type", "name", "alias", "url", "command", "timeout"):
+    for key in ("type", "name", "alias", "timeout"):
         value = config.get(key)
         if value is not None:
             summary[key] = value
+    if isinstance(config.get("command"), list):
+        from engine.mcp.client import _redact_command
+        summary["command"] = _redact_command(config["command"])
+    if isinstance(config.get("url"), str):
+        from engine.mcp.client import _redact_url
+        summary["url"] = _redact_url(config["url"])
     if isinstance(config.get("headers"), dict):
         summary["headers"] = sorted(config["headers"].keys())
     if isinstance(config.get("env"), dict):

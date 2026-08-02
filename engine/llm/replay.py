@@ -25,6 +25,8 @@ compaction timing, gate verdicts, routing, tool dispatch).
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
@@ -38,6 +40,8 @@ from engine.llm.contracts import (
     ToolCallData,
 )
 from engine.llm.events import ProviderEvent, ProviderEventType
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayExhaustedError(RuntimeError):
@@ -109,12 +113,29 @@ class RecordedTurn:
 
 
 def load_recording(path: Path | str) -> list[RecordedTurn]:
-    """Read a JSONL recording into ordered turns."""
+    """Read a JSONL recording into ordered turns.
+
+    A crash during append can leave a truncated final line.  Malformed or
+    non-object lines are skipped (with a warning) so the rest of the recording
+    stays loadable instead of failing wholesale.
+    """
+    recording_path = Path(path)
     turns: list[RecordedTurn] = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in recording_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        payload = json.loads(line)
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            logger.warning(
+                "skipping malformed recording line in %s", recording_path.name
+            )
+            continue
+        if not isinstance(payload, dict):
+            logger.warning(
+                "skipping non-object recording line in %s", recording_path.name
+            )
+            continue
         if "events" in payload:
             turns.append(
                 RecordedTurn(
@@ -151,9 +172,18 @@ class RecordingLLM:
         return getattr(self._inner, name)
 
     def _append(self, payload: dict[str, Any]) -> None:
-        line = json.dumps(payload, ensure_ascii=False)
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        # Append through a same-directory temp file and an atomic rename so a
+        # crash mid-write cannot leave a truncated final line that would make
+        # the whole recording unloadable.  load_recording skips malformed lines
+        # as a second line of defense for files written by older versions.
+        tmp = self._path.with_name(f"{self._path.name}.tmp")
+        try:
+            existing = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
+        except FileNotFoundError:
+            existing = ""
+        tmp.write_text(existing + line, encoding="utf-8")
+        os.replace(tmp, self._path)
 
     async def chat(
         self,
@@ -260,8 +290,10 @@ class ReplayLLM:
     ) -> ChatResponse:
         turn = self._next_turn()
         if turn.response is None:
+            # ``_next_turn`` has already advanced ``_index``, so the turn that
+            # just failed the shape check is ``_index - 1``, not ``_index``.
             raise ReplayShapeError(
-                f"turn {self._index} was recorded as a stream — replay it through "
+                f"turn {self._index - 1} was recorded as a stream — replay it through "
                 "chat_events, not chat"
             )
         return turn.response
@@ -277,8 +309,10 @@ class ReplayLLM:
         # never regenerated, so no cache hint is meaningful here.
         turn = self._next_turn()
         if turn.events is None:
+            # ``_next_turn`` has already advanced ``_index``, so the turn that
+            # just failed the shape check is ``_index - 1``, not ``_index``.
             raise ReplayShapeError(
-                f"turn {self._index} was recorded non-streaming — replay it "
+                f"turn {self._index - 1} was recorded non-streaming — replay it "
                 "through chat, not chat_events"
             )
         for event in turn.events:

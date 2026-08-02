@@ -47,6 +47,15 @@ class _AnthropicStreamError(LLMResponseError):
         self.retryable = retryable
 
 
+class _AnthropicStreamTruncatedError(LLMResponseError):
+    """The provider dropped the stream before ``message_stop``.
+
+    Kept distinct from other stream errors so the retry loop can treat a
+    pre-content truncation as transient without retrying malformed payloads,
+    mirroring the OpenAI adapter's ``_StreamTruncatedError``.
+    """
+
+
 class AnthropicAdapter(HTTPAdapterMixin):
     """Translate Anthropic Messages payloads and named SSE events."""
 
@@ -231,10 +240,17 @@ class AnthropicAdapter(HTTPAdapterMixin):
 
                     if event_type == "error":
                         error = event.get("error")
-                        message = error.get("message") if isinstance(error, dict) else None
                         error_type = error.get("type") if isinstance(error, dict) else None
+                        if not isinstance(error_type, str):
+                            error_type = None
+                        # Only the short error ``type`` — an enum-like
+                        # identifier — is surfaced.  The free-text ``message``
+                        # is dropped because relays echo request content
+                        # (including the prompt) into it, and provider error
+                        # bodies must not surface in exceptions or logs (see
+                        # ``HTTPAdapterMixin._raise_for_status``).
                         raise _AnthropicStreamError(
-                            f"Anthropic stream error: {message or 'unknown provider error'}",
+                            f"Anthropic stream error: {error_type or 'unknown provider error'}",
                             retryable=error_type in _RETRYABLE_STREAM_ERROR_TYPES,
                         )
 
@@ -245,7 +261,9 @@ class AnthropicAdapter(HTTPAdapterMixin):
                     # normalized contract and are intentionally ignored.
 
                 if not saw_stop:
-                    raise LLMResponseError("Anthropic stream ended before message_stop.")
+                    raise _AnthropicStreamTruncatedError(
+                        "Anthropic stream ended before message_stop."
+                    )
                 for committed_event in commit_attempt():
                     yield committed_event
                 if usage and not emitted_usage:
@@ -268,6 +286,17 @@ class AnthropicAdapter(HTTPAdapterMixin):
                     raise
                 logger.warning(
                     "Anthropic stream attempt %d returned a retryable error event, retrying",
+                    attempt + 1,
+                )
+            except _AnthropicStreamTruncatedError as exc:
+                # A relay that drops the connection before message_stop — with
+                # no content emitted — is a transient failure: retry, mirroring
+                # the pre-content retry behavior of the HTTP request path and
+                # the OpenAI adapter.
+                if saw_content_event or attempt >= MAX_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "Anthropic stream attempt %d ended before message_stop, retrying",
                     attempt + 1,
                 )
             except httpx.HTTPStatusError as exc:
