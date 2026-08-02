@@ -198,6 +198,9 @@ type RequestOptions = {
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
+// After the terminal SSE event, wait this long for a trailing usage frame in a
+// later TCP read before giving up on the response closing.
+const POST_DONE_DRAIN_MS = 30;
 const MAX_SSE_FRAME_CHARS = 256 * 1024;
 
 type TimeoutSignal = {
@@ -383,11 +386,13 @@ export type ObservabilityRun = {
 
 export async function listObservabilityRuns(baseUrl: string, limit = 50): Promise<ObservabilityRun[]> {
   const runs = await request<ObservabilityRun[]>(baseUrl, `/api/agent/observability/runs?limit=${limit}`);
-  // run.reason/outcome are model-derived and rendered in the run explorer.
+  // run.reason/outcome/forced_skill are model-authored and rendered in the run
+  // explorer.
   return runs.map((run) => ({
     ...run,
     outcome: run.outcome ? sanitizeTerminalText(run.outcome) : null,
     reason: run.reason ? sanitizeTerminalText(run.reason) : null,
+    forced_skill: run.forced_skill ? sanitizeTerminalText(run.forced_skill) : null,
   }));
 }
 
@@ -860,28 +865,22 @@ export function decodeSseEvent(rawChunk: string): StreamEvent | null {
 function consumeSseChunks(chunks: string[], sawDone: boolean): { events: StreamEvent[]; sawDone: boolean } {
   const events: StreamEvent[] = [];
   let completed = sawDone;
-  let draining = false;
 
   for (const chunk of chunks) {
-    if (completed && !draining) break;
     const event = decodeSseEvent(chunk);
     if (!event) continue;
     if (completed) {
       // After the terminal event only usage counters are legitimate: a server
-      // may legally frame token_usage/context_usage right after done, and
-      // dropping them would permanently undercount the session totals.  Stale
-      // content events after done are dropped.
+      // may legally frame token_usage/context_usage after done (even in a later
+      // TCP read), and dropping them would permanently undercount the session
+      // totals.  Stale content events after done are dropped.
       if (event.type === "token_usage" || event.type === "context_usage") {
         events.push(event);
       }
       continue;
     }
     events.push(event);
-    if (event.type === "done") {
-      completed = true;
-      // Keep draining the rest of THIS buffer; future reads stop at sawDone.
-      draining = true;
-    }
+    if (event.type === "done") completed = true;
   }
 
   return { events, sawDone: completed };
@@ -909,7 +908,26 @@ async function* readSseEvents(
       const consumed = consumeSseChunks(parsed.chunks, sawDone);
       sawDone = consumed.sawDone;
       yield* consumed.events;
-      if (sawDone) return;
+      if (sawDone) {
+        // The server usually closes right after done, but a TCP packet split can
+        // put a trailing token_usage/context_usage frame in the NEXT read.  Give
+        // it a brief window, then stop — never hang the turn waiting for the
+        // response to close.
+        const trailing = await Promise.race([
+          reader.read(),
+          new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), POST_DONE_DRAIN_MS)),
+        ]);
+        if (trailing === "timeout") return;
+        const { done: trailingDone, value: trailingValue } = trailing;
+        if (trailingDone) break;
+        if (!trailingValue || trailingValue.length === 0) return;
+        buffer += decoder.decode(trailingValue, { stream: true });
+        const trailingParsed = splitSseBuffer(buffer);
+        assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
+        const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
+        yield* trailingConsumed.events;
+        return;
+      }
     }
 
     buffer += decoder.decode();

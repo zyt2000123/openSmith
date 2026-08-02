@@ -203,15 +203,18 @@ class AutoTaskRepo:
         *,
         auto_task_id: str | None = None,
         lease_token: str | None = None,
+        force: bool = False,
     ) -> dict | None:
         """Record a run outcome only while the caller still owns the task lease.
 
         Without the gate, a worker whose 15-minute lease expired mid-run (and so
         lost the task to a reclaim) could still write a stale run row while a
-        second worker executes the same instruction.
+        second worker executes the same instruction.  ``force=True`` bypasses the
+        gate for the cancellation path, where this worker's own run row must be
+        marked failed to avoid a permanent phantom 'running' row.
         """
         db = await get_app_db()
-        if auto_task_id is not None:
+        if auto_task_id is not None and not force:
             rows = await db.execute_fetchall(
                 "SELECT status, lease_token FROM auto_tasks WHERE id=?",
                 (auto_task_id,),

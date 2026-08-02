@@ -1236,19 +1236,21 @@ let signalExitCode: number | null = null;
 async function exitWith(code: number): Promise<void> {
   if (exiting) return;
   exiting = true;
-  // A signal exit must win the exit code over the normal path's 0/1.
-  const finalCode = signalExitCode ?? code;
   try {
     await stopOwnedServer();
   } catch {
     // Never let a failed child reap block the exit.
   }
-  process.exit(finalCode);
+  // A signal exit must win the exit code over the normal path's 0/1; compute it
+  // at the very end so a signal arriving while we await the server still wins.
+  process.exit(signalExitCode ?? code);
 }
 
 async function exitOnSignal(code: number): Promise<void> {
-  if (exiting) return;
+  // Claim the signal exit code unconditionally: even if an exit is already in
+  // flight (awaiting stopOwnedServer), the process must exit 130/143, not 0.
   signalExitCode = code;
+  if (exiting) return;
   try {
     app.unmount();
   } catch {

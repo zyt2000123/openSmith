@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL DEFAULT ({_ISO_NOW})
 );
 
+CREATE INDEX IF NOT EXISTS idx_messages_session
+    ON messages(session_id);
+
 CREATE TABLE IF NOT EXISTS auto_tasks (
     id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,

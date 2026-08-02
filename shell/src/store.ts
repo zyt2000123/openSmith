@@ -247,6 +247,7 @@ function applyDoneStreamState(state: AppState, event: Extract<StreamEvent, { typ
     ...bounded,
     pendingApproval: null,
     approvalResolving: false,
+    lastToolCallId: null,
     recoverableRunId: event.status === "completed" ? null : (event.runId ?? state.recoverableRunId),
     // A tool whose result never arrived would otherwise stay in the running
     // map for the rest of the session, leaving the HUD spinner on for every
@@ -294,6 +295,9 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
   if (event.type === "run_started") {
     return {
       recoverableRunId: event.runId || state.recoverableRunId,
+      // A new run invalidates the previous run's tool-call id for approval
+      // settlement matching.
+      lastToolCallId: null,
       toolActivity: applyToolActivity(state.toolActivity, event),
       ...applyBoundedStreamEvent(state, event),
     };

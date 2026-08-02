@@ -277,9 +277,9 @@ class ConfigService:
                         raise HTTPException(502, "Configured relay returned an oversized model list")
                     body = b""
                     async for chunk in response.aiter_bytes():
-                        body += chunk
-                        if len(body) > _MAX_RELAY_BODY_BYTES:
+                        if len(body) + len(chunk) > _MAX_RELAY_BODY_BYTES:
                             raise HTTPException(502, "Configured relay returned an oversized model list")
+                        body += chunk
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="Unable to list models from the configured relay") from exc
 

@@ -168,8 +168,9 @@ class SessionRepo:
         db = await get_app_db()
         rows = await db.execute_fetchall(
             "SELECT * FROM messages WHERE session_id=? AND rowid > "
-            "(SELECT rowid FROM messages WHERE id=?) ORDER BY created_at ASC LIMIT ?",
-            (session_id, message_id, limit),
+            "(SELECT rowid FROM messages WHERE id=? AND session_id=?) "
+            "ORDER BY created_at ASC LIMIT ?",
+            (session_id, message_id, session_id, limit),
         )
         return [dict(r) for r in rows]
 
@@ -180,8 +181,9 @@ class SessionRepo:
         db = await get_app_db()
         rows = await db.execute_fetchall(
             "SELECT * FROM messages WHERE session_id=? AND rowid < "
-            "(SELECT rowid FROM messages WHERE id=?) ORDER BY created_at DESC LIMIT ?",
-            (session_id, message_id, limit),
+            "(SELECT rowid FROM messages WHERE id=? AND session_id=?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (session_id, message_id, session_id, limit),
         )
         rows.reverse()
         return [dict(r) for r in rows]

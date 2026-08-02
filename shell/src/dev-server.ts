@@ -96,7 +96,10 @@ function assertSafeServerTarget(target: ServerTarget): void {
   } catch {
     throw new Error(`SMITH_SERVER_URL is not a valid URL: ${target.baseUrl}`);
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = parsed.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
   if (parsed.protocol === "http:" && !LOOPBACK_HOST_RE.test(host)) {
     throw new Error(
       `SMITH_SERVER_URL=${target.baseUrl} would send the local auth token over cleartext ` +
@@ -174,16 +177,22 @@ export function stopOwnedServer(): Promise<void> {
 async function performStopOwnedServer(): Promise<void> {
   const child = ownedServer;
   if (!child || child.exitCode !== null) return;
-  ownedServer = null;
+  // Do NOT clear ownedServer here: if the child survives the hard timeout, the
+  // sync `exit`-event fallback (cleanupOwnedServer) must still be able to see
+  // and signal it instead of leaving a port-holding orphan unreachable.
   const finished = new Promise<void>((resolve) => {
-    const escalation = setTimeout(() => {
-      signalProcessGroup(child, "SIGKILL");
-    }, SERVER_TERMINATION_GRACE_MS);
     const finish = (): void => {
       clearTimeout(escalation);
       clearTimeout(hard);
+      if (ownedServer === child) ownedServer = null;
       resolve();
     };
+    const escalation = setTimeout(() => {
+      // Only escalate while the child is still alive; an unconditional SIGKILL
+      // on the group could hit an unrelated process group whose leader PID was
+      // reused after a prompt child exit.
+      if (child.exitCode === null) signalProcessGroup(child, "SIGKILL");
+    }, SERVER_TERMINATION_GRACE_MS);
     const hard = setTimeout(finish, SERVER_TERMINATION_HARD_TIMEOUT_MS);
     hard.unref?.();
     child.once("exit", finish);

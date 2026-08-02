@@ -47,6 +47,9 @@ def _session_stream_lock(session_id: str) -> asyncio.Lock:
 
 # Recent messages passed to the engine as short-term conversational context
 _HISTORY_LIMIT = 10
+# Upper bound for one compress call; far beyond any real session while still
+# bounding memory (compression already loads the conversation into memory).
+_COMPRESS_MESSAGE_CAP = 50_000
 logger = logging.getLogger(__name__)
 
 
@@ -237,13 +240,19 @@ class SessionService:
         if not deleted:
             raise HTTPException(404, "Session not found")
         await close_session_mcp_clients(session_id)
+        # Drop the per-session stream lock so deleted sessions do not leak a
+        # lock per session for the server's lifetime.
+        _SESSION_STREAM_LOCKS.pop(session_id, None)
 
     async def compress_session(self, agent_id: str, session_id: str) -> ContextCompressionOut:
         session = await self.session_repo.get_owned(session_id, agent_id)
         if session is None:
             raise HTTPException(404, "Session not found")
 
-        rows = await self.session_repo.get_messages(session_id)
+        # Compression summarizes the WHOLE conversation, so fetch it all
+        # explicitly: the get_messages default cap (200) would otherwise silently
+        # drop the tail of a long session from both summary and context.
+        rows = await self.session_repo.get_messages(session_id, limit=_COMPRESS_MESSAGE_CAP)
         if not rows:
             raise HTTPException(400, "Cannot compress an empty session")
 
@@ -472,9 +481,14 @@ class SessionService:
                 message_id=message_id,
             )
             if _resume_run_id is None:
-                run = engine_run_stream_with_runtime(request, runtime, services)
+                # RunStateStore.create() fsyncs; keep the blocking I/O off the
+                # event loop like the rest of the S1 persistence changes.
+                run = await asyncio.to_thread(
+                    engine_run_stream_with_runtime, request, runtime, services
+                )
             else:
-                run = engine_resume_stream_with_runtime(
+                run = await asyncio.to_thread(
+                    engine_resume_stream_with_runtime,
                     request,
                     runtime,
                     services,

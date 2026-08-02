@@ -247,7 +247,9 @@ export function renderMarkdownTableLines(layout: MarkdownTableLayout): string[] 
 export function MarkdownTableBlock({ markdown, width }: { markdown: string; width: number }) {
   const table = parseMarkdownTable(markdown);
   if (!table) {
-    return <MarkdownText text={markdown} width={width} />;
+    // Same hardening as the transcript renderer: never emit OSC-8 hyperlinks
+    // (file:///javascript:/data: targets are model-authored).
+    return <MarkdownText text={markdown} width={width} hyperlinks={false} />;
   }
 
   // Rules are emitted as their own <Text> so they keep the border colour while

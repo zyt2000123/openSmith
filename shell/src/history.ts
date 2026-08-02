@@ -8,9 +8,11 @@ import path from "node:path";
 export const HISTORY_LIMIT = 200;
 
 // Credential shapes copied from the trace store's redaction so a prompt that
-// pasted an API key/token is not persisted verbatim to disk.
+// pasted an API key/token is not persisted verbatim to disk.  The sk- minimum
+// is 24 (real OpenAI/Anthropic keys are 48+ chars) to avoid mangling ordinary
+// words like "sk-scheduler" or "task-sk-1234" during up-arrow recall.
 const SECRET_PATTERN =
-  /(?<![A-Za-z0-9])(?:\b(?:bearer|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{16,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)/gi;
+  /(?<![A-Za-z0-9])(?:\b(?:bearer|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{16,}|sk-[A-Za-z0-9_-]{24,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)/gi;
 
 function redactHistory(text: string): string {
   return text.replace(SECRET_PATTERN, "[REDACTED]");
