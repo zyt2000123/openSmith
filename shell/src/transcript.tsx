@@ -42,6 +42,11 @@ const TOOL_PRESENTATION: Record<ToolState, { color: string; marker: string; labe
 const MARKDOWN_OPTIONS = {
   theme: { listMarker: { color: ASSISTANT } },
   listIndent: 1,
+  // OSC-8 hyperlinks are emitted at render time for ANY scheme (file://,
+  // javascript:, data:) and the model authors the markdown.  Keep links as
+  // plain text rather than handing the terminal a clickable local-file or
+  // javascript: target.
+  hyperlinks: false,
 } as const;
 
 const PROCESSING_LABEL = "Processing";

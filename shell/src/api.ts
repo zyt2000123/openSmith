@@ -198,6 +198,9 @@ type RequestOptions = {
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
+// After the terminal SSE event, wait this long for a trailing usage frame in a
+// later TCP read before giving up on the response closing.
+const POST_DONE_DRAIN_MS = 30;
 const MAX_SSE_FRAME_CHARS = 256 * 1024;
 
 type TimeoutSignal = {
@@ -353,7 +356,10 @@ export async function initializeProjectInstructions(baseUrl: string, workingDir:
 }
 
 export async function listSessions(baseUrl: string, options: Pick<RequestOptions, "signal"> = {}): Promise<Session[]> {
-  return request<Session[]>(baseUrl, "/api/agent/sessions", options);
+  const sessions = await request<Session[]>(baseUrl, "/api/agent/sessions", options);
+  // Session titles come from the user/agent and are rendered raw in the sidebar;
+  // sanitise at the same decode boundary as streamed content.
+  return sessions.map((session) => ({ ...session, title: sanitizeTerminalText(session.title) }));
 }
 
 export async function getTokenStats(baseUrl: string, year?: number): Promise<TokenStats> {
@@ -379,7 +385,15 @@ export type ObservabilityRun = {
 };
 
 export async function listObservabilityRuns(baseUrl: string, limit = 50): Promise<ObservabilityRun[]> {
-  return request<ObservabilityRun[]>(baseUrl, `/api/agent/observability/runs?limit=${limit}`);
+  const runs = await request<ObservabilityRun[]>(baseUrl, `/api/agent/observability/runs?limit=${limit}`);
+  // run.reason/outcome/forced_skill are model-authored and rendered in the run
+  // explorer.
+  return runs.map((run) => ({
+    ...run,
+    outcome: run.outcome ? sanitizeTerminalText(run.outcome) : null,
+    reason: run.reason ? sanitizeTerminalText(run.reason) : null,
+    forced_skill: run.forced_skill ? sanitizeTerminalText(run.forced_skill) : null,
+  }));
 }
 
 export type RunDiagnosis = {
@@ -431,7 +445,12 @@ export async function getObservabilityHealth(baseUrl: string): Promise<AgentHeal
 }
 
 export async function listRunIncidents(baseUrl: string, limit = 20): Promise<RunIncident[]> {
-  return request<RunIncident[]>(baseUrl, `/api/agent/observability/incidents?limit=${limit}`);
+  const incidents = await request<RunIncident[]>(baseUrl, `/api/agent/observability/incidents?limit=${limit}`);
+  return incidents.map((incident) => ({
+    ...incident,
+    category: sanitizeTerminalText(incident.category),
+    message: sanitizeTerminalText(incident.message),
+  }));
 }
 
 export async function getRunImprovementProposal(baseUrl: string, runId: string): Promise<RunImprovementProposal> {
@@ -463,14 +482,22 @@ export type Message = {
 };
 
 export async function listMessages(baseUrl: string, sessionId: string): Promise<Message[]> {
-  const messages = await request<Message[]>(baseUrl, `/api/agent/sessions/${sessionId}/messages`);
+  const messages = await request<Message[]>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}/messages`);
   // Restored history is model-authored too, and it reaches the terminal through
   // the same renderers as live output — sanitise it on the same boundary.
   return messages.map((message) => ({ ...message, content: sanitizeTerminalText(message.content) }));
 }
 
 export async function listSkills(baseUrl: string): Promise<SkillSummary[]> {
-  return request<SkillSummary[]>(baseUrl, "/api/agent/skills");
+  const skills = await request<SkillSummary[]>(baseUrl, "/api/agent/skills");
+  // Skill descriptions are model/repo-authored (SKILL.md) and are rendered in
+  // the /skills panels; sanitise at the decode boundary like streamed content.
+  return skills.map((skill) => ({
+    ...skill,
+    name: sanitizeTerminalText(skill.name),
+    description: sanitizeTerminalText(skill.description),
+    source: sanitizeTerminalText(skill.source),
+  }));
 }
 
 /**
@@ -508,7 +535,19 @@ export type McpServer = {
 };
 
 export async function listMcpServers(baseUrl: string): Promise<McpServer[]> {
-  return request<McpServer[]>(baseUrl, "/api/agent/mcp");
+  const servers = await request<McpServer[]>(baseUrl, "/api/agent/mcp");
+  // MCP server/tool names and descriptions are config- or provider-authored and
+  // rendered in the /mcp panel; sanitise at the decode boundary.
+  return servers.map((server) => ({
+    ...server,
+    name: sanitizeTerminalText(server.name),
+    error: server.error ? sanitizeTerminalText(server.error) : null,
+    tools: server.tools.map((tool) => ({
+      ...tool,
+      name: sanitizeTerminalText(tool.name),
+      description: sanitizeTerminalText(tool.description),
+    })),
+  }));
 }
 
 export type ContextCompression = {
@@ -523,7 +562,7 @@ export async function compressSession(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<ContextCompression> {
-  return request<ContextCompression>(baseUrl, `/api/agent/sessions/${sessionId}/compress`, {
+  return request<ContextCompression>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}/compress`, {
     method: "POST",
     timeoutMs: 120_000,
     signal,
@@ -535,7 +574,7 @@ export async function updateSessionModel(
   sessionId: string,
   modelProfile: string | null,
 ): Promise<Session> {
-  return request<Session>(baseUrl, `/api/agent/sessions/${sessionId}/model`, {
+  return request<Session>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}/model`, {
     method: "PATCH",
     body: { model_profile: modelProfile },
   });
@@ -547,7 +586,7 @@ export async function resolveRunApproval(
   approvalId: string,
   approved: boolean,
 ): Promise<void> {
-  await request<void>(baseUrl, `/api/agent/runs/${runId}/approval`, {
+  await request<void>(baseUrl, `/api/agent/runs/${encodeURIComponent(runId)}/approval`, {
     method: "POST",
     body: { approval_id: approvalId, approved },
   });
@@ -558,7 +597,7 @@ export async function getRun(baseUrl: string, runId: string): Promise<RunState> 
 }
 
 export async function deleteSession(baseUrl: string, sessionId: string): Promise<void> {
-  await request<void>(baseUrl, `/api/agent/sessions/${sessionId}`, {
+  await request<void>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
   });
 }
@@ -706,7 +745,7 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
       approvalId: String(payload.approval_id ?? ""),
       tool: String(payload.tool ?? "tool"),
       level: String(payload.level ?? "execute"),
-      reason: sanitizeUnknownText(payload.reason) || "Approval required",
+      reason: sanitizeUnknownText(payload.reason).slice(0, 500) || "Approval required",
       arguments: objectPayload(payload.arguments),
       ...(presentation ? { presentation } : {}),
     };
@@ -819,7 +858,7 @@ export function decodeSseEvent(rawChunk: string): StreamEvent | null {
   const { eventName, payload } = parsed;
   if (eventName === "error") throw new Error(terminalText(payload.message ?? payload.error) || "Server stream failed.");
 
-  const decoder = SSE_EVENT_DECODERS[eventName];
+  const decoder = Object.hasOwn(SSE_EVENT_DECODERS, eventName) ? SSE_EVENT_DECODERS[eventName] : undefined;
   return decoder ? decoder(payload) : null;
 }
 
@@ -828,11 +867,20 @@ function consumeSseChunks(chunks: string[], sawDone: boolean): { events: StreamE
   let completed = sawDone;
 
   for (const chunk of chunks) {
-    if (completed) break;
     const event = decodeSseEvent(chunk);
     if (!event) continue;
+    if (completed) {
+      // After the terminal event only usage counters are legitimate: a server
+      // may legally frame token_usage/context_usage after done (even in a later
+      // TCP read), and dropping them would permanently undercount the session
+      // totals.  Stale content events after done are dropped.
+      if (event.type === "token_usage" || event.type === "context_usage") {
+        events.push(event);
+      }
+      continue;
+    }
     events.push(event);
-    completed ||= event.type === "done";
+    if (event.type === "done") completed = true;
   }
 
   return { events, sawDone: completed };
@@ -860,7 +908,33 @@ async function* readSseEvents(
       const consumed = consumeSseChunks(parsed.chunks, sawDone);
       sawDone = consumed.sawDone;
       yield* consumed.events;
-      if (sawDone) return;
+      if (sawDone) {
+        // The server usually closes right after done, but a TCP packet split can
+        // put a trailing token_usage/context_usage frame in later reads.  Drain
+        // within a short budget, then stop — never hang the turn waiting for the
+        // response to close.
+        const deadline = Date.now() + POST_DONE_DRAIN_MS;
+        for (;;) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return;
+          const trailing = await Promise.race([
+            reader.read(),
+            new Promise<"timeout">((resolve) => {
+              const timer = setTimeout(() => resolve("timeout"), remaining);
+              timer.unref?.();
+            }),
+          ]);
+          if (trailing === "timeout") return;
+          const { done: trailingDone, value: trailingValue } = trailing;
+          if (trailingDone) break;
+          if (!trailingValue || trailingValue.length === 0) return;
+          buffer += decoder.decode(trailingValue, { stream: true });
+          const trailingParsed = splitSseBuffer(buffer);
+          assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
+          const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
+          yield* trailingConsumed.events;
+        }
+      }
     }
 
     buffer += decoder.decode();
@@ -932,7 +1006,7 @@ export async function* streamMessage(
 ): AsyncGenerator<StreamEvent, void, void> {
   yield* streamRequest(
     baseUrl,
-    `/api/agent/sessions/${sessionId}/messages/stream`,
+    `/api/agent/sessions/${encodeURIComponent(sessionId)}/messages/stream`,
     {
       content,
       context: options.context,

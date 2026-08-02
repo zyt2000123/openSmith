@@ -3,12 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from fastapi import HTTPException
 
 from engine.execution import EngineRequest, reply_with_runtime as engine_reply_with_runtime
+from engine.observability.trace_store import _redact_secrets_in_text
 
-from ..schemas.auto_task import AutoTaskCreate, AutoTaskUpdate, AutoTaskOut, AutoTaskRunOut
+from ..schemas.auto_task import (
+    MAX_RETRIES_CAP,
+    MIN_INTERVAL_SECONDS,
+    AutoTaskCreate,
+    AutoTaskUpdate,
+    AutoTaskOut,
+    AutoTaskRunOut,
+)
 from ..infrastructure.repositories.auto_task_repo import AutoTaskRepo
 from ..infrastructure.repositories.agent_profile_repo import AgentProfileRepo
 from ..infrastructure.repositories.session_repo import SessionRepo
@@ -19,6 +28,10 @@ log = logging.getLogger(__name__)
 _RETRY_BASE_DELAY_SECONDS = 60
 _MAX_RETRY_DELAY_SECONDS = 900
 _LEASE_RENEW_INTERVAL_SECONDS = 60
+# Transient renewal errors (SQLITE_BUSY, connection hiccups) are retried before
+# the lease is treated as lost; an immediately-cancelled healthy run would leave
+# the task to be re-executed after expiry (double cost).
+_LEASE_RENEW_RETRIES = 3
 # Safety net for a whole auto-task run.  Individual LLM requests and tool calls
 # have their own timeouts; this caps a pathological multi-turn loop so a hung
 # run cannot hold a _MAX_CONCURRENT_RUNS slot (and its lease) forever.
@@ -31,12 +44,41 @@ _MAX_CONCURRENT_RUNS = 4
 # and let the event loop garbage-collect a run that is still going.
 _BACKGROUND_RUNS: set[asyncio.Task] = set()
 
+# Reserved-but-not-yet-started slots.  start_auto_task checks len(_BACKGROUND_RUNS)
+# against the cap and then awaits a DB claim before adding the task, so two
+# concurrent triggers could both pass the check.  Reserving the slot BEFORE the
+# first await closes that TOCTOU window.
+_RESERVED_SLOTS = 0
+
+
+def _reserve_run_slot() -> bool:
+    global _RESERVED_SLOTS
+    if _RESERVED_SLOTS + len(_BACKGROUND_RUNS) >= _MAX_CONCURRENT_RUNS:
+        return False
+    _RESERVED_SLOTS += 1
+    return True
+
+
+def _release_run_slot() -> None:
+    global _RESERVED_SLOTS
+    _RESERVED_SLOTS = max(0, _RESERVED_SLOTS - 1)
+
 
 def _forget_background_run(job: asyncio.Task) -> None:
     """Release the finished job and retrieve its exception so asyncio stays quiet."""
     _BACKGROUND_RUNS.discard(job)
     if not job.cancelled() and job.exception() is not None:
         log.error("Detached auto task run failed", exc_info=job.exception())
+
+
+def _redact_error_text(exc: BaseException) -> str:
+    """Persist a failure reason without embedding credentials from error text.
+
+    httpx/engine errors can echo the full request URL or provider response;
+    strip the credential shapes the trace store redacts before the text is
+    stored and later served to any authenticated caller.
+    """
+    return _redact_secrets_in_text(str(exc))[:500]
 
 
 async def cancel_background_runs() -> None:
@@ -127,7 +169,14 @@ class AutoTaskService:
         task = await self.repo.get(task_id)
         if task is None or task["agent_id"] != agent_id:
             raise HTTPException(404, "Auto task not found")
-        started = await self.start_auto_task(task)
+        if not _reserve_run_slot():
+            raise HTTPException(
+                429, "Too many auto tasks are already running; try again later"
+            )
+        try:
+            started = await self._start_claimed(task)
+        finally:
+            _release_run_slot()
         if started is None:
             raise HTTPException(409, "Auto task is already running")
         return started
@@ -139,7 +188,21 @@ class AutoTaskService:
         at once whether it won and gets a run id to poll, while the engine turn
         never holds an HTTP request or a scheduler tick open.  That turn renews a
         15-minute lease, so it is expected to outlive any request timeout.
+
+        The concurrency cap is enforced here (not just in tick) so a manual
+        trigger cannot start more detached runs than a scheduled tick would.
+        The slot is reserved before the first await so concurrent triggers
+        cannot both pass the cap check (TOCTOU).
         """
+        if not _reserve_run_slot():
+            return None
+        try:
+            return await self._start_claimed(task)
+        finally:
+            _release_run_slot()
+
+    async def _start_claimed(self, task: dict) -> AutoTaskRunOut | None:
+        """Claim and detach; the caller already holds a reserved run slot."""
         claim = await self._claim(task)
         if claim is None:
             return None
@@ -163,8 +226,15 @@ class AutoTaskService:
         trigger_config = task["trigger_config"]
         run_finalized: dict | None = None
 
+        # If the lease is lost mid-run (renewal failed: another worker reclaimed
+        # the task, or the process is shutting down) the engine turn MUST stop:
+        # continuing would duplicate side effects and double LLM billing while a
+        # second worker executes the same instruction.
+        current_task = asyncio.current_task()
         lease_renewal = asyncio.create_task(
-            self._renew_lease_until_finished(task_id, lease_token)
+            self._renew_lease_until_finished(
+                task_id, lease_token, on_lost=current_task.cancel
+            )
         )
 
         try:
@@ -221,9 +291,34 @@ class AutoTaskService:
             # interval/cron task whose execution outlives its schedule must not
             # be immediately due again.
             next_run = self._calc_next_run(trigger_type, trigger_config)
-            finished = await self.repo.finish_run(run["id"], "completed", reply_text)
+            finished = await self.repo.finish_run(
+                run["id"],
+                "completed",
+                reply_text,
+                auto_task_id=task_id,
+                lease_token=lease_token,
+            )
             if finished is None:
-                raise HTTPException(500, "Failed to record auto task run")
+                # Lease was lost between renewal and finish (another worker
+                # reclaimed the task).  The side effects already happened, so
+                # record this worker's own run as completed for an accurate
+                # history (the row is per-worker; the task itself belongs to
+                # the new owner).
+                finished = await self.repo.finish_run(
+                    run["id"], "completed", reply_text, force=True
+                )
+            if finished is None:
+                log.warning(
+                    "Auto task %s run %s not recorded: lease no longer held",
+                    task_id,
+                    run["id"],
+                )
+                finished = {
+                    **run,
+                    "status": "completed",
+                    "output": reply_text,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }
             run_finalized = finished
             try:
                 lease_released = await self.repo.finish_task(
@@ -256,6 +351,51 @@ class AutoTaskService:
                 log.warning("Auto task %s lease was lost after completion", task_id)
             return AutoTaskRunOut(**run_finalized)
 
+        except asyncio.CancelledError:
+            # Lease was lost mid-run (or shutdown cancelled the run). Another
+            # worker may own the task, so finish_task must NOT run (we no longer
+            # hold the token).  If the run already completed (side effects fully
+            # applied, run_finalized set) never downgrade it to failed; a late
+            # cancellation landing after completion must not erase the outcome.
+            # Otherwise mark the run failed even though the lease is gone — the
+            # run row is this worker's own, and leaving it 'running' would make
+            # it a phantom row forever (the lease reset only reclaims expired
+            # tasks, not live-lease ones).
+            if run_finalized is None:
+                try:
+                    await self.repo.finish_run(
+                        run["id"],
+                        "failed",
+                        "",
+                        error="auto task lease was lost",
+                        auto_task_id=task_id,
+                        lease_token=lease_token,
+                        force=True,
+                    )
+                except Exception:
+                    log.warning(
+                        "failed to mark auto task run %s failed after lease loss",
+                        run["id"],
+                        exc_info=True,
+                    )
+                # Release the task lease best-effort.  If we still own it (e.g.
+                # cancelled by a shutdown or an unrecoverable renewal error),
+                # the task must go back to idle instead of re-executing after
+                # the lease expires; if another worker reclaimed it, this is a
+                # no-op.
+                try:
+                    next_run = self._calc_next_run(trigger_type, trigger_config)
+                    await self.repo.finish_task(
+                        task_id, "idle", next_run, lease_token, retry_count=0
+                    )
+                except Exception:
+                    log.warning(
+                        "failed to release auto task %s lease on cancellation",
+                        task_id,
+                        exc_info=True,
+                    )
+            raise
+
         except Exception as exc:
             if run_finalized is not None:
                 # Defensive: the success path returns before any later statement,
@@ -265,7 +405,7 @@ class AutoTaskService:
             log.exception("Auto task %s failed", task_id)
             is_scheduled = trigger_type != "manual"
             retry_count = int(task.get("retry_count") or 0) + 1 if is_scheduled else 0
-            max_retries = max(0, int(task.get("max_retries", 2) or 0))
+            max_retries = min(MAX_RETRIES_CAP, max(0, int(task.get("max_retries", 2) or 0)))
             retry_status = "failed"
             if is_scheduled and retry_count <= max_retries:
                 retry_status = "idle"
@@ -285,10 +425,27 @@ class AutoTaskService:
             if not finished_task:
                 log.warning("Auto task %s lease was lost before failure handling", task_id)
             finished = await self.repo.finish_run(
-                run["id"], "failed", "", error=str(exc)
+                run["id"],
+                "failed",
+                "",
+                error=_redact_error_text(exc),
+                auto_task_id=task_id,
+                lease_token=lease_token,
             )
             if finished is None:
-                raise HTTPException(500, "Failed to record auto task run") from exc
+                # Lease lost before failure handling: do not blow up the detached
+                # task over bookkeeping, and never retry a superseded run.
+                log.warning(
+                    "Auto task %s run %s failure not recorded: lease no longer held",
+                    task_id,
+                    run["id"],
+                )
+                finished = {
+                    **run,
+                    "status": "failed",
+                    "error": _redact_error_text(exc),
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }
             return AutoTaskRunOut(**finished)
         finally:
             lease_renewal.cancel()
@@ -332,13 +489,48 @@ class AutoTaskService:
                 log.exception("Scheduler failed to start task %s", task["id"])
         return started
 
-    async def _renew_lease_until_finished(self, task_id: str, lease_token: str) -> None:
-        """Keep ownership alive while an LLM/tool run outlives the initial lease."""
+    async def _renew_lease_until_finished(
+        self, task_id: str, lease_token: str, on_lost: Callable[[], None]
+    ) -> None:
+        """Keep ownership alive while an LLM/tool run outlives the initial lease.
+
+        Losing the lease mid-run means another worker owns the task now; call
+        ``on_lost`` so the owner cancels the engine turn instead of continuing.
+        A renewal error is retried before being treated as loss: a transient DB
+        hiccup must not cancel a healthy run whose lease still holds (the task
+        would later be re-executed, doubling cost).
+        """
+        renewal_errors = 0
         try:
             while True:
                 await asyncio.sleep(_LEASE_RENEW_INTERVAL_SECONDS)
-                if not await self.repo.renew_lease(task_id, lease_token):
+                try:
+                    renewed = await self.repo.renew_lease(task_id, lease_token)
+                except Exception:
+                    # A transient DB error (SQLITE_BUSY, a lock, a closed
+                    # connection) is NOT proof the lease was lost; retry a few
+                    # times before treating it as loss.  Treating a hiccup as
+                    # loss would cancel a healthy run whose lease still holds,
+                    # and the task would later be re-executed (double cost).
+                    renewal_errors += 1
+                    if renewal_errors <= _LEASE_RENEW_RETRIES:
+                        log.warning(
+                            "Auto task %s lease renewal error (%d/%d); retrying",
+                            task_id,
+                            renewal_errors,
+                            _LEASE_RENEW_RETRIES,
+                        )
+                        continue
+                    log.exception(
+                        "Auto task %s lease renewal failed; treating the lease as lost",
+                        task_id,
+                    )
+                    on_lost()
+                    return
+                renewal_errors = 0
+                if not renewed:
                     log.warning("Auto task %s lease was lost while running", task_id)
+                    on_lost()
                     return
         except asyncio.CancelledError:
             raise
@@ -354,7 +546,12 @@ class AutoTaskService:
         if trigger_type == "cron":
             return next_cron_time(trigger_config, after=now).isoformat()
         if trigger_type == "interval":
-            return next_interval_time(int(trigger_config), after=now).isoformat()
+            seconds = int(trigger_config)
+            if seconds < MIN_INTERVAL_SECONDS:
+                raise ValueError(
+                    f"interval must be at least {MIN_INTERVAL_SECONDS}s"
+                )
+            return next_interval_time(seconds, after=now).isoformat()
         return None
 
     @classmethod

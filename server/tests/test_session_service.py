@@ -59,8 +59,55 @@ class FakeSessionRepo:
         self.identity_id = identity_id
         return True
 
-    async def get_messages(self, session_id: str, limit: int = 0, offset: int = 0) -> list[dict]:
-        return self.messages[offset:] if limit == 0 else self.messages[offset : offset + limit]
+    async def get_messages(
+        self,
+        session_id: str,
+        limit: int = 0,
+        offset: int = 0,
+        max_content_bytes: int | None = None,
+    ) -> list[dict]:
+        rows = self.messages[offset:]
+        if limit > 0:
+            rows = rows[:limit]
+        if max_content_bytes is not None:
+            total = 0
+            bounded: list[dict] = []
+            for row in rows:
+                content = row.get("content", "")
+                total += len(content) if isinstance(content, str) else 0
+                if total > max_content_bytes:
+                    break
+                bounded.append(row)
+            return bounded
+        return rows
+
+    async def get_message(self, session_id: str, message_id: str) -> dict | None:
+        return next(
+            (m for m in self.messages if m["id"] == message_id),
+            None,
+        )
+
+    async def get_messages_since(
+        self, session_id: str, message_id: str, limit: int = 20
+    ) -> list[dict]:
+        try:
+            start = next(
+                index for index, m in enumerate(self.messages) if m["id"] == message_id
+            )
+        except StopIteration:
+            return []
+        return self.messages[start + 1 : start + 1 + limit]
+
+    async def get_messages_before(
+        self, session_id: str, message_id: str, limit: int
+    ) -> list[dict]:
+        try:
+            end = next(
+                index for index, m in enumerate(self.messages) if m["id"] == message_id
+            )
+        except StopIteration:
+            return []
+        return self.messages[max(0, end - limit) : end]
 
     async def get_recent_messages(self, session_id: str, limit: int) -> list[dict]:
         return []
@@ -1386,3 +1433,109 @@ async def test_stream_message_reports_failed_status_when_persisting_the_reply_fa
         "status": "failed",
         "reason": "reply_persistence_failed",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_stream_lock_map_is_bounded_and_keeps_held_locks() -> None:
+    """The per-session lock map must not leak a lock per session forever.
+
+    Only unlocked locks are evicted once the map grows past the bound; a lock a
+    stream currently holds (or is queued on) must never be dropped, or a new
+    stream for that session could bypass the serialization.
+    """
+    module = session_service_module
+    module._SESSION_STREAM_LOCKS.clear()
+
+    held = module._session_stream_lock("held-session")
+    await held.acquire()
+    try:
+        assert held.locked()
+        for index in range(100):
+            module._session_stream_lock(f"session-{index}")
+        # The map never grows unboundedly after the bound is crossed.
+        assert len(module._SESSION_STREAM_LOCKS) <= module._SESSION_STREAM_LOCKS_MAX
+        # A held lock is never evicted (eviction only removes unlocked entries).
+        assert module._SESSION_STREAM_LOCKS.get("held-session") is held
+    finally:
+        held.release()
+        module._SESSION_STREAM_LOCKS.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_messages_byte_budget_stops_fetching_at_the_cap(monkeypatch) -> None:
+    """max_content_bytes must stop a pathological session from being buffered whole.
+
+    A single oversized message (or a long tail) beyond the byte budget must not
+    be loaded into memory; the fetch returns the prefix that fits.
+    """
+    import importlib
+    import aiosqlite
+
+    from app.infrastructure import schema as schema_module
+    from app.infrastructure.repositories.session_repo import SessionRepo
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await schema_module.ensure_schema(db)
+    repo_module = importlib.import_module("app.infrastructure.repositories.session_repo")
+
+    async def fake_get_app_db():
+        return db
+
+    monkeypatch.setitem(repo_module.SessionRepo.create.__globals__, "get_app_db", fake_get_app_db)
+    repo = SessionRepo()
+    session = await repo.create("smith-id", "probe")
+    for index in range(10):
+        await repo.add_message(session["id"], "user", f"m{index}: " + "x" * (10 * (index + 1)))
+    await db.commit()
+
+    # 60 bytes of content total; a 30-byte budget keeps only the first messages.
+    rows = await repo.get_messages(session["id"], limit=50, max_content_bytes=30)
+    total = sum(len(row["content"]) for row in rows)
+    assert total <= 30
+    assert len(rows) < 10
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_stream_lock_serializes_concurrent_turns() -> None:
+    """Many turns on the SAME session must serialize (one holder at a time),
+    while turns on DIFFERENT sessions proceed concurrently."""
+    module = session_service_module
+    module._SESSION_STREAM_LOCKS.clear()
+
+    same_session = module._session_stream_lock("session-1")
+    other_session = module._session_stream_lock("session-2")
+
+    peak_same = 0
+    active_same = 0
+    peak_total = 0
+    active_total = 0
+
+    async def turn(lock: asyncio.Lock, *, cross: bool) -> None:
+        nonlocal active_same, peak_same, active_total, peak_total
+        async with lock:
+            active_total += 1
+            peak_total = max(peak_total, active_total)
+            if not cross:
+                active_same += 1
+                peak_same = max(peak_same, active_same)
+            await asyncio.sleep(0.005)
+            if not cross:
+                active_same -= 1
+            active_total -= 1
+
+    # 10 turns on the same session: strict mutual exclusion.
+    await asyncio.gather(*[turn(same_session, cross=False) for _ in range(10)])
+    assert peak_same == 1
+
+    # Turns on another session overlap with a turn on session-1: the per-session
+    # lock must never serialize across sessions.
+    await asyncio.gather(
+        turn(same_session, cross=False),
+        turn(other_session, cross=True),
+        turn(other_session, cross=True),
+    )
+    assert peak_total >= 2
+
+    module._SESSION_STREAM_LOCKS.clear()

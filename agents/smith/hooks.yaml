@@ -9,13 +9,6 @@ hooks:
       priority: 1
       description: "Block modifications to linter/formatter/type-checker config files"
 
-    - id: fact-gate
-      enabled: false  # 默认禁用，需要 session context 集成
-      module: "agents/smith/hooks/fact_gate.py"
-      class: "FactGateHook"
-      priority: 2
-      description: "Require investigation before first file edit"
-
   post:
     - id: console-warn
       enabled: true

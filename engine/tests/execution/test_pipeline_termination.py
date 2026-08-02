@@ -187,15 +187,25 @@ def test_backtrack_target_missing_terminates_blocked() -> None:
     assert blocked and "not found" in blocked[0].data["reason"]
 
 
-def test_user_disabled_pipeline_skill_blocks_without_skipping_the_declared_node() -> None:
+def test_user_disabled_pipeline_skill_runs_react_fallback_in_its_declared_slot() -> None:
     class PassingGate:
         async def check(self, output, context):
             return GateResult("pass", "")
 
+    class RecordingLLM:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls.append([dict(message) for message in messages])
+            return ChatResponse(text="fallback completed the node")
+
+    llm = RecordingLLM()
+
     async def run() -> list[ExecutionEvent]:
         events = []
         async for event in run_agent_stream(
-            FakeLLM(), "system prompt", "build a feature",
+            llm, "system prompt", "build a feature",
             FakeToolRegistry(), FakeSkillRegistry(), FEATURE_ROUTE,
             SkillChain([SkillNode("planning", PassingGate())]), FailureLoopGuard(),
             disabled_skill_names=frozenset({"planning"}),
@@ -205,60 +215,146 @@ def test_user_disabled_pipeline_skill_blocks_without_skipping_the_declared_node(
 
     events = asyncio.run(run())
 
-    assert [event.type for event in events] == [
-        EventType.ROUTE_DECIDED,
-        EventType.SKILL_START,
-        EventType.SKILL_END,
-        EventType.BLOCKED,
-        EventType.DONE,
+    assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
+        "planning",
     ]
-    blocked = next(event for event in events if event.type is EventType.BLOCKED)
-    assert "disabled" in blocked.data["reason"]
+    assert [event.data["status"] for event in events if event.type is EventType.SKILL_END] == [
+        "passed",
+    ]
+    assert EventType.BLOCKED not in [event.type for event in events]
+    assert "Pipeline Node React Fallback" in "\n".join(
+        str(message["content"])
+        for message in llm.calls[0]
+        if message.get("role") == "system"
+    )
 
 
-def test_pipeline_with_a_missing_skill_blocks_without_running_generic_react() -> None:
-    """A declared node must resolve to its Skill; pipelines cannot degrade to ReAct."""
+def test_pipeline_with_a_missing_skill_runs_node_react_fallback() -> None:
+    """One unavailable node must not bypass the rest of its declared chain."""
 
     class MissingSkillRegistry:
         def get(self, name):
             return None
 
-    class UnexpectedLLM:
+    class FallbackLLM:
         def __init__(self) -> None:
-            self.calls = 0
+            self.calls: list[list[dict]] = []
 
         async def chat(self, messages, tools=None, prefix_cache_key=None):
-            self.calls += 1
+            self.calls.append([dict(message) for message in messages])
             return ChatResponse(text=_RUBRIC_PASSING_TEXT)
 
-    llm = UnexpectedLLM()
+    llm = FallbackLLM()
 
     async def run() -> list[ExecutionEvent]:
         events: list[ExecutionEvent] = []
         async for event in run_agent_stream(
             llm, "system prompt", "inspect the configured provider",
             FakeToolRegistry(), MissingSkillRegistry(), FEATURE_ROUTE,
-            SkillChain([SkillNode("understanding", AlwaysFailGate())]), FailureLoopGuard(),
+            SkillChain([SkillNode("understanding", PassingGate())]), FailureLoopGuard(),
         ):
             events.append(event)
         return events
 
     events = asyncio.run(run())
 
-    assert [event.type for event in events] == [
-        EventType.ROUTE_DECIDED,
-        EventType.SKILL_START,
-        EventType.SKILL_END,
-        EventType.BLOCKED,
-        EventType.DONE,
+    assert EventType.BLOCKED not in [event.type for event in events]
+    assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
+        "understanding",
     ]
-    assert next(event for event in events if event.type is EventType.SKILL_END).data == {
-        "skill": "understanding",
-        "status": "blocked",
-    }
-    blocked = next(event for event in events if event.type is EventType.BLOCKED)
-    assert "requires installed Skill" in blocked.data["reason"]
-    assert llm.calls == 0
+    assert [event.data["status"] for event in events if event.type is EventType.SKILL_END] == [
+        "passed",
+    ]
+    assert [event.data["text"] for event in events if event.type is EventType.TEXT_DELTA] == [
+        _RUBRIC_PASSING_TEXT,
+    ]
+    assert "Pipeline Node React Fallback" in "\n".join(
+        str(message["content"])
+        for message in llm.calls[0]
+        if message.get("role") == "system"
+    )
+
+
+def test_pipeline_skill_runtime_failure_runs_node_react_fallback() -> None:
+    class FailingThenPassingLLM:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls.append([dict(message) for message in messages])
+            if len(self.calls) == 1:
+                return ChatResponse(finish_reason="error")
+            return ChatResponse(text=_RUBRIC_PASSING_TEXT)
+
+    llm = FailingThenPassingLLM()
+
+    async def run() -> list[ExecutionEvent]:
+        return [
+            event
+            async for event in run_agent_stream(
+                llm, "system prompt", "build a feature",
+                FakeToolRegistry(), FakeSkillRegistry(), FEATURE_ROUTE,
+                SkillChain([SkillNode("planning", PassingGate())]), FailureLoopGuard(),
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert EventType.FAILED not in [event.type for event in events]
+    assert [event.data["status"] for event in events if event.type is EventType.SKILL_END] == [
+        "passed",
+    ]
+    assert len(llm.calls) == 2
+    fallback_system_text = "\n".join(
+        str(message["content"])
+        for message in llm.calls[1]
+        if message.get("role") == "system"
+    )
+    assert "Pipeline Node React Fallback" in fallback_system_text
+    assert "provider_finish_error" in fallback_system_text
+
+
+def test_pipeline_gate_failure_repairs_the_same_node_with_react() -> None:
+    class RejectFirstAttemptGate:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def check(self, output, context):
+            self.calls += 1
+            if self.calls == 1:
+                return GateResult("fail", "include a verifiable result", "add evidence")
+            return GateResult("pass", "accepted")
+
+    gate = RejectFirstAttemptGate()
+    llm = RecordingLLM(["SKILL DRAFT", "REACT REPAIRED RESULT"])
+
+    async def run() -> list[ExecutionEvent]:
+        return [
+            event
+            async for event in run_agent_stream(
+                llm, "system prompt", "build a feature",
+                FakeToolRegistry(), FakeSkillRegistry(), FEATURE_ROUTE,
+                SkillChain([SkillNode("planning", gate)]), FailureLoopGuard(),
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert gate.calls == 2
+    assert EventType.BLOCKED not in [event.type for event in events]
+    assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
+        "planning", "planning",
+    ]
+    assert "Pipeline Node React Fallback" in "\n".join(
+        str(message["content"])
+        for message in llm.calls[1]
+        if message.get("role") == "system"
+    )
+    assert "add evidence" in "\n".join(
+        str(message["content"])
+        for message in llm.calls[1]
+        if message.get("role") == "system"
+    )
 
 
 def test_guard_escalates_per_node() -> None:
@@ -434,20 +530,31 @@ def test_backtrack_evicts_committed_outputs_at_or_after_target() -> None:
 
 def test_backtrack_re_run_handoff_has_no_stale_future_node_output() -> None:
     """A backtracked re-run must not receive superseded outputs in its handoff."""
+    class FailUntilBacktrackGate:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def check(self, output, context):
+            self.calls += 1
+            if self.calls < 4:
+                return GateResult("fail", "retry implement")
+            return GateResult("pass", "accepted after backtrack")
+
     llm = RecordingLLM([
         "PLAN-OUTPUT-A",
         "PLAN-OUTPUT-B",
-        "C-OUTPUT-1",
-        "C-OUTPUT-2",
+        "IMPLEMENT-SKILL-A",
+        "IMPLEMENT-REACT-A",
+        "IMPLEMENT-REACT-B",
         "PLAN-OUTPUT-A2",
         "PLAN-OUTPUT-B2",
-        "C-OUTPUT-3",
+        "IMPLEMENT-SKILL-B",
     ])
     chain = SkillChain(
         [
             SkillNode("planning", PassingGate()),
             SkillNode("research", PassingGate()),
-            SkillNode("implement", AlwaysFailGate()),
+            SkillNode("implement", FailUntilBacktrackGate()),
         ],
         backtrack_map={"implement": "planning"},
     )
@@ -469,14 +576,15 @@ def test_backtrack_re_run_handoff_has_no_stale_future_node_output() -> None:
 
     asyncio.run(run())
 
-    # planning 在第 4 次调用重跑（回溯后）。B1（research 首轮产出）已在回溯时
+    # planning 在第 6 次调用重跑（前两次 implement 通过 ReAct 补偿后回溯）。
+    # B1（research 首轮产出）已在回溯时
     # 被逐出，不应再出现在 planning 重跑的 Prior Workflow Outputs 里。
-    planning_rerun = "".join(str(m.get("content", "")) for m in llm.calls[4])
+    planning_rerun = "".join(str(m.get("content", "")) for m in llm.calls[5])
     assert "PLAN-OUTPUT-B" not in planning_rerun
     assert "PLAN-OUTPUT-A" not in planning_rerun
 
 
-# --- P3: budget message surfaced on incomplete/failed node ------------------
+# --- P3: failed Skill attempts fall back inside their declared node ----------
 
 
 def _incomplete_node_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_stream_factory):
@@ -491,6 +599,21 @@ def _incomplete_node_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, eve
     import engine.skill.executor as skill_executor_module
 
     monkeypatch.setattr(skill_executor_module, "execute_skill_events", fake_execute_skill_events)
+    fallback_reasons: list[str] = []
+
+    async def fake_execute_react_fallback_events(
+        node_name, failure_reason, instructions, llm, tool_registry, messages, context, max_react_iters,
+        tool_guard=None, provisional_lifecycle=True,
+        react_event_loop_fn=None, prefix_cache_key=None,
+    ):
+        fallback_reasons.append(failure_reason)
+        yield ExecutionEvent(EventType.TEXT_DELTA, {"text": "REACT FALLBACK COMPLETED"})
+
+    monkeypatch.setattr(
+        skill_executor_module,
+        "execute_react_fallback_events",
+        fake_execute_react_fallback_events,
+    )
 
     async def run():
         return [
@@ -502,7 +625,7 @@ def _incomplete_node_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, eve
                 FakeToolRegistry(),
                 FakeSkillRegistry(),
                 FEATURE_ROUTE,
-                SkillChain([SkillNode("planning", AlwaysFailGate())]),
+                SkillChain([SkillNode("planning", PassingGate())]),
                 FailureLoopGuard(),
                 execution_context={
                     "agent_id": "a",
@@ -512,10 +635,10 @@ def _incomplete_node_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, eve
             )
         ]
 
-    return asyncio.run(run())
+    return asyncio.run(run()), fallback_reasons
 
 
-def test_incomplete_node_surfaces_engine_budget_message(
+def test_incomplete_node_runs_react_fallback_without_exposing_rejected_budget_draft(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     budget_text = budget_exhausted_message(TOOL_CALL_BUDGET_MESSAGE)
@@ -524,86 +647,31 @@ def test_incomplete_node_surfaces_engine_budget_message(
         yield ExecutionEvent(EventType.TEXT_DELTA, {"text": budget_text})
         yield ExecutionEvent(EventType.INCOMPLETE, {"reason": "tool_call_budget"})
 
-    events = _incomplete_node_events(tmp_path, monkeypatch, event_stream_factory)
+    events, fallback_reasons = _incomplete_node_events(tmp_path, monkeypatch, event_stream_factory)
 
     delta_texts = [e.data["text"] for e in events if e.type is EventType.TEXT_DELTA]
-    assert budget_text in delta_texts
-    assert [e.data["status"] for e in events if e.type is EventType.SKILL_END] == ["incomplete"]
+    assert budget_text not in delta_texts
+    assert delta_texts == ["REACT FALLBACK COMPLETED"]
+    assert fallback_reasons == ["Skill 'planning' did not complete: tool_call_budget."]
+    assert [e.data["status"] for e in events if e.type is EventType.SKILL_END] == ["passed"]
+    assert EventType.INCOMPLETE not in [event.type for event in events]
     assert events[-1].type is EventType.DONE
 
 
-def test_incomplete_node_does_not_surface_a_provider_draft(
+def test_incomplete_node_runs_react_fallback_without_exposing_provider_draft(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def event_stream_factory():
         yield ExecutionEvent(EventType.TEXT_DELTA, {"text": "UNGATED CONTENT-FILTERED DRAFT"})
         yield ExecutionEvent(EventType.INCOMPLETE, {"reason": "content_filter"})
 
-    events = _incomplete_node_events(tmp_path, monkeypatch, event_stream_factory)
+    events, fallback_reasons = _incomplete_node_events(tmp_path, monkeypatch, event_stream_factory)
 
-    assert not [e for e in events if e.type is EventType.TEXT_DELTA]
-    assert EventType.INCOMPLETE in [e.type for e in events]
-
-
-# --- P7: a missing pipeline Skill fails closed ------------------------------
-
-
-def test_missing_pipeline_skill_blocks_before_react_or_gate() -> None:
-    """The node has no executable workflow when its declared Skill is absent."""
-
-    class GateMustNotRun:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def check(self, output, context):
-            self.calls += 1
-            raise AssertionError("a missing Skill must block before its gate")
-
-    class LLMMustNotRun:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def chat(self, messages, tools=None, prefix_cache_key=None):
-            self.calls += 1
-            raise AssertionError("a missing Skill must not start generic ReAct")
-
-    class MissingSkillRegistry:
-        def get(self, name):
-            return None
-
-    llm = LLMMustNotRun()
-    gate = GateMustNotRun()
-
-    async def run():
-        return [
-            event
-            async for event in run_pipeline(
-                SkillChain([SkillNode("planning", gate)]),
-                llm,
-                "build a feature",
-                [
-                    {"role": "system", "content": "system prompt"},
-                    {"role": "user", "content": "build a feature"},
-                ],
-                FakeToolRegistry(),
-                MissingSkillRegistry(),
-                None,
-                FailureLoopGuard(),
-                5,
-                {},
-            )
-        ]
-
-    events = asyncio.run(run())
-
-    assert [event.type for event in events] == [
-        EventType.SKILL_START,
-        EventType.SKILL_END,
-        EventType.BLOCKED,
-        EventType.DONE,
+    assert [event.data["text"] for event in events if event.type is EventType.TEXT_DELTA] == [
+        "REACT FALLBACK COMPLETED",
     ]
-    assert gate.calls == 0
-    assert llm.calls == 0
+    assert fallback_reasons == ["Skill 'planning' did not complete: content_filter."]
+    assert EventType.INCOMPLETE not in [event.type for event in events]
 
 
 # --- P6: provisional ledger survives checkpoint resume ----------------------

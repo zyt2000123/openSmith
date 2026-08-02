@@ -9,7 +9,6 @@ chain head at run end, making a later rollback detectable too.
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections import deque
 from datetime import datetime, timezone
@@ -17,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from common.hash_chain import ChainVerification, HashChainLog
-from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
+from common.paths import PRIVATE_DIR_MODE
 from engine.execution.events import EventType, ExecutionEvent
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization)", re.I)
@@ -152,6 +151,15 @@ class TraceStore:
     def seal(self, run_id: str) -> dict:
         """Anchor the chain head so a later rollback of this run is detected."""
         return self._chain(run_id).seal()
+
+    def reopen(self, run_id: str) -> None:
+        """Drop a stale anchor so a resumed run's chain stays verifiable.
+
+        Called when a recoverable run is resumed: the previous run finished
+        and sealed an anchor, and extending the chain without clearing it would
+        make every verify() report a false ``anchor mismatch``.
+        """
+        self._chain(run_id).unseal()
 
     def verify(self, run_id: str) -> ChainVerification:
         """Walk this run's chain and report the first integrity failure."""

@@ -195,12 +195,42 @@ class AutoTaskRepo:
         }
 
     async def finish_run(
-        self, run_id: str, status: str, output: str, error: str | None = None
+        self,
+        run_id: str,
+        status: str,
+        output: str,
+        error: str | None = None,
+        *,
+        auto_task_id: str | None = None,
+        lease_token: str | None = None,
+        force: bool = False,
     ) -> dict | None:
+        """Record a run outcome only while the caller still owns the task lease.
+
+        Without the gate, a worker whose 15-minute lease expired mid-run (and so
+        lost the task to a reclaim) could still write a stale run row while a
+        second worker executes the same instruction.  ``force=True`` bypasses the
+        lease gate for this worker's OWN run row (cancellation or completed-with-
+        lost-lease), where the row must be finalized to avoid a phantom 'running'
+        row.  Even a force write never downgrades a row that is no longer
+        'running' (e.g. a completed run hit by a late cancellation).
+        """
         db = await get_app_db()
+        if auto_task_id is not None and not force:
+            rows = await db.execute_fetchall(
+                "SELECT status, lease_token FROM auto_tasks WHERE id=?",
+                (auto_task_id,),
+            )
+            if (
+                not rows
+                or rows[0]["status"] != "running"
+                or rows[0]["lease_token"] != lease_token
+            ):
+                return None
         now = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "UPDATE auto_task_runs SET status=?, output=?, finished_at=?, error=? WHERE id=?",
+            "UPDATE auto_task_runs SET status=?, output=?, finished_at=?, error=? "
+            "WHERE id=? AND status='running'",
             (status, output, now, error, run_id),
         )
         await db.commit()

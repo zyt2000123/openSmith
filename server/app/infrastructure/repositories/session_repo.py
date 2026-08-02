@@ -142,19 +142,73 @@ class SessionRepo:
             return None
         return await self.get_owned(session_id, agent_id)
 
-    async def get_messages(self, session_id: str, limit: int = 0, offset: int = 0) -> list[dict]:
+    async def get_messages(
+        self,
+        session_id: str,
+        limit: int = 0,
+        offset: int = 0,
+        max_content_bytes: int | None = None,
+    ) -> list[dict]:
         db = await get_app_db()
-        if limit > 0 or offset > 0:
-            effective_limit = limit if limit > 0 else -1
+        # 0 historically meant "everything", which buffers a whole long session
+        # into memory on every call.  Treat it as a bounded default; callers that
+        # genuinely need the full transcript pass an explicit limit.
+        effective_limit = limit if limit > 0 else 200
+        if max_content_bytes is None:
             rows = await db.execute_fetchall(
                 "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
                 (session_id, effective_limit, offset),
             )
-        else:
-            rows = await db.execute_fetchall(
-                "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC",
-                (session_id,),
-            )
+            return [dict(r) for r in rows]
+        # Byte-bounded fetch: stop accumulating once the conversation's content
+        # exceeds the budget, so an enormous session cannot be buffered whole.
+        rows: list[dict] = []
+        total = 0
+        cursor = await db.execute(
+            "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
+            (session_id, effective_limit, offset),
+        )
+        async for row in cursor:
+            content = row["content"] if isinstance(row["content"], str) else ""
+            total += len(content)
+            if total > max_content_bytes:
+                break
+            rows.append(dict(row))
+        await cursor.close()
+        return rows
+
+    async def get_message(self, session_id: str, message_id: str) -> dict | None:
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND id=?", (session_id, message_id)
+        )
+        return dict(rows[0]) if rows else None
+
+    async def get_messages_since(
+        self, session_id: str, message_id: str, limit: int = 20
+    ) -> list[dict]:
+        """Rows strictly after ``message_id`` (by rowid), bounded and ascending."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND rowid > "
+            "(SELECT rowid FROM messages WHERE id=? AND session_id=?) "
+            "ORDER BY created_at ASC LIMIT ?",
+            (session_id, message_id, session_id, limit),
+        )
+        return [dict(r) for r in rows]
+
+    async def get_messages_before(
+        self, session_id: str, message_id: str, limit: int
+    ) -> list[dict]:
+        """Rows strictly before ``message_id`` (by rowid), bounded, ascending."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND rowid < "
+            "(SELECT rowid FROM messages WHERE id=? AND session_id=?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (session_id, message_id, session_id, limit),
+        )
+        rows.reverse()
         return [dict(r) for r in rows]
 
     async def add_message(self, session_id: str, role: str, content: str) -> dict:

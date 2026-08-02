@@ -200,3 +200,181 @@ def test_run_state_fsyncs_the_parent_directory_after_replace(
     restored = store.get("run-1")
     assert restored is not None and restored.status is RunStatus.QUEUED
     assert not list((tmp_path / "runs").glob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_run_event_boundary_preserves_stream_order(tmp_path: Path) -> None:
+    """Concurrent async record() calls must write the trace in stream order.
+
+    The boundary offloads the blocking trace/state I/O to worker threads;
+    asyncio.to_thread alone does not guarantee execution order, which would
+    scramble the hash-chain sequence numbers and the byte-offset cursor.
+    """
+    import asyncio
+
+    from engine.execution.events import EventType, ExecutionEvent
+    from engine.execution.orchestration.lifecycle import _RunEventBoundary
+    from engine.observability.recorder import RunEventRecorder
+    from engine.observability.runtime import RunObservation
+    from engine.observability.trace_store import TraceStore
+
+    trace_store = TraceStore(tmp_path)
+    observation = RunObservation(RunEventRecorder("run-1", trace_store=trace_store))
+    boundary = _RunEventBoundary(None, "run-1", observer=observation)
+
+    async def fire(index: int) -> None:
+        await boundary.record(ExecutionEvent(EventType.TOOL_CALL_START, {"name": f"tool-{index}"}))
+
+    await asyncio.gather(*[fire(index) for index in range(20)])
+
+    records = trace_store.read("run-1")
+    assert len(records) == 20
+    assert [record["data"].get("name") for record in records] == [f"tool-{index}" for index in range(20)]
+    # The hash chain must remain verifiable and the seq strictly ascending.
+    verification = trace_store.verify("run-1")
+    assert verification.ok
+    seqs = [int(record["seq"]) for record in records]
+    assert seqs == sorted(seqs)
+
+
+def test_run_state_store_serializes_concurrent_writers(tmp_path: Path) -> None:
+    """Concurrent read-modify-write from many threads must not lose updates.
+
+    RunStateStore is written from engine worker threads (offloaded fsync) AND
+    from the server event loop (resolve_approval).  Without the per-root RLock
+    two writers interleave their get->mutate->save and drop events/increments.
+    """
+    import threading
+
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith-id")
+
+    threads = 8
+    events_per_thread = 20
+    barrier = threading.Barrier(threads)
+    errors: list[BaseException] = []
+
+    def worker(worker_id: int) -> None:
+        try:
+            barrier.wait()
+            for _ in range(events_per_thread):
+                store.record_event("run-1", f"event-{worker_id}")
+        except BaseException as exc:  # noqa: BLE001 - test isolation
+            errors.append(exc)
+
+    workers = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+    for thread in workers:
+        thread.start()
+    for thread in workers:
+        thread.join()
+
+    assert not errors
+    restored = store.get("run-1")
+    assert restored is not None
+    # Exactly threads*events_per_thread increments survived; the lock prevents
+    # lost updates from interleaved read-modify-write.
+    assert restored.event_seq == threads * events_per_thread
+
+
+def test_run_state_store_concurrent_approval_race(tmp_path: Path) -> None:
+    """Engine-thread state writes racing the server loop's resolve_approval.
+
+    The S1 fix must make these read-modify-writes atomic: exactly one resolver
+    wins the pending approval, and the concurrent record_event increments are
+    all preserved (no lost update on the same run state file).
+    """
+    import threading
+
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith-id")
+    store.transition("run-1", RunStatus.RUNNING)
+    store.request_approval(
+        "run-1",
+        approval_id="approval-1",
+        tool_name="shell",
+        level="execute",
+        reason="review",
+    )
+
+    resolvers = 3
+    writers = 6
+    writes_per_writer = 10
+    barrier = threading.Barrier(resolvers + writers)
+    outcomes: list[str] = []
+
+    def resolver() -> None:
+        try:
+            barrier.wait()
+            store.resolve_approval("run-1", "approval-1", approved=True)
+            outcomes.append("resolved")
+        except RunStateTransitionError:
+            # A concurrent resolver legitimately loses the race once the state
+            # left WAITING_APPROVAL; this is the expected serialization.
+            outcomes.append("lost-race")
+        except Exception as exc:  # noqa: BLE001 - test isolation
+            outcomes.append(f"error:{type(exc).__name__}")
+
+    def writer(worker_id: int) -> None:
+        try:
+            barrier.wait()
+            for _ in range(writes_per_writer):
+                store.record_event("run-1", f"writer-{worker_id}")
+        except Exception as exc:  # noqa: BLE001 - test isolation
+            outcomes.append(f"error:{type(exc).__name__}")
+
+    threads = [threading.Thread(target=resolver) for _ in range(resolvers)] + [
+        threading.Thread(target=writer, args=(i,)) for i in range(writers)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count("resolved") == 1
+    assert "error:" not in " ".join(outcomes)
+
+    state = store.get("run-1")
+    assert state is not None
+    assert state.status is RunStatus.RUNNING
+    # request_approval (+1) + the winning resolve (+1) + writers*events.
+    assert state.event_seq == 2 + writers * writes_per_writer
+
+
+@pytest.mark.asyncio
+async def test_run_event_boundary_stream_order_stress(tmp_path: Path) -> None:
+    """A larger, mixed-event burst fired concurrently must still land in stream
+    order with a verifiable hash chain.
+
+    The boundary serializes its to_thread offloads; without the serialization a
+    busy thread pool reorders trace records, scrambling the chain's seq and the
+    byte-offset cursor.
+    """
+    import asyncio
+
+    from engine.execution.events import EventType, ExecutionEvent
+    from engine.execution.orchestration.lifecycle import _RunEventBoundary
+    from engine.observability.recorder import RunEventRecorder
+    from engine.observability.runtime import RunObservation
+    from engine.observability.trace_store import TraceStore
+
+    trace_store = TraceStore(tmp_path)
+    observation = RunObservation(RunEventRecorder("run-1", trace_store=trace_store))
+    boundary = _RunEventBoundary(None, "run-1", observer=observation)
+
+    total = 100
+    markers = [f"t{index}" for index in range(total)]
+
+    async def fire(index: int) -> None:
+        # Mix event types so the trace carries distinguishing data.
+        await boundary.record(ExecutionEvent(EventType.TOOL_CALL_START, {"name": markers[index]}))
+
+    await asyncio.gather(*[fire(index) for index in range(total)])
+
+    records = trace_store.read("run-1")
+    assert len(records) == total
+    names = [record["data"].get("name") for record in records]
+    assert names == markers  # exact stream order under concurrency
+    verification = trace_store.verify("run-1")
+    assert verification.ok
+    seqs = [int(record["seq"]) for record in records]
+    assert seqs == list(range(1, total + 1))

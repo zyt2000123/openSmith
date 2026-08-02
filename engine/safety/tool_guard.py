@@ -161,6 +161,23 @@ def _shares_inode_with_protected_file(
         roots.extend(working_dir / name for name in FileGuard._ALWAYS_BLOCKED)
     roots.extend(extra_protected_roots)
 
+    # Secret-bearing files (`.env`, `.npmrc`, …) live as plain files, not
+    # under a blocked directory, so the walk above never sees them.  A
+    # ``ln .env x`` then ``edit_file(x)`` would name-check clean and inode-scan
+    # clean.  Compare directly against the well-known sensitive files instead.
+    sensitive_candidates = [home / name for name in FileGuard._SENSITIVE_WRITE]
+    if working_dir is not None:
+        sensitive_candidates.extend(
+            working_dir / name for name in FileGuard._SENSITIVE_WRITE
+        )
+    for candidate in sensitive_candidates:
+        try:
+            candidate_info = os.lstat(candidate)
+        except OSError:
+            continue
+        if (candidate_info.st_dev, candidate_info.st_ino) == identity:
+            return True
+
     for root in roots:
         if not root.is_dir():
             continue

@@ -1,9 +1,8 @@
-"""Hook 接口定义
+"""Abstract interfaces for the three tool-lifecycle hook types.
 
-定义三种 Hook 类型的抽象接口：
-- PreToolHook: 工具执行前拦截（可阻止操作）
-- PostToolHook: 工具执行后观察（只能警告）
-- StopHook: 会话结束时批量处理
+- ``PreToolHook``: intercept before tool execution (may block the call).
+- ``PostToolHook``: observe after tool execution (may only warn).
+- ``StopHook``: batched processing when the session stops.
 """
 
 from __future__ import annotations

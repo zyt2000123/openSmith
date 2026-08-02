@@ -131,11 +131,6 @@ def needs_compaction(
     return _conversation_tokens(conversation) >= context_limit * trigger_ratio
 
 
-def context_limit_for_llm(llm: object | None) -> int:
-    """Use the selected route's declared model window with a safe fallback."""
-    return model_limits_for(llm).context_window
-
-
 def compaction_policy_for_llm(llm: object | None) -> tuple[int, float]:
     """Return a safe input budget and the selected compaction trigger.
 

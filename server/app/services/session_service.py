@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -21,6 +22,7 @@ from engine.execution import (
 from engine.context import CONTEXT_DISPLAY_WINDOW, summarize_session
 from engine.identity import IdentityCatalog, IdentityCatalogError
 from engine.llm.model_config import resolve_llm_config
+from engine.observability.trace_store import _redact_secrets_in_text
 from common.yaml_utils import YamlConfigError
 
 from ..schemas.session import ContextCompressionOut, SessionOut, MessageOut
@@ -29,8 +31,43 @@ from ..infrastructure.repositories.agent_profile_repo import AgentProfileRepo
 from .engine_runtime import build_engine_runtime, close_session_mcp_clients
 from .token_stats_service import TokenStatsService
 
+# Two concurrent streams on the same session both read the recent history and
+# then both insert their user message, so each run's context omits the other's
+# just-inserted turn and the two assistant replies interleave into a corrupted
+# conversation.  Serialize turns per session: a fast retry queues behind the
+# in-flight turn instead of cross-wiring it.
+#
+# The map is guarded by a threading lock so it stays safe even if the server
+# ever runs the handlers from more than one thread/loop, and it is bounded: an
+# abandoned (never-deleted) session must not leak a lock per session forever.
+# Only unlocked locks are evicted — a lock that is held (or has waiters queued)
+# can never be removed while a stream is mid-turn.
+_SESSION_STREAM_LOCKS: dict[str, asyncio.Lock] = {}
+_SESSION_STREAM_LOCKS_GUARD = threading.Lock()
+_SESSION_STREAM_LOCKS_MAX = 64
+
+
+def _session_stream_lock(session_id: str) -> asyncio.Lock:
+    with _SESSION_STREAM_LOCKS_GUARD:
+        lock = _SESSION_STREAM_LOCKS.get(session_id)
+        if lock is None:
+            if len(_SESSION_STREAM_LOCKS) >= _SESSION_STREAM_LOCKS_MAX:
+                for key, candidate in list(_SESSION_STREAM_LOCKS.items()):
+                    if not candidate.locked():
+                        del _SESSION_STREAM_LOCKS[key]
+            lock = asyncio.Lock()
+            _SESSION_STREAM_LOCKS[session_id] = lock
+        return lock
+
 # Recent messages passed to the engine as short-term conversational context
 _HISTORY_LIMIT = 10
+# Upper bound for one compress call; far beyond any real session while still
+# bounding the row count (compression already loads the conversation into memory).
+_COMPRESS_MESSAGE_CAP = 50_000
+# Byte budget for a compress call: stop fetching once the conversation content
+# exceeds this, so an enormous session cannot be buffered whole and sent to the
+# summarizer.
+_COMPRESS_BYTE_CAP = 20_000_000
 logger = logging.getLogger(__name__)
 
 
@@ -172,21 +209,12 @@ class SessionService:
     async def _history_before_message(
         self,
         session_id: str,
-        rows: list[dict],
         message_id: str,
     ) -> list[dict]:
         """Build bounded history preceding the exact user message being resumed."""
-        user_index = next(
-            (
-                index for index, row in enumerate(rows)
-                if row.get("id") == message_id and row.get("role") == "user"
-            ),
-            -1,
+        prior_rows = await self.session_repo.get_messages_before(
+            session_id, message_id, limit=_HISTORY_LIMIT
         )
-        if user_index < 0:
-            raise HTTPException(409, "Run session has no user message to resume")
-
-        prior_rows = rows[:user_index]
         context_reader = getattr(self.session_repo, "get_context", None)
         context = await context_reader(session_id) if context_reader is not None else {}
         summary = context.get("context_summary") if isinstance(context, dict) else ""
@@ -226,13 +254,24 @@ class SessionService:
         if not deleted:
             raise HTTPException(404, "Session not found")
         await close_session_mcp_clients(session_id)
+        # Drop the per-session stream lock so deleted sessions do not leak a
+        # lock per session for the server's lifetime.
+        _SESSION_STREAM_LOCKS.pop(session_id, None)
 
     async def compress_session(self, agent_id: str, session_id: str) -> ContextCompressionOut:
         session = await self.session_repo.get_owned(session_id, agent_id)
         if session is None:
             raise HTTPException(404, "Session not found")
 
-        rows = await self.session_repo.get_messages(session_id)
+        # Compression summarizes the WHOLE conversation, so fetch it all
+        # explicitly (the get_messages default cap of 200 would silently drop the
+        # tail), bounded by both row count and content bytes so a pathological
+        # session cannot be buffered whole.
+        rows = await self.session_repo.get_messages(
+            session_id,
+            limit=_COMPRESS_MESSAGE_CAP,
+            max_content_bytes=_COMPRESS_BYTE_CAP,
+        )
         if not rows:
             raise HTTPException(400, "Cannot compress an empty session")
 
@@ -319,25 +358,26 @@ class SessionService:
                 409,
                 "Run predates message-bound resume and cannot be resumed safely",
             )
-        rows = await self.session_repo.get_messages(state.session_id)
-        user_message = next(
-            (
-                row for row in rows
-                if row.get("id") == state.message_id and row.get("role") == "user"
-            ),
-            None,
-        )
-        if user_message is None or not isinstance(user_message.get("content"), str):
+        user_message = await self.session_repo.get_message(state.session_id, state.message_id)
+        if (
+            user_message is None
+            or user_message.get("role") != "user"
+            or not isinstance(user_message.get("content"), str)
+        ):
             raise HTTPException(409, "Run message is no longer available for resume")
-        user_index = rows.index(user_message)
-        if any(row.get("role") == "user" for row in rows[user_index + 1 :]):
+        # A newer user turn after this run's message means the session moved past
+        # it; the check is bounded to the tail, which is all that can invalidate
+        # a resume.
+        after_rows = await self.session_repo.get_messages_since(
+            state.session_id, state.message_id, limit=20
+        )
+        if any(row.get("role") == "user" for row in after_rows):
             raise HTTPException(
                 409,
                 "Run has a newer user turn and cannot be resumed into this session safely",
             )
         history = await self._history_before_message(
             state.session_id,
-            rows,
             state.message_id,
         )
         # This completes ownership and identity validation synchronously, before
@@ -426,14 +466,27 @@ class SessionService:
         terminal_reason: str | None = None
         terminal_notice: str | None = None
         try:
-            if _resume_run_id is None:
-                # Fetch recent history BEFORE saving the new message (avoids duplication)
-                history = await self._recent_history(session_id)
-                user_message = await self.session_repo.add_message(session_id, "user", content)
-                message_id = str(user_message["id"])
-            else:
-                history = list(_history_override or [])
-                message_id = _message_id
+            session_lock = _session_stream_lock(session_id)
+            lock_held = False
+            try:
+                # Serialize history-read + user-message insert: two concurrent
+                # turns both read before either inserts, so each run's context
+                # would omit the other's just-inserted user turn.  The lock is
+                # held only for this mutation window (not across the streaming
+                # generator) so an abandoned stream can never deadlock a session.
+                await session_lock.acquire()
+                lock_held = True
+                if _resume_run_id is None:
+                    # Fetch recent history BEFORE saving the new message (avoids duplication)
+                    history = await self._recent_history(session_id)
+                    user_message = await self.session_repo.add_message(session_id, "user", content)
+                    message_id = str(user_message["id"])
+                else:
+                    history = list(_history_override or [])
+                    message_id = _message_id
+            finally:
+                if lock_held:
+                    session_lock.release()
             runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
             model_name = str(getattr(getattr(services, "llm", None), "model", "") or "")
             request = EngineRequest(
@@ -447,9 +500,14 @@ class SessionService:
                 message_id=message_id,
             )
             if _resume_run_id is None:
-                run = engine_run_stream_with_runtime(request, runtime, services)
+                # RunStateStore.create() fsyncs; keep the blocking I/O off the
+                # event loop like the rest of the S1 persistence changes.
+                run = await asyncio.to_thread(
+                    engine_run_stream_with_runtime, request, runtime, services
+                )
             else:
-                run = engine_resume_stream_with_runtime(
+                run = await asyncio.to_thread(
+                    engine_resume_stream_with_runtime,
                     request,
                     runtime,
                     services,
@@ -504,7 +562,12 @@ class SessionService:
                 elif t == "tool_call_start":
                     args = ev.data.get("arguments") or {}
                     hint = args.get("path") or args.get("file_path") or args.get("query") or args.get("command", "")
-                    yield sse("tool_call", {"id": ev.data.get("id", ""), "name": ev.data.get("name", ""), "hint": str(hint)[:120]})
+                    # The tool arguments are model-authored and often contain
+                    # credentials the model read from the workspace (e.g. a
+                    # `curl -H "Authorization: Bearer ..."`).  Redact the same
+                    # credential shapes the trace store redacts so secrets never
+                    # stream to the client.
+                    yield sse("tool_call", {"id": ev.data.get("id", ""), "name": ev.data.get("name", ""), "hint": _redact_secrets_in_text(str(hint))[:120]})
                 elif t == "tool_call_result":
                     presentation = ev.data.get("presentation")
                     result_summary = ev.data.get("reason") or ev.data.get("content", "")[:120]
@@ -515,7 +578,7 @@ class SessionService:
                         "error": bool(ev.data.get("error") or ev.data.get("blocked")),
                         "blocked": bool(ev.data.get("blocked")),
                         "preflight": bool(ev.data.get("preflight")),
-                        "summary": result_summary,
+                        "summary": _redact_secrets_in_text(str(result_summary))[:120],
                     })
                     if ev.data.get("approval_required"):
                         approval_payload = {

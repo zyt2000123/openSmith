@@ -21,6 +21,7 @@ import {
   selectedSlashItem,
 } from "./commands.js";
 import { Composer } from "./composer.js";
+import { stopOwnedServer } from "./dev-server.js";
 import { loadHistory, saveHistory } from "./history.js";
 import { LIFECYCLE_HOOKS } from "./hooks.js";
 import { RunProgress, StatusHud } from "./hud.js";
@@ -717,7 +718,6 @@ function FooterStatus({
   if (!busy) return <Text color={MUTED}>{statusLine}</Text>;
   return null;
 }
-
 function SkillIndicator({ skill }: { skill: SkillSummary | null }) {
   if (!skill) return null;
   return (
@@ -1224,7 +1224,55 @@ const app = render(
   </InkPictureProvider>,
   { exitOnCtrlC: false },
 );
+
+// Every exit path funnels through stopOwnedServer() so the uvicorn child is
+// reaped (SIGTERM → SIGKILL escalation on the process group) before the shell
+// exits.  With Ink's raw mode, Ctrl-C is a keystroke handled by Ink; external
+// SIGINT/SIGTERM still need handlers here because Ink's signal-exit only
+// re-raises when it is the sole signal listener (any extra listener disables
+// the re-raise), so we unmount the app ourselves to restore the terminal.
+let exiting = false;
+let signalExitCode: number | null = null;
+async function exitWith(code: number): Promise<void> {
+  if (exiting) return;
+  exiting = true;
+  try {
+    await stopOwnedServer();
+  } catch {
+    // Never let a failed child reap block the exit.
+  }
+  // A signal exit must win the exit code over the normal path's 0/1; compute it
+  // at the very end so a signal arriving while we await the server still wins.
+  process.exit(signalExitCode ?? code);
+}
+
+async function exitOnSignal(code: number): Promise<void> {
+  // Claim the signal exit code unconditionally: even if an exit is already in
+  // flight (awaiting stopOwnedServer), the process must exit 130/143, not 0.
+  signalExitCode = code;
+  if (exiting) return;
+  try {
+    app.unmount();
+  } catch {
+    // Unmounting while already tearing down is fine.
+  }
+  // waitUntilExit resolves once unmount completes (terminal restored); route
+  // through the same exitWith so the server is reaped exactly once.  exitWith
+  // picks up signalExitCode, so whichever path runs first exits with 130/143.
+  void app.waitUntilExit().then(
+    () => exitWith(0),
+    () => exitWith(1),
+  );
+}
+
+process.once("SIGINT", () => {
+  void exitOnSignal(130);
+});
+process.once("SIGTERM", () => {
+  void exitOnSignal(143);
+});
+
 void app.waitUntilExit().then(
-  () => process.exit(0),
-  () => process.exit(1),
+  () => exitWith(0),
+  () => exitWith(1),
 );

@@ -142,13 +142,6 @@ class HTTPAdapterMixin:
                 f"{self._error_label} request failed after {MAX_RETRIES} attempts: {exc}"
             ) from exc
 
-    async def _error_detail(self, response: httpx.Response, *, limit: int = 500) -> str:
-        """Read a bounded slice of an error body so a 4xx says what was wrong."""
-        compact = await self._read_error_text(response)
-        if not compact:
-            return "<empty error body>"
-        return compact[:limit] + ("…" if len(compact) > limit else "")
-
     async def _read_error_text(self, response: httpx.Response) -> str:
         """Read only enough untrusted error data to classify the failure."""
         chunks: list[bytes] = []

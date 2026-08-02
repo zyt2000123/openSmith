@@ -268,6 +268,18 @@ def _sanitize_all_layers(memory_dir: Path, report: DreamReport) -> None:
         content = md_file.read_text(encoding="utf-8")
         cleaned, file_secrets, file_injections = _sanitize_lines(content)
         if file_secrets or file_injections:
+            if not cleaned.strip() and content.strip():
+                # A cross-line match made sanitize_memory_text wipe the whole
+                # file (it returns "" when a secret/injection only matches the
+                # full text).  Never blank a non-empty memory layer over a
+                # single ambiguous match — that is a data-loss footgun.
+                # Keep the original bytes and record the skip instead.
+                logger.warning(
+                    "refusing to blank non-empty memory layer %s during "
+                    "sanitize (cross-line secret/injection match)",
+                    md_file,
+                )
+                continue
             atomic_write_text(md_file, cleaned)
             secrets_removed += file_secrets
             injections_removed += file_injections

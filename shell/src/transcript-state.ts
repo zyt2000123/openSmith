@@ -410,7 +410,9 @@ function approvalArgumentsSummary(arguments_: Record<string, unknown>): string {
     .join(", ");
   const safeText = Array.from(text, (character) => {
     const code = character.charCodeAt(0);
-    return code < 32 || code === 127 ? " " : character;
+    // 7-bit C0 (0x00-0x1F, 0x7F) and 8-bit C1 (0x80-0x9F) controls can carry
+    // OSC/CSI payloads; both must never reach the terminal renderer.
+    return code < 32 || (code >= 127 && code <= 159) ? " " : character;
   }).join("");
   return ` Details: ${safeText.slice(0, 500)}.`;
 }

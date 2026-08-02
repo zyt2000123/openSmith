@@ -32,7 +32,7 @@ export function splitComposerGraphemes(value: string): string[] {
 const ANSI_SEQUENCE = /\u001b\[[0-9;?]*[\u0020-\u002f]*[\u0040-\u007e]|\u001b[\u0040-\u005a\u005c-\u005f]/g;
 const LINE_BREAK = /\r\n?|\n/g;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching them is the point
-const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/g;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f\u0080-\u009f]/g;
 
 /**
  * Reduce a raw input chunk to text this single-line composer can render safely:

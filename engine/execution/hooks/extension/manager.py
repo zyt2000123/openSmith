@@ -1,9 +1,9 @@
-"""Engine-internal extension hooks (the legacy HookManager dispatch system).
+"""Engine-extension hooks: the ``HookManager`` dispatch system.
 
 These are *engine extension* hooks — intercepting prompt assembly, memory
 lifecycle ticks, and after-turn persistence — as opposed to the tool-lifecycle
-hooks in this same package (PreToolHook / PostToolHook / StopHook).  They are
-co-located here so the whole hook surface has one import path:
+hooks in :mod:`engine.execution.hooks.tool` (PreToolHook / PostToolHook /
+StopHook).  Both systems share the single import path
 ``engine.execution.hooks``.
 
 Hooks let registered handlers intercept and modify behavior at key points:

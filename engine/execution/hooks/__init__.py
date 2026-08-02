@@ -1,24 +1,21 @@
-"""Hook 系统模块
+"""Hook system.
 
-提供完整的 Hook 基础设施，单一导入路径 ``engine.execution.hooks``：
+Single import path ``engine.execution.hooks`` for two hook systems:
 
-- 工具生命周期（tool lifecycle）: ``PreToolHook`` / ``PostToolHook`` /
-  ``StopHook`` + ``HookRegistry`` + ``HookLoader`` —— 在工具执行前/后/会话
-  结束时拦截。
-- 引擎内部扩展（engine extension）: ``HookManager`` / ``HookType`` —— 改写
-  prompt、memory 生命周期 tick、after-turn 持久化。
+- Tool lifecycle hooks (:mod:`engine.execution.hooks.tool`):
+  ``PreToolHook`` / ``PostToolHook`` / ``StopHook`` + ``HookRegistry`` +
+  ``HookLoader`` — intercept around tool execution.
+- Engine-extension hooks (:mod:`engine.execution.hooks.extension`):
+  ``HookManager`` / ``HookType`` — rewrite prompts, memory lifecycle ticks,
+  and after-turn persistence.
 
-两套接口职责不同但共享同一包，统一由 `engine.execution.hooks` 一个入口导出。
+Both systems are re-exported here so callers keep one import path.
 """
 
-from .hook_interface import PostToolHook, PreToolHook, StopHook
-from .hook_loader import HookLoader
-from .hook_manager import HookRegistry
-from .engine_hooks import (
-    DEFAULT_HOOK_TIMEOUT_SECONDS,
-    HookManager,
-    HookType,
-)
+from __future__ import annotations
+
+from .extension import DEFAULT_HOOK_TIMEOUT_SECONDS, HookManager, HookType
+from .tool import HookLoader, HookRegistry, PostToolHook, PreToolHook, StopHook
 
 __all__ = [
     "PreToolHook",

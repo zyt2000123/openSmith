@@ -76,7 +76,16 @@ class FakeAutoTaskRepo:
             "error": None,
         }
 
-    async def finish_run(self, run_id: str, status: str, output: str, error: str | None = None) -> dict:
+    async def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        output: str,
+        error: str | None = None,
+        *,
+        auto_task_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> dict:
         row = {
             "id": run_id,
             "auto_task_id": "task-1",
@@ -634,3 +643,147 @@ async def test_hung_engine_run_times_out_and_releases_the_slot(
 
     assert finished["status"] == "failed"
     assert "timed out" in (finished["error"] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_manual_trigger_respects_the_concurrency_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual trigger must not start more detached runs than _MAX_CONCURRENT_RUNS.
+
+    The cap was enforced only in tick(); the /trigger path bypassed it, so a
+    caller could loop over N tasks and run N engine turns with no bound.
+    """
+    release = asyncio.Event()
+
+    async def blocking_reply(request, runtime, services):
+        await release.wait()
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    task_repo = FakeAutoTaskRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+
+    started = []
+    for _ in range(auto_task_service_module._MAX_CONCURRENT_RUNS):
+        started.append(await service.start_auto_task(_task()))
+    assert all(item is not None for item in started)
+    # At the cap, start_auto_task must refuse rather than spawn a 5th run.
+    assert await service.start_auto_task(_task()) is None
+
+    release.set()
+    await _drain_background_runs()
+
+
+@pytest.mark.asyncio
+async def test_trigger_returns_429_when_at_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    async def blocking_reply(request, runtime, services):
+        await release.wait()
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    task_repo = FakeAutoTaskRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+
+    for _ in range(auto_task_service_module._MAX_CONCURRENT_RUNS):
+        assert await service.start_auto_task(_task()) is not None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.trigger_auto_task("smith-id", "task-1")
+    assert exc_info.value.status_code == 429
+
+    release.set()
+    await _drain_background_runs()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_starts_respect_the_cap_without_a_toctou_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N concurrent start_auto_task calls must not all start when N > cap.
+
+    The cap check used to run before an await (the DB claim), so every
+    concurrent caller saw an empty registry and started a run.  The slot is now
+    reserved synchronously before the first await, closing the TOCTOU window.
+    """
+    release = asyncio.Event()
+    claim_gate = asyncio.Event()
+    claim_count = 0
+
+    class GatedRepo(FakeAutoTaskRepo):
+        async def claim_running(self, task_id: str) -> str | None:
+            nonlocal claim_count
+            claim_count += 1
+            await claim_gate.wait()  # widen the race window
+            return "lease-token"
+
+    async def blocking_reply(request, runtime, services):
+        await release.wait()
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    service = AutoTaskService(GatedRepo(), FakeProfileRepo(), FakeSessionRepo())
+
+    tasks = [
+        asyncio.create_task(
+            service.start_auto_task(_task(task_id=f"task-{index}"))
+        )
+        for index in range(2 * auto_task_service_module._MAX_CONCURRENT_RUNS)
+    ]
+    await asyncio.sleep(0)  # let every task reach (or fail) the slot reservation
+    claim_gate.set()
+    results = await asyncio.gather(*tasks)
+
+    started = [result for result in results if result is not None]
+    assert len(started) <= auto_task_service_module._MAX_CONCURRENT_RUNS
+    assert claim_count <= auto_task_service_module._MAX_CONCURRENT_RUNS
+
+    release.set()
+    await _drain_background_runs()
+
+
+@pytest.mark.asyncio
+async def test_reserved_slots_drain_when_starts_are_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a start_auto_task in the middle of the claim must release the
+    reserved slot; a leaked reservation would permanently shrink the cap."""
+    claim_gate = asyncio.Event()
+
+    class GatedRepo(FakeAutoTaskRepo):
+        async def claim_running(self, task_id: str) -> str | None:
+            await claim_gate.wait()
+            return "lease-token"
+
+    async def blocking_reply(request, runtime, services):
+        await asyncio.sleep(0.01)
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    service = AutoTaskService(GatedRepo(), FakeProfileRepo(), FakeSessionRepo())
+
+    tasks = [
+        asyncio.create_task(service.start_auto_task(_task(task_id=f"task-{index}")))
+        for index in range(auto_task_service_module._MAX_CONCURRENT_RUNS)
+    ]
+    await asyncio.sleep(0)  # all reach the claim await and hold a reservation
+    assert auto_task_service_module._RESERVED_SLOTS == auto_task_service_module._MAX_CONCURRENT_RUNS
+
+    # The cap is fully reserved, so a new start refuses.
+    assert await service.start_auto_task(_task(task_id="overflow")) is None
+
+    # Cancel the in-flight starts; every finally must release its reservation.
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert auto_task_service_module._RESERVED_SLOTS == 0
+
+    # A subsequent start succeeds once the slots drained.
+    claim_gate.set()
+    assert await service.start_auto_task(_task(task_id="after-drain")) is not None
+    await _drain_background_runs()
+    assert auto_task_service_module._RESERVED_SLOTS == 0
