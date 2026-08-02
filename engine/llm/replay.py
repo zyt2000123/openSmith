@@ -29,7 +29,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
 
-from engine.llm.contracts import ChatResponse, ToolCallData
+from engine.llm.contracts import (
+    ChatResponse,
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    ModelLimits,
+    ProviderCapabilities,
+    ToolCallData,
+)
 from engine.llm.events import ProviderEvent, ProviderEventType
 
 
@@ -199,6 +206,7 @@ class ReplayLLM:
     """
 
     model = "replay"
+    provider = "replay"
 
     def __init__(self, turns: Sequence[RecordedTurn | ChatResponse]) -> None:
         self._turns = [
@@ -209,6 +217,25 @@ class ReplayLLM:
         self.stream = bool(self._turns) and self._turns[0].is_streaming
         if self.stream:
             self.chat_events = self._replay_chat_events
+        # A recording does not capture the original route's capacity facts, so
+        # replay reports the same conservative defaults the engine falls back
+        # to for any client that omits them.  Declaring them explicitly keeps
+        # ReplayLLM a complete LLMPort instead of relying on getattr fallbacks.
+        self.capabilities = ProviderCapabilities(
+            streaming=self.stream,
+            tool_calls=True,
+            prefix_cache_key=False,
+        )
+        self.context_window = DEFAULT_CONTEXT_WINDOW
+        self.context_window_declared = False
+        self.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS
+        self.max_output_tokens_declared = False
+        self.limits = ModelLimits(
+            context_window=self.context_window,
+            context_window_declared=self.context_window_declared,
+            max_output_tokens=self.max_output_tokens,
+            max_output_tokens_declared=self.max_output_tokens_declared,
+        )
 
     @property
     def turns_consumed(self) -> int:

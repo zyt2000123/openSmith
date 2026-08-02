@@ -207,7 +207,12 @@ class ProviderClient:
             tools,
             prefix_cache_key=prefix_cache_key,
         )
-        yield ProviderEvent(ProviderEventType.RESPONSE_CREATED, {"provider": self.provider})
+        # Same data shape as the streaming adapters emit for this event, so
+        # consumers can read ``model`` uniformly on both paths.
+        yield ProviderEvent(
+            ProviderEventType.RESPONSE_CREATED,
+            {"model": self.model},
+        )
         if response.reasoning:
             yield ProviderEvent(ProviderEventType.REASONING_DELTA, {"delta": response.reasoning})
         if response.text:
@@ -229,6 +234,7 @@ class ProviderClient:
             {
                 "finish_reason": response.finish_reason,
                 "raw_finish_reason": response.raw_finish_reason,
+                "model": response.model or self.model,
             },
         )
 

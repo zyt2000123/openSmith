@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ipaddress
 import math
-import os
 import socket
 from enum import Enum
 from pathlib import Path
@@ -38,6 +37,49 @@ def _config_paths() -> tuple[Path, Path, Path]:
         SMITH_PROFILE_DIR if SMITH_PROFILE_DIR is not None else paths.smith_profile_dir,
         AGENT_DIR if AGENT_DIR is not None else paths.agent_dir,
     )
+
+
+# Deep-merge of the three static config levels, cached per file fingerprint
+# (path + mtime + size).  Config resolution runs on every model route lookup,
+# so re-reading unchanged YAML files on each call is wasted disk I/O; edits to
+# any level are still picked up because the fingerprint changes.
+_BASE_MERGE_CACHE: tuple[tuple[object, ...], dict[str, Any]] | None = None
+
+
+def _file_fingerprint(path: Path) -> tuple[str, int, int]:
+    try:
+        stat = path.stat()
+        return (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (str(path), 0, 0)
+
+
+def _merged_base_config() -> dict[str, Any]:
+    """Merge platform/seed/runtime config levels, cached until a file changes."""
+    global _BASE_MERGE_CACHE
+    data_dir, smith_profile_dir, agent_dir = _config_paths()
+    fingerprint: tuple[object, ...] = (
+        # The loader identity keeps the cache honest when tests replace
+        # load_yaml with a stub; the file fingerprints catch real edits.
+        id(load_yaml),
+        *(
+            _file_fingerprint(path)
+            for path in (
+                data_dir / "config.yaml",
+                smith_profile_dir / "config.yaml",
+                agent_dir / "config.yaml",
+            )
+        ),
+    )
+    if _BASE_MERGE_CACHE is not None and _BASE_MERGE_CACHE[0] == fingerprint:
+        return _BASE_MERGE_CACHE[1]
+    merged = merge_configs(
+        load_yaml(data_dir / "config.yaml"),
+        load_yaml(smith_profile_dir / "config.yaml"),
+        load_yaml(agent_dir / "config.yaml"),
+    )
+    _BASE_MERGE_CACHE = (fingerprint, merged)
+    return merged
 
 
 class LLMUsage(str, Enum):
@@ -321,11 +363,7 @@ def resolve_price_table() -> dict[str, dict[str, float]]:
     ``cache_read`` and ``cache_write`` tokens.  Prices always come from local
     configuration — never from a gateway or provider API.
     """
-    data_dir, smith_profile_dir, agent_dir = _config_paths()
-    platform = load_yaml(data_dir / "config.yaml")
-    template = load_yaml(smith_profile_dir / "config.yaml")
-    agent = load_yaml(agent_dir / "config.yaml")
-    merged = merge_configs(platform, template, agent)
+    merged = _merged_base_config()
     llm = merged.get("llm")
     pricing = llm.get("pricing") if isinstance(llm, dict) else None
     if not isinstance(pricing, dict):
@@ -351,12 +389,12 @@ def resolve_llm_config(
 ) -> dict[str, Any]:
     """Return the selected LLM route after merging config levels.
 
-    Levels (lower overrides upper):
-      1. Environment defaults
-      2. Platform:  ~/.agent-smith/config.yaml
-      3. Smith seed: agents/smith/config.yaml
-      4. Smith runtime: ~/.agent-smith/agent/config.yaml
-      5. Session:   dict passed at runtime
+    Configuration files are the only source of route settings.  Levels (lower
+    overrides upper):
+      1. Platform:  ~/.agent-smith/config.yaml
+      2. Smith seed: agents/smith/config.yaml
+      3. Smith runtime: ~/.agent-smith/agent/config.yaml
+      4. Session:   dict passed at runtime
 
     ``llm.routes`` may override the base config for ``interactive``, ``gate``,
     ``background``.  Omitted routes inherit the base model unchanged.
@@ -365,26 +403,7 @@ def resolve_llm_config(
     model fields while timeout profiles remain shared.
     """
     selected_usage = _as_usage(usage)
-    env_defaults: dict[str, Any] = {}
-    env_llm: dict[str, str] = {}
-    for env_key, cfg_key in (
-        ("AGENTSMITH_LLM_API_KEY", "api_key"),
-        ("AGENTSMITH_LLM_BASE_URL", "base_url"),
-        ("AGENTSMITH_LLM_MODEL", "model"),
-        ("AGENTSMITH_LLM_PROVIDER", "provider"),
-    ):
-        val = os.environ.get(env_key)
-        if val:
-            env_llm[cfg_key] = val
-    if env_llm:
-        env_defaults["llm"] = env_llm
-
-    data_dir, smith_profile_dir, agent_dir = _config_paths()
-    platform = load_yaml(data_dir / "config.yaml")
-    template = load_yaml(smith_profile_dir / "config.yaml")
-    agent = load_yaml(agent_dir / "config.yaml")
-
-    merged = merge_configs(env_defaults, platform, template, agent, session_override or {})
+    merged = merge_configs(_merged_base_config(), session_override or {})
 
     llm = merged.get("llm", merged)
     if not isinstance(llm, dict):

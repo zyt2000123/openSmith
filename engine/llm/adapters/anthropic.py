@@ -445,9 +445,24 @@ class AnthropicAdapter(HTTPAdapterMixin):
         content: object,
     ) -> None:
         if messages and messages[-1]["role"] == role:
-            messages[-1]["content"] = cls._merge_content(messages[-1]["content"], content)
+            merged = cls._merge_content(messages[-1]["content"], content)
+            if role == "user":
+                # Anthropic requires tool_result blocks to precede text in one
+                # user turn.  The ReAct loop can interleave a system hint
+                # between two tool results, and the merge would otherwise put
+                # text in the middle of them — reorder so the results stay
+                # grouped and leading.
+                merged = cls._order_user_blocks(merged)
+            messages[-1]["content"] = merged
             return
         messages.append({"role": role, "content": cls._copy_content(content)})
+
+    @staticmethod
+    def _order_user_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Order tool_result blocks first, preserving order within each group."""
+        results = [block for block in blocks if block.get("type") == "tool_result"]
+        rest = [block for block in blocks if block.get("type") != "tool_result"]
+        return [*results, *rest]
 
     @classmethod
     def _merge_content(cls, left: object, right: object) -> list[dict[str, Any]]:
