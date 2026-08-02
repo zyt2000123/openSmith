@@ -3,8 +3,11 @@ import asyncio
 import sys
 from pathlib import Path
 
-from engine.execution.pipeline.gate import GateResult, LLMGate
+import pytest
+
+from engine.execution.pipeline.gate import GateResult, LLMGate, coerce_gate_result
 from engine.execution.pipeline.skill_chain import GATE_REGISTRY, load_gate_content
+from engine.llm.client import ChatResponse
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -80,6 +83,42 @@ def test_llm_gate_fails_closed_when_llm_verification_errors():
 
     assert result.verdict == "fail"
     assert result.reason == "LLM verification failed"
+
+
+def _llm_gate_with_verdict(raw_text: str):
+    class PassingGate:
+        async def check(self, output, context):
+            return GateResult("pass", "heuristic pass")
+
+    class VerdictLLM:
+        async def chat(self, messages):
+            return ChatResponse(text=raw_text)
+
+    gate = LLMGate(PassingGate(), "check {output}")
+    gate.set_llm(VerdictLLM())
+    return asyncio.run(gate.check("output", {}))
+
+
+def test_llm_gate_accepts_case_insensitive_pass_with_trailing_punctuation():
+    """Benign formatting must not turn a valid PASS into an invalid-verdict retry."""
+    for raw in ("PASS", "PASS.", "PASS:", "pass", "Pass。", "PASS:"):
+        result = _llm_gate_with_verdict(raw)
+        assert result.verdict == "pass", raw
+
+
+def test_llm_gate_parses_fail_and_carries_the_reason():
+    result = _llm_gate_with_verdict("FAIL: evidence is missing")
+    assert result.verdict == "fail"
+    assert "evidence is missing" in result.reason
+
+
+def test_coerce_gate_result_validates_gate_result_instances():
+    """A concrete GateResult must not bypass verdict/reason validation."""
+    with pytest.raises(TypeError):
+        coerce_gate_result(GateResult("maybe", ""))  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        coerce_gate_result(GateResult("pass", 42))  # type: ignore[arg-type]
+    assert coerce_gate_result(GateResult("pass", "ok")).verdict == "pass"
 
 
 if __name__ == "__main__":

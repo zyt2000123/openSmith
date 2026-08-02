@@ -4,6 +4,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -11,6 +12,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app import main  # noqa: E402
 from app.infrastructure import auth  # noqa: E402
+
+
+def test_auth_token_write_refuses_a_preplanted_symlink(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The token file must be created atomically, never written through a symlink
+    that a local attacker could plant (e.g. a dangling link pointing at an
+    arbitrary file) to clobber that file when the server starts."""
+    token_path = tmp_path / "auth_token"
+    outside = tmp_path / "victim.txt"  # does not exist yet; a dangling link
+    token_path.symlink_to(outside)  # would have the server create it on start
+
+    monkeypatch.setattr(auth, "_TOKEN_PATH", token_path)
+    monkeypatch.setattr(auth, "_cached_token", None)
+    monkeypatch.setattr(auth, "_cached_token_path", None)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        auth.get_local_token()
+
+    assert not outside.exists()
+    assert token_path.is_symlink()
 
 
 def test_server_lifespan_materializes_local_auth_token_before_shell_requests(

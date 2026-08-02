@@ -165,18 +165,40 @@ def _bounded(value: object, limit: int) -> str:
     return cleaned[:limit]
 
 
-def _load_evidence(memory_dir: Path) -> NudgeEvidence:
+def _read_recent_lines(memory_dir: Path) -> list[str]:
+    """Read recent.jsonl, repairing a torn trailing line from a crashed writer.
+
+    Offset-advancing readers treat every line they pass as inspected.  A partial
+    line left by an interrupted ``open("a")`` write would otherwise be silently
+    consumed (and never re-emitted), so drop it from the file before parsing.
+    """
     recent_path = memory_dir / "recent.jsonl"
     if not recent_path.exists() and not recent_path.is_symlink():
-        return NudgeEvidence(0, 0, "", ())
-
+        return []
     recent = safe_file_in_dir(memory_dir, recent_path)
     if recent is None:
-        return NudgeEvidence(0, 0, "", (), "recent.jsonl is unavailable or unsafe")
+        raise OSError("recent.jsonl is unavailable or unsafe")
     try:
-        lines = recent.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return NudgeEvidence(0, 0, "", (), "recent.jsonl could not be read")
+        raw = recent.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise OSError("recent.jsonl could not be read") from exc
+    if not raw or raw.endswith("\n"):
+        return raw.splitlines()
+    # The writer was interrupted mid-line: repair the log by removing the torn
+    # line so it can never be treated as inspected evidence.
+    lines = raw.splitlines()
+    if len(lines) > 1:
+        atomic_write_text(recent, "\n".join(lines[:-1]) + "\n")
+    else:
+        atomic_write_text(recent, "")
+    return lines[:-1]
+
+
+def _load_evidence(memory_dir: Path) -> NudgeEvidence:
+    try:
+        lines = _read_recent_lines(memory_dir)
+    except OSError as exc:
+        return NudgeEvidence(0, 0, "", (), str(exc))
 
     try:
         stored_offset = _read_offset(memory_dir)
@@ -269,7 +291,16 @@ def _parse_candidates(text: str, evidence: NudgeEvidence) -> list[NudgeCandidate
             raise MemoryNudgeError("nudge candidate represented transient task state")
         if len(excerpt) < 12 or len(excerpt) > _MAX_EVIDENCE_CHARS:
             raise MemoryNudgeError("nudge candidate evidence is too short or too long")
-        if not any(excerpt in source_excerpt for source_excerpt in evidence.excerpts):
+        # The excerpt must bind to exactly one event block.  Substring
+        # containment alone would let a short generic excerpt be attributed to a
+        # different event whose summary happens to contain the same fragment.
+        normalized_excerpt = " ".join(excerpt.split())
+        matched_sources = [
+            source_excerpt
+            for source_excerpt in evidence.excerpts
+            if normalized_excerpt in " ".join(source_excerpt.split())
+        ]
+        if len(matched_sources) != 1:
             raise MemoryNudgeError("nudge candidate evidence was not present in source")
         if any(contains_secret(value) or contains_injection(value) for value in (content, excerpt)):
             raise MemoryNudgeError("nudge candidate contained unsafe content")
@@ -292,12 +323,9 @@ def _candidate_key(candidate: NudgeCandidate) -> tuple[str, str, str, str, str]:
 
 
 def _existing_candidate_keys(memory_dir: Path) -> set[tuple[str, str, str, str, str]]:
-    recent = safe_file_in_dir(memory_dir, memory_dir / "recent.jsonl")
-    if recent is None:
-        raise OSError("recent.jsonl is unavailable or unsafe")
     try:
-        lines = recent.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
+        lines = _read_recent_lines(memory_dir)
+    except OSError as exc:
         raise OSError("recent.jsonl could not be read") from exc
 
     existing: set[tuple[str, str, str, str, str]] = set()

@@ -6,13 +6,20 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
-from engine.safety.approval import ApprovalScope, current_approval_context
+from engine.safety.approval import (
+    ApprovalScope,
+    _SECRET_FLAG_RE,
+    _is_sensitive_argument_name,
+    _is_secret_value,
+    current_approval_context,
+)
 from engine.tool.interface import ToolCall, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -164,6 +171,41 @@ def _shares_inode_with_protected_file(
     return False
 
 
+_SENSITIVE_READ_EXTENSIONS = (".pem", ".key", ".p12", ".pfx")
+_ENV_TEMPLATE_SUFFIXES = (".env.example", ".env.template", ".env.sample")
+# A basename matching this (with word boundaries) is an SSH-style private key
+# even when it has been copied away from ``.ssh`` — ``id_rsa_old``,
+# ``backup-id_ed25519`` and the like.
+_SENSITIVE_KEY_NAME_RE = re.compile(
+    r"(?:^|[-_.])(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:[-_.]|$)"
+)
+# Files inside any ``.git`` directory whose read warrants high-risk approval:
+# ``config`` embeds remote URLs (often ``https://user:token@host``), the
+# ``credentials`` file stores passwords verbatim, ``config.worktree`` the same.
+_GIT_CREDENTIAL_FILES = frozenset({"config", "config.worktree", "credentials"})
+
+
+def _is_sensitive_read_name(name: str) -> bool:
+    """Whether a case-folded basename warrants high-risk approval when read.
+
+    The read path has no write-branch equivalent: ``read_file`` declares
+    ``approval_policy="never"``, so the only protection is the case-sensitive
+    regex rules, which miss ``.ENV``, ``.env.staging``, ``key.PEM`` and a
+    stray ``id_rsa`` — all reachable on a case-insensitive APFS filesystem.
+    This mirrors the write branch (any ``.env*``) plus the private-key rule
+    set, matched case-insensitively.  Documented env templates and public keys
+    stay ordinary reads.
+    """
+    folded = name.lower()
+    if folded.endswith(".pub"):
+        return False
+    if folded.startswith(".env"):
+        return not folded.endswith(_ENV_TEMPLATE_SUFFIXES)
+    if folded.endswith(_SENSITIVE_READ_EXTENSIONS):
+        return True
+    return bool(_SENSITIVE_KEY_NAME_RE.search(folded))
+
+
 class FileGuard:
     _ALWAYS_BLOCKED = frozenset({".ssh", ".gnupg", ".aws", ".kube"})
     _SENSITIVE_WRITE = frozenset({".env", ".env.local", ".env.production", ".npmrc", ".pypirc"})
@@ -201,6 +243,19 @@ class FileGuard:
     @property
     def is_working_directory_scoped(self) -> bool:
         return self._working_dir is not None
+
+    def is_inside_allowed_dirs(self, target: Path) -> bool:
+        """Whether a resolved path lies within the ordinary allowed directories.
+
+        The registry uses this to decide how much a one-shot path approval may
+        whitelist: inside the workspace every sibling is already accessible, so
+        directory-granularity is harmless; an external path must not silently
+        grant the whole directory.
+        """
+        try:
+            return any(target.is_relative_to(d) for d in self._allowed)
+        except ValueError:
+            return False
 
     def _is_non_delegable_write_target(self, target: Path, lexical: Path) -> bool:
         for root in self._non_delegable_write_roots:
@@ -288,6 +343,31 @@ class FileGuard:
                         f"Access to {part}/ contains user credentials and requires "
                         "high-risk approval"
                     ),
+                )
+
+        if not writing:
+            # Reads have no write-branch equivalent: read_file is
+            # ``approval_policy="never"`` and the regex rules are
+            # case-sensitive, so .ENV / .env.staging / key.PEM / id_rsa would
+            # otherwise bypass approval entirely on case-insensitive filesystems.
+            name = target.name.lower()
+            if _is_sensitive_read_name(name):
+                return self._path_approval(
+                    target,
+                    writing=False,
+                    high_risk=True,
+                    reason=f"Read of sensitive file {target.name} requires high-risk approval",
+                )
+            # .git/config embeds remote URLs (which often carry credentials) and
+            # .git/credentials stores them verbatim; both are free reads today.
+            if name in _GIT_CREDENTIAL_FILES and any(
+                part.lower() == ".git" for part in (*target.parts, *lexical.parts)
+            ):
+                return self._path_approval(
+                    target,
+                    writing=False,
+                    high_risk=True,
+                    reason="Read of .git credential-bearing file requires high-risk approval",
                 )
 
         if writing:
@@ -390,6 +470,19 @@ class FileGuard:
 # ── Audit log (req #6: every tool call logged) ──────────────
 
 class AuditLog:
+    """Append-only JSONL audit sink holding a single file handle.
+
+    ``record`` runs synchronously from the guard on the event loop; opening
+    and closing the file on every call is pure syscall overhead.  The handle
+    is opened lazily on first use — so callers may point ``_path`` at a fresh
+    file before any record — and stays open afterwards, flushed after each
+    append so entries are durable and immediately visible to synchronous
+    readers.  A bounded queue drained by a writer thread would take the I/O
+    off the loop entirely, but consumers (including this repo's own regression
+    tests) read the audit file synchronously right after ``check()``, so the
+    write must stay deterministic.
+    """
+
     def __init__(self, log_path: Optional[Path] = None):
         if log_path is None:
             try:
@@ -398,7 +491,18 @@ class AuditLog:
             except Exception:
                 log_path = Path.home() / ".agent-smith" / "audit.jsonl"
         self._path = log_path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._handle: Optional[TextIO] = None
+        self._handle_path: Optional[Path] = None
+
+    def _ensure_handle(self) -> TextIO:
+        if self._handle is None or self._handle_path != self._path:
+            if self._handle is not None:
+                self._handle.close()
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = open(self._path, "a", encoding="utf-8")
+            self._handle_path = self._path
+        return self._handle
 
     def record(self, tool_name: str, arguments: dict, result: GuardResult, **extra: object) -> None:
         entry = {
@@ -411,37 +515,61 @@ class AuditLog:
             **_summarize_args(extra),
         }
         try:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            with self._lock:
+                handle = self._ensure_handle()
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                handle.flush()
         except Exception:
             logger.warning("failed to append tool safety audit", exc_info=True)
 
+    def flush(self) -> None:
+        with self._lock:
+            if self._handle is not None:
+                self._handle.flush()
 
-_SENSITIVE_ARG_KEY_PARTS = (
-    "apikey",
-    "authorization",
-    "cookie",
-    "credential",
-    "passwd",
-    "password",
-    "privatekey",
-    "secret",
-    "token",
-)
+    def close(self) -> None:
+        with self._lock:
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+                self._handle_path = None
 
 
-def _is_sensitive_arg_key(key: object) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-    return any(part in normalized for part in _SENSITIVE_ARG_KEY_PARTS)
+def _summarize_sequence(values: list | tuple, max_len: int) -> list[object]:
+    """Summarize a sequence, redacting flag-value pairs and secret-shaped items.
+
+    Mirrors ``approval._summarize_list`` so the audit trail stays as clean as
+    the approval card: a positional ``["--token", "sk-..."]`` pair would
+    otherwise round-trip the credential verbatim into the log.
+    """
+    redacted: list[object] = []
+    redact_next = False
+    for item in values:
+        if redact_next:
+            redacted.append("***")
+            redact_next = False
+            continue
+        if isinstance(item, str):
+            match = _SECRET_FLAG_RE.match(item)
+            if match:
+                if "=" in item:
+                    redacted.append(item.split("=", 1)[0] + "=***")
+                else:
+                    redacted.append(item)
+                    redact_next = True
+                continue
+            if _is_secret_value(item):
+                redacted.append("***")
+                continue
+        redacted.append(_summarize_value(item, max_len))
+    return redacted
 
 
 def _summarize_value(value: object, max_len: int) -> object:
     if isinstance(value, dict):
         return _summarize_args(value, max_len=max_len)
-    if isinstance(value, list):
-        return [_summarize_value(item, max_len) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_summarize_value(item, max_len) for item in value)
+    if isinstance(value, (list, tuple)):
+        return _summarize_sequence(value, max_len)
     if isinstance(value, str) and len(value) > max_len:
         return value[:max_len] + f"...({len(value)} chars)"
     return value
@@ -451,7 +579,7 @@ def _summarize_args(args: dict, max_len: int = 200) -> dict:
     """Recursively redact credential-bearing argument fields for audit storage."""
     redacted = {}
     for k, v in args.items():
-        if _is_sensitive_arg_key(k):
+        if _is_sensitive_argument_name(k):
             redacted[k] = "***"
         else:
             redacted[k] = _summarize_value(v, max_len)

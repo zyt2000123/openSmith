@@ -39,6 +39,9 @@ TOOL_META = {
 }
 
 
+MAX_WRITE_BYTES = 8 * 1024 * 1024  # 8MB per call
+
+
 def _execute_sync(
     *,
     path: str,
@@ -46,6 +49,14 @@ def _execute_sync(
     append: bool = False,
     _snapshot_tracker: Callable[[str], object] | None = None,
 ) -> str:
+    if not isinstance(content, str):
+        return "Error: content must be a string"
+    size = len(content.encode("utf-8"))
+    if size > MAX_WRITE_BYTES:
+        return (
+            f"Error: content exceeds the {MAX_WRITE_BYTES // (1024 * 1024)} MB "
+            "per-call write limit"
+        )
     # The directory boundary lives in engine/safety/tool_guard.py, which runs
     # before this provider and is the only layer that knows about approvals — a
     # user may approve a write outside the workspace, and a provider-level block
@@ -88,7 +99,6 @@ def _execute_sync(
         return f"Error writing file: {e}"
 
     action = "appended to" if append else "wrote"
-    size = len(content.encode("utf-8"))
     return f"OK: {action} {resolved} ({size} bytes){snapshot_warning}"
 
 

@@ -10,6 +10,7 @@ re-execution of side-effectful tools during a future resume flow.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from uuid import uuid4
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
 from engine.execution.events import EventType, ExecutionEvent
+
+logger = logging.getLogger(__name__)
 
 
 class RunStatus(str, Enum):
@@ -300,6 +303,27 @@ class RunScope:
         ]
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist an ``os.replace`` so a power loss cannot lose the rename.
+
+    File contents are fsynced before the rename; syncing the parent directory
+    afterward makes the rename entry itself durable.  Best-effort: some
+    platforms reject directory fsync, and the already-fsynced file data
+    survives regardless.
+    """
+    try:
+        dir_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        logger.warning("cannot open runs directory for fsync: %s", path, exc_info=True)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        logger.warning("directory fsync failed for runs directory: %s", path, exc_info=True)
+    finally:
+        os.close(dir_fd)
+
+
 class RunStateStore:
     """Atomic, private JSON persistence for run metadata."""
 
@@ -517,6 +541,7 @@ class RunStateStore:
                 os.fsync(handle.fileno())
             os.replace(temp_path, path)
             path.chmod(PRIVATE_FILE_MODE)
+            _fsync_directory(self.root)
         except OSError as exc:
             temp_path.unlink(missing_ok=True)
             raise RunStateError(f"Unable to save run state for {state.run_id!r}") from exc

@@ -72,11 +72,22 @@ def enabled_tools_from_config(
     if enabled is None:
         configured = available
     elif isinstance(enabled, list):
-        configured = [
-            name
-            for name in enabled
-            if isinstance(name, str) and name in available
-        ]
+        known = set(tool_registry.list_tool_names(include_disabled=True))
+        configured = []
+        for name in enabled:
+            if not isinstance(name, str) or not name:
+                continue
+            if name in available:
+                configured.append(name)
+            elif name not in known:
+                # A typo in tools.enabled used to vanish silently: this function
+                # removed the name before set_enabled() could report it, so the
+                # unknown-tool warning in prepare_runtime was unreachable.  Log
+                # here, at the point of filtering, so a misconfigured name is
+                # audible instead of silently disabling the tool.
+                logger.warning(
+                    "agent config enabled unknown tool %r; ignoring it", name
+                )
     else:
         raise ValueError(
             f"tools.enabled must be a list of tool names, got {type(enabled).__name__}"
@@ -248,6 +259,9 @@ async def prepare_runtime(
         if request.identity_id
         else catalog.default
     )
+    # Pipelines require a declared, high-confidence intent. A hidden LLM
+    # classifier on each keyword miss slowed direct-ReAct turns and could
+    # incorrectly start a multi-step workflow.
     route = route_task(request.message, catalog)
     state_dir = _identity_state_dir(runtime)
     requested_working_dir = request.working_dir or runtime.default_working_dir

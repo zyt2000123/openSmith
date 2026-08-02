@@ -17,7 +17,6 @@ _DISCOVERY_TIMEOUT_SECONDS = 35.0
 # Compatibility seam for tests embedding a temporary runtime profile.
 AGENT_DIR: Path | None = None
 
-
 def _agent_dir() -> Path:
     return AGENT_DIR if AGENT_DIR is not None else common_config.PATHS.agent_dir
 
@@ -108,6 +107,12 @@ class McpService:
                     )
                     for tool in tools
                 ],
+            )
+        except TimeoutError:
+            return McpServerOut(
+                **common,
+                status="error",
+                error=f"MCP server {name} connect/list_tools timed out",
             )
         except Exception as exc:
             return McpServerOut(**common, status="error", error=str(exc))

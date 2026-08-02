@@ -12,7 +12,7 @@ TOOL_META = {
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Skill name (e.g., 'planning', 'code-review', 'sde-debug')"
+                "description": "Skill name (e.g., 'grilling', 'code-review', 'tdd-workflow')"
             }
         },
         "required": ["name"]

@@ -42,7 +42,10 @@ class AutoTaskRepo:
             ),
         )
         await db.commit()
-        return await self.get(tid)  # type: ignore[return-value]
+        row = await self.get(tid)
+        if row is None:
+            raise RuntimeError(f"Inserted auto task {tid!r} but could not re-fetch it")
+        return row
 
     async def get(self, task_id: str) -> dict | None:
         db = await get_app_db()
@@ -248,6 +251,7 @@ class AutoTaskRepo:
             "trigger_type": row["trigger_type"],
             "trigger_config": row["trigger_config"],
             "instruction": row["instruction"],
+            "working_dir": row["working_dir"],
             "enabled": bool(row["enabled"]),
             "status": row["status"],
             "last_run_at": row["last_run_at"],

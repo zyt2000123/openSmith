@@ -23,9 +23,6 @@ def test_profile_seed_only_fills_missing_files_and_preserves_user_content(
 
     profile_files.init_smith_profile_files(
         profile_seed_dir=seed,
-        name="Smith",
-        role="smith",
-        description="test",
     )
 
     assert (profile / "role.md").read_text(encoding="utf-8") == "user role"
@@ -41,9 +38,6 @@ def test_shipped_smith_workflow_is_seeded_as_default(
 
     profile_files.init_smith_profile_files(
         profile_seed_dir=SMITH_PROFILE_DIR,
-        name="Smith",
-        role="smith",
-        description="test",
     )
 
     workflow = (profile / "workflow.md").read_text(encoding="utf-8")

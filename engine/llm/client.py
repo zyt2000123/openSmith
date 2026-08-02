@@ -138,11 +138,13 @@ class ProviderClient:
                     if isinstance(usage, dict):
                         usage_raw = usage
                 elif event.type is ProviderEventType.RESPONSE_COMPLETED:
+                    # The provider signaled completion; treat the generation as
+                    # successful even if the consumer stops iterating now.
+                    ok = True
                     model = event.data.get("model")
                     if isinstance(model, str) and model:
                         served_model = model
                 yield event
-            ok = True
         finally:
             await self._emit_generation(
                 usage_raw=usage_raw,
@@ -198,11 +200,18 @@ class ProviderClient:
         prefix_cache_key: str | None,
     ) -> AsyncIterator[ProviderEvent]:
         """Normalize a non-streaming completion into the same event contract."""
-        yield ProviderEvent(ProviderEventType.RESPONSE_CREATED, {"provider": self.provider})
+        # Await the completion before announcing RESPONSE_CREATED so a failing
+        # model call never leaks a "response started" event to the consumer.
         response = await self.chat(
             messages,
             tools,
             prefix_cache_key=prefix_cache_key,
+        )
+        # Same data shape as the streaming adapters emit for this event, so
+        # consumers can read ``model`` uniformly on both paths.
+        yield ProviderEvent(
+            ProviderEventType.RESPONSE_CREATED,
+            {"model": self.model},
         )
         if response.reasoning:
             yield ProviderEvent(ProviderEventType.REASONING_DELTA, {"delta": response.reasoning})
@@ -225,6 +234,7 @@ class ProviderClient:
             {
                 "finish_reason": response.finish_reason,
                 "raw_finish_reason": response.raw_finish_reason,
+                "model": response.model or self.model,
             },
         )
 

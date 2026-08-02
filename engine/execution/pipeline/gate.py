@@ -34,9 +34,8 @@ class Gate(Protocol):
 def coerce_gate_result(value: object) -> GateResult:
     """Adapt declarative content decisions without importing engine types there."""
     if isinstance(value, GateResult):
-        return value
-
-    if isinstance(value, Mapping):
+        verdict, reason, retry_hint = value.verdict, value.reason, value.retry_hint
+    elif isinstance(value, Mapping):
         verdict = value.get("verdict")
         reason = value.get("reason")
         retry_hint = value.get("retry_hint")
@@ -45,11 +44,24 @@ def coerce_gate_result(value: object) -> GateResult:
         reason = getattr(value, "reason", None)
         retry_hint = getattr(value, "retry_hint", None)
 
+    # ``GateResult`` is a plain dataclass whose ``Literal`` verdict is not
+    # runtime-enforced, so it must pass the same checks as every other shape.
     if verdict not in {"pass", "fail", "retry"} or not isinstance(reason, str):
         raise TypeError("gate must return verdict=pass|fail|retry and a string reason")
     if retry_hint is not None and not isinstance(retry_hint, str):
         raise TypeError("gate retry_hint must be a string when provided")
     return GateResult(verdict, reason, retry_hint=retry_hint)
+
+
+def _normalized_llm_verdict(text: str) -> str:
+    """Upper-case a gate verdict, tolerating benign trailing punctuation.
+
+    A strict ``text == "PASS"`` match turns ``"PASS."`` or ``"PASS:"`` into an
+    invalid-verdict failure with a retry.  The gate system is deliberately
+    strict about *content*, but verdict formatting is not signal: models often
+    emit a trailing period or colon after the verdict word.
+    """
+    return text.strip().rstrip(".!?。！？:：;；\t\r\n").upper()
 
 
 class LLMGate:
@@ -85,10 +97,11 @@ class LLMGate:
                     {"role": "user", "content": prompt},
                 ])
             text = resp.text.strip()
-            if text.startswith("FAIL"):
-                reason = text[5:].strip(": ")
+            verdict = _normalized_llm_verdict(text)
+            if verdict.startswith("FAIL"):
+                reason = text[len("FAIL"):].strip(":： \t\r\n")
                 return GateResult("fail", f"LLM verification: {reason}", retry_hint=reason)
-            if text == "PASS":
+            if verdict.startswith("PASS"):
                 return result
             return GateResult(
                 "fail",

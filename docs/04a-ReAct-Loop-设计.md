@@ -1,6 +1,6 @@
 # 04a · ReAct Loop 设计
 
-> **源文件**：`engine/execution/react_loop.py` (657 行)
+> **源文件**：`engine/execution/react/react_loop.py` (1170 行)
 >
 > **定位**：ReAct Loop 是 Agent-Smith 执行引擎的最内层循环——LLM 在单个技能步骤内的"思考 → 调工具 → 观察 → 再思考"核心循环。所有 Agent 输出（文本/流式/事件）最终都经过这里。
 
@@ -180,8 +180,11 @@ react_loop 产出的所有事件类型：
 | `PROVISIONAL_RETRACT` | `{provision_id, reason}` | 草稿撤回（工具调用 / 错误 / 门禁失败） |
 | `TEXT_DELTA` | `{text, already_streamed?}` | 最终文本增量 |
 | `TOKEN_USAGE` | `{input_tokens, output_tokens, total_tokens}` | 每轮 token 用量 |
+| `CONTEXT_USAGE` | `{used, limit, percentage, ...}` | 每轮请求前的上下文占用与上限 |
+| `CONTEXT_COMPRESSION_START` / `END` | `{reason}` / `{recovered, ...}` | 上下文压缩开始 / 结束（触发时） |
 | `TOOL_CALL_START` | `{name, id, arguments}` | 工具执行开始 |
 | `TOOL_CALL_RESULT` | `{id, error, blocked, preflight, ...}` | 工具执行结果 |
+| `SMITH_UI` / `SMITH_UI_FALLBACK` | `{ui, ...}` / `{raw, ...}` | 结构化 UI 事件；无效 payload 降级为文本 |
 | `INCOMPLETE` | `{reason, ...}` | 非正常终止（软失败） |
 | `FAILED` | `{reason}` | 硬失败 |
 
@@ -321,7 +324,7 @@ LLM 在执行完工具后，有时会回复"让我去搜索一下"而非给出�
 
 ## 七、会话压缩
 
-`engine/execution/compression.py` 提供两级压缩，每轮循环开头执行：
+`engine/context/compression.py` 提供三级压缩，每轮循环开头执行：
 
 ### 7.1 第一级：工具输出裁剪 (`prune_tool_outputs`)
 
@@ -364,12 +367,13 @@ conversation = head + tail
 ### 7.4 Token 估算
 
 ```python
-def estimate_tokens(text):
-    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
-    return cjk + (len(text) - cjk) // 3
+def estimate_tokens(text):  # engine/context/budget.py:35
+    cjk = sum(1 for char in text if "一" <= char <= "鿿")
+    return (3 * cjk) + (len(text) - cjk + 2) // 3
 ```
 
-CJK 字符按 1:1 估算，其余按 3:1。宁可高估触发压缩，不要低估撑爆窗口。
+CJK 字符按 3:1 保守估算（一个汉字 UTF-8 编码 3 字节，作为无合并 token 时的稳定上界），
+其余按 3:1。宁可高估触发压缩，不要低估撑爆窗口。
 
 ---
 
@@ -486,9 +490,10 @@ Provisional 生命周期假设前端能够：
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `engine/execution/react_loop.py` | 657 | 核心循环 + 流式组装 + 适配器 |
+| `engine/execution/react/react_loop.py` | 1170 | 核心循环 + 流式组装 + 适配器 |
 | `engine/execution/react/budget.py` | 124 | 预算常量 + 假完成检测 + 预算耗尽兜底 |
-| `engine/execution/events.py` | 62 | ExecutionEvent + EventType 枚举 |
-| `engine/execution/compression.py` | 159 | 工具裁剪 + LLM 摘要压缩 |
-| `engine/safety/tool_policy.py` | 74 | ToolGuard + FactGate 统一网关 |
-| `engine/llm/events.py` | 61 | ProviderEvent + ProviderEventType 枚举 |
+| `engine/execution/events.py` | 100 | ExecutionEvent + EventType 枚举 |
+| `engine/context/compression.py` | 283 | 工具裁剪 + LLM 摘要压缩 |
+| `engine/context/budget.py` | 170 | token 估算 + 上下文预算策略 |
+| `engine/safety/tool_policy.py` | 163 | ToolGuard + FactGate 统一网关 |
+| `engine/llm/events.py` | 64 | ProviderEvent + ProviderEventType 枚举 |

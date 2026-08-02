@@ -4,9 +4,15 @@ from pathlib import Path
 
 from engine.execution.events import EventType, ExecutionEvent
 from engine.observability import (
+    HealthCalculator,
+    IncidentDetector,
     ObservabilityRetentionPolicy,
+    RunDiagnoser,
     RunEventRecorder,
     RunMetadata,
+    RunObservation,
+    RunSummary,
+    RunSummaryRecord,
     RunSummaryStore,
     TraceStore,
 )
@@ -77,6 +83,30 @@ def test_recorder_continues_projecting_when_trace_write_fails() -> None:
 
     assert projected == ["failed"]
     assert recorder.summary().event_counts == {"failed": 1}
+
+
+def test_observation_persists_the_route_selected_during_execution(tmp_path) -> None:
+    from engine.execution.events import RunObservationContext
+
+    observation = RunObservation.start(RunObservationContext(
+        run_id="run-route",
+        agent_id="smith",
+        profile_dir=tmp_path,
+        created_at="2026-08-02T00:00:00+00:00",
+    ))
+    observation.record(ExecutionEvent(EventType.ROUTE_DECIDED, {
+        "identity_id": "coding",
+        "route_id": "tdd-development",
+        "pipeline_id": "tdd-development",
+    }))
+    observation.record(ExecutionEvent(EventType.RUN_FINISHED, {"status": "completed"}))
+
+    record = RunSummaryStore(tmp_path).get("run-route")
+
+    assert record is not None
+    assert record.metadata.identity_id == "coding"
+    assert record.metadata.route_id == "tdd-development"
+    assert record.metadata.pipeline_id == "tdd-development"
 
 
 def test_summary_store_persists_aggregate_only_and_merges_resumed_run(tmp_path) -> None:
@@ -198,3 +228,147 @@ def test_observability_retention_environment_only_uses_zero_to_disable(
 
     assert policy.max_completed_runs == 2_000
     assert policy.max_age_days is None
+
+
+def _completed_record(outcome: str) -> RunSummaryRecord:
+    return RunSummaryRecord(
+        schema_version=1,
+        metadata=RunMetadata(
+            run_id="run-x",
+            agent_id="smith",
+            created_at="2026-08-02T00:00:00+00:00",
+        ),
+        finished_at="2026-08-02T00:01:00+00:00",
+        summary=RunSummary(
+            run_id="run-x",
+            event_count=1,
+            event_counts={},
+            tool_call_count=1,
+            backtrack_count=0,
+            approval_required_count=0,
+            token_usage={},
+            outcome=outcome,
+            reason=None,
+        ),
+    )
+
+
+def test_incident_detector_flags_genuine_tool_timeouts() -> None:
+    record = _completed_record("completed")
+    trace = [
+        {"type": "tool_call_result", "data": {
+            "error": True,
+            "blocked": False,
+            "preflight": False,
+            "content": "Tool timed out after 30s",
+            "error_kind": "timeout",
+            "retryable": True,
+            "timed_out": True,
+            "side_effect_status": "unknown",
+        }},
+        {"type": "run_finished", "data": {"status": "completed"}},
+    ]
+
+    incidents = IncidentDetector().detect(record, trace)
+
+    timeouts = [incident for incident in incidents if incident.category == "tool_timeout"]
+    assert len(timeouts) == 1
+    assert timeouts[0].evidence["timeout_count"] == 1
+
+
+def test_incident_detector_does_not_flag_approval_timeout_as_tool_timeout() -> None:
+    record = _completed_record("completed")
+    trace = [
+        {"type": "tool_call_result", "data": {
+            "blocked": True,
+            "error": False,
+            "preflight": False,
+            "reason": "Approval timed out",
+        }},
+        {"type": "run_finished", "data": {"status": "completed"}},
+    ]
+
+    incidents = IncidentDetector().detect(record, trace)
+
+    assert all(incident.category != "tool_timeout" for incident in incidents)
+    assert incidents == []
+
+
+def test_diagnosis_recovers_timeout_failure_node_and_evidence() -> None:
+    record = _completed_record("completed")
+    trace = [
+        {"type": "tool_call_start", "data": {"name": "shell"}},
+        {"type": "tool_call_result", "data": {
+            "name": "shell",
+            "error": True,
+            "blocked": False,
+            "error_kind": "timeout",
+            "timed_out": True,
+        }},
+        {"type": "run_finished", "data": {"status": "completed"}},
+    ]
+
+    diagnosis = RunDiagnoser().diagnose(record, trace)
+
+    assert diagnosis.status == "needs_attention"
+    assert diagnosis.primary_category == "tool_timeout"
+    assert diagnosis.failure_node == "tool:shell"
+    assert "tool=shell" in diagnosis.evidence
+
+
+def test_incident_detector_never_emits_run_blocked_from_run_finished() -> None:
+    # RUN_FINISHED producers emit only completed/incomplete/failed/cancelled;
+    # "blocked" exists only on SKILL_END and is not a run terminal status.
+    record = _completed_record("blocked")
+    trace = [{"type": "run_finished", "data": {"status": "blocked"}}]
+
+    incidents = IncidentDetector().detect(record, trace)
+
+    assert all(incident.category != "run_blocked" for incident in incidents)
+    assert incidents == []
+
+
+def test_health_tool_success_rate_ignores_approval_required_events() -> None:
+    record = RunSummaryRecord(
+        schema_version=1,
+        metadata=RunMetadata(
+            run_id="run-1",
+            agent_id="smith",
+            created_at="2026-08-02T00:00:00+00:00",
+        ),
+        finished_at="2026-08-02T00:01:00+00:00",
+        summary=RunSummary(
+            run_id="run-1",
+            event_count=3,
+            event_counts={"tool_call_result": 2, "run_finished": 1},
+            tool_call_count=1,
+            backtrack_count=0,
+            approval_required_count=1,
+            token_usage={},
+            outcome="completed",
+            reason=None,
+        ),
+    )
+    traces = [
+        [
+            {"type": "tool_call_result", "data": {
+                "blocked": True,
+                "approval_required": True,
+                "error": False,
+            }},
+            {"type": "tool_call_result", "data": {
+                "error": False,
+                "content": "ok",
+                "approval_outcome": "granted",
+            }},
+            {"type": "run_finished", "data": {"status": "completed"}},
+        ]
+    ]
+
+    health = HealthCalculator().calculate("smith", [record], traces)
+
+    # The gate probe must not count as a phantom failure: one approved,
+    # successful tool yields 100%, not 50%.
+    assert health.tool_success_rate == 1.0
+    assert health.run_count == 1
+    assert health.completed_count == 1

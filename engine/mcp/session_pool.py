@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from engine.mcp.client import MCPClient, MCPTool
+from engine.mcp.client import MCPClient, MCPConnectError, MCPTool
 from engine.mcp.config import mcp_server_log_summary, mcp_tool_prefix_from_config, mcp_transport_from_config
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,18 @@ class MCPClientSessionPool:
 
     async def release(self, session_id: str) -> None:
         """Close all MCP connections owned by a deleted conversation."""
+        await self.evict(session_id)
+
+    async def evict(self, session_id: str) -> None:
+        """Drop a session's cached connections after a transport or tool-call
+        failure so the next acquire reconnects instead of reusing a dead server.
+
+        Unlike ``release()`` -- which is session teardown -- ``evict()`` keeps
+        the session alive: the next ``acquire()`` with the same configuration
+        reconnects every server instead of returning the now-untrusted cached
+        clients.  Callers use this when a borrowed client raises a fatal error
+        (stdio crash, HTTP session expiry, network failure).
+        """
         async with self._lifecycle_lock:
             session_lock = await self._get_session_lock(session_id)
         async with session_lock:
@@ -121,6 +133,7 @@ class MCPClientSessionPool:
 
     async def _connect_all(self, configured_servers: list[dict[str, Any]]) -> list[SessionMCPServer]:
         servers: list[SessionMCPServer] = []
+        failures = 0
         try:
             for config in configured_servers:
                 try:
@@ -131,6 +144,7 @@ class MCPClientSessionPool:
                         tools=tools,
                     ))
                 except Exception:
+                    failures += 1
                     logger.exception(
                         "failed to connect session MCP server: %r",
                         mcp_server_log_summary(config),
@@ -138,6 +152,14 @@ class MCPClientSessionPool:
         except BaseException:
             await _close_servers(servers)
             raise
+        if configured_servers and failures == len(configured_servers):
+            # Never cache an empty server list under a fingerprint whose
+            # connect failed: that would silently remove every MCP tool for
+            # the session while still short-circuiting the retry on the next
+            # acquire.  Surface a typed error the caller can act on instead.
+            raise MCPConnectError(
+                f"all {len(configured_servers)} MCP servers failed to connect"
+            )
         return servers
 
     async def _get_session_lock(self, session_id: str) -> asyncio.Lock:

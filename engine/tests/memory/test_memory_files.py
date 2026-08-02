@@ -17,3 +17,37 @@ def test_injection_detection_covers_common_chinese_marker():
 
     assert cleaned == ""
     assert injections_removed == 1
+
+
+def test_sanitize_memory_text_drops_multiline_private_key_block():
+    pem = (
+        "safe context line\n"
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEpQIBAAKCAQEAabcdefghijklmnopqrstuvwxyz0123456789\n"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\n"
+        "-----END RSA PRIVATE KEY-----\n"
+        "keep this line"
+    )
+
+    cleaned, secrets_removed, injections_removed = sanitize_memory_text(pem)
+
+    assert "safe context line" in cleaned
+    assert "keep this line" in cleaned
+    assert "PRIVATE KEY" not in cleaned
+    assert "MIIEpQIBAAKCAQEA" not in cleaned
+    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ" not in cleaned
+    assert secrets_removed >= 3
+    assert injections_removed == 0
+
+
+def test_sanitize_memory_text_redacts_a_key_only_message():
+    pem = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ==\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
+
+    cleaned, secrets_removed, _ = sanitize_memory_text(pem)
+
+    assert cleaned == ""
+    assert secrets_removed >= 3

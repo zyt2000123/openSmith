@@ -142,11 +142,97 @@ def test_half_streamed_turn_is_not_recorded(tmp_path):
     assert not path.exists() or path.read_text(encoding="utf-8").strip() == ""
 
 
+def test_recorder_forwards_prefix_cache_key_to_inner_stream(tmp_path):
+    """react_loop 在 prefix cache 开启时会给 chat_events 传 key,录制器必须透传。"""
+    path = tmp_path / "with-cache.jsonl"
+    seen: dict[str, object] = {}
+
+    class _CacheStreamingProvider:
+        stream = True
+        model = "fake-cache"
+
+        async def chat_events(self, messages, tools=None, prefix_cache_key=None):
+            seen["prefix_cache_key"] = prefix_cache_key
+            yield ProviderEvent(ProviderEventType.RESPONSE_CREATED, {})
+            yield ProviderEvent(ProviderEventType.RESPONSE_COMPLETED, {})
+
+        async def close(self) -> None:
+            pass
+
+    recorder = RecordingLLM(_CacheStreamingProvider(), path)
+
+    async def drain():
+        async for _ in recorder.chat_events(
+            [{"role": "user", "content": "x"}],
+            prefix_cache_key="stable-prefix",
+        ):
+            pass
+
+    asyncio.run(drain())
+
+    assert seen["prefix_cache_key"] == "stable-prefix"
+    assert path.read_text(encoding="utf-8").strip(), "the turn must still be recorded"
+
+
 def test_replaying_a_stream_through_chat_is_refused():
     llm = ReplayLLM([RecordedTurn(events=tuple(_stream_turn()))])
 
     with pytest.raises(ReplayShapeError):
         asyncio.run(llm.chat([{"role": "user", "content": "x"}]))
+
+
+def test_replay_shape_error_names_the_offending_turn_when_chat() -> None:
+    """诊断必须指向刚被消费的回合(off-by-one 修复),而不是下一个。"""
+    llm = ReplayLLM([RecordedTurn(events=tuple(_stream_turn()))])
+
+    with pytest.raises(ReplayShapeError) as exc_info:
+        asyncio.run(llm.chat([{"role": "user", "content": "x"}]))
+
+    assert "turn 0" in str(exc_info.value)
+    assert "turn 1" not in str(exc_info.value)
+
+
+def test_replay_shape_error_names_the_offending_turn_when_streaming() -> None:
+    """混合录音里,形状不匹配的回合编号必须准确。"""
+    llm = ReplayLLM([
+        RecordedTurn(events=tuple(_stream_turn())),
+        ChatResponse(text="done"),
+    ])
+
+    # First turn is streaming: consume it through chat_events — succeeds.
+    asyncio.run(_drain_stream(llm))
+    # Second turn is non-streaming; asking for a stream must name turn 1.
+    with pytest.raises(ReplayShapeError) as exc_info:
+        asyncio.run(_drain_stream(llm))
+
+    assert "turn 1" in str(exc_info.value)
+    assert "turn 2" not in str(exc_info.value)
+
+
+def test_load_recording_skips_a_truncated_final_line(tmp_path) -> None:
+    """崩溃留下的残缺末行不应让整份录音无法加载。"""
+    path = tmp_path / "corrupt.jsonl"
+    path.write_text(
+        '{"response":{"text":"ok"}}\n'
+        '{"response":{"te\n'        # truncated mid-append line
+        '{"response":{"text":"also ok"}}\n',
+        encoding="utf-8",
+    )
+
+    turns = load_recording(path)
+
+    assert [turn.response.text for turn in turns] == ["ok", "also ok"]
+
+
+def test_recorder_appends_atomically_without_leaving_temp_file(tmp_path) -> None:
+    """原子追加:录制文件恒可加载,且不残留临时文件。"""
+    path = tmp_path / "atomic.jsonl"
+    recorder = RecordingLLM(_FakeProvider(_turns()), path)
+    asyncio.run(_collect(recorder))
+
+    turns = load_recording(path)
+    assert [turn.response.text for turn in turns] == ["", "done"]
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 # ── non-streaming ──────────────────────────────────────────────────────────

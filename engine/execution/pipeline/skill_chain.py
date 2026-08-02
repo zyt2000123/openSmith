@@ -142,6 +142,11 @@ class SkillNode:
     # question, persists the current node, and waits for the next user message
     # instead of treating it as a failed quality gate.
     await_user_input_marker: str | None = None
+    # A small set of conversational nodes may infer a pause from a terminal
+    # question when an upstream skill does not know Smith's private marker.
+    # Other marker-capable nodes still require the marker so a trailing offer
+    # (for example, after a completed review) cannot bypass their gate.
+    infer_await_user_input_from_question: bool = False
     # ``None`` preserves the identity-wide tool set for legacy pipelines.
     # An empty tuple deliberately exposes no tools; a populated tuple is a
     # hard capability boundary for this particular node.
@@ -231,6 +236,18 @@ class SkillChain:
                     "must be a non-empty string when present"
                 )
 
+            infer_question_pause = step.get("infer_await_user_input_from_question", False)
+            if not isinstance(infer_question_pause, bool):
+                raise ValueError(
+                    f"{path.name}: steps[{index}].infer_await_user_input_from_question "
+                    "must be a boolean when present"
+                )
+            if infer_question_pause and await_marker is None:
+                raise ValueError(
+                    f"{path.name}: steps[{index}].infer_await_user_input_from_question "
+                    "requires await_user_input_marker"
+                )
+
             allowed_tools_raw = step.get("allowed_tools")
             allowed_tools: tuple[str, ...] | None = None
             if allowed_tools_raw is not None:
@@ -257,6 +274,7 @@ class SkillChain:
                 condition=condition,
                 instructions=instructions.strip(),
                 await_user_input_marker=await_marker,
+                infer_await_user_input_from_question=infer_question_pause,
                 allowed_tools=allowed_tools,
             ))
 

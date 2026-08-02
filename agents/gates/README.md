@@ -48,9 +48,9 @@ GATES = {"my_gate": MyGate}
 ```yaml
 base_gate: rubric        # 兜底层:每个节点产出先过它(可选,可为列表 base_gates)
 steps:
-  - skill: planning
-    gate: planning_llm   # 领域层:该节点自己的门禁
-    condition: needs_architecture   # 可选
+  - skill: diagnosing-bugs
+    gate: red_loop        # 领域层:该节点自己的门禁
+    condition: coding_bugfix_needs_diagnosis   # 可选
 ```
 
 键名冲突(两个文件注册同一 key)与内容文件语法错误都会在启动时直接抛错——

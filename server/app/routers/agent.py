@@ -109,7 +109,9 @@ async def stream_message(
         identity_id=body.identity_id,
         working_dir=body.working_dir,
     )
-    return EventSourceResponse(stream)
+    # ping keeps idle SSE connections (long LLM thinking turns) alive through
+    # proxies that would otherwise time out the connection.
+    return EventSourceResponse(stream, ping=15)
 
 
 @router.get("/skills", response_model=list[SkillSummaryOut])
@@ -218,7 +220,7 @@ async def resume_run(
     svc: AgentService = Depends(get_agent_service),
 ):
     stream = await svc.prepare_resume_run(run_id)
-    return EventSourceResponse(stream)
+    return EventSourceResponse(stream, ping=15)
 
 
 @router.post("/runs/{run_id}/approval", response_model=RunStateOut)

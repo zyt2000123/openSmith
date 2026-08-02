@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -27,8 +28,9 @@ SUPPORTED_PROTOCOL_VERSIONS = {
 CLIENT_INFO = {"name": "agent-smith", "version": "0.2.0"}
 MAX_TOOL_NAME_LENGTH = 64
 MAX_MCP_RESPONSE_BYTES = 1024 * 1024
-# Whole-stream backstop for SSE, where the per-message cap resets each event.
-# Loose on purpose: only a server trickling events indefinitely should hit it.
+# Whole-stream backstop for SSE and stdio: the per-message cap resets on
+# every event/line, so only a server trickling data indefinitely should hit
+# this ceiling.  Loose on purpose: legitimate long calls are unaffected.
 MAX_MCP_SSE_STREAM_BYTES = 64 * MAX_MCP_RESPONSE_BYTES
 MAX_MCP_TOOL_LIST_PAGES = 100
 _FRAMING_BROKEN_MESSAGE = (
@@ -64,6 +66,23 @@ class MCPToolError(RuntimeError):
     """Raised when an MCP tool reports a failed tool result."""
 
 
+class MCPConnectError(RuntimeError):
+    """Raised when every configured MCP server fails to connect.
+
+    Catchable by a session pool: nothing is cached for a fingerprint whose
+    connect failed, so the caller can surface the failure instead of losing
+    all MCP tools for the session.
+    """
+
+
+class MCPSessionExpiredError(RuntimeError):
+    """Raised when a Streamable HTTP MCP session has expired server-side.
+
+    The transport clears its stale session id before raising so a later
+    request can re-initialize; callers may evict the connection from a pool.
+    """
+
+
 class MCPTransport(Protocol):
     label: str
 
@@ -78,6 +97,35 @@ class MCPTransport(Protocol):
 
     async def close(self) -> None:
         ...
+
+
+def _redact_command(command: list[str]) -> str:
+    """Log only the executable name, never arguments that may embed tokens."""
+    if not command:
+        return "<no-command>"
+    return command[0]
+
+
+def _redact_url(url: str) -> str:
+    """Strip query/fragment and embedded credentials from a URL for logging.
+
+    URL query parameters and basic-auth userinfo routinely carry tokens; the
+    transport label and log summaries must never reproduce them.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<invalid-url>"
+    netloc = parsed.netloc
+    if parsed.username or parsed.password:
+        host = parsed.hostname or ""
+        try:
+            netloc = f"{host}:{parsed.port}" if parsed.port else host
+        except ValueError:
+            # Malformed port in the netloc: keep the host only, never the
+            # credentials, and never fail the redaction path on user input.
+            netloc = host
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 class StdioMCPTransport:
@@ -105,7 +153,7 @@ class StdioMCPTransport:
         # so the newline framing is gone for good and no later request on this
         # pipe can trust what it reads.
         self._framing_broken = False
-        self.label = " ".join(command)
+        self.label = _redact_command(command)
 
     async def connect(self) -> None:
         self._process = await asyncio.create_subprocess_exec(
@@ -171,6 +219,11 @@ class StdioMCPTransport:
             self._process.stdin.write((json.dumps(msg) + "\n").encode())
             await self._process.stdin.drain()
 
+            # The per-line timeout below resets on every read, so a server
+            # sending periodic notifications can otherwise hold this request
+            # open forever.  A whole-request byte budget bounds the wait the
+            # same way MAX_MCP_SSE_STREAM_BYTES bounds an SSE stream.
+            total_bytes = 0
             while True:
                 try:
                     line = await asyncio.wait_for(self._process.stdout.readline(), timeout=30)
@@ -187,6 +240,12 @@ class StdioMCPTransport:
                     raise RuntimeError("MCP stdio response exceeds maximum size") from exc
                 if not line:
                     raise RuntimeError("MCP server closed stdout unexpectedly")
+                total_bytes += len(line)
+                if total_bytes > MAX_MCP_SSE_STREAM_BYTES:
+                    # We abandon the read mid-stream, so any bytes the server
+                    # is still writing would desynchronize the next request.
+                    self._framing_broken = True
+                    raise RuntimeError("MCP stdio response stream exceeds maximum total size")
                 resp = _parse_json_object(
                     line.decode(),
                     label="MCP stdio response",
@@ -268,7 +327,7 @@ class StreamableHTTPMCPTransport:
         self._owns_client = http_client is None
         self._session_id: str | None = None
         self._protocol_version = PROTOCOL_VERSION
-        self.label = url
+        self.label = _redact_url(url)
 
     async def connect(self) -> None:
         if self._client is not None:
@@ -301,7 +360,11 @@ class StreamableHTTPMCPTransport:
             ),
         ) as response:
             if response.status_code == 404 and self._session_id:
-                raise RuntimeError("MCP HTTP session expired")
+                # The server discarded our session.  Drop the stale id so the
+                # next request can re-initialize instead of replaying it into a
+                # 404 forever, and raise a typed error the pool can evict on.
+                self._session_id = None
+                raise MCPSessionExpiredError("MCP HTTP session expired")
             response.raise_for_status()
             self._capture_session(response.headers)
 
@@ -466,21 +529,29 @@ class MCPClient:
             raise MCPToolError(content or f"MCP tool failed: {name}")
         return content
 
-    def to_openai_schemas(self, tools: list[MCPTool]) -> list[dict]:
+    def to_openai_schemas(
+        self,
+        tools: list[MCPTool],
+        *,
+        prefix: str = "mcp",
+    ) -> list[dict]:
         """Convert MCP tools to OpenAI function calling format.
 
-        Tool names are prefixed with ``mcp_`` to avoid collisions with
-        locally registered tools.
+        Names follow the same per-prefix, de-duplicated path as
+        ``register_mcp_tools_with_prefix`` so advertised names always equal the
+        names actually registered.  Pass the same prefix used for registration.
         """
         schemas: list[dict] = []
+        taken: set[str] = set()
         for tool in tools:
-            tool_part = _safe_tool_name_part(tool.name)
-            if not tool_part:
+            registered_name = _mcp_registered_name(prefix, tool.name, taken)
+            if registered_name is None:
                 continue
+            taken.add(registered_name)
             schemas.append({
                 "type": "function",
                 "function": {
-                    "name": _safe_tool_name_part(f"mcp_{tool_part}"),
+                    "name": registered_name,
                     "description": tool.description,
                     "parameters": tool.input_schema,
                 },
@@ -517,22 +588,18 @@ async def register_mcp_tools_with_prefix(
     """Discover MCP tools and register them into a ToolRegistry."""
     tools = tools if tools is not None else await client.list_tools()
     count = 0
-    safe_prefix = _safe_tool_name_part(prefix) or "mcp"
     taken: set[str] = set()
     for tool in tools:
         # 闭包捕获 — 使用默认参数绑定当前迭代值
         async def _execute(*, _client: MCPClient = client, _name: str = tool.name, **kwargs: Any) -> str:
             return await _client.call_tool(_name, kwargs)
 
-        tool_part = _safe_tool_name_part(tool.name)
-        if not tool_part:
-            log.warning("Skipping MCP tool with empty/invalid name: %r", tool.name)
-            continue
         # Cap the joined name, not the two halves: a provider applies its
         # 64-character limit to what it actually receives.
-        registered_name = _deduplicate_tool_name(
-            _safe_tool_name_part(f"{safe_prefix}_{tool_part}"), tool.name, taken
-        )
+        registered_name = _mcp_registered_name(prefix, tool.name, taken)
+        if registered_name is None:
+            log.warning("Skipping MCP tool with empty/invalid name: %r", tool.name)
+            continue
         try:
             registry.register(
                 name=registered_name,
@@ -655,6 +722,24 @@ def _deduplicate_tool_name(registered_name: str, original: str, taken: set[str])
     digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:8]
     head = registered_name[: MAX_TOOL_NAME_LENGTH - len(digest) - 1].rstrip("_")
     return f"{head}_{digest}"
+
+
+def _mcp_registered_name(prefix: str, tool_name: str, taken: set[str]) -> str | None:
+    """Build the registered tool name shared by registration and schema
+    advertisement.
+
+    Two server-side names can fold onto one registered name; ``taken`` applies
+    the same collision suffix the registry would, so an advertised schema name
+    always equals the name actually registered.  Returns None when the tool
+    name cleans down to nothing.
+    """
+    safe_prefix = _safe_tool_name_part(prefix) or "mcp"
+    tool_part = _safe_tool_name_part(tool_name)
+    if not tool_part:
+        return None
+    return _deduplicate_tool_name(
+        _safe_tool_name_part(f"{safe_prefix}_{tool_part}"), tool_name, taken
+    )
 
 
 def _client_label(client: Any) -> str:

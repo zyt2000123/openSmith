@@ -25,12 +25,23 @@ compaction timing, gate verdicts, routing, tool dispatch).
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
 
-from engine.llm.contracts import ChatResponse, ToolCallData
+from engine.llm.contracts import (
+    ChatResponse,
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    ModelLimits,
+    ProviderCapabilities,
+    ToolCallData,
+)
 from engine.llm.events import ProviderEvent, ProviderEventType
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayExhaustedError(RuntimeError):
@@ -102,12 +113,29 @@ class RecordedTurn:
 
 
 def load_recording(path: Path | str) -> list[RecordedTurn]:
-    """Read a JSONL recording into ordered turns."""
+    """Read a JSONL recording into ordered turns.
+
+    A crash during append can leave a truncated final line.  Malformed or
+    non-object lines are skipped (with a warning) so the rest of the recording
+    stays loadable instead of failing wholesale.
+    """
+    recording_path = Path(path)
     turns: list[RecordedTurn] = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in recording_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        payload = json.loads(line)
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            logger.warning(
+                "skipping malformed recording line in %s", recording_path.name
+            )
+            continue
+        if not isinstance(payload, dict):
+            logger.warning(
+                "skipping non-object recording line in %s", recording_path.name
+            )
+            continue
         if "events" in payload:
             turns.append(
                 RecordedTurn(
@@ -144,9 +172,18 @@ class RecordingLLM:
         return getattr(self._inner, name)
 
     def _append(self, payload: dict[str, Any]) -> None:
-        line = json.dumps(payload, ensure_ascii=False)
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        # Append through a same-directory temp file and an atomic rename so a
+        # crash mid-write cannot leave a truncated final line that would make
+        # the whole recording unloadable.  load_recording skips malformed lines
+        # as a second line of defense for files written by older versions.
+        tmp = self._path.with_name(f"{self._path.name}.tmp")
+        try:
+            existing = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
+        except FileNotFoundError:
+            existing = ""
+        tmp.write_text(existing + line, encoding="utf-8")
+        os.replace(tmp, self._path)
 
     async def chat(
         self,
@@ -164,15 +201,22 @@ class RecordingLLM:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        prefix_cache_key: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Relay the event stream while collecting the whole turn.
 
         The write happens once, after the stream ends. Appending per event would
         leave a half turn on the file when a consumer breaks early, and replay
         would then serve that half turn as if it were complete.
+
+        ``prefix_cache_key`` is forwarded only when present so the wrapper also
+        works over minimal inner stubs that predate that parameter.
         """
         collected: list[dict[str, Any]] = []
-        async for event in self._inner.chat_events(messages, tools=tools):
+        kwargs: dict[str, Any] = {"tools": tools}
+        if prefix_cache_key is not None:
+            kwargs["prefix_cache_key"] = prefix_cache_key
+        async for event in self._inner.chat_events(messages, **kwargs):
             collected.append(dump_event(event))
             yield event
         self._append({"events": collected})
@@ -192,6 +236,7 @@ class ReplayLLM:
     """
 
     model = "replay"
+    provider = "replay"
 
     def __init__(self, turns: Sequence[RecordedTurn | ChatResponse]) -> None:
         self._turns = [
@@ -202,6 +247,25 @@ class ReplayLLM:
         self.stream = bool(self._turns) and self._turns[0].is_streaming
         if self.stream:
             self.chat_events = self._replay_chat_events
+        # A recording does not capture the original route's capacity facts, so
+        # replay reports the same conservative defaults the engine falls back
+        # to for any client that omits them.  Declaring them explicitly keeps
+        # ReplayLLM a complete LLMPort instead of relying on getattr fallbacks.
+        self.capabilities = ProviderCapabilities(
+            streaming=self.stream,
+            tool_calls=True,
+            prefix_cache_key=False,
+        )
+        self.context_window = DEFAULT_CONTEXT_WINDOW
+        self.context_window_declared = False
+        self.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS
+        self.max_output_tokens_declared = False
+        self.limits = ModelLimits(
+            context_window=self.context_window,
+            context_window_declared=self.context_window_declared,
+            max_output_tokens=self.max_output_tokens,
+            max_output_tokens_declared=self.max_output_tokens_declared,
+        )
 
     @property
     def turns_consumed(self) -> int:
@@ -226,8 +290,10 @@ class ReplayLLM:
     ) -> ChatResponse:
         turn = self._next_turn()
         if turn.response is None:
+            # ``_next_turn`` has already advanced ``_index``, so the turn that
+            # just failed the shape check is ``_index - 1``, not ``_index``.
             raise ReplayShapeError(
-                f"turn {self._index} was recorded as a stream — replay it through "
+                f"turn {self._index - 1} was recorded as a stream — replay it through "
                 "chat_events, not chat"
             )
         return turn.response
@@ -236,11 +302,17 @@ class ReplayLLM:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        prefix_cache_key: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
+        # ``prefix_cache_key`` is accepted for LLMPort signature parity but
+        # deliberately ignored: recorded turns are served in order, they are
+        # never regenerated, so no cache hint is meaningful here.
         turn = self._next_turn()
         if turn.events is None:
+            # ``_next_turn`` has already advanced ``_index``, so the turn that
+            # just failed the shape check is ``_index - 1``, not ``_index``.
             raise ReplayShapeError(
-                f"turn {self._index} was recorded non-streaming — replay it "
+                f"turn {self._index - 1} was recorded non-streaming — replay it "
                 "through chat, not chat_events"
             )
         for event in turn.events:

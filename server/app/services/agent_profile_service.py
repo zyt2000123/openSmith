@@ -40,9 +40,6 @@ class AgentProfileService:
             try:
                 init_smith_profile_files(
                     profile_seed_dir=common_config.PATHS.smith_profile_dir,
-                    name=body.name,
-                    role=body.role,
-                    description=body.description,
                 )
             except Exception:
                 await self.repo.delete(row["id"])

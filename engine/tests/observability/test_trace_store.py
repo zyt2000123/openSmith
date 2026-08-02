@@ -148,3 +148,23 @@ def test_trace_store_cursor_does_not_advance_past_an_incomplete_record(tmp_path)
 
     assert [record["seq"] for record in appended_records] == [2]
     assert next_cursor == path.stat().st_size
+
+
+def test_trace_store_only_chmods_when_creating_the_trace_file(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = TraceStore(tmp_path)
+    store.append("run-chmod", ExecutionEvent(EventType.RUN_STARTED, {}))
+
+    chmod_calls: list[Path] = []
+
+    def record_chmod(path: Path, mode: int) -> None:
+        chmod_calls.append(path)
+
+    monkeypatch.setattr(Path, "chmod", record_chmod)
+    store.append("run-chmod", ExecutionEvent(EventType.RUN_FINISHED, {}))
+
+    # Appending to an already-private file must not re-chmod on every event.
+    assert chmod_calls == []
+    assert os.stat(tmp_path / "traces" / "run-chmod.jsonl").st_mode & 0o777 == 0o600

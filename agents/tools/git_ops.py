@@ -109,7 +109,8 @@ def _safe_environment(cwd: str | None) -> dict[str, str]:
 
     Git may execute repository-controlled hooks, filters, and helpers.  Those
     subprocesses must not inherit provider credentials or other service
-    secrets owned by the Agent-Smith runtime.
+    secrets owned by the Agent-Smith runtime.  ``GIT_PAGER``/``GIT_EDITOR``
+    pin interactive programs to no-ops since our captures are pipes anyway.
     """
     home = os.path.abspath(cwd) if cwd else os.getcwd()
     environment = {
@@ -119,6 +120,8 @@ def _safe_environment(cwd: str | None) -> dict[str, str]:
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "Never",
+        "GIT_PAGER": "cat",
+        "GIT_EDITOR": "true",
     }
     for key in _SAFE_ENV_KEYS:
         value = os.environ.get(key)
@@ -133,8 +136,22 @@ async def _run_git(
     """Run a git command via the execution environment; return (returncode, stdout, stderr)."""
     if environment is None:
         return -1, "", "no execution environment is available for git"
+    # A repository's .git/config is trusted input from the workspace and can
+    # point git at commands it would then execute in this process.  Neutralize
+    # every such knob we know about with command-line overrides (which beat
+    # repo config): hooks, the fsmonitor helper, external diffs, credential
+    # helpers, and a custom ssh transport.  Filters (clean/smudge via
+    # .gitattributes) and remote.<name>.receivepack/uploadpack have no global
+    # override and remain a documented residual.
+    harden = [
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.fsmonitor=false",
+        "-c", "diff.external=",
+        "-c", "credential.helper=",
+        "-c", "core.sshCommand=ssh",
+    ]
     result = await environment.run_command(
-        argv=["git", *args],
+        argv=["git", *harden, *args],
         cwd=cwd,
         timeout_seconds=timeout,
         env=_safe_environment(cwd),
@@ -147,15 +164,28 @@ async def _run_git(
     return exit_code, result.stdout, result.stderr
 
 
+_URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s]+)@")
+
+
+def _redact_url_credentials(text: str) -> str:
+    """Strip userinfo (including any embedded password) from URLs.
+
+    A repository's remote URL can carry embedded credentials
+    (``https://user:token@host/repo``); ``git remote -v`` and push output echo
+    them verbatim, leaking the token into tool output and the transcript.
+    """
+    return _URL_CREDENTIALS_RE.sub(r"\1***@", text)
+
+
 def _format_result(returncode: int, stdout: str, stderr: str) -> str:
     """Format git output into a single result string."""
     parts: list[str] = []
     if stdout:
         text = stdout if len(stdout) <= MAX_OUTPUT else stdout[:MAX_OUTPUT] + "\n... (truncated)"
-        parts.append(text)
+        parts.append(_redact_url_credentials(text))
     if stderr:
         text = stderr if len(stderr) <= MAX_OUTPUT else stderr[:MAX_OUTPUT] + "\n... (truncated)"
-        parts.append(f"[stderr]\n{text}")
+        parts.append(f"[stderr]\n{_redact_url_credentials(text)}")
     body = "\n".join(parts) if parts else "(no output)"
     return f"[exit_code={returncode}]\n{body}"
 
@@ -369,7 +399,7 @@ async def execute(
 
         remotes = await probe("remotes", ["remote", "-v"])
         if remotes and remotes.strip():
-            sections.append(f"Remotes:\n{remotes.strip()}")
+            sections.append(f"Remotes:\n{_redact_url_credentials(remotes.strip())}")
 
         history = await probe("recent commits", ["log", "--oneline", "-10", "--no-decorate"])
         if history and history.strip():

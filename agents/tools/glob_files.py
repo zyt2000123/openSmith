@@ -99,30 +99,36 @@ def _safe_glob(base: Path, pattern: str) -> tuple[list[Path], bool]:
         except OSError:
             return
 
-    def walk(directory: Path, index: int) -> None:
+    # Explicit DFS stack instead of recursion: the walk depth equals the
+    # directory depth, so a deep tree could exhaust the Python stack before
+    # MAX_SCAN_ENTRIES ever tripped.  Results are sorted downstream, so LIFO
+    # order here does not affect the output.
+    stack: list[tuple[Path, int]] = [(base, 0)]
+    while stack:
+        directory, index = stack.pop()
         key = (directory, index)
         if key in visited:
-            return
+            continue
         visited.add(key)
         if index == len(components):
             add_file(directory)
-            return
+            continue
 
         component = components[index]
         if component == "**":
-            walk(directory, index + 1)
+            stack.append((directory, index + 1))
             for entry in entries(directory):
                 if entry.name in EXCLUDED_DIRS or entry.name.startswith(".") or entry.is_symlink():
                     continue
                 candidate = Path(entry.path)
                 try:
                     if entry.is_dir(follow_symlinks=False):
-                        walk(candidate, index)
+                        stack.append((candidate, index))
                     elif index == len(components) - 1 and entry.is_file(follow_symlinks=False):
                         add_file(candidate)
                 except OSError:
                     continue
-            return
+            continue
 
         for entry in entries(directory):
             if (
@@ -137,11 +143,10 @@ def _safe_glob(base: Path, pattern: str) -> tuple[list[Path], bool]:
                     if entry.is_file(follow_symlinks=False):
                         add_file(candidate)
                 elif entry.is_dir(follow_symlinks=False):
-                    walk(candidate, index + 1)
+                    stack.append((candidate, index + 1))
             except OSError:
                 continue
 
-    walk(base, 0)
     return matches, truncated
 
 

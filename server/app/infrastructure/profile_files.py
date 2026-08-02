@@ -11,13 +11,8 @@ def smith_profile_dir() -> Path:
     return common_config.PATHS.agent_dir
 
 
-def init_smith_profile_files(
-    *,
-    profile_seed_dir: Path,
-    name: str,
-    role: str,
-    description: str,
-) -> None:
+def init_smith_profile_files(*, profile_seed_dir: Path) -> None:
+    """Seed the one writable runtime profile from the shipped templates."""
     dest = smith_profile_dir()
     dest.mkdir(parents=True, exist_ok=True)
 

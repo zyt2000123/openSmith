@@ -52,24 +52,36 @@ class SkillRegistry:
 
     def load_builtin(self, skills_dir: Path) -> None:
         """Scan *skills_dir* for subdirectories containing SKILL.md."""
-        if not skills_dir.is_dir():
+        if skills_dir.is_symlink() or not skills_dir.is_dir():
             return
+        resolved_root = skills_dir.resolve()
         loaded: dict[str, SkillBody] = {}
         for child in sorted(skills_dir.iterdir()):
+            if child.is_symlink() or not child.is_dir():
+                continue
             skill_file = child / "SKILL.md"
-            if skill_file.is_file():
-                skill = _parse_or_skip(skill_file)
-                if skill is None:
-                    continue
-                if skill.meta.name != child.name:
-                    logger.warning(
-                        "Skipping skill whose directory and declared name differ: %s",
-                        skill_file,
-                    )
-                    continue
-                loaded[skill.meta.name] = skill
+            if (
+                skill_file.is_symlink()
+                or not skill_file.is_file()
+                or not skill_file.resolve().is_relative_to(resolved_root)
+            ):
+                continue
+            skill = _parse_or_skip(skill_file)
+            if skill is None:
+                continue
+            if skill.meta.name != child.name:
+                logger.warning(
+                    "Skipping skill whose directory and declared name differ: %s",
+                    skill_file,
+                )
+                continue
+            loaded[skill.meta.name] = skill
         with self._lock:
             self._builtin_skills = loaded
+            # A fresh scan supersedes any prior per-request allowlist; a stale
+            # _allowed_names would otherwise hide newly added skills after a
+            # mid-request catalog refresh.
+            self._allowed_names = None
             self._rebuild_active_catalog()
 
     def load_agent_skills(self, agent_skills_dir: Path) -> None:
@@ -79,6 +91,9 @@ class SkillRegistry:
                 self._agent_skills_dir = None
                 self._agent_skills = {}
                 self._agent_skill_dirs = {}
+                # See comment below: a fresh scan must not be gated by a stale
+                # per-request allowlist.
+                self._allowed_names = None
                 self._rebuild_active_catalog()
             return
         resolved_root = agent_skills_dir.resolve()
@@ -109,6 +124,12 @@ class SkillRegistry:
             self._agent_skills_dir = agent_skills_dir
             self._agent_skills = loaded
             self._agent_skill_dirs = loaded_dirs
+            # Mid-request refreshes (e.g. after a skill_manage mutation) must
+            # re-derive the active catalog from the full scan.  A stale
+            # _allowed_names set at request start would otherwise filter out
+            # skills created after that point for the rest of the request;
+            # callers re-apply their restrictions from the full catalog.
+            self._allowed_names = None
             self._rebuild_active_catalog()
 
     def get(self, name: str) -> SkillBody | None:

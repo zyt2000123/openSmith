@@ -428,6 +428,182 @@ def test_anthropic_retries_pre_content_overloaded_stream_error() -> None:
     assert events[1].data == {"delta": "Recovered"}
 
 
+def test_openai_retries_a_pre_content_truncated_stream() -> None:
+    """流在产出任何内容前被切断(缺 [DONE])属于瞬时故障,应像 Anthropic 一样重试。"""
+    adapter = OpenAIAdapter(LLMProviderConfig(
+        provider="openai", api_key="k",
+        base_url="https://openai.test/v1", model="m",
+    ))
+    client = ProviderClient(adapter)
+    calls = {"n": 0}
+
+    async def no_wait(*_args) -> None:
+        return None
+
+    async def fake_send(request, *, stream: bool):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # A relay drops the connection before [DONE], with no content.
+            return httpx.Response(
+                200,
+                request=request,
+                stream=_SseStream([b'data: {"choices":[{"delta":{}}]}\n\n']),
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_SseStream([
+                b'data: {"choices":[{"delta":{"content":"Recovered"}}]}\n\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                b"data: [DONE]\n\n",
+            ]),
+        )
+
+    adapter._wait_for_retry = no_wait  # type: ignore[method-assign]
+    adapter._http.send = fake_send  # type: ignore[assignment]
+
+    try:
+        events = asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    assert calls["n"] == 2
+    assert [event.type for event in events] == [
+        ProviderEventType.RESPONSE_CREATED,
+        ProviderEventType.OUTPUT_TEXT_DELTA,
+        ProviderEventType.RESPONSE_COMPLETED,
+    ]
+    assert events[1].data == {"delta": "Recovered"}
+
+
+def test_anthropic_retries_a_pre_content_truncated_stream() -> None:
+    """流在产出任何内容前被切断(缺 message_stop)属于瞬时故障,应像 OpenAI 一样重试。"""
+    adapter = AnthropicAdapter(_anthropic_config())
+    client = ProviderClient(adapter)
+    calls = {"n": 0}
+
+    async def no_wait(*_args) -> None:
+        return None
+
+    async def fake_send(request, *, stream: bool):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # A relay ends the stream cleanly before message_stop, with no content.
+            return httpx.Response(
+                200,
+                request=request,
+                stream=_SseStream([
+                    b'event: message_start\ndata: {"type":"message_start","message":{}}\n\n',
+                ]),
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_SseStream([
+                b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+                b'"index":0,"delta":{"type":"text_delta","text":"Recovered"}}\n\n',
+                b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            ]),
+        )
+
+    adapter._wait_for_retry = no_wait  # type: ignore[method-assign]
+    adapter._http.send = fake_send  # type: ignore[assignment]
+
+    try:
+        events = asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    assert calls["n"] == 2
+    assert [event.type for event in events] == [
+        ProviderEventType.RESPONSE_CREATED,
+        ProviderEventType.OUTPUT_TEXT_DELTA,
+        ProviderEventType.RESPONSE_COMPLETED,
+    ]
+    assert events[1].data == {"delta": "Recovered"}
+
+
+def test_anthropic_truncation_after_content_is_not_retried() -> None:
+    """内容已产出后被切断不再是瞬时故障,直接以原始错误结束。"""
+    from engine.llm.contracts import LLMResponseError as _Err
+
+    adapter = AnthropicAdapter(_anthropic_config())
+    client = ProviderClient(adapter)
+    calls = {"n": 0}
+
+    async def no_wait(*_args) -> None:
+        return None
+
+    async def fake_send(request, *, stream: bool):
+        calls["n"] += 1
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_SseStream([
+                b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+                b'"index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+            ]),
+        )
+
+    adapter._wait_for_retry = no_wait  # type: ignore[method-assign]
+    adapter._http.send = fake_send  # type: ignore[assignment]
+
+    try:
+        with pytest.raises(_Err):
+            asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    assert calls["n"] == 1
+
+
+def test_openai_stream_error_does_not_surface_provider_message() -> None:
+    """Provider error text echoes the prompt; it must not reach the exception."""
+    from engine.llm.contracts import LLMResponseError as _Err
+
+    client = _openai_client()
+
+    async def fake_send(request, *, stream: bool):
+        return httpx.Response(200, request=request, stream=_SseStream([
+            b'data: {"error":{"message":"the user said SECRET-CONTENT","type":"rate_limit"}}\n\n',
+            b"data: [DONE]\n\n",
+        ]))
+
+    client.adapter._http.send = fake_send  # type: ignore[assignment]
+    try:
+        with pytest.raises(_Err) as exc_info:
+            asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    assert "SECRET-CONTENT" not in str(exc_info.value)
+    assert "rate_limit" not in str(exc_info.value)
+
+
+def test_anthropic_stream_error_does_not_surface_provider_message() -> None:
+    """Provider error text echoes the prompt; only the sanitized type may surface."""
+    from engine.llm.contracts import LLMResponseError as _Err
+
+    adapter = AnthropicAdapter(_anthropic_config())
+    client = ProviderClient(adapter)
+
+    async def fake_send(request, *, stream: bool):
+        return httpx.Response(200, request=request, stream=_SseStream([
+            b'event: error\ndata: {"type":"error","error":'
+            b'{"type":"invalid_request_error","message":"echo SECRET-CONTENT"}}\n\n',
+        ]))
+
+    adapter._http.send = fake_send  # type: ignore[assignment]
+    try:
+        with pytest.raises(_Err) as exc_info:
+            asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    assert "SECRET-CONTENT" not in str(exc_info.value)
+    assert "invalid_request_error" in str(exc_info.value)
+
+
 def test_anthropic_moves_late_system_instruction_into_ordered_user_turn() -> None:
     system, messages = AnthropicAdapter._translate_messages([
         {"role": "system", "content": "Initial guidance."},

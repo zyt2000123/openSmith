@@ -10,7 +10,7 @@
 | 理解产品边界 | [01 · 产品设计与定位](01-产品设计与定位.md) | `README.md`、Shell/Server 入口 |
 | 理解当前架构与一次 Run | [02 · 系统架构](02-系统架构.md) | `server/app/main.py`、`engine/execution/` |
 | 修改执行运行时 | [04 · Engine 设计与实现](04-Engine-设计与实现.md) | `engine/` 与对应测试 |
-| 修改模型调用、记忆、身份或技能 | [04b · LLM](04b-LLM模块设计.md)、[05 · 记忆](05-Engine-记忆系统.md)、[06 · Agents](06-Agents-内容层.md) | `engine/{llm,memory,identity,skill}/`、`agents/` |
+| 修改模型调用、记忆、身份或技能 | [04b · LLM](04b-LLM模块设计.md)、[05 · 记忆](05-Engine-记忆系统.md)、[06 · Agents](06-Agents-内容层.md) | `engine/{llm,memory,identity,skill}/`、`agents/`（目录地图见 [`agents/README.md`](../agents/README.md)） |
 | 修改本地 API 或终端 UI | [07 · Server](07-Server-平台后端.md)、[08 · Shell](08-Shell-终端前端.md) | `server/app/routers/`、`shell/src/` |
 | 开发、验证和下一阶段工作 | [10 · 开发规范](10-开发规范与约定.md)、[11 · 路线图](11-开发路线图与待办.md) | 包脚本、测试、Issue/ADR |
 

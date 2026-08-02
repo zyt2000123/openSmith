@@ -138,5 +138,6 @@ class AgentProfileRepo:
             "knowledge": json.loads(row["knowledge"]),
             "environment": row["environment"],
             "accent": row["accent"],
+            "config_path": row["config_path"],
             "created_at": row["created_at"],
         }

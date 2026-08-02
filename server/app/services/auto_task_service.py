@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 _RETRY_BASE_DELAY_SECONDS = 60
 _MAX_RETRY_DELAY_SECONDS = 900
 _LEASE_RENEW_INTERVAL_SECONDS = 60
+# Safety net for a whole auto-task run.  Individual LLM requests and tool calls
+# have their own timeouts; this caps a pathological multi-turn loop so a hung
+# run cannot hold a _MAX_CONCURRENT_RUNS slot (and its lease) forever.
+_TASK_EXECUTION_TIMEOUT_SECONDS = 1800
 # Concurrent detached runs. Each one drives a full engine turn, so this is a cap
 # on simultaneous LLM work, not on throughput: deferred tasks stay due.
 _MAX_CONCURRENT_RUNS = 4
@@ -81,17 +85,17 @@ class AutoTaskService:
         rows = await self.repo.list_by_agent(agent_id)
         return [AutoTaskOut(**r) for r in rows]
 
-    async def get_auto_task(self, task_id: str) -> AutoTaskOut:
+    async def get_auto_task(self, agent_id: str, task_id: str) -> AutoTaskOut:
         row = await self.repo.get(task_id)
-        if row is None:
+        if row is None or row["agent_id"] != agent_id:
             raise HTTPException(404, "Auto task not found")
         return AutoTaskOut(**row)
 
     async def update_auto_task(
-        self, task_id: str, body: AutoTaskUpdate
+        self, agent_id: str, task_id: str, body: AutoTaskUpdate
     ) -> AutoTaskOut:
         existing = await self.repo.get(task_id)
-        if existing is None:
+        if existing is None or existing["agent_id"] != agent_id:
             raise HTTPException(404, "Auto task not found")
 
         updates = body.model_dump(exclude_none=True)
@@ -108,17 +112,20 @@ class AutoTaskService:
             raise HTTPException(404, "Auto task not found")
         return AutoTaskOut(**row)
 
-    async def delete_auto_task(self, task_id: str) -> None:
+    async def delete_auto_task(self, agent_id: str, task_id: str) -> None:
+        row = await self.repo.get(task_id)
+        if row is None or row["agent_id"] != agent_id:
+            raise HTTPException(404, "Auto task not found")
         deleted = await self.repo.delete(task_id)
         if not deleted:
             raise HTTPException(404, "Auto task not found")
 
     # ── Trigger / Run ──
 
-    async def trigger_auto_task(self, task_id: str) -> AutoTaskRunOut:
+    async def trigger_auto_task(self, agent_id: str, task_id: str) -> AutoTaskRunOut:
         """Accept one run of an auto task; the run itself proceeds in the background."""
         task = await self.repo.get(task_id)
-        if task is None:
+        if task is None or task["agent_id"] != agent_id:
             raise HTTPException(404, "Auto task not found")
         started = await self.start_auto_task(task)
         if started is None:
@@ -152,8 +159,10 @@ class AutoTaskService:
         """Execute: create a session, send the instruction to engine, save the run."""
         task_id = task["id"]
         agent_id = task["agent_id"]
+        trigger_type = task["trigger_type"]
+        trigger_config = task["trigger_config"]
+        run_finalized: dict | None = None
 
-        next_run = self._calc_next_run(task["trigger_type"], task["trigger_config"])
         lease_renewal = asyncio.create_task(
             self._renew_lease_until_finished(task_id, lease_token)
         )
@@ -185,44 +194,87 @@ class AutoTaskService:
                 profile_name,
                 session_id=session["id"],
             )
-            result = await engine_reply_with_runtime(
-                EngineRequest(
-                    message=task["instruction"],
-                    identity_id=identity_id,
-                    working_dir=working_dir,
-                ),
-                runtime,
-                services,
-            )
+            try:
+                result = await asyncio.wait_for(
+                    engine_reply_with_runtime(
+                        EngineRequest(
+                            message=task["instruction"],
+                            identity_id=identity_id,
+                            working_dir=working_dir,
+                        ),
+                        runtime,
+                        services,
+                    ),
+                    timeout=_TASK_EXECUTION_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                raise RuntimeError(
+                    f"auto task timed out after {_TASK_EXECUTION_TIMEOUT_SECONDS}s"
+                ) from None
             reply_text = result.text
 
             await self.session_repo.add_message(
                 session["id"], "assistant", reply_text
             )
 
-            if not await self.repo.finish_task(
-                task_id,
-                "idle",
-                next_run,
-                lease_token,
-                retry_count=0,
-            ):
-                raise RuntimeError("auto task lease was lost before completion")
+            # Compute the next slot from completion time, not start time: an
+            # interval/cron task whose execution outlives its schedule must not
+            # be immediately due again.
+            next_run = self._calc_next_run(trigger_type, trigger_config)
             finished = await self.repo.finish_run(run["id"], "completed", reply_text)
             if finished is None:
                 raise HTTPException(500, "Failed to record auto task run")
-            return AutoTaskRunOut(**finished)
+            run_finalized = finished
+            try:
+                lease_released = await self.repo.finish_task(
+                    task_id,
+                    "idle",
+                    next_run,
+                    lease_token,
+                    retry_count=0,
+                )
+            except Exception:
+                # Bookkeeping failure after the run was recorded as completed.
+                # Never downgrade the run to failed or reschedule a retry, which
+                # would re-apply the engine's side effects; release the lease
+                # best-effort so the task is not stuck 'running' until expiry.
+                log.exception("failed to finalize auto task %s after completion", task_id)
+                lease_released = False
+                try:
+                    await self.repo.finish_task(
+                        task_id, "idle", next_run, lease_token, retry_count=0
+                    )
+                except Exception:
+                    log.warning(
+                        "auto task %s lease was not released; it will expire and be reclaimed",
+                        task_id,
+                        exc_info=True,
+                    )
+            if not lease_released:
+                # Either another worker reclaimed the task (inherent to the lease
+                # design) or a retry above failed; either way this run is final.
+                log.warning("Auto task %s lease was lost after completion", task_id)
+            return AutoTaskRunOut(**run_finalized)
 
         except Exception as exc:
+            if run_finalized is not None:
+                # Defensive: the success path returns before any later statement,
+                # but never turn a completed run into a failed one.
+                log.exception("unexpected error after auto task %s completed", task_id)
+                return AutoTaskRunOut(**run_finalized)
             log.exception("Auto task %s failed", task_id)
-            is_scheduled = task.get("trigger_type") != "manual"
+            is_scheduled = trigger_type != "manual"
             retry_count = int(task.get("retry_count") or 0) + 1 if is_scheduled else 0
             max_retries = max(0, int(task.get("max_retries", 2) or 0))
-            retry_at = next_run
             retry_status = "failed"
             if is_scheduled and retry_count <= max_retries:
                 retry_status = "idle"
                 retry_at = self._retry_next_run(retry_count)
+            else:
+                # Non-retryable failure: schedule the next slot from now so a
+                # task whose execution outlived its interval does not immediately
+                # loop through failure again.
+                retry_at = self._calc_next_run(trigger_type, trigger_config)
             finished_task = await self.repo.finish_task(
                 task_id,
                 retry_status,
@@ -245,7 +297,10 @@ class AutoTaskService:
             except asyncio.CancelledError:
                 pass
 
-    async def list_runs(self, task_id: str) -> list[AutoTaskRunOut]:
+    async def list_runs(self, agent_id: str, task_id: str) -> list[AutoTaskRunOut]:
+        row = await self.repo.get(task_id)
+        if row is None or row["agent_id"] != agent_id:
+            raise HTTPException(404, "Auto task not found")
         rows = await self.repo.list_runs(task_id)
         return [AutoTaskRunOut(**r) for r in rows]
 

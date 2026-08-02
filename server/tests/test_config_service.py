@@ -613,6 +613,69 @@ llm:
     assert stored["llm"]["routes"]["interactive"]["model"] == "route-choice"
 
 
+def test_config_service_model_null_clears_a_shadowing_interactive_route(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Clearing the base model must also drop a stale interactive route model, or
+    the UI would report no model while the route keeps one in effect."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: openai
+  api_key: primary-secret
+  base_url: https://primary.example/v1
+  model: base-model
+  routes:
+    interactive:
+      model: stale-model
+      timeout_profile: interactive
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ConfigService, "_config_path", config_path)
+
+    saved = ConfigService().set_llm_config(updates={"model": None})
+
+    assert saved["model"] == ""
+    stored = load_yaml(config_path)
+    assert "model" not in stored["llm"]
+    assert stored["llm"]["routes"]["interactive"] == {"timeout_profile": "interactive"}
+
+
+def test_config_service_reports_effective_generation_limits_when_route_overrides_them(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """get_llm_config must report what the interactive route actually resolves to,
+    including max_output_tokens/context_window — the engine merges those too."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: openai
+  api_key: primary-secret
+  base_url: https://primary.example/v1
+  model: base-model
+  max_output_tokens: 2048
+  context_window: 128000
+  routes:
+    interactive:
+      max_output_tokens: 4096
+      context_window: 200000
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ConfigService, "_config_path", config_path)
+
+    shown = ConfigService().get_llm_config()
+
+    assert shown["model"] == "base-model"
+    assert shown["max_output_tokens"] == 4096
+    assert shown["context_window"] == 200000
+
+
 def test_config_api_rejects_unknown_provider_and_boolean_generation_limit(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(ConfigService, "_config_path", tmp_path / "config.yaml")
     app = FastAPI()

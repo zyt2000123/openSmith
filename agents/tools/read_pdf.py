@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from collections.abc import Iterable
 
 TOOL_META = {
@@ -42,6 +43,7 @@ TOOL_META = {
     "approval_policy": "never",
     "side_effect": "none",
     "execution_environment": "host",
+    "timeout_seconds": 120,
 }
 
 MAX_PDF_BYTES = 100 * 1024 * 1024
@@ -52,27 +54,33 @@ _PAGE_PART = re.compile(r"^(\d+)(?:-(\d+))?$")
 
 
 def _parse_pages(spec: str, page_count: int) -> list[int]:
-    """Parse a 1-based page selection into zero-based page indexes."""
+    """Parse a 1-based page selection into zero-based page indexes.
+
+    An empty/``all`` selection reads a bounded window of the whole document
+    (capped at ``MAX_PAGES_PER_CALL``) rather than erroring on a long PDF;
+    an *explicit* selection larger than the cap is a user error and fails
+    loudly here.
+    """
     normalized = spec.strip().lower()
     if not normalized or normalized == "all":
-        indexes = list(range(page_count))
-    else:
-        indexes: list[int] = []
-        seen: set[int] = set()
-        for raw_part in normalized.split(","):
-            part = raw_part.strip()
-            match = _PAGE_PART.fullmatch(part)
-            if match is None:
-                raise ValueError(f"Invalid page selection: {raw_part.strip()!r}")
-            start = int(match.group(1))
-            end = int(match.group(2) or start)
-            if start < 1 or end < start or end > page_count:
-                raise ValueError(f"Page selection out of range: {part!r} (PDF has {page_count} pages)")
-            for page in range(start, end + 1):
-                index = page - 1
-                if index not in seen:
-                    indexes.append(index)
-                    seen.add(index)
+        return list(range(min(page_count, MAX_PAGES_PER_CALL)))
+
+    indexes: list[int] = []
+    seen: set[int] = set()
+    for raw_part in normalized.split(","):
+        part = raw_part.strip()
+        match = _PAGE_PART.fullmatch(part)
+        if match is None:
+            raise ValueError(f"Invalid page selection: {raw_part.strip()!r}")
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start < 1 or end < start or end > page_count:
+            raise ValueError(f"Page selection out of range: {part!r} (PDF has {page_count} pages)")
+        for page in range(start, end + 1):
+            index = page - 1
+            if index not in seen:
+                indexes.append(index)
+                seen.add(index)
 
     if len(indexes) > MAX_PAGES_PER_CALL:
         raise ValueError(
@@ -105,10 +113,22 @@ def _metadata_lines(metadata: object) -> list[str]:
     return lines
 
 
-def _extract_with_pypdf(reader: object, indexes: Iterable[int]) -> dict[int, str]:
+_READ_TIMEOUT_BUDGET = 100.0  # seconds; slightly under TOOL_META timeout_seconds so a
+                              # clean error surfaces before the registry cancels the await
+
+
+class _PdfTimeout(Exception):
+    """Internal signal that the per-call extraction budget was exceeded."""
+
+
+def _extract_with_pypdf(
+    reader: object, indexes: Iterable[int], deadline: float | None = None
+) -> dict[int, str]:
     pages = getattr(reader, "pages")
     result: dict[int, str] = {}
     for index in indexes:
+        if deadline is not None and time.monotonic() > deadline:
+            raise _PdfTimeout()
         try:
             result[index] = pages[index].extract_text() or ""
         except Exception as exc:
@@ -120,12 +140,15 @@ def _extract_with_pdfplumber(
     path: str,
     indexes: Iterable[int],
     password: str | None,
+    deadline: float | None = None,
 ) -> dict[int, str]:
     import pdfplumber
 
     result: dict[int, str] = {}
     with pdfplumber.open(path, password=password) as pdf:
         for index in indexes:
+            if deadline is not None and time.monotonic() > deadline:
+                raise _PdfTimeout()
             try:
                 result[index] = pdf.pages[index].extract_text() or ""
             except Exception as exc:
@@ -165,7 +188,9 @@ def _execute_sync(
             if not reader.decrypt(password):
                 return "Error: PDF password is incorrect or unsupported."
         page_count = len(reader.pages)
+        spec = pages.strip().lower()
         indexes = _parse_pages(pages, page_count)
+        all_truncated = (not spec or spec == "all") and page_count > len(indexes)
     except ValueError as exc:
         return f"Error: {exc}"
     except Exception as exc:
@@ -173,15 +198,23 @@ def _execute_sync(
 
     # pdfplumber wins whenever it is available, so try it first: extracting with
     # pypdf up front only to discard the whole result parsed every page twice.
+    # A deadline bounds the extraction phase from inside the worker thread: the
+    # registry's wait_for can cancel the await but cannot stop the thread.
+    deadline = time.monotonic() + _READ_TIMEOUT_BUDGET
     try:
-        text_by_page = _extract_with_pdfplumber(resolved, indexes, password)
+        text_by_page = _extract_with_pdfplumber(resolved, indexes, password, deadline)
         extractor = "pdfplumber"
+    except _PdfTimeout:
+        return f"Error: PDF reading timed out after {_READ_TIMEOUT_BUDGET:g}s"
     except Exception:
         text_by_page = {}
         extractor = "pypdf"
     if not text_by_page:
-        text_by_page = _extract_with_pypdf(reader, indexes)
-        extractor = "pypdf"
+        try:
+            text_by_page = _extract_with_pypdf(reader, indexes, deadline)
+            extractor = "pypdf"
+        except _PdfTimeout:
+            return f"Error: PDF reading timed out after {_READ_TIMEOUT_BUDGET:g}s"
 
     # An empty page is legitimate — a scanned PDF has no text layer — but a page
     # whose extraction *raised* is a failure.  When every requested page failed on
@@ -200,9 +233,13 @@ def _execute_sync(
     if isinstance(max_chars, bool) or not isinstance(max_chars, int):
         max_chars = DEFAULT_MAX_CHARS
     max_chars = min(max(max_chars, 1_000), MAX_CHARS)
+    selection_note = (
+        f" (first {MAX_PAGES_PER_CALL} of {page_count} shown; specify pages= to read more)"
+        if all_truncated else ""
+    )
     output = [
         f"# {resolved}",
-        f"pages: {page_count}; selected: {_format_page_selection(indexes)}; extractor: {extractor}",
+        f"pages: {page_count}; selected: {_format_page_selection(indexes)}{selection_note}; extractor: {extractor}",
     ]
     output.extend(_metadata_lines(reader.metadata))
 

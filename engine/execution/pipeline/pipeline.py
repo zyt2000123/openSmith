@@ -6,8 +6,9 @@ routing, lifecycle management, and legacy compatibility.
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import logging
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,21 @@ logger = logging.getLogger(__name__)
 # 兜底层重试上限：base gate 不过时同节点最多重跑的次数（含首次）。
 _BASE_GATE_MAX_RETRIES = 3
 
+# Context key carrying the per-node provisional-streaming ledger between
+# agent_loop's checkpoint restore and run_pipeline.  Lives in the private
+# ("_") namespace so it is never checkpointed as part of the context dict;
+# the pipeline round-trips it through SessionCheckpoint.provisional_outputs.
+CTX_PROVISIONAL_OUTPUTS = "_committed_provisional_output"
+
+# react_loop's budget-exhaustion notices all end with this fixed suffix
+# (engine.execution.react.budget.budget_exhausted_message).  Matching it keeps
+# those system notices visible while hiding content-filtered/truncated
+# provider drafts, which must never be promoted to a reply.
+_BUDGET_MESSAGE_SUFFIX = (
+    "I stopped to avoid an infinite loop. "
+    "Please retry with a narrower request or inspect the latest failed tool result."
+)
+
 
 # ---------------------------------------------------------------------------
 # Public: pipeline runner
@@ -72,15 +88,33 @@ async def run_pipeline(
     """
     from engine.skill.executor import execute_skill_events
 
+    # P5/P11: fail loudly on ambiguous topology instead of silently corrupting
+    # output context keys or looping on forward/self backtrack targets.
+    chain_index = _validate_chain_topology(chain)
+
     node_idx = start_node_idx
     max_backtracks = 5
     backtrack_count = 0
-    committed_provisional_output: dict[str, bool] = {}
+    committed_provisional_output: dict[str, bool] = dict(
+        context.get(CTX_PROVISIONAL_OUTPUTS) or {}
+    )
+    context.pop(CTX_PROVISIONAL_OUTPUTS, None)
+    # P1: map each committed output key back to the node that produced it so a
+    # backtrack can evict the superseded outputs it jumps past.  Reconstructed
+    # on resume from whatever outputs the checkpoint already restored.
+    committed_output_index: dict[str, int] = {
+        output_key(node.skill_name): index
+        for index, node in enumerate(chain.nodes)
+        if output_key(node.skill_name) in context
+    }
 
     while node_idx < len(chain.nodes):
         node = chain.nodes[node_idx]
 
         if node.condition is not None and not node.condition(context):
+            # P4: a backtrack hint addressed to this skipped node must not leak
+            # into the next executed node as its rubric feedback.
+            context.pop(CTX_RETRY_HINT, None)
             node_idx += 1
             continue
 
@@ -89,6 +123,7 @@ async def run_pipeline(
         # fallback, while the former must not execute at all.
         if node.skill_name in disabled_skill_names:
             logger.info("skipping user-disabled pipeline skill %r", node.skill_name)
+            context.pop(CTX_RETRY_HINT, None)
             node_idx += 1
             continue
 
@@ -125,7 +160,16 @@ async def run_pipeline(
                         "skill %r not in registry; node degrades to plain ReAct with a prompt prefix",
                         node.skill_name,
                     )
-                    messages = base_messages + [{"role": "user", "content": f"[Skill: {node.skill_name}] {user_message}"}]
+                    # P7: ``base_messages`` already ends with the user turn;
+                    # appending another consecutive user message duplicates the
+                    # request and is rejected by some providers.  Replace the
+                    # trailing user turn with the skill-prefixed variant.
+                    messages = list(base_messages)
+                    prefixed = f"[Skill: {node.skill_name}] {user_message}"
+                    if messages and messages[-1].get("role") == "user":
+                        messages[-1] = {**messages[-1], "content": prefixed}
+                    else:
+                        messages.append({"role": "user", "content": prefixed})
                     # attempt==1：base gate 重试；attempt==0 且有 hint：域门禁
                     # retry 重进本节点（见下方 retry 分支写入 CTX_RETRY_HINT）。
                     if attempt <= 1 and context.get(CTX_RETRY_HINT):
@@ -176,6 +220,13 @@ async def run_pipeline(
                         "provision_id": provision_id, "reason": reason,
                     })
                     provision_settled = True
+                    # P3: react_loop's budget-exhausted TEXT_DELTA is swallowed
+                    # by _collect_node_events, so the user never sees why the
+                    # node stopped.  Surface engine budget notices before the
+                    # terminal events; content-filtered/truncated provider
+                    # drafts stay hidden (never a reply or persisted turn).
+                    if result.text and _is_budget_message(result.text):
+                        yield ExecutionEvent(EventType.TEXT_DELTA, {"text": result.text})
                     # ``result.text`` was never accepted by this node's gate.
                     # It may be a content-filtered or truncated provider draft,
                     # so never turn it into a normal reply (or persisted turn).
@@ -188,9 +239,16 @@ async def run_pipeline(
                     return
                 output = result.text
 
+                inferred_question = (
+                    node.infer_await_user_input_from_question
+                    and _ends_with_user_question(output)
+                )
                 if (
                     node.await_user_input_marker
-                    and node.await_user_input_marker in output
+                    and (
+                        node.await_user_input_marker in output
+                        or inferred_question
+                    )
                 ):
                     # This is a successful, deliberate pause — not a failed
                     # node.  Persist the question as prior-node context and
@@ -202,8 +260,14 @@ async def run_pipeline(
                     })
                     provision_settled = True
                     context[output_key(node.skill_name)] = visible_output
-                    committed_provisional_output[node.skill_name] = result.was_provisional
-                    _save_checkpoint(context, node_idx, awaiting_user_input=True)
+                    committed_provisional_output[output_key(node.skill_name)] = result.was_provisional
+                    committed_output_index[output_key(node.skill_name)] = node_idx
+                    await _save_checkpoint(
+                        context,
+                        node_idx,
+                        awaiting_user_input=True,
+                        provisional_outputs=committed_provisional_output,
+                    )
                     yield ExecutionEvent(EventType.SKILL_END, {
                         "skill": node.skill_name,
                         "status": "awaiting_input",
@@ -214,7 +278,11 @@ async def run_pipeline(
                     yield ExecutionEvent(EventType.TEXT_DELTA, data)
                     yield ExecutionEvent(EventType.AWAITING_INPUT, {
                         "skill": node.skill_name,
-                        "reason": "awaiting_user_input",
+                        "reason": (
+                            "awaiting_user_input"
+                            if node.await_user_input_marker in output
+                            else "awaiting_user_question"
+                        ),
                     })
                     yield ExecutionEvent(EventType.DONE, {})
                     return
@@ -256,14 +324,20 @@ async def run_pipeline(
             if gate_result.verdict == "pass":
                 yield ExecutionEvent(EventType.PROVISIONAL_COMMIT, {"provision_id": provision_id})
                 provision_settled = True
-                context[output_key(node.skill_name)] = output
-                committed_provisional_output[node.skill_name] = result.was_provisional
-                _save_checkpoint(context, node_idx)
+                key = output_key(node.skill_name)
+                context[key] = output
+                committed_provisional_output[key] = result.was_provisional
+                committed_output_index[key] = node_idx
+                await _save_checkpoint(
+                    context,
+                    node_idx,
+                    provisional_outputs=committed_provisional_output,
+                )
                 yield ExecutionEvent(EventType.SKILL_END, {"skill": node.skill_name, "status": "passed"})
                 node_idx += 1
                 continue
 
-            sig = FailureSignature(error_type=node.skill_name, context_hash=hashlib.md5(output.encode()).hexdigest()[:8])
+            sig = FailureSignature(error_type=node.skill_name)
             action = guard.record(sig)
 
             yield ExecutionEvent(EventType.PROVISIONAL_RETRACT, {
@@ -291,7 +365,7 @@ async def run_pipeline(
                     yield ExecutionEvent(EventType.DONE, {})
                     return
                 target = chain.backtrack_map[node.skill_name]
-                target_idx = next((i for i, n in enumerate(chain.nodes) if n.skill_name == target), None)
+                target_idx = chain_index.get(target)
                 if target_idx is None:
                     # backtrack 映射指向不存在的节点是配置错误；静默跳回节点 0
                     # 会重跑已通过的步骤且与 BACKTRACK 事件宣称的目标不符。
@@ -303,6 +377,13 @@ async def run_pipeline(
                     })
                     yield ExecutionEvent(EventType.DONE, {})
                     return
+                # P1: committed outputs of nodes at/after the target are
+                # superseded by the re-run.  Leaving them in context lets stale
+                # first-pass results leak into the re-run skills' handoff and
+                # into the final reply (which picks the last committed output).
+                _evict_outputs_at_or_after(
+                    context, committed_output_index, committed_provisional_output, target_idx
+                )
                 # 回溯同样要把失败原因带到目标节点。否则 planning 重跑时
                 # messages 仍是最初的原始需求，模型拿不到"为什么被打回"的任何
                 # 信号，大概率复现同一份产出 —— 而 FailureLoopGuard 按 skill
@@ -342,7 +423,7 @@ async def run_pipeline(
         key = output_key(node.skill_name)
         if key in context:
             data: dict[str, object] = {"text": context[key]}
-            if committed_provisional_output.get(node.skill_name):
+            if committed_provisional_output.get(key):
                 data["already_streamed"] = True
             yield ExecutionEvent(EventType.TEXT_DELTA, data)
             break
@@ -387,6 +468,21 @@ class _NodeResult:
         self.failed_reason: str | None = None
 
 
+def _ends_with_user_question(output: str) -> bool:
+    """Recognize a terminal user-owned question in a pause-capable node.
+
+    Upstream skills can follow their conversational contract while omitting
+    Smith's private HTML pause marker. Retrying a whole node solely to obtain
+    that marker wastes a model call and asks the user the same question again.
+    The fallback is intentionally narrow: a pipeline must explicitly opt a
+    node into question inference, and the visible final line must be a
+    question. Nodes that only support an explicit marker still run their
+    quality gate when a completed answer ends with an optional question.
+    """
+    visible = re.sub(r"<!--[^>]*-->", "", output).strip()
+    return bool(re.search(r"[?？][\s>*_`\]]*$", visible))
+
+
 async def _collect_node_events(
     event_stream: AsyncGenerator[ExecutionEvent, None],
     provision_id: str,
@@ -427,15 +523,83 @@ async def _collect_node_events(
 
 
 # ---------------------------------------------------------------------------
+# Internal: topology / stale-output helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_chain_topology(chain: "SkillChain") -> dict[str, int]:
+    """Build the unique skill-name -> node-index map, failing loudly on misuse.
+
+    Outputs are keyed in context by skill name (``<skill>_output``), so a
+    chain with duplicate skill names silently corrupts outputs — the last
+    write wins and earlier work is lost.  Backtrack targets are only useful
+    when they point at an earlier node: re-running an already-passed node is
+    pointless, and a self target merely delays the guard's block.
+    """
+    index_by_name: dict[str, int] = {}
+    for index, node in enumerate(chain.nodes):
+        previous = index_by_name.get(node.skill_name)
+        if previous is not None:
+            raise ValueError(
+                f"pipeline step {node.skill_name!r} appears at node {previous} and {index}; "
+                "duplicate skill names corrupt the output context key"
+            )
+        index_by_name[node.skill_name] = index
+
+    for source, target in chain.backtrack_map.items():
+        source_idx = index_by_name.get(source)
+        if source_idx is None:
+            raise ValueError(f"backtrack source {source!r} is not a pipeline step")
+        target_idx = index_by_name.get(target)
+        if target_idx is None:
+            # Handled gracefully at switch time with an explicit BLOCKED outcome.
+            continue
+        if target_idx >= source_idx:
+            raise ValueError(
+                f"backtrack target {target!r} (node {target_idx}) must precede "
+                f"source {source!r} (node {source_idx})"
+            )
+    return index_by_name
+
+
+def _evict_outputs_at_or_after(
+    context: dict,
+    committed_output_index: dict[str, int],
+    committed_provisional_output: dict[str, bool],
+    target_idx: int,
+) -> None:
+    """Drop committed outputs of every node at/after ``target_idx`` (P1).
+
+    On a backtrack the chain re-runs from the target node, so any output a
+    node at/after the target produced earlier is superseded.  Evicting them
+    from context (and therefore from the next checkpoint) stops stale
+    first-pass results from leaking into the re-run skills' handoff or the
+    final reply.
+    """
+    for stale_key in [
+        key for key, index in committed_output_index.items() if index >= target_idx
+    ]:
+        context.pop(stale_key, None)
+        committed_provisional_output.pop(stale_key, None)
+        del committed_output_index[stale_key]
+
+
+def _is_budget_message(text: str) -> bool:
+    """True when the collected text is an engine budget-exhaustion notice."""
+    return text.strip().endswith(_BUDGET_MESSAGE_SUFFIX)
+
+
+# ---------------------------------------------------------------------------
 # Internal: checkpoint helpers
 # ---------------------------------------------------------------------------
 
 
-def _save_checkpoint(
+async def _save_checkpoint(
     context: dict,
     node_idx: int,
     *,
     awaiting_user_input: bool = False,
+    provisional_outputs: dict[str, bool] | None = None,
 ) -> None:
     session_id = str(context.get(CTX_SESSION_ID) or "")
     state_dir = str(context.get(CTX_STATE_DIR) or "")
@@ -443,7 +607,7 @@ def _save_checkpoint(
         return
     try:
         from .checkpoint import SessionStateManager, SessionCheckpoint
-        SessionStateManager(Path(state_dir)).save(SessionCheckpoint(
+        checkpoint = SessionCheckpoint(
             agent_id=str(context.get(CTX_AGENT_ID) or ""),
             session_id=session_id,
             identity_id=str(context.get(CTX_IDENTITY_ID) or ""),
@@ -454,7 +618,11 @@ def _save_checkpoint(
             working_dir=str(context.get(CTX_WORKING_DIR) or ""),
             run_id=str(context.get(CTX_RUN_ID) or ""),
             awaiting_user_input=awaiting_user_input,
-        ))
+            provisional_outputs=dict(provisional_outputs or {}),
+        )
+        # P9: json.dump + fsync + os.replace + chmod must not run on the event
+        # loop; checkpoint writes happen after every committed node.
+        await asyncio.to_thread(SessionStateManager(Path(state_dir)).save, checkpoint)
     except Exception:
         logger.exception("failed to save session checkpoint")
 

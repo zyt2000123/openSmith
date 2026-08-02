@@ -8,7 +8,7 @@ from typing import AsyncGenerator
 
 from engine.execution.events import EventType, ExecutionEvent
 from engine.execution.pipeline.backtrack import FailureLoopGuard
-from engine.execution.pipeline.pipeline import run_pipeline
+from engine.execution.pipeline.pipeline import CTX_PROVISIONAL_OUTPUTS, run_pipeline
 from engine.execution.pipeline.pipeline_context import (
     CTX_AGENT_ID,
     CTX_CHAIN_REQUEST,
@@ -270,6 +270,9 @@ def _apply_session_checkpoint(
                 checkpoint.context.get(CTX_USER_MESSAGE, ""),
             )
             restored[CTX_USER_RESPONSE] = user_message
+            # P6: carry the provisional-streaming ledger so the resumed run does
+            # not re-render text that was already streamed before the pause.
+            restored[CTX_PROVISIONAL_OUTPUTS] = dict(checkpoint.provisional_outputs)
             return restored, checkpoint.skill_chain_index
         if (
             same_scope
@@ -283,10 +286,9 @@ def _apply_session_checkpoint(
                 session_id,
                 checkpoint.skill_chain_index + 1,
             )
-            return (
-                {**checkpoint.context, **context},
-                checkpoint.skill_chain_index + 1,
-            )
+            restored = {**checkpoint.context, **context}
+            restored[CTX_PROVISIONAL_OUTPUTS] = dict(checkpoint.provisional_outputs)
+            return restored, checkpoint.skill_chain_index + 1
         manager.clear(session_id)
     except Exception:
         logger.exception("failed to inspect crash checkpoint; starting fresh")
@@ -340,6 +342,7 @@ async def _run_forced_skill_stream(
     output_parts: list[str] = []
     output_was_streamed = False
     terminal_type: str | None = None
+    terminal_event: ExecutionEvent | None = None
     async for event in execute_skill_events(
         skill,
         llm,
@@ -357,21 +360,28 @@ async def _run_forced_skill_stream(
                 event.data.get("already_streamed")
             )
             continue
-        if event.type == EventType.INCOMPLETE:
-            terminal_type = "incomplete"
-        elif event.type == EventType.FAILED:
-            terminal_type = "failed"
+        if event.type in {EventType.INCOMPLETE, EventType.FAILED}:
+            terminal_type = (
+                "incomplete" if event.type is EventType.INCOMPLETE else "failed"
+            )
+            # P12: a consumer that treats FAILED/INCOMPLETE as a stop point
+            # would never render the accumulated text if it arrived later.
+            # Hold the terminal event back until the text has been emitted.
+            terminal_event = event
+            continue
         yield event
     if terminal_type:
+        data: dict[str, object] = {"text": "".join(output_parts)}
+        if output_was_streamed:
+            data["already_streamed"] = True
+        if output_parts:
+            yield ExecutionEvent(EventType.TEXT_DELTA, data)
+        if terminal_event is not None:
+            yield terminal_event
         yield ExecutionEvent(
             EventType.SKILL_END,
             {"skill": forced_skill, "status": terminal_type},
         )
-        if output_parts:
-            data: dict[str, object] = {"text": "".join(output_parts)}
-            if output_was_streamed:
-                data["already_streamed"] = True
-            yield ExecutionEvent(EventType.TEXT_DELTA, data)
         yield ExecutionEvent(EventType.DONE, {})
         return
 

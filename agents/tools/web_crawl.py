@@ -6,7 +6,9 @@ import html
 from html.parser import HTMLParser
 import importlib.util
 import json
+import os
 from pathlib import Path
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -56,6 +58,7 @@ USER_AGENT = "AgentSmithCrawler/1.0"
 MAX_PAGES = 50
 MAX_DEPTH = 4
 MAX_DOCUMENT_BYTES = 512 * 1024
+MAX_ROBOTS_CRAWL_DELAY = 10.0
 TRACKING_PARAMS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
 
@@ -238,6 +241,13 @@ def _extract_links(base_url: str, source: str) -> list[str]:
 
 
 def _parse_xml_urls(source: str, names: set[str]) -> list[str]:
+    # ElementTree expands internal entities; a small sitemap carrying a
+    # billion-laughs DOCTYPE could blow up into a large in-memory document.
+    # Refusing any DTD is the standard cheap mitigation.  The scan covers the
+    # WHOLE source: an attacker can pad the XML prolog with a comment to push
+    # the DOCTYPE declaration past a fixed-size window.
+    if "<!DOCTYPE" in source or "<!ENTITY" in source:
+        return []
     try:
         root = ET.fromstring(source)
     except ET.ParseError:
@@ -359,57 +369,79 @@ def _download_with_retries(
     raise RuntimeError("unreachable")
 
 
-async def _render_with_playwright(url: str, timeout: float = 30.0) -> str:
-    """Render a public page in a short-lived, request-filtered browser context."""
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "browser rendering requires the optional 'playwright' dependency and Chromium"
-        ) from exc
+class _BrowserRenderer:
+    """One headless browser reused across a single crawl's rendered pages.
 
-    fetch = _web_fetch_module()
-    validation = fetch._validate_url(url)
-    if validation:
-        raise ValueError(validation)
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=["--disable-quic", "--no-first-run"],
-        )
-        context = await browser.new_context(
+    Launching Chromium per page made a JS-heavy crawl start a fresh browser
+    for every rendered URL.  Reusing the browser instance bounds that cost to
+    one launch per crawl while a fresh context per page still isolates each
+    page's cookies and storage.
+    """
+
+    def __init__(self) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise RuntimeError(
+                "browser rendering requires the optional 'playwright' dependency and Chromium"
+            ) from exc
+        self._playwright = sync_playwright().start()
+        try:
+            self._browser = self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-quic", "--no-first-run"],
+            )
+        except Exception:
+            self._playwright.stop()
+            raise
+
+    def render(self, url: str, timeout: float = 30.0) -> str:
+        """Render *url* in a request-filtered, short-lived browser context."""
+        fetch = _web_fetch_module()
+        validation = fetch._validate_url(url)
+        if validation:
+            raise ValueError(validation)
+
+        def guard_request(route, request) -> None:
+            request_validation = fetch._validate_url(request.url)
+            if request_validation:
+                route.abort("blockedbyclient")
+            else:
+                route.continue_()
+
+        context = self._browser.new_context(
             accept_downloads=False,
             user_agent=USER_AGENT,
         )
-
-        async def guard_request(route, request):
-            request_validation = fetch._validate_url(request.url)
-            if request_validation:
-                await route.abort("blockedbyclient")
-                return
-            await route.continue_()
-
-        await context.route("**/*", guard_request)
-        page = await context.new_page()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+            context.route("**/*", guard_request)
+            page = context.new_page()
             try:
-                await page.wait_for_load_state("networkidle", timeout=min(5_000, int(timeout * 1000)))
-            except Exception:
-                pass
-            # Bounded scrolling supports common lazy-loaded public pages without
-            # turning a single fetch into an unbounded crawl.
-            for _ in range(3):
-                before = await page.evaluate("document.body.scrollHeight")
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(350)
-                after = await page.evaluate("document.body.scrollHeight")
-                if after <= before:
-                    break
-            return await page.content()
+                page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+                try:
+                    page.wait_for_load_state("networkidle", timeout=min(5_000, int(timeout * 1000)))
+                except Exception:
+                    pass
+                # Bounded scrolling supports common lazy-loaded public pages without
+                # turning a single fetch into an unbounded crawl.
+                for _ in range(3):
+                    before = page.evaluate("document.body.scrollHeight")
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(350)
+                    after = page.evaluate("document.body.scrollHeight")
+                    if after <= before:
+                        break
+                return page.content()
+            finally:
+                page.close()
         finally:
-            await context.close()
-            await browser.close()
+            context.close()
+
+    def close(self) -> None:
+        try:
+            self._browser.close()
+        finally:
+            self._playwright.stop()
 
 
 def _read_state(path: str) -> dict[str, Any]:
@@ -424,6 +456,25 @@ def _read_state(path: str) -> dict[str, Any]:
     return value.get("records", {}) if isinstance(value, dict) else {}
 
 
+def _ensure_private_dir(path: Path) -> None:
+    """Create *path* and every missing ancestor with 0700, leaving existing
+    directories' modes untouched.
+
+    ``mkdir(parents=True, mode=...)`` applies the mode only to the final
+    component and lets created ancestors fall back to the process umask; and
+    chmod-ing an *existing* ancestor (e.g. ``/tmp``) would be wrong.  Only
+    directories this function actually creates are tightened.
+    """
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+
+
 def _write_state(
     path: str,
     records: dict[str, dict[str, Any]],
@@ -434,13 +485,29 @@ def _write_state(
         return
     _raise_if_cancelled(cancel_event)
     destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(destination.parent)
     persisted = {
         url: {key: value for key, value in record.items() if key != "text"}
         for url, record in records.items()
     }
     _raise_if_cancelled(cancel_event)
-    destination.write_text(json.dumps({"version": 1, "records": persisted}, indent=2), encoding="utf-8")
+    # Crawled content is user evidence; mirror memory_ops' 0600 discipline and
+    # write atomically so a crash never leaves a half-written state file.
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(json.dumps({"version": 1, "records": persisted}, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, destination)
+        destination.chmod(0o600)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _crawl(
@@ -478,7 +545,11 @@ def _crawl(
         raise
     except Exception as exc:
         raise ValueError(f"could not retrieve robots.txt: {exc}") from exc
-    effective_delay = max(crawl_delay, policy.crawl_delay or 0.0)
+    # A site-controlled robots.txt can ask for an arbitrarily large
+    # crawl-delay; honoring it verbatim lets a hostile site stall the crawl
+    # until the overall timeout.  Cap the site's requested delay.
+    policy_delay = min(policy.crawl_delay or 0.0, MAX_ROBOTS_CRAWL_DELAY)
+    effective_delay = max(crawl_delay, policy_delay)
     queue: list[tuple[str, int]] = [(seed, 0)]
     queued = {seed}
     if include_sitemaps:
@@ -504,71 +575,88 @@ def _crawl(
     records: dict[str, dict[str, Any]] = {}
     skipped_robots = 0
     last_request = 0.0
-    while queue and len(records) < max_pages:
-        _raise_if_cancelled(cancel_event)
-        current, depth = queue.pop(0)
-        if not _robots_allows(policy, current):
-            skipped_robots += 1
-            continue
-        pause = effective_delay - (time.monotonic() - last_request)
-        if pause > 0:
-            if cancel_event is not None:
-                if cancel_event.wait(pause):
-                    raise _CrawlCancelled()
-            else:
-                time.sleep(pause)
-        try:
-            status, final_url, content_type, body = _download_with_retries(
-                current, 30, retries=max_retries, cancel_event=cancel_event
-            )
+    renderer: _BrowserRenderer | None = None
+
+    def ensure_renderer() -> _BrowserRenderer:
+        nonlocal renderer
+        if renderer is None:
+            renderer = _BrowserRenderer()
+        return renderer
+
+    try:
+        while queue and len(records) < max_pages:
             _raise_if_cancelled(cancel_event)
-            last_request = time.monotonic()
-        except _CrawlCancelled:
-            raise
-        except Exception as exc:
-            warnings.append(f"fetch failed: {current} ({exc})")
-            continue
-        if not 200 <= status < 300:
-            warnings.append(f"HTTP {status}: {final_url}")
-            continue
-        is_xml = "xml" in content_type or body.lstrip().startswith("<?xml")
-        should_render = render == "always" or (
-            render == "auto" and not is_xml and len(_web_fetch_module()._html_to_text(body)) < 400
-        )
-        if should_render:
+            current, depth = queue.pop(0)
+            if not _robots_allows(policy, current):
+                skipped_robots += 1
+                continue
+            pause = effective_delay - (time.monotonic() - last_request)
+            if pause > 0:
+                if cancel_event is not None:
+                    if cancel_event.wait(pause):
+                        raise _CrawlCancelled()
+                else:
+                    time.sleep(pause)
             try:
+                status, final_url, content_type, body = _download_with_retries(
+                    current, 30, retries=max_retries, cancel_event=cancel_event
+                )
                 _raise_if_cancelled(cancel_event)
-                body = asyncio.run(_render_with_playwright(final_url, timeout=30))
-                _raise_if_cancelled(cancel_event)
-                content_type = "text/html"
-                is_xml = False
+                last_request = time.monotonic()
             except _CrawlCancelled:
                 raise
             except Exception as exc:
-                if render == "always":
-                    raise ValueError(f"browser render failed for {final_url}: {exc}") from exc
-                warnings.append(f"browser render skipped: {final_url} ({exc})")
-        if is_xml:
-            links = _parse_feed(body)
-            title = ""
-            content = body
-        elif "html" in content_type or body.lstrip().startswith("<"):
-            parser = _LinkParser()
-            parser.feed(body)
-            parser.close()
-            title = parser.title
-            content = _web_fetch_module()._html_to_text(body)
-            links = _extract_links(final_url, body)
-        else:
-            warnings.append(f"unsupported content type: {content_type or 'unknown'} ({final_url})")
-            continue
-        normalized_final = _normalize_url(final_url) or current
-        records[normalized_final] = _build_record(normalized_final, title, content, previous)
-        if depth < max_depth:
-            for link in links:
-                if link not in queued and _origin(link) == origin:
-                    queue.append((link, depth + 1))
-                    queued.add(link)
+                warnings.append(f"fetch failed: {current} ({exc})")
+                continue
+            if not 200 <= status < 300:
+                warnings.append(f"HTTP {status}: {final_url}")
+                continue
+            is_xml = "xml" in content_type or body.lstrip().startswith("<?xml")
+            should_render = render == "always" or (
+                render == "auto" and not is_xml and len(_web_fetch_module()._html_to_text(body)) < 400
+            )
+            if should_render:
+                try:
+                    _raise_if_cancelled(cancel_event)
+                    body = ensure_renderer().render(final_url, timeout=30)
+                    _raise_if_cancelled(cancel_event)
+                    content_type = "text/html"
+                    is_xml = False
+                except _CrawlCancelled:
+                    raise
+                except Exception as exc:
+                    if render == "always":
+                        raise ValueError(f"browser render failed for {final_url}: {exc}") from exc
+                    warnings.append(f"browser render skipped: {final_url} ({exc})")
+            if is_xml:
+                links = _parse_feed(body)
+                title = ""
+                content = body
+            elif "html" in content_type or body.lstrip().startswith("<"):
+                parser = _LinkParser()
+                parser.feed(body)
+                parser.close()
+                title = parser.title
+                content = _web_fetch_module()._html_to_text(body)
+                links = _extract_links(final_url, body)
+            else:
+                warnings.append(f"unsupported content type: {content_type or 'unknown'} ({final_url})")
+                continue
+            normalized_final = _normalize_url(final_url) or current
+            records[normalized_final] = _build_record(normalized_final, title, content, previous)
+            if depth < max_depth:
+                for link in links:
+                    if link not in queued and _origin(link) == origin:
+                        queue.append((link, depth + 1))
+                        queued.add(link)
+    finally:
+        # The browser is a heavyweight process resource; never leak it when the
+        # crawl is cancelled, times out, or raises mid-loop.
+        if renderer is not None:
+            try:
+                renderer.close()
+            except Exception:
+                pass
     _write_state(state_path, records, cancel_event=cancel_event)
     return {
         "seed": seed,

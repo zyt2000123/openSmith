@@ -10,6 +10,8 @@ class RunSummaryOut(BaseModel):
     agent_id: str
     session_id: str | None = None
     identity_id: str | None = None
+    route_id: str | None = None
+    pipeline_id: str | None = None
     working_dir: str | None = None
     forced_skill: str | None = None
     created_at: str

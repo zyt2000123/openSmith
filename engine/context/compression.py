@@ -13,6 +13,7 @@ from .budget import (
     CONTEXT_SAFETY_MARGIN_RATIO,
     context_budget_for,
     estimate_compressible_tokens,
+    # estimate_tokens is re-exported here for engine.context's public surface.
     estimate_messages_tokens,
     estimate_tokens,
     model_limits_for,
@@ -31,6 +32,47 @@ PRUNE_MIN_CHARS = 2000
 CONTEXT_TRIGGER_RATIO = 0.7
 DEFAULT_CONTEXT_LIMIT = DEFAULT_CONTEXT_WINDOW
 CONTEXT_DISPLAY_WINDOW = DEFAULT_CONTEXT_LIMIT
+
+
+def _split_active_context(
+    conversation: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split leading contracts, compactable history, and active work.
+
+    The newest user turn is the request currently being executed. A context
+    fitter may summarize or trim only the preceding history; the active turn
+    and its subsequent assistant/tool trail stay verbatim.
+    """
+    leading_system_count = 0
+    for message in conversation:
+        if message.get("role") != "system":
+            break
+        leading_system_count += 1
+
+    active_start: int | None = None
+    for index in range(len(conversation) - 1, leading_system_count - 1, -1):
+        if conversation[index].get("role") == "user":
+            active_start = index
+            break
+
+    if active_start is None:
+        return (
+            [dict(message) for message in conversation[:leading_system_count]],
+            [dict(message) for message in conversation[leading_system_count:]],
+            [],
+        )
+    return (
+        [dict(message) for message in conversation[:leading_system_count]],
+        [dict(message) for message in conversation[leading_system_count:active_start]],
+        [dict(message) for message in conversation[active_start:]],
+    )
+
+
+def _preserved_active_context(conversation: list[dict]) -> list[dict]:
+    """Return the irreducible contract plus current user request/work."""
+    protected, _, active = _split_active_context(conversation)
+    return [*protected, *active]
+
 
 def prune_tool_outputs(
     conversation: list[dict],
@@ -129,20 +171,13 @@ def trim_conversation_for_context_limit(
     if token_budget <= 0 or estimate_messages_tokens(copied) <= token_budget:
         return copied
 
-    # The first system message is the runtime contract. Never silently rewrite
-    # it to make a request fit; callers must classify an oversized contract as
-    # an explicit unfit-static-prompt result.
-    protected: list[dict] = []
-    history_start = 0
-    while (
-        history_start < len(copied)
-        and copied[history_start].get("role") == "system"
-    ):
-        protected.append(copied[history_start])
-        history_start += 1
+    # Leading system messages are the runtime contract. The newest user turn
+    # and its current work are equally non-negotiable: replacing either with a
+    # tail slice can reverse a current safety constraint or task objective.
+    protected, history, active = _split_active_context(copied)
 
     history_lines: list[str] = []
-    for message in copied[history_start:]:
+    for message in history:
         role = str(message.get("role", "unknown"))
         content = message.get("content")
         if not isinstance(content, str) or not content:
@@ -162,69 +197,56 @@ def trim_conversation_for_context_limit(
     recovery_prefix = (
         "[Context deterministically shortened to fit the selected model]\n"
     )
+    recovery_ack = {
+        "role": "assistant",
+        "content": "Understood. I have the relevant earlier context.",
+    }
     history_text = "\n".join(history_lines)
 
-    def candidate(keep: int) -> list[dict]:
+    def historical_candidate(keep: int) -> list[dict]:
         tail = history_text[-keep:] if keep else ""
         marker = "[... earlier context truncated ...]\n" if keep < len(history_text) else ""
+        recovered_history = recovery_prefix + marker + tail
+        if not recovered_history.strip():
+            return [*protected, *active]
         return [
             *protected,
-            {"role": "user", "content": recovery_prefix + marker + tail},
+            {"role": "user", "content": recovered_history},
+            dict(recovery_ack),
+            *active,
         ]
 
-    minimum = candidate(0)
-    if estimate_messages_tokens(minimum) > token_budget:
-        # Return the protected contract unchanged. The final fitter will fail
-        # closed instead of corrupting it or calling the provider.
-        return protected
+    # The protected contract, the synthesized recovery annotation, and the
+    # active work are constant across every binary-search step; only the
+    # synthesized history message varies. Measuring that fixed prefix once and
+    # serializing a single message per step avoids re-serializing the whole
+    # conversation O(log N) times.
+    fixed_cost = estimate_messages_tokens([*protected, recovery_ack, *active])
+    protected_active_cost = estimate_messages_tokens([*protected, *active])
+
+    def candidate_cost(keep: int) -> int:
+        tail = history_text[-keep:] if keep else ""
+        marker = "[... earlier context truncated ...]\n" if keep < len(history_text) else ""
+        recovered_history = recovery_prefix + marker + tail
+        if not recovered_history.strip():
+            return protected_active_cost
+        return fixed_cost + estimate_messages_tokens(
+            [{"role": "user", "content": recovered_history}]
+        )
+
+    minimum = historical_candidate(0)
+    if candidate_cost(0) > token_budget:
+        # Preserve the active request even if no space remains to annotate the
+        # discarded history. The final fitter fails closed when that request
+        # itself exceeds capacity.
+        return [*protected, *active]
 
     low, high = 0, len(history_text)
     best = minimum
     while low <= high:
         keep = (low + high) // 2
-        current = candidate(keep)
-        if estimate_messages_tokens(current) <= token_budget:
-            best = current
-            low = keep + 1
-        else:
-            high = keep - 1
-    return best
-
-
-def _trim_middle(text: str, token_budget: int) -> str:
-    if token_budget <= 0:
-        return ""
-    if estimate_tokens(text) <= token_budget:
-        return text
-    marker = "\n[... context truncated ...]\n"
-    low, high = 0, len(text)
-    best = ""
-    while low <= high:
-        keep = (low + high) // 2
-        head = keep // 2
-        tail = keep - head
-        candidate = text[:head] + marker + (text[-tail:] if tail else "")
-        if estimate_tokens(candidate) <= token_budget:
-            best = candidate
-            low = keep + 1
-        else:
-            high = keep - 1
-    return best or _trim_tail(marker, token_budget)
-
-
-def _trim_tail(text: str, token_budget: int) -> str:
-    if token_budget <= 0:
-        return ""
-    if estimate_tokens(text) <= token_budget:
-        return text
-    marker = "[... earlier context truncated ...]\n"
-    low, high = 0, len(text)
-    best = ""
-    while low <= high:
-        keep = (low + high) // 2
-        candidate = marker + (text[-keep:] if keep else "")
-        if estimate_tokens(candidate) <= token_budget:
-            best = candidate
+        if candidate_cost(keep) <= token_budget:
+            best = historical_candidate(keep)
             low = keep + 1
         else:
             high = keep - 1
@@ -251,16 +273,17 @@ async def compress(conversation: list[dict], llm: "LLMPort | None" = None) -> li
 async def compact_history(conversation: list[dict], llm: "LLMPort") -> list[dict]:
     """Replace conversation with a compacted summary via LLM.
 
-    Returns a new conversation list: [system_prompt, summary_message].
-    The original system prompt (first message) is preserved.
+    Returns a new conversation with prior history summarized before the active
+    user turn. The leading system contract and current request/work are
+    preserved verbatim.
     """
-    system_messages: list[dict] = []
-    for message in conversation:
-        if message.get("role") != "system":
-            break
-        system_messages.append(message)
+    system_messages, history, active = _split_active_context(conversation)
+    if not history:
+        # A request that is too large by itself cannot be safely compacted: a
+        # summary would replace the very instruction the model must execute.
+        return conversation
 
-    summary_result = await summarize_session(conversation, llm)
+    summary_result = await summarize_session(history, llm)
     if not summary_result.usable:
         # 摘要为空/被截断/被拒答时整体替换历史等于静默失忆——
         # 放弃本轮 compact，保留 prune 后的原始对话。
@@ -280,4 +303,5 @@ async def compact_history(conversation: list[dict], llm: "LLMPort") -> list[dict
         "content": f"[Previous conversation summary]\n{summary_result.summary}",
     })
     result.append({"role": "assistant", "content": "Understood. I have the full context from our previous conversation. How can I help?"})
+    result.extend(active)
     return result

@@ -1,6 +1,7 @@
 """Grep tool — search file contents using ripgrep (rg) or fallback to grep."""
 
 import asyncio
+import functools
 import os
 import subprocess
 
@@ -33,8 +34,47 @@ TOOL_META = {
 MAX_RESULTS = 200
 MAX_LINE_LEN = 500
 EXCLUDED = [".git", "node_modules", "__pycache__", ".venv", "dist", ".build", "*.egg-info"]
+_SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 
 
+def _casefold_glob(pattern: str) -> str:
+    """Make a single-component glob case-insensitive via character classes.
+
+    GNU/BSD grep's ``--exclude-dir`` matches case-sensitively, unlike the
+    ripgrep ``--iglob`` used in the primary path.  Rewriting each letter as a
+    ``[xX]`` class makes ``.git`` exclude ``.GIT``/``.Git`` the same way the
+    runtime's own ``_casefolded()`` discipline does elsewhere.
+    """
+    out: list[str] = []
+    for char in pattern:
+        if char.isalpha():
+            out.append(f"[{char.lower()}{char.upper()}]")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _safe_environment(search_path: str) -> dict[str, str]:
+    """Minimal env for the search subprocess, mirroring shell/git_ops.
+
+    rg and grep inherit the server process environment by default; stripping
+    it keeps service credentials and user-level config out of a model-requested
+    search.  ``RIPGREP_CONFIG_PATH`` is pinned to the null device so a user's
+    global rg config cannot silently change search semantics.
+    """
+    environment = {
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "HOME": os.path.abspath(search_path),
+        "RIPGREP_CONFIG_PATH": os.devnull,
+    }
+    for key in _SAFE_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
+@functools.lru_cache(maxsize=1)
 def _has_rg() -> bool:
     try:
         subprocess.run(["rg", "--version"], capture_output=True, check=True)
@@ -77,7 +117,7 @@ def _execute_sync(
         # primary engine) would have used.
         args = ["grep", "-r", "-E", "--binary-files=without-match"]
         for e in EXCLUDED:
-            args.extend(["--exclude-dir", e])
+            args.extend(["--exclude-dir", _casefold_glob(e)])
         if ignore_case: args.append("-i")
         if files_only: args.append("-l")
         else:
@@ -88,7 +128,13 @@ def _execute_sync(
         args.append(resolved)
 
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_safe_environment(resolved),
+        )
     except subprocess.TimeoutExpired:
         return "Error: search timed out. Try a more specific pattern or path."
 

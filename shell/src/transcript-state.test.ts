@@ -255,16 +255,13 @@ test("SkillChain lifecycle stays visible while awaiting the user's reply", () =>
   assert.equal(turn.streaming, false);
   assert.equal(turn.blocks[0]?.type === "skill" && turn.blocks[0].state, "waiting");
 
+  // Route / gate / backtrack / awaiting-input telemetry updates the skill
+  // block state but never renders a separate system notice.
   const notices = entries.filter((entry) => entry.kind === "system").map((entry) => entry.text);
-  assert.deepEqual(notices, [
-    "Route: Coding → requirements-research.",
-    "Gate grilling: retry — Need a target user.",
-    "Backtracking research → grilling — Scope is ambiguous.",
-    "Waiting for your input to continue grilling. Reply in chat.",
-  ]);
+  assert.deepEqual(notices, []);
 });
 
-test("a direct route is presented as ReAct", () => {
+test("a direct route produces no route notice", () => {
   const entries = applyStreamEvent(freshTurn(), {
     type: "route_decided",
     identityId: "smith",
@@ -273,8 +270,21 @@ test("a direct route is presented as ReAct", () => {
     pipelineId: "",
   });
 
-  const notice = entries.find((entry) => entry.kind === "system");
-  assert.equal(notice?.kind === "system" && notice.text, "Route: Smith → ReAct.");
+  const notices = entries.filter((entry) => entry.kind === "system");
+  assert.equal(notices.length, 0);
+});
+
+test("a routed chain also produces no route notice", () => {
+  const entries = applyStreamEvent(freshTurn(), {
+    type: "route_decided",
+    identityId: "coding",
+    identityName: "Coding",
+    routeId: "requirements-research",
+    pipelineId: "requirements-research",
+  });
+
+  const notices = entries.filter((entry) => entry.kind === "system");
+  assert.equal(notices.length, 0);
 });
 
 test("tool calls remain standalone when no workflow skill is running", () => {

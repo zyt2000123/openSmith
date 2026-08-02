@@ -397,21 +397,65 @@ def test_macos_seatbelt_blocks_sensitive_writes_inside_workspace(
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
-def test_macos_seatbelt_allows_reading_git_metadata(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".git/config",
+        ".git/credentials",
+        ".GIT/config",
+        ".git/CREDENTIALS",
+        "nested/.git/config",
+    ],
+)
+def test_macos_seatbelt_blocks_reading_git_credentials(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
     workspace = tmp_path / "workspace"
-    git_config = workspace / ".git" / "config"
-    git_config.parent.mkdir(parents=True)
-    git_config.write_text("[core]\n", encoding="utf-8")
+    target = workspace / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("must-not-leak\n", encoding="utf-8")
+    environment = MacOSSeatbeltEnvironment(workspace=workspace)
 
     result = asyncio.run(
-        MacOSSeatbeltEnvironment(workspace=workspace).run_command(
-            argv=["/bin/cat", ".git/config"],
+        environment.run_command(
+            argv=["/bin/cat", relative_path],
+            cwd=str(workspace),
+        )
+    )
+
+    assert result.exit_code not in (None, 0)
+    assert "must-not-leak" not in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".gitignore",
+        "config/.gitignore",
+        "README.md",
+    ],
+)
+def test_macos_seatbelt_still_allows_reading_gitignore_and_normal_files(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("safe project file\n", encoding="utf-8")
+    environment = MacOSSeatbeltEnvironment(workspace=workspace)
+
+    result = asyncio.run(
+        environment.run_command(
+            argv=["/bin/cat", relative_path],
             cwd=str(workspace),
         )
     )
 
     assert result.exit_code == 0, result.stderr or result.error
-    assert result.stdout == "[core]\n"
+    assert result.stdout == "safe project file\n"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
@@ -552,6 +596,42 @@ def test_macos_seatbelt_blocks_creating_hardlink_aliases_during_execution(
     assert result.exit_code not in (None, 0)
     assert not alias.exists()
     assert target.read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_macos_seatbelt_hardlink_preflight_is_cached_until_workspace_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = MacOSSeatbeltEnvironment(workspace=workspace)
+    calls = {"count": 0}
+    original = MacOSSeatbeltEnvironment._sensitive_hardlink_error
+
+    def counting(self: MacOSSeatbeltEnvironment) -> str | None:
+        calls["count"] += 1
+        return original(self)
+
+    monkeypatch.setattr(
+        MacOSSeatbeltEnvironment, "_sensitive_hardlink_error", counting
+    )
+
+    first = asyncio.run(
+        environment.run_command(argv=["/bin/echo", "one"], cwd=str(workspace))
+    )
+    second = asyncio.run(
+        environment.run_command(argv=["/bin/echo", "two"], cwd=str(workspace))
+    )
+    assert first.exit_code == 0, first.stderr or first.error
+    assert second.exit_code == 0, second.stderr or second.error
+    assert calls["count"] == 1
+
+    (workspace / "new.txt").write_text("changed\n", encoding="utf-8")
+    third = asyncio.run(
+        environment.run_command(argv=["/bin/echo", "three"], cwd=str(workspace))
+    )
+    assert third.exit_code == 0, third.stderr or third.error
+    assert calls["count"] == 2
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")

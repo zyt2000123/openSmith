@@ -9,24 +9,7 @@ from engine.safety.tool_guard import ToolGuard
 from engine.safety.approval import ApprovalScope
 
 
-@pytest.mark.asyncio
-async def test_approved_path_adds_directory_to_whitelist(tmp_path):
-    """After approving access to a file, the parent directory is auto-whitelisted."""
-
-    # Setup
-    working_dir = tmp_path / "project"
-    working_dir.mkdir()
-    external_dir = tmp_path / "documents"
-    external_dir.mkdir()
-    external_file = external_dir / "notes.txt"
-    external_file.write_text("test content")
-
-    rules_path = tmp_path / "rules.json"
-    rules_path.write_text("[]")
-
-    guard = ToolGuard(rules_path, allowed_dirs=None)
-    guard.set_working_directory(working_dir)
-
+def _registry_with_read_file(guard: ToolGuard) -> ToolRegistry:
     registry = ToolRegistry()
     registry.bind_tool_guard(guard)
 
@@ -45,36 +28,93 @@ async def test_approved_path_adds_directory_to_whitelist(tmp_path):
         path_args=("path",),
         is_write_tool=False,
     )
+    return registry
 
-    # Initial state: external_dir NOT in whitelist
+
+@pytest.mark.asyncio
+async def test_external_approval_whitelists_only_the_exact_file(tmp_path):
+    """One external approval must not grant the whole directory.
+
+    Directory granularity let a single approved read (e.g. /etc/hosts) silently
+    grant every sibling file in an arbitrary system directory, including
+    credential-bearing names the name-based sensitive checks do not cover.
+    """
+    working_dir = tmp_path / "project"
+    working_dir.mkdir()
+    external_dir = tmp_path / "documents"
+    external_dir.mkdir()
+    external_file = external_dir / "notes.txt"
+    external_file.write_text("test content")
+    (external_dir / "master.passwd").write_text("root:hashed:0:0:root:/root:/bin/sh")
+
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text("[]")
+
+    guard = ToolGuard(rules_path, allowed_dirs=None)
+    guard.set_working_directory(working_dir)
+    registry = _registry_with_read_file(guard)
+
+    # Initial state: external dir/file NOT whitelisted.
     assert not guard.whitelist.is_path_allowed(str(external_dir))
+    assert not guard.whitelist.is_path_allowed(str(external_file))
 
-    # Create and authorize a call
     call = ToolCall(
         id="call1",
         name="read_file",
         arguments={"path": str(external_file)},
     )
-
-    # Check what the guard returns
     decision = guard.check(call)
-    print(f"Decision: allowed={decision.allowed}, approval_required={decision.approval_required}, boundary_block={decision.boundary_block}")
-    print(f"Approval scope: {decision.approval_scope}")
+    assert decision.boundary_block, "external path must be a boundary approval"
 
-    approval_scope = ApprovalScope.path(str(external_file), writing=False)
-    print(f"Created approval_scope: kind={approval_scope.kind}, target={approval_scope.target}")
-
-    # Execute with authorization (this should trigger auto-whitelist)
-    with registry.authorize_execution(call, approval_id="test-approval", approval_scope=approval_scope):
+    with registry.authorize_execution(
+        call,
+        approval_id="test-approval",
+        approval_scope=decision.approval_scope,
+    ):
         result = await registry.execute(call)
+    assert "test content" in result.content
 
-    print(f"Whitelist after execution: {guard.whitelist._allowed_paths}")
-    print(f"Result: {result}")
+    # The exact file is whitelisted; the parent directory is NOT.
+    assert guard.whitelist.is_path_allowed(str(external_file))
+    assert not guard.whitelist.is_path_allowed(str(external_dir))
 
-    # After execution: external_dir SHOULD be in whitelist
-    assert guard.whitelist.is_path_allowed(str(external_dir)), \
-        f"Parent directory {external_dir} should be auto-whitelisted"
+    # Sibling read is still blocked: no silent directory-wide grant.
+    sibling = ToolCall(
+        id="call2",
+        name="read_file",
+        arguments={"path": str(external_dir / "master.passwd")},
+    )
+    blocked = await registry.execute(sibling)
+    assert blocked.is_error
+    assert "[BLOCKED]" in blocked.content
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+@pytest.mark.asyncio
+async def test_workspace_approval_keeps_directory_granularity(tmp_path):
+    """Inside the ordinary allowed dirs, directory whitelisting stays a no-op."""
+    working_dir = tmp_path / "project"
+    working_dir.mkdir()
+    sub = working_dir / "sub"
+    sub.mkdir()
+    env_file = sub / ".env"
+    env_file.write_text("SECRET=1")
+
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text("[]")
+
+    guard = ToolGuard(rules_path, allowed_dirs=[working_dir])
+    registry = _registry_with_read_file(guard)
+
+    # A sensitive file inside the workspace still requires approval...
+    call = ToolCall(id="c1", name="read_file", arguments={"path": str(env_file)})
+    decision = guard.check(call)
+    assert decision.approval_required and not decision.boundary_block
+    with registry.authorize_execution(
+        call, approval_id="a", approval_scope=decision.approval_scope
+    ):
+        await registry.execute(call)
+
+    # ...and the parent directory is whitelisted (harmless: the whole workspace
+    # was already readable, so this never broadens the boundary).
+    assert guard.whitelist.is_path_allowed(str(sub))
+

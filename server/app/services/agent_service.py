@@ -243,13 +243,21 @@ class AgentService:
         )
 
     async def update_auto_task(self, task_id: str, body: AutoTaskUpdate):
-        return await self.auto_task_service.update_auto_task(task_id, body)
+        return await self.auto_task_service.update_auto_task(
+            await self._profile_id(), task_id, body
+        )
 
     async def trigger_auto_task(self, task_id: str) -> AutoTaskRunOut:
-        return await self.auto_task_service.trigger_auto_task(task_id)
+        return await self.auto_task_service.trigger_auto_task(
+            await self._profile_id(), task_id
+        )
 
     async def delete_auto_task(self, task_id: str) -> None:
-        await self.auto_task_service.delete_auto_task(task_id)
+        await self.auto_task_service.delete_auto_task(
+            await self._profile_id(), task_id
+        )
 
     async def list_runs(self, task_id: str):
-        return await self.auto_task_service.list_runs(task_id)
+        return await self.auto_task_service.list_runs(
+            await self._profile_id(), task_id
+        )

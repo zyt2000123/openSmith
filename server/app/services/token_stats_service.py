@@ -86,6 +86,15 @@ class TokenStatsService:
                 (occurred_at or datetime.now(timezone.utc)).isoformat(),
             ),
         )
+        # An exact usage event supersedes the local text-token estimates for the
+        # same session (they carry source_key LIKE 'message:%'); clear them in the
+        # same transaction so get_stats never double-counts between this call and
+        # the next sync_from_traces.
+        await db.execute(
+            "DELETE FROM token_usage_events "
+            "WHERE source_key LIKE 'message:%' AND session_id=?",
+            (session_id,),
+        )
         await db.commit()
 
     async def record_generation(self, record: "GenerationRecord") -> None:
@@ -256,7 +265,7 @@ class TokenStatsService:
                 byte_offset INTEGER NOT NULL DEFAULT 0,
                 project_path TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT 'unknown',
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00','now'))
             )
             """
         )
@@ -372,14 +381,20 @@ class TokenStatsService:
                 """
                 INSERT INTO observability_trace_cursors (
                     run_id, byte_offset, project_path, model, updated_at
-                ) VALUES (?, ?, ?, ?, datetime('now'))
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     byte_offset=excluded.byte_offset,
                     project_path=excluded.project_path,
                     model=excluded.model,
                     updated_at=excluded.updated_at
                 """,
-                (run_id, max(0, next_offset), project_path, model),
+                (
+                    run_id,
+                    max(0, next_offset),
+                    project_path,
+                    model,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
         await db.commit()
         return imported + await self._sync_message_estimates(db)

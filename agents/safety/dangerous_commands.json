@@ -294,7 +294,7 @@
     "tools": ["shell"],
     "category": "platform_integrity",
     "severity": "high",
-    "patterns": ["\\b(rm|mv|chmod|chown|truncate|tee)\\b.*(Agent-Smith|\\.agent-smith)"],
+    "patterns": ["(?i)\\b(rm|mv|cp|install|dd|chmod|chown|truncate|tee)\\b.*(Agent-Smith|\\.agent-smith)"],
     "excludePatterns": [],
     "description": "Command would mutate or remove Agent-Smith platform files. Memory writes must use the controlled memory path.",
     "remediation": "Use the memory lifecycle hook for memory updates; do not mutate platform files with destructive shell commands."

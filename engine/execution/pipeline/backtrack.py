@@ -7,7 +7,6 @@ from typing import Literal
 @dataclass
 class FailureSignature:
     error_type: str
-    context_hash: str
 
 
 class FailureLoopGuard:

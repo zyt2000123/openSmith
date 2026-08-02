@@ -69,7 +69,7 @@ class IncidentDetector:
                 reason=reason,
                 evidence={"event_count": summary.event_count, **failure_details},
             ))
-        elif summary.outcome in {"cancelled", "incomplete", "blocked"}:
+        elif summary.outcome in {"cancelled", "incomplete"}:
             incidents.append(RunIncident(
                 **base,
                 severity="warning",
@@ -94,7 +94,7 @@ class IncidentDetector:
             for event in trace_events
             if event.get("type") == "tool_call_result"
             and isinstance(event.get("data"), dict)
-            and _is_timeout(event["data"])
+            and is_timeout(event["data"])
         )
         if timeouts:
             incidents.append(RunIncident(
@@ -108,10 +108,15 @@ class IncidentDetector:
         return incidents
 
 
-def _is_timeout(data: dict[str, Any]) -> bool:
-    status = str(data.get("status") or "").lower()
-    reason = str(data.get("reason") or data.get("error") or "").lower()
-    return status == "timeout" or "timeout" in reason or "timed out" in reason
+def is_timeout(data: dict[str, Any]) -> bool:
+    """Whether a TOOL_CALL_RESULT payload records a genuine tool timeout.
+
+    The react loop marks real tool timeouts with ``timed_out=True`` and
+    ``error_kind="timeout"`` (tool/registry.py).  Approval timeouts instead
+    carry a ``reason`` such as "Approval timed out" and never set ``timed_out``,
+    so they must not be classified as tool timeouts.
+    """
+    return data.get("timed_out") is True or data.get("error_kind") == "timeout"
 
 
 def _failure_details(trace: list[dict[str, Any]]) -> dict[str, int | str]:

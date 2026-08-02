@@ -501,7 +501,7 @@ def test_react_event_loop_discards_length_draft_when_continuation_calls_tool():
     assert finals == [{"text": "answer", "already_streamed": True}]
 
 
-def test_react_event_loop_uses_deterministic_recovery_when_compaction_fails():
+def test_react_event_loop_rejects_active_work_that_cannot_fit_without_rewriting_it():
     class CompressionFailingStreamingLLM(StreamingFakeLLM):
         context_window = 10_000
 
@@ -550,16 +550,13 @@ def test_react_event_loop_uses_deterministic_recovery_when_compaction_fails():
         if event.type == EventType.CONTEXT_USAGE
     ]
 
-    assert llm.compactor_calls == 1
-    assert any(item["fit_status"] == "recovered" for item in context)
-    assert not [
-        event for event in events if event.type in {EventType.INCOMPLETE, EventType.FAILED}
-    ]
-    assert [
-        event.data["text"]
+    assert llm.compactor_calls == 0
+    assert context[-1]["fit_status"] == "unfit_request"
+    assert any(
+        event.type is EventType.INCOMPLETE
+        and event.data["reason"] == "context_capacity_exhausted"
         for event in events
-        if event.type == EventType.TEXT_DELTA
-    ][-1].endswith("continued")
+    )
 
 
 def test_react_event_loop_marks_repeated_model_length_as_incomplete():
@@ -795,7 +792,7 @@ def test_react_event_loop_emits_token_usage():
     assert context["fit_status"] == "fit"
 
 
-def test_react_event_loop_compacts_large_conversation_before_answering():
+def test_react_event_loop_rejects_an_oversized_active_request_before_provider_call():
     async def run():
         llm = FakeLLM(
             [
@@ -819,16 +816,13 @@ def test_react_event_loop_compacts_large_conversation_before_answering():
 
     events, llm = asyncio.run(run())
 
-    assert len(llm.chat_calls) >= 2
-    assert "Summarize our conversation above" in llm.chat_calls[0]["messages"][-1]["content"]
-    assert [event.type for event in events].count(EventType.CONTEXT_COMPRESSION_START) == 1
-    assert [event.type for event in events].count(EventType.CONTEXT_COMPRESSION_END) == 1
-    text = "".join(
-        event.data.get("text", "")
+    assert llm.chat_calls == []
+    assert any(
+        event.type is EventType.INCOMPLETE
+        and event.data["reason"] == "context_capacity_exhausted"
+        and event.data["fit_status"] == "unfit_request"
         for event in events
-        if event.type == EventType.TEXT_DELTA
     )
-    assert text == "done"
 
 
 def test_react_event_loop_rejects_unfit_tool_schemas_before_provider_call():

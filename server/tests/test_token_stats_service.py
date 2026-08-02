@@ -395,3 +395,61 @@ async def test_sync_from_traces_skips_orphaned_sessions(tmp_path: Path) -> None:
 
     rows = await db.execute_fetchall("SELECT run_id FROM token_usage_events")
     assert [row["run_id"] for row in rows] == ["run-live"]
+
+
+@pytest.mark.asyncio
+async def test_record_usage_clears_message_estimates_for_the_session() -> None:
+    """Exact usage must supersede the local message estimates immediately, not
+    only at the next sync_from_traces, or get_stats double-counts in between."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE token_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            source_key TEXT,
+            project_name TEXT NOT NULL DEFAULT '',
+            project_path TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            occurred_at TEXT NOT NULL
+        );
+        INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1'), ('s2', 'agent-1');
+        INSERT INTO token_usage_events
+            (session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at)
+        VALUES
+            ('s1', NULL, 'message:m1', 'local-estimate', 5, 3, 8, '2026-07-14T10:00:00+00:00'),
+            ('s1', NULL, 'message:m2', 'local-estimate', 1, 2, 3, '2026-07-14T10:00:01+00:00'),
+            ('s2', NULL, 'message:m3', 'local-estimate', 9, 9, 18, '2026-07-14T10:00:02+00:00');
+        """
+    )
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    service = TokenStatsService(db_provider)
+    await service.record_usage(
+        session_id="s1",
+        run_id="r1",
+        project_name="Agent-Smith",
+        project_path="/tmp/Agent-Smith",
+        model="gpt-test",
+        usage={"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+        occurred_at=datetime.fromisoformat("2026-07-14T11:00:00+00:00"),
+    )
+
+    rows = await db.execute_fetchall(
+        "SELECT session_id, source_key, total_tokens FROM token_usage_events ORDER BY session_id"
+    )
+    assert [dict(r) for r in rows] == [
+        {"session_id": "s1", "source_key": None, "total_tokens": 125},
+        {"session_id": "s2", "source_key": "message:m3", "total_tokens": 18},
+    ]
+
+    stats = await service.get_stats("agent-1", year=2026)
+    assert stats["total_tokens"] == 143  # 125 exact + 18 estimate for s2, no double count

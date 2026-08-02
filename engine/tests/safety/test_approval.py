@@ -23,6 +23,81 @@ def test_approval_summary_redacts_nested_secrets_and_terminal_controls() -> None
     assert summary["nested"]["items"] == [{"token": "***"}]
 
 
+def test_approval_summary_redacts_secret_flag_pairs_in_list_arguments() -> None:
+    summary = summarize_arguments({
+        "args": ["--token", "sk-test-123456", "--model", "gpt-4o"],
+        "extra": ["--password=supersecret", "--plain", "visible"],
+        "mixed": ["--client-secret", "s3cr3t", "--region", "us-east-1"],
+    })
+
+    assert summary["args"] == ["--token", "***", "--model", "gpt-4o"]
+    assert summary["extra"] == ["--password=***", "--plain", "visible"]
+    assert summary["mixed"] == ["--client-secret", "***", "--region", "us-east-1"]
+
+
+def test_approval_summary_redacts_secret_shaped_list_values() -> None:
+    summary = summarize_arguments({
+        "args": [
+            "ghp_abcdefghijklmnopqrstuvwx",
+            "AKIA0123456789ABCDEF",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            "Bearer tok_abc123",
+        ],
+    })
+
+    assert summary["args"] == ["***", "***", "***", "***"]
+
+
+def test_approval_summary_redacts_case_variant_secret_flags() -> None:
+    summary = summarize_arguments({
+        "args": ["--TOKEN", "sk-abcdefgh", "--Password", "hunter2"],
+    })
+
+    assert summary["args"] == ["--TOKEN", "***", "--Password", "***"]
+
+
+def test_approval_summary_redacts_secrets_embedded_in_string_arguments() -> None:
+    """A key inside a shell command must not survive into the summary."""
+    summary = summarize_arguments({
+        "command": (
+            "curl -H 'Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz123456' "
+            "https://api.example.com"
+        ),
+        "command2": "aws configure --secret-access-key AKIA0123456789ABCDEF --region us",
+    })
+
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in summary["command"]
+    assert summary["command"] == (
+        "curl -H 'Authorization: Bearer ***' https://api.example.com"
+    )
+    assert "AKIA0123456789ABCDEF" not in summary["command2"]
+    assert summary["command2"] == "aws configure --secret-access-key *** --region us"
+
+
+def test_approval_summary_redacts_url_credentials() -> None:
+    summary = summarize_arguments({
+        "url": "https://user:supersecret@example.com/data",
+    })
+
+    assert "supersecret" not in summary["url"]
+    assert summary["url"] == "https://***@example.com/data"
+
+
+def test_approval_summary_preserves_ordinary_content() -> None:
+    """The embedded-secret scan must not mangle everyday arguments."""
+    summary = summarize_arguments({
+        "command": "npm install --save-dev eslint",
+        "url": "https://example.com/api?key=normal&limit=10",
+        "path": "/Users/me/sk-devtools/readme.md",
+        "message": "fix: handle token refresh",
+    })
+
+    assert summary["command"] == "npm install --save-dev eslint"
+    assert summary["url"] == "https://example.com/api?key=normal&limit=10"
+    assert summary["path"] == "/Users/me/sk-devtools/readme.md"
+    assert summary["message"] == "fix: handle token refresh"
+
+
 def test_approval_broker_wakes_the_waiting_run_with_the_user_decision() -> None:
     async def run() -> bool:
         broker = ApprovalBroker()

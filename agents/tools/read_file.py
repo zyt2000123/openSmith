@@ -38,6 +38,12 @@ MAX_LIMIT = 2000
 
 
 def _execute_sync(*, path: str, offset: int = 0, limit: int = 500) -> str:
+    if not isinstance(path, str):
+        return "Error: path must be a string"
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        return "Error: offset must be an integer"
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return "Error: limit must be an integer"
     resolved = os.path.realpath(path)
 
     if not os.path.exists(resolved):
@@ -55,15 +61,43 @@ def _execute_sync(*, path: str, offset: int = 0, limit: int = 500) -> str:
             selected_bytes = 0
             last_line = start
             hit_byte_limit = False
+            line_no = 0
 
-            for line_no, line in enumerate(f, start=1):
+            while len(selected) < limit:
+                # A bounded readline window keeps a single over-long line from
+                # ever entering memory whole: the 50 KB preview budget used to
+                # be applied only after the full line had already been read and
+                # materialized.
+                chunk = f.readline(MAX_READ_BYTES + 1)
+                if not chunk:
+                    break
+                line_no += 1
                 if line_no <= start:
+                    # Skip the line; a giant skipped line is drained in bounded
+                    # slices rather than materialized.
+                    while not chunk.endswith(("\n", "\r")):
+                        rest = f.readline(MAX_READ_BYTES)
+                        if not rest:
+                            break
+                        chunk = rest
                     continue
-                if len(selected) >= limit:
+
+                encoded = chunk.encode("utf-8")
+                line_bytes = len(encoded)
+                if line_bytes > MAX_READ_BYTES and not chunk.endswith(("\n", "\r")):
+                    # One over-long line: emit a truncated preview and stop.
+                    # The remainder is deliberately not read, so the true length
+                    # is unknown — reporting a number would be a guess.
+                    remaining = max(1, MAX_READ_BYTES - selected_bytes)
+                    line = encoded[:remaining].decode("utf-8", errors="replace")
+                    selected.append(
+                        f"{line}…[line truncated at {remaining} bytes; line exceeds "
+                        f"{MAX_READ_BYTES // 1024} KB]"
+                    )
+                    last_line = line_no
+                    hit_byte_limit = True
                     break
 
-                encoded = line.encode("utf-8")
-                line_bytes = len(encoded)
                 if selected_bytes + line_bytes > MAX_READ_BYTES:
                     if not selected:
                         remaining = max(1, MAX_READ_BYTES - selected_bytes)
@@ -79,7 +113,7 @@ def _execute_sync(*, path: str, offset: int = 0, limit: int = 500) -> str:
                     hit_byte_limit = True
                     break
 
-                selected.append(line)
+                selected.append(chunk)
                 selected_bytes += line_bytes
                 last_line = line_no
 

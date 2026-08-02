@@ -34,31 +34,39 @@ The current priority is the terminal workbench experience:
 ```
 User ──▶ Ink shell ──HTTP + SSE──▶ server ──▶ engine
                                                 │
-              identity_catalog (agents/identities/smith.yaml)
-              keyword + priority match ──▶ RouteSpec
+        identity_catalog (agents/identities/smith.yaml · coding.yaml)
+        keyword/example match → LLM fallback (declared routes only) ──▶ RouteDecision
                                                 │
                         ┌───────────────────────┴──────────────────┐
                         ▼                                          ▼
-                 pipeline: null                            pipeline: coding
-                 direct ReAct loop                  (agents/pipelines/coding.yaml)
+                 route: no pipeline                          route: pipeline
+                 direct ReAct loop                  (agents/pipelines/*.yaml)
                                                                    │
-    understanding ─▶ planning ─▶ architecture* ─▶ implementation ─▶ validation
-        gate:          gate:        gate:            gate:             gate:
-    understanding    planning      design     contract_alignment  validation_llm
+   requirements-research:  grilling → research → ecc-plan
+       gates: grilling_complete / research_brief / plan_confirmed
+   tdd-development:  diagnosing-bugs* → tdd-workflow → verification-loop
+       gates: red_loop / tdd_evidence / tdd_verification
+       * runs only when `coding_bugfix_needs_diagnosis` holds
+   code-review:  code-review → verification-loop
+       gates: review_report / review_verification
                                                                    │
-                          gate fails ──▶ backtrack to an earlier node
-    * runs only when `needs_architecture` holds (agents/conditions/coding.py)
+        gate fails ──▶ node retries with gate feedback (CTX_RETRY_HINT)
 ```
 
-Declared routes in `agents/identities/smith.yaml` (priority order): `git` (no
-pipeline), `bugfix`, `refactor`, `feature` (all → `coding`). A pipeline node
-falls back to generic ReAct when no matching `SKILL.md` is installed; the gate
-still runs, so the intermediate contract stays observable.
+Declared routes: `agents/identities/coding.yaml` holds the three chain routes —
+`requirements-research` (priority 30), `tdd-development` (20), `code-review`
+(10); `agents/identities/smith.yaml` holds only `git` (no pipeline). Ordinary
+coding, bugfix, and refactor requests are deliberately **not** hijacked by
+keywords — they stay in generic ReAct. A pipeline node falls back to generic
+ReAct when no matching `SKILL.md` is installed; the gate still runs, so the
+intermediate contract stays observable.
 
-Prompt assembly (`engine/context/assembler.py`) stacks 12 trust-tagged layers:
+Prompt assembly (`engine/context/assembler.py`) stacks 19 trust-tagged layers:
 Agent Role / Style / Workflow, Tool Usage Policy, Available Tools, Available
 Skills, Learned User Context, Global Instructions, Project Instructions,
-Identity Guidance, Evaluation Safety Guidance (conditional), Output Style.
+Identity Guidance, Evaluation Safety Guidance (conditional), Output Style,
+Memory Governance, Durable Memory, Recent Working Context, Durable Memory
+Retrieval, Relevant Episodes, Runtime Context, Engine Runtime Control.
 
 ## 4. Product Language
 
@@ -80,11 +88,11 @@ Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 
 | Layer | Directory | Source lines | Responsibility |
 |---|---|---|---|
-| Infrastructure | `common/` | 269 | Paths, SQLite connection, YAML read/write. Zero business logic. |
-| Execution | `engine/` | 16.5k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
-| Content | `agents/` | 4.0k | Smith identity seed, pipelines, gates, tools, skills, safety rules. Pure content. |
-| Platform | `server/` | 5.9k | FastAPI. Orchestration, session/agent lifecycle, 34 HTTP endpoints. |
-| Terminal UI | `shell/` | 9.3k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
+| Infrastructure | `common/` | 578 | Paths, SQLite connection, YAML read/write. Zero business logic. |
+| Execution | `engine/` | 23.1k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
+| Content | `agents/` | 4.8k | Smith identity seed, pipelines, gates, tools, skills, safety rules. Pure content. |
+| Platform | `server/` | 5.2k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints. |
+| Terminal UI | `shell/` | 10.1k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
 
 Rules:
 
@@ -147,17 +155,22 @@ declaration stays in sync.
 
 ### Working Rhythm
 
-Skills are matched passively; nothing chains them. Name the step you want:
+Intent routing decides between direct ReAct and one of the three shipped
+skill chains (§3). Explicit entry points:
 
-| Intent | Command |
+| Intent | Entry |
 |---|---|
-| Turn a vague ask into a decided plan | `grill me` |
-| Execute a defined task | `/ecc:orch-fix-defect`, `/ecc:orch-add-feature`, `/ecc:orch-refine-code` |
-| Check a diff before it lands | `/ecc:code-review` |
+| Turn a vague ask into a decided plan | `grill me` → `grilling` → `research` → `ecc-plan` |
+| Requirements research | keywords (`需求调研`, `调研`, `研究一下`, …) → `requirements-research` chain |
+| TDD feature/bugfix | keywords (`tdd`, `测试驱动`, `先写测试`, …) → `tdd-development` chain |
+| Review a diff before it lands | keywords (`code review`, `代码评审`, `评审一下`, …) → `code-review` chain |
+| Everything else | stays in generic direct ReAct |
 
-`grill me` stops at shared understanding — it does not hand off. The `orch-*`
-skills delegate to `ecc:orch-pipeline` (Research → Plan → TDD → Review → Commit,
-two human gates); invoke an operation skill, never the engine directly.
+Routing is lexical first (`IdentityCatalog` keyword/example + priority match),
+then an LLM fallback classifier constrained to declared `identity:route`
+tokens (`route_task_with_llm`, wired into `prepare_runtime`); neither path can
+invent an identity, domain, or pipeline. `grill me` stops at shared
+understanding — it does not hand off or implement.
 
 ## 9. Testing And Verification
 
@@ -168,7 +181,7 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 717 passed, server 155 passed (5 skipped).
+Current baseline: engine 810 passed, server 189 passed (5 skipped), shell 236 passed.
 
 ## 10. Not Implemented Yet
 

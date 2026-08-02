@@ -10,11 +10,15 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from engine.execution.orchestration.agent_loop import run_agent_stream
 from engine.execution.pipeline.backtrack import FailureLoopGuard, FailureSignature
-from engine.execution.events import EventType
+from engine.execution.events import EventType, ExecutionEvent
 from engine.execution.pipeline.gate import GateResult
+from engine.execution.pipeline.pipeline import _evict_outputs_at_or_after, run_pipeline
 from engine.execution.react.react_loop import react_event_loop
+from engine.execution.react.budget import TOOL_CALL_BUDGET_MESSAGE, budget_exhausted_message
 from engine.execution.pipeline.skill_chain import SkillChain, SkillNode
 from engine.identity import IdentitySpec, RouteDecision
 from engine.llm.client import ChatResponse
@@ -83,6 +87,95 @@ def test_failing_gate_without_backtrack_terminates_blocked(tmp_path: Path) -> No
     assert not (tmp_path / "sessions" / ".state" / "sess-t.json").exists()
 
 
+def test_question_without_pause_marker_waits_instead_of_retrying_a_gate(
+    tmp_path: Path,
+) -> None:
+    class QuestionLLM:
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            return ChatResponse(text="Which supported provider should we prioritize?")
+
+    class GateMustNotRun:
+        async def check(self, output, context):
+            raise AssertionError("a user question must pause before the node gate")
+
+    chain = SkillChain([
+        SkillNode(
+            "grilling",
+            GateMustNotRun(),
+            await_user_input_marker="<!-- agent-smith:await-user-input -->",
+            infer_await_user_input_from_question=True,
+        ),
+    ])
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                QuestionLLM(),
+                "system prompt",
+                "research a provider",
+                FakeToolRegistry(),
+                FakeSkillRegistry(),
+                FEATURE_ROUTE,
+                chain,
+                FailureLoopGuard(),
+                execution_context={
+                    "agent_id": "a",
+                    "session_id": "sess-question",
+                    "_state_dir": str(tmp_path),
+                },
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert EventType.AWAITING_INPUT in [event.type for event in events]
+    assert EventType.GATE_RESULT not in [event.type for event in events]
+    assert [
+        event.data["status"]
+        for event in events
+        if event.type is EventType.SKILL_END
+    ] == ["awaiting_input"]
+
+
+def test_question_without_question_inference_still_runs_the_node_gate() -> None:
+    class QuestionLLM:
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            return ChatResponse(text="Review complete. Would you like a patch next?")
+
+    class PassingGate:
+        async def check(self, output, context):
+            return GateResult("pass", "review report is complete")
+
+    chain = SkillChain([
+        SkillNode(
+            "code-review",
+            PassingGate(),
+            await_user_input_marker="<!-- agent-smith:await-user-input -->",
+        ),
+    ])
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                QuestionLLM(),
+                "system prompt",
+                "review this diff",
+                FakeToolRegistry(),
+                FakeSkillRegistry(),
+                FEATURE_ROUTE,
+                chain,
+                FailureLoopGuard(),
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert EventType.GATE_RESULT in [event.type for event in events]
+    assert EventType.AWAITING_INPUT not in [event.type for event in events]
+
+
 def test_backtrack_target_missing_terminates_blocked() -> None:
     chain = SkillChain(
         [SkillNode("planning", AlwaysFailGate())],
@@ -143,14 +236,14 @@ def test_pipeline_with_a_missing_skill_falls_back_to_direct_react() -> None:
     ]
 
 
-def test_guard_escalates_per_node_despite_varying_output_hash() -> None:
+def test_guard_escalates_per_node() -> None:
     guard = FailureLoopGuard()
-    # LLM 输出每次不同（hash 不同）也必须按节点计数收敛
-    assert guard.record(FailureSignature("node-a", "h1")) == "retry"
-    assert guard.record(FailureSignature("node-a", "h2")) == "switch"
-    assert guard.record(FailureSignature("node-a", "h3")) == "blocked"
+    # LLM 输出每次不同也必须按节点计数收敛（signature 只按节点 keying）
+    assert guard.record(FailureSignature("node-a")) == "retry"
+    assert guard.record(FailureSignature("node-a")) == "switch"
+    assert guard.record(FailureSignature("node-a")) == "blocked"
     # 其他节点独立计数，不被 node-a 的失败历史污染
-    assert guard.record(FailureSignature("node-b", "h4")) == "retry"
+    assert guard.record(FailureSignature("node-b")) == "retry"
 
 
 def test_truncation_does_not_split_tool_pairs() -> None:
@@ -250,3 +343,390 @@ def _assert_tool_pairs_intact(sent: list[dict]) -> None:
         elif m.get("role") == "tool":
             # 每条 tool 消息必须能配到前文 assistant 的 tool_calls，否则 provider 400
             assert m["tool_call_id"] in seen_call_ids
+
+
+class PassingGate:
+    async def check(self, output, context):
+        return GateResult("pass", "ok")
+
+
+class RecordingLLM:
+    def __init__(self, responses):
+        self._responses = iter(responses)
+        self.calls: list[list[dict]] = []
+
+    async def chat(self, messages, tools=None, prefix_cache_key=None):
+        self.calls.append([dict(m) for m in messages])
+        return ChatResponse(text=next(self._responses))
+
+
+# --- P5/P11: topology validation ------------------------------------------
+
+
+def test_pipeline_rejects_duplicate_skill_names() -> None:
+    chain = SkillChain([
+        SkillNode("planning", PassingGate()),
+        SkillNode("planning", AlwaysFailGate()),
+    ])
+    with pytest.raises(ValueError, match="duplicate skill names"):
+        _collect(chain)
+
+
+def test_pipeline_rejects_self_backtrack_target() -> None:
+    chain = SkillChain(
+        [SkillNode("planning", AlwaysFailGate())],
+        backtrack_map={"planning": "planning"},
+    )
+    with pytest.raises(ValueError, match="must precede"):
+        _collect(chain)
+
+
+def test_pipeline_rejects_forward_backtrack_target() -> None:
+    chain = SkillChain(
+        [SkillNode("planning", PassingGate()), SkillNode("review", AlwaysFailGate())],
+        backtrack_map={"planning": "review"},
+    )
+    with pytest.raises(ValueError, match="must precede"):
+        _collect(chain)
+
+
+# --- P1: stale outputs evicted on backtrack --------------------------------
+
+
+def test_backtrack_evicts_committed_outputs_at_or_after_target() -> None:
+    context = {"a_output": "A1", "b_output": "B1", "c_output": "C1", "other": 1}
+    committed_output_index = {"a_output": 0, "b_output": 1, "c_output": 2}
+    committed_provisional_output = {"a_output": True, "b_output": False, "c_output": True}
+
+    _evict_outputs_at_or_after(
+        context, committed_output_index, committed_provisional_output, target_idx=1
+    )
+
+    assert context == {"a_output": "A1", "other": 1}
+    assert committed_output_index == {"a_output": 0}
+    assert committed_provisional_output == {"a_output": True}
+
+
+def test_backtrack_re_run_handoff_has_no_stale_future_node_output() -> None:
+    """A backtracked re-run must not receive superseded outputs in its handoff."""
+    llm = RecordingLLM([
+        "PLAN-OUTPUT-A",
+        "PLAN-OUTPUT-B",
+        "C-OUTPUT-1",
+        "C-OUTPUT-2",
+        "PLAN-OUTPUT-A2",
+        "PLAN-OUTPUT-B2",
+        "C-OUTPUT-3",
+    ])
+    chain = SkillChain(
+        [
+            SkillNode("planning", PassingGate()),
+            SkillNode("research", PassingGate()),
+            SkillNode("implement", AlwaysFailGate()),
+        ],
+        backtrack_map={"implement": "planning"},
+    )
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                llm,
+                "system prompt",
+                "build a feature",
+                FakeToolRegistry(),
+                FakeSkillRegistry(),
+                FEATURE_ROUTE,
+                chain,
+                FailureLoopGuard(),
+            )
+        ]
+
+    asyncio.run(run())
+
+    # planning 在第 4 次调用重跑（回溯后）。B1（research 首轮产出）已在回溯时
+    # 被逐出，不应再出现在 planning 重跑的 Prior Workflow Outputs 里。
+    planning_rerun = "".join(str(m.get("content", "")) for m in llm.calls[4])
+    assert "PLAN-OUTPUT-B" not in planning_rerun
+    assert "PLAN-OUTPUT-A" not in planning_rerun
+
+
+# --- P4: retry hint must not leak past a skipped backtrack target ----------
+
+
+def test_backtrack_hint_does_not_leak_when_target_skill_is_disabled() -> None:
+    class FailingThenPassingGate:
+        def __init__(self) -> None:
+            self.failures = 0
+
+        async def check(self, output, context):
+            self.failures += 1
+            if self.failures <= 2:
+                return GateResult("fail", "rejected", retry_hint="LEAK-HINT-MARKER")
+            return GateResult("pass", "ok")
+
+    llm = RecordingLLM([
+        "P-1", "P-2", "P-3",  # planning 三次执行（前两次带 hint 重试/回溯）
+        "F-1",               # final 节点
+    ])
+    chain = SkillChain(
+        [
+            SkillNode("review", PassingGate()),
+            SkillNode("planning", FailingThenPassingGate()),
+            SkillNode("final", PassingGate()),
+        ],
+        backtrack_map={"planning": "review"},
+    )
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                llm,
+                "system prompt",
+                "build a feature",
+                FakeToolRegistry(),
+                FakeSkillRegistry(),
+                FEATURE_ROUTE,
+                chain,
+                FailureLoopGuard(),
+                disabled_skill_names=frozenset({"review"}),
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    # planning 的第二次重试确实拿到了 hint（重试机制本身在起作用）……
+    retry_call = "".join(str(m.get("content", "")) for m in llm.calls[1])
+    assert "LEAK-HINT-MARKER" in retry_call
+    # ……但 review 被禁用跳过时 hint 必须被清掉，planning 回溯后的重跑与
+    # final 节点都不得把它当成自己的 rubric feedback。
+    assert "LEAK-HINT-MARKER" not in "".join(
+        str(m.get("content", "")) for m in llm.calls[2]
+    )
+    assert "LEAK-HINT-MARKER" not in "".join(
+        str(m.get("content", "")) for m in llm.calls[3]
+    )
+    assert [event.data["status"] for event in events if event.type is EventType.SKILL_END] == [
+        "retry", "passed", "passed",
+    ]
+
+
+# --- P3: budget message surfaced on incomplete/failed node ------------------
+
+
+def _incomplete_node_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_stream_factory):
+    async def fake_execute_skill_events(
+        skill, llm, tool_registry, messages, context, max_react_iters,
+        tool_guard=None, provisional_lifecycle=True,
+        react_event_loop_fn=None, prefix_cache_key=None,
+    ):
+        async for event in event_stream_factory():
+            yield event
+
+    import engine.skill.executor as skill_executor_module
+
+    monkeypatch.setattr(skill_executor_module, "execute_skill_events", fake_execute_skill_events)
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                FakeLLM(),
+                "system prompt",
+                "build a feature",
+                FakeToolRegistry(),
+                FakeSkillRegistry(),
+                FEATURE_ROUTE,
+                SkillChain([SkillNode("planning", AlwaysFailGate())]),
+                FailureLoopGuard(),
+                execution_context={
+                    "agent_id": "a",
+                    "session_id": "sess-incomplete",
+                    "_state_dir": str(tmp_path),
+                },
+            )
+        ]
+
+    return asyncio.run(run())
+
+
+def test_incomplete_node_surfaces_engine_budget_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget_text = budget_exhausted_message(TOOL_CALL_BUDGET_MESSAGE)
+
+    async def event_stream_factory():
+        yield ExecutionEvent(EventType.TEXT_DELTA, {"text": budget_text})
+        yield ExecutionEvent(EventType.INCOMPLETE, {"reason": "tool_call_budget"})
+
+    events = _incomplete_node_events(tmp_path, monkeypatch, event_stream_factory)
+
+    delta_texts = [e.data["text"] for e in events if e.type is EventType.TEXT_DELTA]
+    assert budget_text in delta_texts
+    assert [e.data["status"] for e in events if e.type is EventType.SKILL_END] == ["incomplete"]
+    assert events[-1].type is EventType.DONE
+
+
+def test_incomplete_node_does_not_surface_a_provider_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def event_stream_factory():
+        yield ExecutionEvent(EventType.TEXT_DELTA, {"text": "UNGATED CONTENT-FILTERED DRAFT"})
+        yield ExecutionEvent(EventType.INCOMPLETE, {"reason": "content_filter"})
+
+    events = _incomplete_node_events(tmp_path, monkeypatch, event_stream_factory)
+
+    assert not [e for e in events if e.type is EventType.TEXT_DELTA]
+    assert EventType.INCOMPLETE in [e.type for e in events]
+
+
+# --- P7: missing-skill fallback replaces the trailing user turn -------------
+
+
+def test_missing_skill_fallback_replaces_user_turn_instead_of_appending() -> None:
+    class RecordingMissingSkillLLM:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls.append([dict(m) for m in messages])
+            return ChatResponse(text=_RUBRIC_PASSING_TEXT)
+
+    class MissingSkillRegistry:
+        def get(self, name):
+            return None
+
+    llm = RecordingMissingSkillLLM()
+
+    async def run():
+        return [
+            event
+            async for event in run_pipeline(
+                SkillChain([SkillNode("planning", AlwaysFailGate())]),
+                llm,
+                "build a feature",
+                [
+                    {"role": "system", "content": "system prompt"},
+                    {"role": "user", "content": "build a feature"},
+                ],
+                FakeToolRegistry(),
+                MissingSkillRegistry(),
+                None,
+                FailureLoopGuard(),
+                5,
+                {},
+            )
+        ]
+
+    asyncio.run(run())
+
+    # 兜底 ReAct 复用 base_messages，必须替换末尾 user turn 而不是追加一条
+    # 重复的 user 消息（部分 provider 拒绝连续 user turn）。
+    for call in llm.calls:
+        user_messages = [m for m in call if m.get("role") == "user"]
+        assert len(user_messages) == 1
+        assert user_messages[0]["content"] == "[Skill: planning] build a feature"
+
+
+# --- P6: provisional ledger survives checkpoint resume ----------------------
+
+
+def test_resume_restores_provisional_ledger_for_already_streamed_final(
+    tmp_path: Path,
+) -> None:
+    from engine.execution.pipeline.checkpoint import SessionCheckpoint, SessionStateManager
+
+    SessionStateManager(tmp_path).save(SessionCheckpoint(
+        run_id="crashedrun0000000000000000000001",
+        agent_id="a",
+        session_id="sess-prov",
+        identity_id="smith",
+        route_id="feature",
+        skill_chain_index=0,  # planning already committed before the crash
+        context={
+            "user_message": "build a feature",
+            "identity_id": "smith",
+            "route_id": "feature",
+            "agent_id": "a",
+            "session_id": "sess-prov",
+            "planning_output": "PLAN-FROM-CHECKPOINT",
+        },
+        timestamp="2026-07-15T00:00:00+00:00",
+        working_dir=str(tmp_path.resolve()),
+        provisional_outputs={"planning_output": True},
+    ))
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                FakeLLM(),
+                "system prompt",
+                "build a feature",
+                FakeToolRegistry(),
+                FakeSkillRegistry(),
+                FEATURE_ROUTE,
+                SkillChain([SkillNode("planning", PassingGate())]),
+                FailureLoopGuard(),
+                execution_context={
+                    "agent_id": "a",
+                    "session_id": "sess-prov",
+                    "_state_dir": str(tmp_path),
+                    "_working_dir": str(tmp_path.resolve()),
+                },
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    final = [e for e in events if e.type is EventType.TEXT_DELTA]
+    assert final and final[0].data["text"] == "PLAN-FROM-CHECKPOINT"
+    # 恢复后 was_provisional 必须来自 checkpoint，否则已经流式渲染过的文本
+    # 会被重复渲染一遍。
+    assert final[0].data.get("already_streamed") is True
+    assert not (tmp_path / "sessions" / ".state" / "sess-prov.json").exists()
+
+
+# --- P9: checkpoint persistence is offloaded off the event loop -------------
+
+
+def test_checkpoint_save_offloads_sync_io_to_a_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """json.dump + fsync + os.replace must run in a thread, never the loop."""
+    import asyncio
+
+    from engine.execution.pipeline import pipeline as pipeline_module
+    from engine.execution.pipeline.pipeline_context import (
+        CTX_AGENT_ID,
+        CTX_IDENTITY_ID,
+        CTX_ROUTE_ID,
+        CTX_RUN_ID,
+        CTX_SESSION_ID,
+        CTX_STATE_DIR,
+        CTX_WORKING_DIR,
+    )
+
+    offloaded: list[object] = []
+
+    async def recording_to_thread(fn, *args, **kwargs):
+        offloaded.append(fn)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording_to_thread)
+
+    context = {
+        CTX_AGENT_ID: "a",
+        CTX_SESSION_ID: "sess-p9",
+        CTX_IDENTITY_ID: "smith",
+        CTX_ROUTE_ID: "feature",
+        CTX_STATE_DIR: str(tmp_path),
+        CTX_WORKING_DIR: str(tmp_path),
+        CTX_RUN_ID: "run-p9",
+    }
+
+    asyncio.run(pipeline_module._save_checkpoint(context, 0))
+
+    assert offloaded, "checkpoint persistence must be offloaded via asyncio.to_thread"
+    assert (tmp_path / "sessions" / ".state" / "sess-p9.json").is_file()

@@ -5,8 +5,9 @@ import json
 import multiprocessing
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,6 +15,12 @@ import engine.memory.maintenance as maintenance_module
 from engine.memory.maintenance import (
     MemoryLifecycleHooks,
     MemoryMaintenanceService,
+)
+from engine.memory.nudge import (
+    MemoryNudgeError,
+    NudgeEvidence,
+    _load_evidence,
+    _parse_candidates,
 )
 from engine.execution.orchestration.lifecycle import (
     _ensure_memory_lifecycle_hooks,
@@ -916,3 +923,379 @@ async def test_maintenance_status_reports_running_while_a_task_is_in_flight(tmp_
         MemoryMaintenanceService._background_tasks.pop(key, None)
 
     assert memory_maintenance_status(memory_dir)["compile"] == "idle"
+
+
+# ---------------------------------------------------------------------------
+# Maintenance retry backoff
+# ---------------------------------------------------------------------------
+
+_DREAM_DOC = """# Durable Project Memory
+
+## Confirmed Facts
+- **Storage**: {detail}
+
+## Decisions
+
+## Reusable Procedures
+
+## Known Pitfalls
+"""
+
+
+def test_dream_maintenance_backs_off_after_a_transport_failure(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    original = _DREAM_DOC.format(
+        detail="Keep the original storage decision for this project with enough detail."
+    )
+    (memory_dir / "durable.md").write_text(original, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps({
+            "task": "storage correction",
+            "summary": "Correct the storage decision.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "scope": "project",
+            "evidence": "user_explicit",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (memory_dir / ".dream_counter").write_text("50", encoding="utf-8")
+    calls = 0
+
+    class FlakyLLM:
+        async def chat(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("provider unavailable")
+
+    async def run() -> tuple[bool, bool]:
+        service = MemoryMaintenanceService(FlakyLLM(), reviewer=PassReviewer())
+        first = await service.run_dream(memory_dir)
+        second = await service.run_dream(memory_dir)
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert (first, second) == (False, False)
+    assert calls == 1  # the second attempt is inside the cooldown
+    assert (memory_dir / ".dream_retry_attempt").is_file()
+
+
+def test_dream_maintenance_retries_review_rejections_without_backoff(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    original = _DREAM_DOC.format(
+        detail="Keep the original storage decision for this project with enough detail."
+    )
+    (memory_dir / "durable.md").write_text(original, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps({
+            "task": "storage correction",
+            "summary": "Correct the storage decision.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "scope": "project",
+            "evidence": "user_explicit",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (memory_dir / ".dream_counter").write_text("50", encoding="utf-8")
+    calls = 0
+
+    class CountingLLM:
+        async def chat(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return ChatResponse(text=original)
+
+    class RejectReviewer:
+        async def chat(self, messages, **_):
+            return ChatResponse(
+                text='{"pass": false, "hard_fail": ["fabrication"], "soft_fail": [], "feedback": "bad"}'
+            )
+
+        async def close(self):
+            pass
+
+    async def run() -> tuple[bool, bool]:
+        service = MemoryMaintenanceService(
+            CountingLLM(),
+            reviewer=RejectReviewer(),  # type: ignore[arg-type]
+        )
+        first = await service.run_dream(memory_dir)
+        second = await service.run_dream(memory_dir)
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert (first, second) == (False, False)
+    assert calls >= 6  # a full review round-trip on both attempts, no cooldown
+    assert not (memory_dir / ".dream_retry_attempt").exists()
+
+
+def test_save_conversation_memory_skips_due_dream_lane_inside_cooldown(
+    tmp_path: Path,
+) -> None:
+    from engine.memory.store import save_conversation_memory
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / ".dream_counter").write_text("50", encoding="utf-8")
+    (memory_dir / ".dream_retry_attempt").write_text(str(time.time()), encoding="utf-8")
+
+    maintenance = AsyncMock(return_value=False)
+    asyncio.run(save_conversation_memory(
+        tmp_path,
+        "task",
+        "reply",
+        had_tools=True,
+        dream_maintenance=maintenance,
+    ))
+
+    maintenance.assert_not_awaited()
+
+
+def test_deferred_schedule_respects_dream_cooldown(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / ".dream_retry_attempt").write_text(str(time.time()), encoding="utf-8")
+
+    service = MemoryMaintenanceService(
+        StaticLLM(),
+        reviewer=PassReviewer(),
+        defer_maintenance=True,
+    )
+    assert asyncio.run(service._schedule_dream(memory_dir)) is False
+    assert not any(
+        path == memory_dir.resolve() and kind == "dream"
+        for (path, kind) in MemoryMaintenanceService._background_tasks
+    )
+
+
+# ---------------------------------------------------------------------------
+# Background-task bookkeeping
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_background_task_finish_does_not_evict_a_new_registration(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    key = (memory_dir.resolve(), "compile")
+
+    async def quick() -> None:
+        return None
+
+    old_task = asyncio.create_task(quick())
+    await old_task
+    new_task = asyncio.create_task(asyncio.Event().wait())
+    MemoryMaintenanceService._background_tasks[key] = new_task
+
+    MemoryMaintenanceService._discard_completed_task(key, old_task)
+
+    assert MemoryMaintenanceService._background_tasks.get(key) is new_task
+    new_task.cancel()
+    try:
+        await new_task
+    except asyncio.CancelledError:
+        pass
+    MemoryMaintenanceService._background_tasks.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_background_task_finish_pops_only_the_registered_completed_task(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    key = (memory_dir.resolve(), "nudge")
+
+    async def quick() -> None:
+        return None
+
+    task = asyncio.create_task(quick())
+    await task
+    MemoryMaintenanceService._background_tasks[key] = task
+
+    MemoryMaintenanceService._discard_completed_task(key, task)
+
+    assert key not in MemoryMaintenanceService._background_tasks
+
+
+# ---------------------------------------------------------------------------
+# Audit-history retention
+# ---------------------------------------------------------------------------
+
+def test_trim_memory_history_keeps_recent_entries(tmp_path: Path) -> None:
+    from engine.memory.history import trim_memory_history
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    history_path = memory_dir / "memory_history.jsonl"
+    stale = json.dumps({
+        "timestamp": "2020-01-01T00:00:00+00:00",
+        "target": "durable",
+        "status": "written",
+    })
+    recent = json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "target": "durable",
+        "status": "written",
+    })
+    history_path.write_text(stale + "\n" + recent + "\n", encoding="utf-8")
+
+    assert trim_memory_history(memory_dir) is True
+    remaining = history_path.read_text(encoding="utf-8").splitlines()
+    assert len(remaining) == 1
+    assert "2020-01-01" not in remaining[0]
+
+
+def test_trim_memory_history_caps_entry_count(tmp_path: Path) -> None:
+    from engine.memory.history import trim_memory_history
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    now = datetime.now(timezone.utc)
+    lines = [
+        json.dumps({
+            "timestamp": (now - timedelta(minutes=index)).isoformat(),
+            "target": "dream",
+            "status": "written",
+        })
+        for index in range(60)
+    ]
+    (memory_dir / "memory_history.jsonl").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+    assert trim_memory_history(memory_dir, max_entries=10) is True
+    remaining = (memory_dir / "memory_history.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(remaining) == 10
+
+
+def test_dream_maintenance_trims_stale_audit_history(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    stale = json.dumps({
+        "timestamp": "2020-01-01T00:00:00+00:00",
+        "target": "dream",
+        "status": "written",
+    })
+    (memory_dir / "memory_history.jsonl").write_text(stale + "\n", encoding="utf-8")
+    original = _DREAM_DOC.format(
+        detail="Keep the original storage decision for this project with enough detail."
+    )
+    replacement = _DREAM_DOC.format(
+        detail="Use the corrected storage decision for this project with enough detail."
+    )
+    (memory_dir / "durable.md").write_text(original, encoding="utf-8")
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps({
+            "task": "storage correction",
+            "summary": "Use the corrected storage decision for this project.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "scope": "project",
+            "evidence": "user_explicit",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    result = asyncio.run(
+        MemoryMaintenanceService(
+            StaticLLM(replacement),
+            reviewer=PassReviewer(),
+        ).run_dream(memory_dir)
+    )
+
+    assert result is True
+    remaining = (memory_dir / "memory_history.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert remaining
+    assert all("2020-01-01" not in line for line in remaining)
+
+
+# ---------------------------------------------------------------------------
+# Nudge candidate handling
+# ---------------------------------------------------------------------------
+
+def test_nudge_load_evidence_repairs_a_torn_trailing_line(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    good = json.dumps({
+        "task": "Run tests",
+        "summary": "pytest passed 141 tests",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "work",
+        "scope": "project",
+        "evidence": "tool_result",
+    })
+    (memory_dir / "recent.jsonl").write_text(
+        good + "\n" + '{"task": "torn',
+        encoding="utf-8",
+    )
+
+    evidence = _load_evidence(memory_dir)
+
+    assert evidence.error is None
+    assert evidence.end_offset == 1
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == good + "\n"
+
+
+def test_nudge_rejects_an_ambiguous_evidence_excerpt() -> None:
+    evidence = NudgeEvidence(
+        start_offset=0,
+        end_offset=2,
+        source=(
+            "[Evidence 1]\nTask: a\nResult: pytest passed 141 tests\n"
+            "Evidence type: tool_result\n\n"
+            "[Evidence 2]\nTask: b\nResult: pytest passed 141 tests\n"
+            "Evidence type: tool_result"
+        ),
+        excerpts=("pytest passed 141 tests", "pytest passed 141 tests"),
+    )
+    payload = json.dumps({
+        "candidates": [{
+            "kind": "procedure",
+            "scope": "project",
+            "content": "Use pytest for testing",
+            "evidence": "passed 141 tests",
+            "evidence_type": "tool_result",
+        }],
+    })
+
+    with pytest.raises(MemoryNudgeError, match="evidence"):
+        _parse_candidates(payload, evidence)
+
+
+def test_nudge_accepts_an_excerpt_bound_to_exactly_one_event() -> None:
+    evidence = NudgeEvidence(
+        start_offset=0,
+        end_offset=2,
+        source=(
+            "[Evidence 1]\nTask: a\nResult: pytest passed 141 tests\n"
+            "Evidence type: tool_result\n\n"
+            "[Evidence 2]\nTask: b\nResult: deploy happened on Friday\n"
+            "Evidence type: tool_result"
+        ),
+        excerpts=("pytest passed 141 tests", "deploy happened on Friday"),
+    )
+    payload = json.dumps({
+        "candidates": [{
+            "kind": "procedure",
+            "scope": "project",
+            "content": "Use pytest for testing",
+            "evidence": "pytest passed 141 tests",
+            "evidence_type": "tool_result",
+        }],
+    })
+
+    candidates = _parse_candidates(payload, evidence)
+    assert len(candidates) == 1
+    assert candidates[0].evidence == "pytest passed 141 tests"

@@ -769,3 +769,48 @@ def test_get_db_runs_directory_setup_without_blocking_the_event_loop(
             config.reset_paths()
 
     asyncio.run(run())
+
+
+def test_get_app_db_runs_schema_setup_once_for_concurrent_callers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Concurrent first access must not run ensure_schema twice: it contains
+    non-idempotent startup cleanup."""
+    from app.infrastructure import database as app_database
+
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=tmp_path / "project")
+    config.reset_paths(paths)
+    real_connect = app_database.aiosqlite.connect
+
+    async def delayed_connect(*args, **kwargs):
+        await asyncio.sleep(0)
+        return await real_connect(*args, **kwargs)
+
+    schema_calls = 0
+
+    async def counting_ensure_schema(db) -> None:
+        nonlocal schema_calls
+        schema_calls += 1
+        await asyncio.sleep(0)  # widen the race window between the two callers
+        await real_ensure_schema(db)
+
+    real_ensure_schema = app_database.ensure_schema
+    monkeypatch.setattr(app_database.aiosqlite, "connect", delayed_connect)
+    monkeypatch.setattr(app_database, "ensure_schema", counting_ensure_schema)
+    monkeypatch.setattr(app_database, "_initialized_db", None)
+
+    async def run() -> None:
+        try:
+            # Concurrent first access: both pass the outer check before either
+            # acquires the schema lock; the double-checked lock must run
+            # ensure_schema exactly once.
+            first, second = await asyncio.gather(
+                app_database.get_app_db(), app_database.get_app_db()
+            )
+            assert first is second
+            assert schema_calls == 1
+        finally:
+            await database.close_db()
+            config.reset_paths()
+
+    asyncio.run(run())

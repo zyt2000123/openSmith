@@ -97,3 +97,46 @@ def test_catalog_rejects_unresolvable_pipeline_and_explicit_skill_references(tmp
             {"legal-contract-review"},
             set(),
         )
+
+
+def _git_catalog(directory: Path) -> IdentityCatalog:
+    _write_identity(
+        directory,
+        "smith.yaml",
+        "schema: agentsmith.identity/v1",
+        "id: smith",
+        "name: Smith",
+        "default: true",
+        "routes:",
+        "  - id: git",
+        "    keywords: [git, commit]",
+        "    pipeline: git",
+    )
+    return IdentityCatalog.load(directory)
+
+
+def test_latin_keyword_matches_when_directly_adjacent_to_cjk(tmp_path: Path) -> None:
+    """\b word boundaries treat CJK ideographs as word chars, so Latin keywords
+    must match on ASCII-only boundaries instead (用git提交, git分支, 帮我commit一下)."""
+    catalog = _git_catalog(tmp_path)
+
+    assert catalog.resolve("用git提交").route_id == "git"
+    assert catalog.resolve("git分支").route_id == "git"
+    assert catalog.resolve("帮我commit一下").route_id == "git"
+    assert catalog.resolve("git提交和commit检查").route_id == "git"
+
+
+def test_latin_keyword_still_rejects_embedded_english_compounds(tmp_path: Path) -> None:
+    catalog = _git_catalog(tmp_path)
+
+    # "git" inside a longer English word must not steal the route.
+    assert catalog.resolve("please legitimate this request").route_id == "direct"
+    assert catalog.resolve("check the digitized document").route_id == "direct"
+    assert catalog.resolve("the committee reviewed it").route_id == "direct"
+
+
+def test_latin_keyword_space_separated_phrase_still_matches(tmp_path: Path) -> None:
+    catalog = _git_catalog(tmp_path)
+
+    assert catalog.resolve("use git to commit my changes").route_id == "git"
+    assert catalog.resolve("commit 现在就开始").route_id == "git"

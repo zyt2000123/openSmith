@@ -39,7 +39,17 @@
 2. route 无 pipeline 或 pipeline 资源不可用：直接 ReAct；
 3. route 指向可用 pipeline：顺序执行 `SkillChain`，每个节点的 base gate 与领域 gate 都通过后才提交输出。
 
-`agents/pipelines/coding.yaml` 是当前唯一 shipped pipeline。它使用 `understanding → planning → [architecture] → implementation → validation`，并声明从失败阶段回退的边。
+当前有三条 shipped pipeline（`agents/pipelines/requirements-research.yaml`、
+`tdd-development.yaml`、`code-review.yaml`），分别对应 `coding` 身份的三条意图路由：
+
+| pipeline | 步骤（skill → gate） |
+|---|---|
+| `requirements-research` | `grilling`→`grilling_complete`、`research`→`research_brief`、`ecc-plan`→`plan_confirmed` |
+| `tdd-development` | `diagnosing-bugs`→`red_loop`（条件 `coding_bugfix_needs_diagnosis`）、`tdd-workflow`→`tdd_evidence`、`verification-loop`→`tdd_verification` |
+| `code-review` | `code-review`→`review_report`、`verification-loop`→`review_verification` |
+
+普通编码、修复与重构请求不命中关键词路由，留在直接 ReAct。每条链都禁止把副作用或
+真实测试结果只写在 Markdown 里：它们必须由 skill 的工具调用和 gate 的事实检查产生。
 
 ### ReAct 与事件
 

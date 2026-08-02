@@ -428,9 +428,8 @@ def test_streaming_client_forwards_prefix_cache_key_to_adapter_body() -> None:
     finally:
         asyncio.run(client.close())
 
-    assert captured["body"]["extra_body"] == {
-        "prefix_cache_key": "stable-prefix",
-    }
+    assert captured["body"]["prefix_cache_key"] == "stable-prefix"
+    assert "extra_body" not in captured["body"]
 
 
 def test_chat_events_retries_429_before_content(monkeypatch) -> None:

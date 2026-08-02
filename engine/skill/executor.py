@@ -25,6 +25,10 @@ from .loader import SkillBody
 ReactLoopFn = Callable[..., Coroutine[Any, Any, str]]
 EventT = TypeVar("EventT")
 WORKFLOW_HANDOFF_TOKEN_BUDGET = 2_000
+# Skill bodies are injected after the assembled prompt has already been
+# trimmed to the provider budget; without a cap of their own an oversized
+# SKILL.md could blow past the context window.
+WORKFLOW_SKILL_TOKEN_BUDGET = 8_000
 
 
 async def execute_skill(
@@ -126,10 +130,14 @@ def _skill_conversation(skill: SkillBody, messages: list[dict], context: dict) -
 
 def _workflow_layers(skill: SkillBody, context: dict) -> tuple[PromptLayer, ...]:
     """Describe a skill and its bounded handoff using prompt-layer metadata."""
+    skill_content = _trim_to_token_budget(
+        f"# Skill: {skill.meta.name}\n\n{skill.content}",
+        WORKFLOW_SKILL_TOKEN_BUDGET,
+    )
     layers = [
         PromptLayer(
             name=f"workflow_skill_{skill.meta.name}",
-            content=f"# Skill: {skill.meta.name}\n\n{skill.content}",
+            content=skill_content,
             source=PromptSource.SKILL_REGISTRY,
             authority=PromptAuthority.AGENT_POLICY,
             trust=PromptTrust.CONFIGURED,

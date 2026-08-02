@@ -232,8 +232,8 @@ class ConfigService:
             "provider": self._string_or_empty(effective("provider")) or "openai",
             "model": self._string_or_empty(effective("model")),
             "base_url": self._string_or_empty(effective("base_url")),
-            "max_output_tokens": llm.get("max_output_tokens"),
-            "context_window": llm.get("context_window"),
+            "max_output_tokens": effective("max_output_tokens"),
+            "context_window": effective("context_window"),
             "routes": self._public_routes(routes),
             "models": self._public_models(models),
             "timeout_profiles": {usage: dict(profile) for usage, profile in timeout_profiles.items()},
@@ -518,7 +518,9 @@ class ConfigService:
             self._apply_models_patch(llm, updates["models"])
         if "timeout_profiles" in updates:
             self._apply_timeout_profiles_patch(llm, updates["timeout_profiles"])
-        if "model" in updates and updates["model"] is not None:
+        if "model" in updates:
+            # Runs for `model: null` too: clearing the base model must also drop
+            # a stale routes.interactive.model that would otherwise keep winning.
             self._align_interactive_model(llm, updates)
 
         try:

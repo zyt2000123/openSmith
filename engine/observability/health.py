@@ -39,10 +39,16 @@ class HealthCalculator:
         completed_count = sum(run.summary.outcome == "completed" for run in runs)
         tool_call_count = sum(run.summary.tool_call_count for run in runs)
         total_tokens = sum(int(run.summary.token_usage.get("total_tokens", 0)) for run in runs)
+        # A pre-approval TOOL_CALL_RESULT (blocked=True, approval_required=True)
+        # is a gate probe, not an executed tool: the real result arrives later
+        # under a separate event.  Counting both would double-count one approved
+        # call as a failure plus a success, so skip the gate probe entirely.
         tool_results = [
             event["data"]
             for event in trace_events
-            if event.get("type") == "tool_call_result" and isinstance(event.get("data"), dict)
+            if event.get("type") == "tool_call_result"
+            and isinstance(event.get("data"), dict)
+            and not event["data"].get("approval_required")
         ]
         successful_tools = sum(_tool_succeeded(result) for result in tool_results)
         return AgentHealth(
