@@ -3,12 +3,20 @@ export type MarkdownLayoutBlock = {
   text: string;
 };
 
-const FENCE_PATTERN = /^( {0,3})(`{3,}|~{3,})/;
-
 type FenceState = {
   marker: "`" | "~";
   length: number;
 };
+
+function openingFence(line: string): FenceState | null {
+  const opening = line.match(/^( {0,3})(`{3,}|~{3,})(.*)$/);
+  if (!opening?.[2]) return null;
+  if (opening[2][0] === "`" && opening[3]?.includes("`")) return null;
+  return {
+    marker: opening[2][0] as "`" | "~",
+    length: opening[2].length,
+  };
+}
 
 function pipeCells(line: string): string[] | null {
   const trimmed = line.trim();
@@ -47,12 +55,7 @@ function fenceTransition(line: string, current: FenceState | null): FenceState |
     return current;
   }
 
-  const opening = line.match(FENCE_PATTERN);
-  if (!opening) return undefined;
-  return {
-    marker: opening[2]?.[0] as "`" | "~",
-    length: opening[2]?.length ?? 3,
-  };
+  return openingFence(line) ?? undefined;
 }
 
 function tableEnd(lines: string[], start: number): number {

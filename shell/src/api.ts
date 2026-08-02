@@ -248,6 +248,11 @@ function timeoutError(timeoutMs: number): Error {
   return new Error(`Request timed out after ${timeoutMs}ms.`);
 }
 
+function finiteNumber(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 export type LlmRouteInput = {
   provider?: string | null;
   api_key?: string | null;
@@ -263,10 +268,10 @@ export type LlmTimeoutProfileInput = Partial<Record<LlmTimeoutField, number | nu
 
 export type LlmConfigInput = {
   vendor?: string;
-  provider: string;
+  provider?: string;
   api_key?: string | null;
-  base_url: string;
-  model: string;
+  base_url?: string;
+  model?: string;
   max_output_tokens?: number | null;
   context_window?: number | null;
   routes?: Partial<Record<LlmUsage, LlmRouteInput | null>>;
@@ -513,10 +518,15 @@ export type ContextCompression = {
   context_summary_cutoff: number;
 };
 
-export async function compressSession(baseUrl: string, sessionId: string): Promise<ContextCompression> {
+export async function compressSession(
+  baseUrl: string,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ContextCompression> {
   return request<ContextCompression>(baseUrl, `/api/agent/sessions/${sessionId}/compress`, {
     method: "POST",
     timeoutMs: 120_000,
+    signal,
   });
 }
 
@@ -758,25 +768,26 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
   }),
   token_usage: (payload) => ({
     type: "token_usage",
-    input_tokens: Number(payload.input_tokens ?? 0),
-    output_tokens: Number(payload.output_tokens ?? 0),
-    total_tokens: Number(payload.total_tokens ?? 0),
+    input_tokens: finiteNumber(payload.input_tokens, 0),
+    output_tokens: finiteNumber(payload.output_tokens, 0),
+    total_tokens: finiteNumber(payload.total_tokens, 0),
   }),
   context_usage: (payload) => ({
     type: "context_usage",
-    context_tokens: Number(payload.context_tokens ?? 0),
-    context_window: Number(payload.context_window ?? CONTEXT_DISPLAY_WINDOW),
-    context_percent: Number(payload.context_percent ?? 0),
+    context_tokens: finiteNumber(payload.context_tokens, 0),
+    context_window: finiteNumber(payload.context_window, CONTEXT_DISPLAY_WINDOW),
+    context_percent: finiteNumber(payload.context_percent, 0),
     estimated: Boolean(payload.estimated ?? true),
-    message_tokens: Number(payload.message_tokens ?? 0),
-    tool_schema_tokens: Number(payload.tool_schema_tokens ?? 0),
-    protocol_tokens: Number(payload.protocol_tokens ?? 0),
-    effective_context_window: Number(
-      payload.effective_context_window ?? payload.context_window ?? CONTEXT_DISPLAY_WINDOW,
+    message_tokens: finiteNumber(payload.message_tokens, 0),
+    tool_schema_tokens: finiteNumber(payload.tool_schema_tokens, 0),
+    protocol_tokens: finiteNumber(payload.protocol_tokens, 0),
+    effective_context_window: finiteNumber(
+      payload.effective_context_window ?? payload.context_window,
+      CONTEXT_DISPLAY_WINDOW,
     ),
-    safe_input_budget: Number(payload.safe_input_budget ?? payload.context_window ?? CONTEXT_DISPLAY_WINDOW),
-    output_reserve: Number(payload.output_reserve ?? 0),
-    safety_margin: Number(payload.safety_margin ?? 0),
+    safe_input_budget: finiteNumber(payload.safe_input_budget ?? payload.context_window, CONTEXT_DISPLAY_WINDOW),
+    output_reserve: finiteNumber(payload.output_reserve, 0),
+    safety_margin: finiteNumber(payload.safety_margin, 0),
     window_declared: Boolean(payload.window_declared ?? false),
     output_limit_declared: Boolean(payload.output_limit_declared ?? false),
     fit_status: String(payload.fit_status ?? "unknown"),

@@ -39,3 +39,9 @@ test("never drops source text while holding a streamed construct", () => {
     assert.equal(snapshot.stable + snapshot.pending, source);
   }
 });
+
+test("does not hold a malformed backtick fence as an unfinished code block", () => {
+  const source = "``` `invalid`\nnext\n";
+
+  assert.deepEqual(splitStreamingMarkdown(source, true), { stable: source, pending: "" });
+});

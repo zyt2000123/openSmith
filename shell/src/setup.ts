@@ -26,7 +26,6 @@ export const SETUP_FIELDS = [
   "base_url",
   "api_key",
   "model",
-  "review_model",
   "max_output_tokens",
   "routes",
   "models",
@@ -36,7 +35,7 @@ export const SETUP_FIELDS = [
   "timeout_profiles",
   "save",
 ] as const;
-export type SetupField = (typeof SETUP_FIELDS)[number];
+export type SetupField = (typeof INITIAL_SETUP_FIELDS)[number] | (typeof SETUP_FIELDS)[number];
 type EditableSetupField = Exclude<SetupField, "save">;
 type RouteSecretField = "interactive_api_key" | "gate_api_key" | "background_api_key";
 type JsonRecord = Record<string, unknown>;
@@ -48,12 +47,12 @@ const SETUP_FIELD_LABELS: Record<SetupField, string> = {
   model: "model",
   review_model: "review model (optional)",
   max_output_tokens: "max output tokens (blank=keep, -=provider default)",
-  api_key: "API key",
+  api_key: "API key (blank=keep, -=clear)",
   routes: "route overrides (JSON)",
   models: "named model profiles (JSON)",
-  interactive_api_key: "interactive route API key",
-  gate_api_key: "gate route API key",
-  background_api_key: "background route API key",
+  interactive_api_key: "interactive route API key (blank=keep, -=clear)",
+  gate_api_key: "gate route API key (blank=keep, -=clear)",
+  background_api_key: "background route API key (blank=keep, -=clear)",
   timeout_profiles: "timeout profiles (JSON)",
   save: "save and continue",
 };
@@ -90,9 +89,6 @@ function jsonForRouteOverrides(config: LlmConfig | null): string {
     const route = config.routes?.[usage];
     if (!route) continue;
     const { has_api_key: _hasApiKey, ...override } = route;
-    // The `model` field already edits the interactive model -- echoing it here as
-    // well would let this stale copy override that field when the draft is saved.
-    if (usage === "interactive") delete override.model;
     if (Object.keys(override).length > 0 || route.has_api_key) routes[usage] = override;
   }
   return Object.keys(routes).length > 0 ? JSON.stringify(routes) : "";
@@ -319,14 +315,9 @@ function routeForUsage(routes: Partial<Record<LlmUsage, LlmRouteInput | null>>, 
   return route;
 }
 
-/** Build the API patch while keeping all secret fields out of the JSON editor. */
-export function buildLlmConfigInput(draft: SetupDraft): LlmConfigInput {
-  const reviewModel = draft.review_model.trim();
-  const routes = parseRoutes(draft.routes) ?? {};
-  const timeoutProfiles = parseTimeoutProfiles(draft.timeout_profiles);
-  const models = parseModels(draft.models);
-  const maxOutputTokens = parseMaxOutputTokens(draft.max_output_tokens);
+type PrimaryRouteField = "provider" | "base_url" | "model";
 
+function validateProvider(draft: SetupDraft): string {
   // setProvider() only guards the Enter path; arrow/Tab navigation writes the field
   // verbatim. Validate at the single exit instead, so no navigation order can slip
   // an unsupported protocol through to the server.
@@ -334,22 +325,72 @@ export function buildLlmConfigInput(draft: SetupDraft): LlmConfigInput {
   if (!Object.hasOwn(PROVIDER_PRESETS, provider)) {
     throw new Error("Compatible protocol must be openai, anthropic, or gemini.");
   }
+  return provider;
+}
 
+function initialPrimaryValues(draft: SetupDraft, provider: string): Array<[PrimaryRouteField, string]> {
+  return [
+    ["provider", provider],
+    ["base_url", draft.base_url.trim()],
+    ["model", draft.model.trim()],
+  ];
+}
+
+function applyInitialPrimaryField(
+  input: LlmConfigInput,
+  routes: Partial<Record<LlmUsage, LlmRouteInput | null>>,
+  interactive: LlmConfig["routes"]["interactive"] | undefined,
+  field: PrimaryRouteField,
+  value: string,
+): void {
+  if (interactive && Object.hasOwn(interactive, field)) {
+    routeForUsage(routes, "interactive")[field] = value;
+    return;
+  }
+  input[field] = value;
+}
+
+function buildInitialConfigInput(
+  draft: SetupDraft,
+  provider: string,
+  existingConfig: LlmConfig | null,
+): LlmConfigInput {
+  const input: LlmConfigInput = { vendor: draft.vendor.trim() };
+  const routes: Partial<Record<LlmUsage, LlmRouteInput | null>> = {};
+  const interactive = existingConfig?.routes?.interactive;
+  for (const [field, value] of initialPrimaryValues(draft, provider)) {
+    applyInitialPrimaryField(input, routes, interactive, field, value);
+  }
+
+  const reviewModel = draft.review_model.trim();
+  if (reviewModel) {
+    routeForUsage(routes, "gate").model = reviewModel;
+  } else if (existingConfig?.routes?.gate && Object.hasOwn(existingConfig.routes.gate, "model")) {
+    routeForUsage(routes, "gate").model = null;
+  }
+
+  const primaryApiKey = secretPatch(draft.api_key);
+  if (primaryApiKey !== undefined) input.api_key = primaryApiKey;
+  if (Object.keys(routes).length > 0) input.routes = routes;
+  return input;
+}
+
+function buildAdvancedConfigInput(draft: SetupDraft, provider: string): LlmConfigInput {
+  const routes = parseRoutes(draft.routes) ?? {};
   const input: LlmConfigInput = {
     vendor: draft.vendor.trim(),
     provider,
     base_url: draft.base_url.trim(),
     model: draft.model.trim(),
+    routes,
+    timeout_profiles: parseTimeoutProfiles(draft.timeout_profiles) ?? {},
   };
-  if (reviewModel) {
-    routeForUsage(routes, "gate").model = reviewModel;
-  } else if (routes.gate && Object.hasOwn(routes.gate, "model")) {
-    routes.gate.model = null;
-  }
-  input.routes = routes;
-  input.timeout_profiles = timeoutProfiles ?? {};
+
+  const models = parseModels(draft.models);
+  const maxOutputTokens = parseMaxOutputTokens(draft.max_output_tokens);
   if (models !== undefined) input.models = models;
   if (maxOutputTokens !== undefined) input.max_output_tokens = maxOutputTokens;
+
   const primaryApiKey = secretPatch(draft.api_key);
   if (primaryApiKey !== undefined) input.api_key = primaryApiKey;
   for (const [usage, field] of ROUTE_SECRET_FIELDS) {
@@ -357,4 +398,16 @@ export function buildLlmConfigInput(draft: SetupDraft): LlmConfigInput {
     if (secret !== undefined) routeForUsage(routes, usage).api_key = secret;
   }
   return input;
+}
+
+/** Build the API patch while keeping all secret fields out of the JSON editor. */
+export function buildLlmConfigInput(
+  draft: SetupDraft,
+  flow: SetupFlow,
+  existingConfig: LlmConfig | null = null,
+): LlmConfigInput {
+  const provider = validateProvider(draft);
+  return flow === "initial"
+    ? buildInitialConfigInput(draft, provider, existingConfig)
+    : buildAdvancedConfigInput(draft, provider);
 }

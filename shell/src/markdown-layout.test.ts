@@ -21,3 +21,13 @@ test("keeps lists together and does not split headings inside fenced code", () =
 
   assert.deepEqual(splitMarkdownLayoutBlocks(markdown), [{ kind: "content", text: markdown }]);
 });
+
+test("does not treat a backtick-bearing info string as a fenced block", () => {
+  const markdown = "``` `invalid`\n| A | B |\n| --- | --- |\n| one | two |\n```\nAfter";
+
+  assert.deepEqual(splitMarkdownLayoutBlocks(markdown), [
+    { kind: "content", text: "``` `invalid`" },
+    { kind: "table", text: "| A | B |\n| --- | --- |\n| one | two |" },
+    { kind: "content", text: "```\nAfter" },
+  ]);
+});
