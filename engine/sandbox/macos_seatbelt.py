@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import os
 import stat
 import sys
@@ -104,6 +105,13 @@ class MacOSSeatbeltEnvironment:
         )
         self._approved_host_access = approved_host_access
         self._host = LocalExecutionEnvironment()
+        # Cache of the last hardlink preflight, keyed by a cheap workspace
+        # fingerprint so unchanged workspaces skip the per-file walk.  The
+        # non-delegable write paths are part of the key because they change
+        # the preflight outcome independently of the filesystem.
+        self._hardlink_preflight_cache: (
+            tuple[str, tuple[Path, ...], str | None] | None
+        ) = None
 
     @staticmethod
     def _resolve_non_delegable_write_paths(
@@ -210,7 +218,18 @@ class MacOSSeatbeltEnvironment:
 (deny file-read* file-write*
     (regex (string-append "^" (regex-quote (param "WORKSPACE"))
         #"/(.*/)?id_(rsa|dsa|ecdsa|ed25519)$")))
-(deny file-write*
+; Git metadata can embed credentials (e.g. URL-embedded in .git/config or a
+; repo-local credential store) and object files can contain committed
+; secrets, so every .git read except plain .gitignore files is denied.  The
+; explicit config/credentials rules keep the intent visible even though the
+; catch-all below subsumes them; .gitignore never matches "\.git(/|$)".
+(deny file-read* file-write*
+    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
+        #"/(.*/)?\.git/config$")))
+(deny file-read* file-write*
+    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
+        #"/(.*/)?\.git/credentials$")))
+(deny file-read* file-write*
     (regex (string-append "^" (regex-quote (param "WORKSPACE"))
         #"/(.*/)?\.git(/|$)")))
 (deny file-read* file-write*
@@ -258,6 +277,43 @@ class MacOSSeatbeltEnvironment:
                 if value:
                     environment[key] = value
         return environment
+
+    def _workspace_fingerprint(self) -> str | None:
+        """Cheap digest of the workspace directory layout.
+
+        The hardlink preflight's outcome can only change when directory
+        entries change, which on APFS bumps the parent directory's mtime and
+        size (and ctime, which user code cannot forge).  Hashing those per
+        scanned directory costs one ``scandir`` plus one ``lstat`` per
+        directory instead of the preflight's ``lstat`` on every regular file,
+        and still invalidates the cache on any entry addition or removal.
+        Returns None when the workspace cannot be fully inspected, forcing the
+        full preflight to re-run (fail closed).
+        """
+        digest = hashlib.sha256()
+        pending = [self._workspace]
+        while pending:
+            root = pending.pop()
+            try:
+                metadata = os.lstat(root)
+            except OSError:
+                return None
+            digest.update(os.fsencode(root))
+            digest.update(str(metadata.st_mtime_ns).encode("ascii"))
+            digest.update(str(metadata.st_ctime_ns).encode("ascii"))
+            digest.update(str(metadata.st_size).encode("ascii"))
+            try:
+                with os.scandir(root) as entries:
+                    # Sort so traversal order does not leak into the digest.
+                    child_dirs = sorted(
+                        entry.path
+                        for entry in entries
+                        if entry.is_dir(follow_symlinks=False)
+                    )
+            except OSError:
+                return None
+            pending.extend(child_dirs)
+        return digest.hexdigest()
 
     def _sensitive_hardlink_error(self) -> str | None:
         """Reject path aliases that a path-based Seatbelt profile cannot identify.
@@ -361,8 +417,27 @@ class MacOSSeatbeltEnvironment:
             return CommandResult(exit_code=None, error=error)
         # The preflight walks the whole workspace; on a large repository that
         # is hundreds of milliseconds of stat calls, which must not block the
-        # event loop and stall every other request in the process.
-        hardlink_error = await asyncio.to_thread(self._sensitive_hardlink_error)
+        # event loop and stall every other request in the process.  Reuse the
+        # last result while a cheap directory-layout fingerprint is unchanged;
+        # any entry change (or an uninspectable workspace) re-runs the full
+        # walk, so the cache never weakens the fail-closed guarantee.
+        fingerprint = await asyncio.to_thread(self._workspace_fingerprint)
+        cached = self._hardlink_preflight_cache
+        if (
+            cached is not None
+            and fingerprint is not None
+            and cached[0] == fingerprint
+            and cached[1] == self._non_delegable_write_paths
+        ):
+            hardlink_error = cached[2]
+        else:
+            hardlink_error = await asyncio.to_thread(self._sensitive_hardlink_error)
+            if fingerprint is not None:
+                self._hardlink_preflight_cache = (
+                    fingerprint,
+                    self._non_delegable_write_paths,
+                    hardlink_error,
+                )
         if hardlink_error:
             return CommandResult(exit_code=None, error=hardlink_error)
 

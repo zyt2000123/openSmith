@@ -20,8 +20,8 @@ from dataclasses import dataclass
 # Exact full-name matching used to let every such variant through into the
 # approval card and the SSE stream the user sees.
 #
-# Keep in sync with ``_SENSITIVE_ARG_KEY_PARTS`` in engine/safety/tool_guard.py —
-# that module imports this one, so the shared helper cannot live over there.
+# Single source of truth: engine/safety/tool_guard.py imports the matching
+# helper from here instead of keeping a second, drift-prone copy.
 _SENSITIVE_ARGUMENT_KEY_PARTS = (
     "apikey",
     "authorization",
@@ -322,6 +322,68 @@ def summarize_arguments(arguments: dict) -> dict[str, object]:
     return _summarize_mapping(arguments)
 
 
+_SECRET_FLAG_RE = re.compile(
+    r"^-{1,2}(?:password|passwd|token|secret|api[-_]?key|apikey|"
+    r"access[-_]?key|client[-_]?secret|private[-_]?key|auth(?:orization)?|"
+    r"bearer|session[-_]?key|cookie)(?:=|$)",
+    re.IGNORECASE,
+)
+
+_SECRET_VALUE_RE = re.compile(
+    r"(?:"
+    r"sk-[A-Za-z0-9_\-]{8,}"
+    r"|gh[pousr]_[A-Za-z0-9]{10,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{8,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
+    r"|Bearer [A-Za-z0-9._\-]+"
+    r")"
+)
+
+
+def _is_secret_value(value: str) -> bool:
+    """Whether a string looks like a credential rather than ordinary content."""
+    text = value.strip()
+    if not text:
+        return False
+    if re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", text):
+        return True
+    return bool(_SECRET_VALUE_RE.fullmatch(text))
+
+
+def _summarize_list(values: list | tuple, *, depth: int) -> list[object]:
+    """Summarize a sequence, redacting flag-value pairs and secret-shaped values.
+
+    Key-based redaction cannot see a credential that arrives as a positional
+    list element (``["--token", "sk-..."]``); the only signal that the next
+    element is sensitive is the flag that precedes it.
+    """
+    redacted: list[object] = []
+    redact_next = False
+    for item in values[:_MAX_SUMMARY_ITEMS]:
+        if redact_next:
+            redacted.append("***")
+            redact_next = False
+            continue
+        if isinstance(item, str):
+            match = _SECRET_FLAG_RE.match(item)
+            if match:
+                if "=" in item:
+                    # ``--token=sk-...`` carries the value inline; keep the flag
+                    # name visible and drop only the value.
+                    redacted.append(item.split("=", 1)[0] + "=***")
+                else:
+                    redacted.append(item)
+                    redact_next = True
+                continue
+            if _is_secret_value(item):
+                redacted.append("***")
+                continue
+        redacted.append(_summarize_value(item, depth=depth + 1))
+    return redacted
+
+
 def _summarize_mapping(arguments: dict, *, depth: int = 0) -> dict[str, object]:
     summary: dict[str, object] = {}
     for index, (raw_key, value) in enumerate(arguments.items()):
@@ -346,10 +408,7 @@ def _summarize_value(value: object, *, key: str | None = None, depth: int = 0) -
     if isinstance(value, dict):
         return _summarize_mapping(value, depth=depth + 1)
     if isinstance(value, (list, tuple)):
-        return [
-            _summarize_value(item, depth=depth + 1)
-            for item in value[:_MAX_SUMMARY_ITEMS]
-        ]
+        return _summarize_list(value, depth=depth)
     return _summarize_value(str(value), depth=depth + 1)
 
 

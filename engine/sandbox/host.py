@@ -220,7 +220,18 @@ class LocalExecutionEnvironment:
             if proc is not None:
                 await _stop_process_group(proc)
             await _cancel_stream_tasks(stdout_task, stderr_task)
-            return CommandResult(exit_code=None, timed_out=True)
+            # The process was reaped by _stop_process_group, so returncode is
+            # real (the signal that killed it, or its own exit code).  Surface
+            # whatever output was read before cancellation, mirroring the
+            # abandoned-drain path, instead of dropping it.
+            stdout, stdout_total = stdout_buffer.value()
+            stderr, stderr_total = stderr_buffer.value()
+            return CommandResult(
+                exit_code=proc.returncode if proc is not None else None,
+                stdout=_format_stream(stdout, stdout_total) if stdout else "",
+                stderr=_format_stream(stderr, stderr_total) if stderr else "",
+                timed_out=True,
+            )
         except asyncio.CancelledError:
             if proc is not None and proc.returncode is None:
                 await _stop_process_group(proc)
