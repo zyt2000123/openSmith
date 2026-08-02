@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from ..schemas.agent_profile import AgentProfileOut

@@ -4,6 +4,8 @@ import aiosqlite
 
 # All rows are written with explicit ISO-8601 timestamps by the repositories;
 # these fallbacks use the same format so mixed sources never break TEXT ordering.
+# Rows left by older ``datetime('now')`` defaults are migrated by
+# _normalize_legacy_timestamps on startup.
 _ISO_NOW = "strftime('%Y-%m-%dT%H:%M:%f+00:00','now')"
 
 APP_SCHEMA = f"""
@@ -208,6 +210,27 @@ async def _reset_stuck_auto_tasks(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _normalize_legacy_timestamps(db: aiosqlite.Connection) -> None:
+    """Convert old ``datetime('now')`` rows (``YYYY-MM-DD HH:MM:SS``) to the same
+    ``T``-separated format the repositories write, so TEXT ordering never mixes
+    separators.  Idempotent: only rows that still contain a space are touched.
+    """
+    for table, column in (
+        ("sessions", "created_at"),
+        ("messages", "created_at"),
+        ("auto_tasks", "created_at"),
+        ("auto_task_runs", "started_at"),
+        ("auto_task_runs", "finished_at"),
+        ("token_usage_events", "occurred_at"),
+        ("observability_trace_cursors", "updated_at"),
+        ("llm_generations", "occurred_at"),
+    ):
+        await db.execute(
+            f"UPDATE {table} SET {column}=replace({column}, ' ', 'T') "
+            f"WHERE instr({column}, ' ') > 0"
+        )
+
+
 async def ensure_schema(db: aiosqlite.Connection) -> None:
     await db.executescript(APP_SCHEMA)
     await _ensure_session_identity_column(db)
@@ -216,4 +239,5 @@ async def ensure_schema(db: aiosqlite.Connection) -> None:
     await _ensure_auto_task_columns(db)
     await _ensure_token_usage_columns(db)
     await _reset_stuck_auto_tasks(db)
+    await _normalize_legacy_timestamps(db)
     await db.commit()

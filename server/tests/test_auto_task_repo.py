@@ -175,3 +175,34 @@ async def test_auto_task_working_dir_round_trips_through_all_read_paths(
     assert (await repo.get(task["id"]))["working_dir"] == "/tmp/other"
 
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_schema_migrates_legacy_space_timestamps_to_iso_format() -> None:
+    """Rows written by the old datetime('now') default (space separator) must be
+    normalized to the T-separated format on startup so TEXT ordering stays sane."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await schema_module.ensure_schema(db)
+    await db.execute(
+        "INSERT INTO sessions (id, agent_id, created_at) VALUES (?, ?, ?)",
+        ("legacy", "smith", "2026-07-20 12:00:00"),
+    )
+    await db.execute(
+        "INSERT INTO sessions (id, agent_id, created_at) VALUES (?, ?, ?)",
+        ("modern", "smith", "2026-07-20T12:00:00+00:00"),
+    )
+    await db.commit()
+
+    await schema_module.ensure_schema(db)
+
+    rows = await db.execute_fetchall("SELECT id, created_at FROM sessions ORDER BY id")
+    assert dict(rows[0]) == {"id": "legacy", "created_at": "2026-07-20T12:00:00"}
+    assert dict(rows[1]) == {"id": "modern", "created_at": "2026-07-20T12:00:00+00:00"}
+
+    # Idempotent: a second pass must not touch the already-normalized rows.
+    await schema_module.ensure_schema(db)
+    rows = await db.execute_fetchall("SELECT id, created_at FROM sessions ORDER BY id")
+    assert dict(rows[0])["created_at"] == "2026-07-20T12:00:00"
+
+    await db.close()

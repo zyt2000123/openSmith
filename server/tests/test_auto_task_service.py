@@ -508,6 +508,56 @@ async def test_completed_run_is_recorded_completed_when_the_lease_is_lost(
 
 
 @pytest.mark.asyncio
+async def test_completed_run_survives_a_finish_task_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If final bookkeeping (finish_task) raises after the run was recorded as
+    completed, the run must stay completed: overwriting it with failed or
+    rescheduling a retry would re-apply the engine's side effects."""
+    class ExplodingFinalizeRepo(FakeAutoTaskRepo):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finish_task_attempts = 0
+
+        async def finish_task(
+            self,
+            task_id: str,
+            status: str,
+            next_run_at: str | None,
+            lease_token: str,
+            *,
+            retry_count: int | None = None,
+        ) -> bool:
+            self.finish_task_attempts += 1
+            raise RuntimeError("database is locked")
+
+    async def ok_reply(request, runtime, services):
+        return SimpleNamespace(text="done")
+
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "load_runtime_identity_catalog",
+        lambda: SimpleNamespace(resolve=lambda message: SimpleNamespace(identity_id="smith")),
+    )
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "build_engine_runtime",
+        lambda *args, **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(auto_task_service_module, "engine_reply_with_runtime", ok_reply)
+
+    task_repo = ExplodingFinalizeRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+    finished = await _run_to_completion(service, _task())
+
+    assert finished["status"] == "completed"
+    # The lease release is retried once best-effort, but the run is never failed.
+    assert task_repo.finish_task_attempts == 2
+    assert task_repo.finished[-1]["status"] == "completed"
+    assert not any(update.get("retry_count") == 1 for update in task_repo.updates)
+
+
+@pytest.mark.asyncio
 async def test_success_schedules_next_run_from_completion_not_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

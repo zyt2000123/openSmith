@@ -688,6 +688,10 @@ class SessionService:
                         # Only a resumed run that produced a replacement reply may
                         # delete the interrupted run's stale partial output; a
                         # resume that fails before producing text keeps it.
+                        # Ordering is deliberate: discard MUST run before
+                        # add_message.  The discard deletes every assistant row
+                        # with rowid between the user message and the next user
+                        # turn, so inserting the new reply first would delete it.
                         await asyncio.shield(
                             self.session_repo.discard_assistant_messages_after_user(
                                 session_id,

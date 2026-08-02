@@ -161,6 +161,7 @@ class AutoTaskService:
         agent_id = task["agent_id"]
         trigger_type = task["trigger_type"]
         trigger_config = task["trigger_config"]
+        run_finalized: dict | None = None
 
         lease_renewal = asyncio.create_task(
             self._renew_lease_until_finished(task_id, lease_token)
@@ -223,21 +224,44 @@ class AutoTaskService:
             finished = await self.repo.finish_run(run["id"], "completed", reply_text)
             if finished is None:
                 raise HTTPException(500, "Failed to record auto task run")
-            if not await self.repo.finish_task(
-                task_id,
-                "idle",
-                next_run,
-                lease_token,
-                retry_count=0,
-            ):
-                # Another worker reclaimed the task while this run was executing.
-                # The engine work here is done and this run is recorded as
-                # completed; do NOT mark it failed or reschedule, which would
-                # double-count the (already recorded) side effects.
+            run_finalized = finished
+            try:
+                lease_released = await self.repo.finish_task(
+                    task_id,
+                    "idle",
+                    next_run,
+                    lease_token,
+                    retry_count=0,
+                )
+            except Exception:
+                # Bookkeeping failure after the run was recorded as completed.
+                # Never downgrade the run to failed or reschedule a retry, which
+                # would re-apply the engine's side effects; release the lease
+                # best-effort so the task is not stuck 'running' until expiry.
+                log.exception("failed to finalize auto task %s after completion", task_id)
+                lease_released = False
+                try:
+                    await self.repo.finish_task(
+                        task_id, "idle", next_run, lease_token, retry_count=0
+                    )
+                except Exception:
+                    log.warning(
+                        "auto task %s lease was not released; it will expire and be reclaimed",
+                        task_id,
+                        exc_info=True,
+                    )
+            if not lease_released:
+                # Either another worker reclaimed the task (inherent to the lease
+                # design) or a retry above failed; either way this run is final.
                 log.warning("Auto task %s lease was lost after completion", task_id)
-            return AutoTaskRunOut(**finished)
+            return AutoTaskRunOut(**run_finalized)
 
         except Exception as exc:
+            if run_finalized is not None:
+                # Defensive: the success path returns before any later statement,
+                # but never turn a completed run into a failed one.
+                log.exception("unexpected error after auto task %s completed", task_id)
+                return AutoTaskRunOut(**run_finalized)
             log.exception("Auto task %s failed", task_id)
             is_scheduled = trigger_type != "manual"
             retry_count = int(task.get("retry_count") or 0) + 1 if is_scheduled else 0
