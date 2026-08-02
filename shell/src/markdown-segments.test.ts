@@ -43,3 +43,12 @@ test("keeps the language when a fence info string has extra words", () => {
     { type: "markdown", text: "Done." },
   ]);
 });
+
+test("keeps a malformed backtick fence in Markdown instead of swallowing following content", () => {
+  const source = "``` `invalid`\n| A | B |\n| --- | --- |\n```\nAfter";
+
+  assert.deepEqual(splitMarkdownBlocks(source), [
+    { type: "markdown", text: "``` `invalid`\n| A | B |\n| --- | --- |" },
+    { type: "markdown", text: "```\nAfter" },
+  ]);
+});

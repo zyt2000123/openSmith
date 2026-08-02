@@ -246,6 +246,7 @@ export class NodeBridge {
       pendingApproval: null,
       approvalResolving: false,
       busy: false,
+      compressing: false,
       runStartedAt: null,
       statusLine: "Cancelled.",
       ...(pendingApproval ? { transcript: removeApprovalNotice(this.s.transcript, pendingApproval.approvalId) } : {}),
@@ -657,16 +658,19 @@ export class NodeBridge {
       this.s.set({ statusLine: "No active session to compress." });
       return;
     }
+    const controller = new AbortController();
+    this.activeRequest = controller;
     this.s.set({ busy: true, compressing: true, panel: "chat", statusLine: "Automatically compressing context" });
     try {
-      const result = await compressSession(baseUrl, currentSession.id);
+      const result = await compressSession(baseUrl, currentSession.id, controller.signal);
       this.s.pushSystemLine(`Context compressed: ${result.message_count} messages summarized.`);
       this.s.set({ statusLine: "Context compressed. The next request will use the saved summary." });
     } catch (error) {
+      if (controller.signal.aborted) return;
       this.s.pushSystemLine(`Context compression failed: ${errorMessage(error)}`, "error");
       this.s.set({ statusLine: "Context compression failed." });
     } finally {
-      this.s.set({ busy: false, compressing: false });
+      this.finishRequest(controller);
     }
   }
 

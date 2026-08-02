@@ -308,6 +308,11 @@ function collectToolParts(activity: ToolActivity, maintenance: MemoryMaintenance
   ];
 }
 
+export function displayContextPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
 function buildHeaderParts(options: {
   model: string;
   projectName: string;
@@ -318,7 +323,7 @@ function buildHeaderParts(options: {
   tokenUsage: TokenUsage;
   contextUsage: ContextUsage;
 }): HudPart[] {
-  const contextPercent = Math.max(0, Math.min(100, Math.round(options.contextUsage.context_percent)));
+  const contextPercent = displayContextPercent(options.contextUsage.context_percent);
   const parts: HudPart[] = [
     [{ text: `[${options.model || "-"}]`, color: MODEL }],
     [

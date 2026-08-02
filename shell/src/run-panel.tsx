@@ -12,6 +12,10 @@ function outcomeColor(outcome: string | null | undefined): string {
   return MUTED;
 }
 
+function finiteDisplayNumber(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 function RunExplorerContent({
   runs,
   health,
@@ -29,7 +33,7 @@ function RunExplorerContent({
             success {(health.success_rate * 100).toFixed(0)}% ({health.completed_count}/{health.run_count})
           </Text>
           <Text color={MUTED}>{formatTokenCount(health.tokens_per_run)} tokens/run</Text>
-          <Text color={MUTED}>{health.average_backtracks.toFixed(1)} backtracks/run</Text>
+          <Text color={MUTED}>{finiteDisplayNumber(health.average_backtracks).toFixed(1)} backtracks/run</Text>
         </Box>
       ) : (
         <Text color={WARNING}>Health summary is unavailable.</Text>
@@ -65,7 +69,7 @@ function RunExplorerContent({
             <Text color={outcomeColor(run.outcome)} bold>
               {run.outcome || "unknown"}
             </Text>
-            <Text color={MUTED}>{run.finished_at.replace("T", " ").slice(0, 19)}</Text>
+            <Text color={MUTED}>{(run.finished_at ?? "").replace("T", " ").slice(0, 19)}</Text>
             <Text color={MUTED}>{run.run_id.slice(0, 10)}</Text>
           </Box>
           <Text color={MUTED}>

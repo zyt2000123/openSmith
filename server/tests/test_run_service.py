@@ -33,7 +33,7 @@ def test_run_state_service_only_returns_runs_for_current_agent(tmp_path: Path) -
 
 def test_run_state_service_resolves_live_approval_for_current_agent(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path)
-    state = store.create("run-1", agent_id="smith-id")
+    store.create("run-1", agent_id="smith-id")
     store.transition("run-1", "running")
     store.request_approval(
         "run-1",

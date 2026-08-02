@@ -238,6 +238,60 @@ test("cancelling a request settles every running tool in the transcript and HUD"
   assert.deepEqual(state.toolActivity.running, {});
 });
 
+test("cancelling context compression aborts its request and releases the input", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    requestStarted = resolve;
+  });
+  let aborted = false;
+  globalThis.fetch = (_input, init) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      requestStarted();
+      signal?.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      });
+    });
+
+  try {
+    const store = createAppStore();
+    store.getState().set({
+      baseUrl: "http://127.0.0.1:8140",
+      currentSession: {
+        id: "session-1",
+        agent_id: "smith",
+        title: "Active",
+        created_at: "now",
+        message_count: 1,
+      },
+    });
+    const bridge = new NodeBridge(store);
+    const handedOff: string[] = [];
+    (bridge as unknown as { sendMessage: (text: string) => Promise<boolean> }).sendMessage = async (text) => {
+      handedOff.push(text);
+      return true;
+    };
+    const compression = bridge.compressCurrentSession();
+    await started;
+
+    assert.equal(store.getState().compressing, true);
+    assert.equal(bridge.cancelRequest(), true);
+    assert.equal(bridge.enqueueMessage("follow-up"), true);
+    await compression;
+    await Promise.resolve();
+
+    assert.equal(aborted, true);
+    assert.deepEqual(handedOff, ["follow-up"]);
+    assert.equal(store.getState().compressing, false);
+    assert.equal(store.getState().busy, false);
+    assert.equal(store.getState().statusLine, "Queued 1/3.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("leaving the token panel while it loads does not reopen it", async () => {
   const originalFetch = globalThis.fetch;
   let release!: (response: Response) => void;

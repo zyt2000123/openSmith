@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildRunProgressParts, formatElapsed, memoryMaintenanceLabel } from "./hud.js";
+import { buildRunProgressParts, displayContextPercent, formatElapsed, memoryMaintenanceLabel } from "./hud.js";
 import { MUTED } from "./theme.js";
 
 test("formats active run duration for the status HUD", () => {
@@ -33,6 +33,12 @@ test("keeps the existing compact progress line when no token usage is available"
     { text: "(0s", color: MUTED },
     { text: ")", color: MUTED },
   ]);
+});
+
+test("context percentage falls back safely when a compatible server returns a non-finite value", () => {
+  assert.equal(displayContextPercent(Number.NaN), 0);
+  assert.equal(displayContextPercent(Number.POSITIVE_INFINITY), 0);
+  assert.equal(displayContextPercent(120.4), 100);
 });
 
 // ── Ambient memory maintenance (dreaming indicator) ──

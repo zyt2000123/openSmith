@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiosqlite
 import pytest
@@ -270,7 +272,10 @@ async def test_sync_from_traces_imports_exact_usage_once(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_sync_from_messages_provides_explicit_local_estimate(tmp_path: Path) -> None:
+async def test_sync_from_messages_provides_explicit_local_estimate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db = await aiosqlite.connect(":memory:")
     db.row_factory = aiosqlite.Row
     await db.executescript(
@@ -309,7 +314,17 @@ async def test_sync_from_messages_provides_explicit_local_estimate(tmp_path: Pat
 
     service = TokenStatsService(db_provider, trace_root=tmp_path)
     assert await service.sync_from_traces() == 2
+
+    encoding_lookups = 0
+
+    def track_encoding_lookup(_name: str):
+        nonlocal encoding_lookups
+        encoding_lookups += 1
+        return SimpleNamespace(encode=lambda *_args, **_kwargs: [])
+
+    monkeypatch.setitem(sys.modules, "tiktoken", SimpleNamespace(get_encoding=track_encoding_lookup))
     assert await service.sync_from_traces() == 0
+    assert encoding_lookups == 0
 
     stats = await service.get_stats("agent-1", year=2026)
     assert stats["total_tokens"] > 0

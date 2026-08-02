@@ -946,7 +946,7 @@ async function submitSetup(
       return;
     }
     try {
-      await bridge.saveConfig(buildLlmConfigInput(draft));
+      await bridge.saveConfig(buildLlmConfigInput(draft, setupFlow, state.config));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       state.set({ statusLine: `Configuration error: ${message}` });

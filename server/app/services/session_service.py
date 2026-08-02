@@ -395,35 +395,6 @@ class SessionService:
             execution_identity_id=_execution_identity_id,
         )
 
-    async def stream_message(
-        self,
-        agent_id: str,
-        session_id: str,
-        content: str,
-        context: str | None = None,
-        skill_name: str | None = None,
-        identity_id: str | None = None,
-        working_dir: str | None = None,
-        *,
-        _history_override: list[dict] | None = None,
-        _resume_run_id: str | None = None,
-        _message_id: str | None = None,
-    ) -> AsyncGenerator[dict, None]:
-        stream = await self.prepare_stream_message(
-            agent_id,
-            session_id,
-            content,
-            context=context,
-            skill_name=skill_name,
-            identity_id=identity_id,
-            working_dir=working_dir,
-            _history_override=_history_override,
-            _resume_run_id=_resume_run_id,
-            _message_id=_message_id,
-        )
-        async for event in stream:
-            yield event
-
     async def _stream_message(
         self,
         agent_id: str,

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { LlmConfig } from "./api.js";
-import { buildLlmConfigInput, createSetupDraft, INITIAL_SETUP_FIELDS } from "./setup.js";
+import { buildLlmConfigInput, createSetupDraft, INITIAL_SETUP_FIELDS, SETUP_FIELDS, setupFieldLabel } from "./setup.js";
 import type { SetupDraft } from "./store.js";
 
 function draft(overrides: Partial<SetupDraft> = {}): SetupDraft {
@@ -29,6 +29,15 @@ test("initial setup separates the supplier name from the compatible protocol", (
     [...INITIAL_SETUP_FIELDS],
     ["vendor", "provider", "base_url", "api_key", "model", "review_model", "save"],
   );
+});
+
+test("API key fields explain how to preserve or clear a stored secret", () => {
+  assert.equal(setupFieldLabel("api_key"), "API key (blank=keep, -=clear)");
+  assert.equal(setupFieldLabel("gate_api_key"), "gate route API key (blank=keep, -=clear)");
+});
+
+test("advanced setup keeps the review model in the routes JSON as its single source of truth", () => {
+  assert.equal((SETUP_FIELDS as readonly string[]).includes("review_model"), false);
 });
 
 test("setup draft restores the essential values from saved config", () => {
@@ -61,8 +70,8 @@ test("setup draft restores the essential values from saved config", () => {
   assert.deepEqual(JSON.parse(result.timeout_profiles), { gate: { read: 45, stream_read: 50 } });
 });
 
-test("setup saves only essential fields and clears legacy advanced settings", () => {
-  const result = buildLlmConfigInput(draft({ review_model: "review-model" }));
+test("initial setup saves only the essential fields it exposes", () => {
+  const result = buildLlmConfigInput(draft({ review_model: "review-model" }), "initial");
 
   assert.deepEqual(result, {
     vendor: "OpenAI",
@@ -70,7 +79,6 @@ test("setup saves only essential fields and clears legacy advanced settings", ()
     base_url: "https://api.openai.com/v1",
     model: "gpt-4.1-mini",
     routes: { gate: { model: "review-model" } },
-    timeout_profiles: {},
   });
 });
 
@@ -90,10 +98,10 @@ test("setup clears the review route when no review model is configured", () => {
   const setupDraft = createSetupDraft(config);
   setupDraft.review_model = "";
 
-  const result = buildLlmConfigInput(setupDraft);
+  const result = buildLlmConfigInput(setupDraft, "initial", config);
 
   assert.deepEqual(result.routes, { gate: { model: null } });
-  assert.deepEqual(result.timeout_profiles, {});
+  assert.equal(result.timeout_profiles, undefined);
 });
 
 test("setup preserves a route whose only stored value is its API key", () => {
@@ -111,13 +119,13 @@ test("setup preserves a route whose only stored value is its API key", () => {
   };
 
   const setupDraft = createSetupDraft(config);
-  const result = buildLlmConfigInput(setupDraft);
+  const result = buildLlmConfigInput(setupDraft, "initial", config);
 
   assert.deepEqual(JSON.parse(setupDraft.routes), { gate: {} });
-  assert.deepEqual(result.routes, { gate: {} });
+  assert.equal(result.routes, undefined);
 });
 
-test("setup does not echo the interactive model into the route override editor", () => {
+test("initial setup updates an interactive override without changing the base model used by other routes", () => {
   const config: LlmConfig = {
     configured: true,
     has_api_key: true,
@@ -132,16 +140,55 @@ test("setup does not echo the interactive model into the route override editor",
   };
 
   const setupDraft = createSetupDraft(config);
-  const result = buildLlmConfigInput({ ...setupDraft, model: "chosen-model" });
+  const result = buildLlmConfigInput({ ...setupDraft, model: "chosen-model" }, "initial", config);
 
-  assert.deepEqual(JSON.parse(setupDraft.routes), { interactive: { timeout_profile: "interactive" } });
+  assert.deepEqual(JSON.parse(setupDraft.routes), {
+    interactive: { model: "route-model", timeout_profile: "interactive" },
+  });
   assert.equal(setupDraft.model, "route-model");
-  assert.equal(result.model, "chosen-model");
-  assert.deepEqual(result.routes, { interactive: { timeout_profile: "interactive" } });
+  assert.equal(result.model, undefined);
+  assert.deepEqual(result.routes, { interactive: { model: "chosen-model" } });
+});
+
+test("advanced routes JSON controls the gate model without a stale review model overwriting it", () => {
+  const result = buildLlmConfigInput(
+    draft({
+      review_model: "old-gate-model",
+      routes: '{"gate":{"model":"chosen-gate-model"}}',
+    }),
+    "advanced",
+  );
+
+  assert.deepEqual(result.routes, { gate: { model: "chosen-gate-model" } });
+});
+
+test("advanced setup round-trips an explicit interactive model override", () => {
+  const config: LlmConfig = {
+    configured: true,
+    has_api_key: true,
+    vendor: "OpenAI",
+    provider: "openai",
+    base_url: "https://api.openai.com/v1",
+    model: "route-model",
+    max_output_tokens: null,
+    routes: { interactive: { model: "route-model", timeout_profile: "interactive", has_api_key: false } },
+    timeout_profiles: {},
+    models: {},
+  };
+
+  const setupDraft = createSetupDraft(config);
+  const result = buildLlmConfigInput(setupDraft, "advanced", config);
+
+  assert.deepEqual(JSON.parse(setupDraft.routes), {
+    interactive: { model: "route-model", timeout_profile: "interactive" },
+  });
+  assert.deepEqual(result.routes, {
+    interactive: { model: "route-model", timeout_profile: "interactive" },
+  });
 });
 
 test("setup rejects a provider that only exists on Object.prototype", () => {
   for (const provider of ["constructor", "toString", "valueOf"]) {
-    assert.throws(() => buildLlmConfigInput(draft({ provider })), /Compatible protocol/);
+    assert.throws(() => buildLlmConfigInput(draft({ provider }), "initial"), /Compatible protocol/);
   }
 });

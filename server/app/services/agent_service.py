@@ -199,7 +199,6 @@ class AgentService:
         return result.model_dump()
 
     async def get_token_stats(self, year: int | None = None) -> dict:
-        await self.token_stats_service.sync_from_traces()
         return await self.token_stats_service.get_stats(await self._profile_id(), year=year)
 
     async def get_run(self, run_id: str):

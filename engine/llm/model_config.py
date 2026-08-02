@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import os
 import socket
 from enum import Enum
 from pathlib import Path
@@ -38,12 +39,32 @@ def _config_paths() -> tuple[Path, Path, Path]:
         AGENT_DIR if AGENT_DIR is not None else paths.agent_dir,
     )
 
-
 # Deep-merge of the three static config levels, cached per file fingerprint
 # (path + mtime + size).  Config resolution runs on every model route lookup,
 # so re-reading unchanged YAML files on each call is wasted disk I/O; edits to
-# any level are still picked up because the fingerprint changes.
+# any level are still picked up because the fingerprint changes.  Environment
+# overrides (AGENTSMITH_LLM_*) are the lowest-precedence layer and are part of
+# the fingerprint so a change invalidates the cache.
 _BASE_MERGE_CACHE: tuple[tuple[object, ...], dict[str, Any]] | None = None
+
+_ENV_LLM_KEYS = (
+    ("AGENTSMITH_LLM_API_KEY", "api_key"),
+    ("AGENTSMITH_LLM_BASE_URL", "base_url"),
+    ("AGENTSMITH_LLM_MODEL", "model"),
+    ("AGENTSMITH_LLM_PROVIDER", "provider"),
+)
+
+
+def _env_defaults() -> dict[str, Any]:
+    """LLM settings sourced from the environment, as the lowest-precedence layer."""
+    env_llm: dict[str, str] = {}
+    for env_key, cfg_key in _ENV_LLM_KEYS:
+        val = os.environ.get(env_key)
+        if val:
+            env_llm[cfg_key] = val
+    if not env_llm:
+        return {}
+    return {"llm": env_llm}
 
 
 def _file_fingerprint(path: Path) -> tuple[str, int, int]:
@@ -55,13 +76,15 @@ def _file_fingerprint(path: Path) -> tuple[str, int, int]:
 
 
 def _merged_base_config() -> dict[str, Any]:
-    """Merge platform/seed/runtime config levels, cached until a file changes."""
+    """Merge env/platform/seed/runtime config levels, cached until something changes."""
     global _BASE_MERGE_CACHE
     data_dir, smith_profile_dir, agent_dir = _config_paths()
+    env = _env_defaults()
     fingerprint: tuple[object, ...] = (
         # The loader identity keeps the cache honest when tests replace
         # load_yaml with a stub; the file fingerprints catch real edits.
         id(load_yaml),
+        tuple(sorted(env.get("llm", {}).items())),
         *(
             _file_fingerprint(path)
             for path in (
@@ -74,6 +97,7 @@ def _merged_base_config() -> dict[str, Any]:
     if _BASE_MERGE_CACHE is not None and _BASE_MERGE_CACHE[0] == fingerprint:
         return _BASE_MERGE_CACHE[1]
     merged = merge_configs(
+        env,
         load_yaml(data_dir / "config.yaml"),
         load_yaml(smith_profile_dir / "config.yaml"),
         load_yaml(agent_dir / "config.yaml"),

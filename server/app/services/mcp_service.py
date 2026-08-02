@@ -12,14 +12,10 @@ from engine.mcp.config import mcp_server_log_summary, mcp_transport_from_config
 
 from ..schemas.mcp import McpServerOut, McpToolSummaryOut
 
+_MAX_CONCURRENT_DISCOVERIES = 4
+_DISCOVERY_TIMEOUT_SECONDS = 35.0
 # Compatibility seam for tests embedding a temporary runtime profile.
 AGENT_DIR: Path | None = None
-
-# A single hanging MCP server (stdio process or HTTP endpoint) must not block
-# list_servers forever; each phase is capped and the error is surfaced per server.
-_MCP_CONNECT_TIMEOUT_SECONDS = 30.0
-_MCP_LIST_TOOLS_TIMEOUT_SECONDS = 30.0
-
 
 def _agent_dir() -> Path:
     return AGENT_DIR if AGENT_DIR is not None else common_config.PATHS.agent_dir
@@ -38,18 +34,31 @@ class McpService:
         if not isinstance(configured, list):
             return [McpServerOut(name="config", type="unknown", status="error", error="mcp_servers must be a list")]
 
-        result: list[McpServerOut] = []
+        result: list[McpServerOut | None] = [None] * len(configured)
+        inspections: list[tuple[int, dict[str, Any]]] = []
         for index, raw in enumerate(configured):
             if not isinstance(raw, dict):
-                result.append(McpServerOut(
+                result[index] = McpServerOut(
                     name=f"server-{index + 1}",
                     type="unknown",
                     status="error",
                     error="server entry must be a mapping",
-                ))
+                )
                 continue
-            result.append(await self._inspect_server(raw, index))
-        return result
+            inspections.append((index, raw))
+
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DISCOVERIES)
+
+        async def inspect_limited(config: dict[str, Any], index: int) -> McpServerOut:
+            async with semaphore:
+                return await self._inspect_server(config, index)
+
+        inspected = await asyncio.gather(
+            *(inspect_limited(raw, index) for index, raw in inspections)
+        )
+        for (index, _), server in zip(inspections, inspected):
+            result[index] = server
+        return [server for server in result if server is not None]
 
     async def _inspect_server(self, config: dict[str, Any], index: int) -> McpServerOut:
         summary = mcp_server_log_summary(config)
@@ -75,12 +84,16 @@ class McpService:
                 return McpServerOut(**common, status="error", error="invalid MCP transport configuration")
             client = MCPClient(transport=transport)
             try:
-                await asyncio.wait_for(
-                    client.connect(), timeout=_MCP_CONNECT_TIMEOUT_SECONDS
-                )
-                tools = await asyncio.wait_for(
-                    client.list_tools(), timeout=_MCP_LIST_TOOLS_TIMEOUT_SECONDS
-                )
+                try:
+                    async with asyncio.timeout(_DISCOVERY_TIMEOUT_SECONDS):
+                        await client.connect()
+                        tools = await client.list_tools()
+                except TimeoutError:
+                    return McpServerOut(
+                        **common,
+                        status="error",
+                        error=f"MCP discovery timed out after {_DISCOVERY_TIMEOUT_SECONDS:g} seconds",
+                    )
             finally:
                 await client.close()
             return McpServerOut(

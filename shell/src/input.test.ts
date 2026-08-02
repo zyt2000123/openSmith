@@ -21,6 +21,7 @@ import {
   handleSkillToggle,
   handleSlashNavigation,
   handleViewToggle,
+  routeInput,
   type ShellInputOptions,
 } from "./input.js";
 import { createModelPicker } from "./model-picker.js";
@@ -322,17 +323,52 @@ test("Escape cancels the pending approval instead of consuming queued input", ()
   assert.equal(cancelled, true);
 });
 
-test("Ctrl-C during compression does not exit the shell", () => {
+test("Ctrl-C cancels compression instead of trapping the user in the shell", () => {
   const store = createAppStore();
-  let exited = false;
-  const options = inputOptions(new NodeBridge(store), store);
+  let cancelled = false;
+  const options = inputOptions(
+    {
+      cancelRequest: () => {
+        cancelled = true;
+        return true;
+      },
+    } as unknown as NodeBridge,
+    store,
+  );
   options.compressing = true;
-  options.exit = () => {
-    exited = true;
-  };
 
   assert.equal(handleCtrlC("c", { ctrl: true } as Key, options), true);
-  assert.equal(exited, false);
+  assert.equal(cancelled, true);
+});
+
+test("Escape cancels compression before the input lock discards the key", () => {
+  const store = createAppStore();
+  let cancelled = false;
+  const options = inputOptions(
+    {
+      cancelRequest: () => {
+        cancelled = true;
+        return true;
+      },
+    } as unknown as NodeBridge,
+    store,
+  );
+  options.compressing = true;
+
+  routeInput("", escapeKey(), options);
+
+  assert.equal(cancelled, true);
+});
+
+test("Tab from a child panel continues after its parent instead of jumping to welcome", () => {
+  const store = createAppStore();
+  const options = inputOptions({ refreshMcpServers: () => {} } as unknown as NodeBridge, store);
+  options.panel = "skills";
+  store.getState().set({ panel: "skills" });
+
+  routeInput("", { tab: true } as Key, options);
+
+  assert.equal(store.getState().panel, "mcp");
 });
 
 test("approval input consumes Tab instead of switching panels", () => {

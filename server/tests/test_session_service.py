@@ -17,6 +17,20 @@ from engine.execution import RunStateStore
 from engine.identity import IdentityCatalog
 
 
+async def stream_prepared_message(service: SessionService, *args, **kwargs):
+    """Consume the production preflight seam used by the HTTP router."""
+    stream = await service.prepare_stream_message(*args, **kwargs)
+    async for event in stream:
+        yield event
+
+
+async def resume_prepared_run(service: SessionService, *args, **kwargs):
+    """Consume the production resume-preflight seam used by the HTTP router."""
+    stream = await service.prepare_resume_run(*args, **kwargs)
+    async for event in stream:
+        yield event
+
+
 class FakeSessionRepo:
     def __init__(self) -> None:
         self.saved_messages: list[tuple[str, str, str]] = []
@@ -240,7 +254,7 @@ async def test_stream_message_forwards_skill_name_and_blocked_flag(monkeypatch: 
     svc = SessionService(FakeSessionRepo(), FakeAgentProfileRepo())
     events = [
         event
-        async for event in svc.stream_message(
+        async for event in stream_prepared_message(svc,
             "smith-id",
             "sess-1",
             "analyze this repo",
@@ -331,7 +345,7 @@ async def test_stream_message_forwards_skillchain_lifecycle_events(
 
     events = [
         event
-        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FakeSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "Help me shape this product idea",
@@ -395,11 +409,11 @@ async def test_stream_message_persists_token_usage_with_project_and_model(
 
     events = [
         event
-        async for event in SessionService(
+        async for event in stream_prepared_message(SessionService(
             FakeSessionRepo(),
             FakeAgentProfileRepo(),
             token_stats_service=Recorder(),
-        ).stream_message(
+        ),
             "smith-id",
             "sess-1",
             "hello",
@@ -463,10 +477,10 @@ async def test_stream_message_forwards_complete_context_receipt(
 
     events = [
         event
-        async for event in SessionService(
+        async for event in stream_prepared_message(SessionService(
             FakeSessionRepo(),
             FakeAgentProfileRepo(),
-        ).stream_message("smith-id", "sess-1", "hello")
+        ), "smith-id", "sess-1", "hello")
     ]
     receipt = json.loads(
         next(event for event in events if event["event"] == "context_usage")["data"]
@@ -531,12 +545,12 @@ async def test_resume_run_reuses_session_scope_and_discards_partial_reply(
 
     events = [
         event
-        async for event in SessionService(
+        async for event in resume_prepared_run(SessionService(
             repo,
             FakeAgentProfileRepo(),
             identity_catalog=_identity_catalog(identities_dir),
             run_state_store=store,
-        ).resume_run("smith-id", "run-1")
+        ), "smith-id", "run-1")
     ]
 
     request = captured["request"]
@@ -582,11 +596,11 @@ async def test_resume_run_rejects_an_older_run_without_deleting_later_turns(
     with pytest.raises(HTTPException, match="newer user turn") as exc_info:
         _ = [
             event
-            async for event in SessionService(
+            async for event in resume_prepared_run(SessionService(
                 repo,
                 FakeAgentProfileRepo(),
                 run_state_store=store,
-            ).resume_run("smith-id", "run-1")
+            ), "smith-id", "run-1")
         ]
 
     assert exc_info.value.status_code == 409
@@ -901,7 +915,7 @@ async def test_stream_message_forwards_provider_text_delta_without_replaying_fin
     repo = FakeSessionRepo()
     events = [
         event
-        async for event in SessionService(repo, FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(repo, FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "hello",
@@ -944,7 +958,7 @@ async def test_stream_message_surfaces_memory_persistence_failure(
 
     events = [
         event
-        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FakeSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "hello",
@@ -1010,7 +1024,7 @@ async def test_stream_message_forwards_provisional_lifecycle_and_persists_only_c
     repo = FakeSessionRepo()
     events = [
         event
-        async for event in SessionService(repo, FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(repo, FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "hello",
@@ -1069,7 +1083,7 @@ async def test_stream_message_forwards_validated_smith_ui_event(monkeypatch: pyt
 
     events = [
         event
-        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FakeSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "show deployment",
@@ -1104,7 +1118,7 @@ async def test_stream_message_forwards_engine_smith_ui_fallback(monkeypatch: pyt
 
     events = [
         event
-        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FakeSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "show deployment",
@@ -1157,7 +1171,7 @@ async def test_stream_message_saves_visible_provisional_reply_on_client_disconne
 
     repo = FakeSessionRepo()
     svc = SessionService(repo, FakeAgentProfileRepo())
-    stream = svc.stream_message("smith-id", "sess-1", "hello")
+    stream = await svc.prepare_stream_message("smith-id", "sess-1", "hello")
     await anext(stream)
     await anext(stream)
     # 模拟客户端断连：SSE 响应会 aclose 生成器，触发 GeneratorExit
@@ -1189,7 +1203,7 @@ async def test_stream_message_marks_model_output_limit_as_incomplete(monkeypatch
 
     events = [
         event
-        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FakeSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "hello",
@@ -1224,7 +1238,7 @@ async def test_stream_message_preserves_a_blocked_run_reason(monkeypatch: pytest
 
     events = [
         event
-        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FakeSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "hello",
@@ -1257,7 +1271,7 @@ async def test_stream_message_marks_unhandled_engine_error_as_failed(monkeypatch
 
     events = [
         event
-        async for event in SessionService(FakeSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FakeSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "hello",
@@ -1315,7 +1329,7 @@ async def test_stream_message_persists_visible_reply_when_the_consumer_is_cancel
     service = SessionService(repo, FakeAgentProfileRepo())
 
     async def consume() -> None:
-        async for _ in service.stream_message("smith-id", "sess-1", "hello"):
+        async for _ in stream_prepared_message(service, "smith-id", "sess-1", "hello"):
             pass
 
     task = asyncio.create_task(consume())
@@ -1358,7 +1372,7 @@ async def test_stream_message_reports_failed_status_when_persisting_the_reply_fa
 
     events = [
         event
-        async for event in SessionService(FailingSessionRepo(), FakeAgentProfileRepo()).stream_message(
+        async for event in stream_prepared_message(SessionService(FailingSessionRepo(), FakeAgentProfileRepo()),
             "smith-id",
             "sess-1",
             "hello",

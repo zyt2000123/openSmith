@@ -77,3 +77,25 @@ async def test_agent_service_creates_single_smith_profile_when_missing() -> None
     assert profile.name == "Smith"
     assert profile.role == "personal-assistant"
     assert fake.created == 1
+
+
+@pytest.mark.asyncio
+async def test_get_token_stats_reads_persisted_stats_without_resyncing_traces() -> None:
+    class FakeTokenStatsService:
+        sync_calls = 0
+
+        async def sync_from_traces(self) -> int:
+            self.sync_calls += 1
+            return 0
+
+        async def get_stats(self, agent_id: str, year: int | None = None) -> dict:
+            return {"agent_id": agent_id, "year": year}
+
+    token_stats = FakeTokenStatsService()
+    stats = await AgentService(
+        agent_profile_service=FakeAgentProfileService([profile_row()]),
+        token_stats_service=token_stats,
+    ).get_token_stats(year=2026)
+
+    assert stats == {"agent_id": "existing-id", "year": 2026}
+    assert token_stats.sync_calls == 0

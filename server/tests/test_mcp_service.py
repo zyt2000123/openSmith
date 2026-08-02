@@ -71,59 +71,93 @@ mcp_servers:
 
 
 @pytest.mark.asyncio
-async def test_mcp_service_surfaces_a_hanging_server_as_an_error_not_a_block(
+async def test_mcp_service_probes_configured_servers_concurrently(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A server that never answers connect must be reported as an error, not hang
-    the whole list_servers call."""
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir()
     (agent_dir / "config.yaml").write_text(
         """
 mcp_servers:
-  - name: stuck
-    type: stdio
-    command: [echo, hello]
+  - name: slow
+    command: [slow]
+  - name: fast
+    command: [fast]
 """.strip(),
         encoding="utf-8",
     )
     monkeypatch.setattr(mcp_service_module, "AGENT_DIR", agent_dir)
 
-    class FakeTransport:
-        label = "stuck"
-
-        async def connect(self):
-            pass
-
-        async def send_request(self, method, params):
-            return {}
-
-        async def send_notification(self, method, params):
-            pass
-
-        async def close(self):
-            pass
+    slow_started = asyncio.Event()
+    allow_slow = asyncio.Event()
+    fast_finished = asyncio.Event()
 
     class FakeClient:
         def __init__(self, *, transport):
-            self.transport = transport
+            self.name = transport["name"]
 
         async def connect(self):
-            await asyncio.sleep(60)  # hangs forever
+            if self.name == "slow":
+                slow_started.set()
+                await allow_slow.wait()
 
         async def list_tools(self):
+            if self.name == "fast":
+                fast_finished.set()
             return []
 
         async def close(self):
             pass
 
     monkeypatch.setattr(mcp_service_module, "MCPClient", FakeClient)
-    monkeypatch.setattr(mcp_service_module, "mcp_transport_from_config", lambda config: FakeTransport())
-    monkeypatch.setattr(mcp_service_module, "_MCP_CONNECT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(mcp_service_module, "mcp_transport_from_config", lambda config: config)
+
+    task = asyncio.create_task(McpService().list_servers())
+    try:
+        await asyncio.wait_for(slow_started.wait(), timeout=0.1)
+        await asyncio.wait_for(fast_finished.wait(), timeout=0.1)
+    finally:
+        allow_slow.set()
+
+    result = await task
+    assert [item.name for item in result] == ["slow", "fast"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_service_reports_a_discovery_timeout_and_closes_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "config.yaml").write_text(
+        "mcp_servers:\n  - name: stalled\n    command: [stalled]",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mcp_service_module, "AGENT_DIR", agent_dir)
+    monkeypatch.setattr(mcp_service_module, "_DISCOVERY_TIMEOUT_SECONDS", 0.01)
+    closed = False
+
+    class FakeClient:
+        def __init__(self, *, transport):
+            pass
+
+        async def connect(self):
+            await asyncio.Event().wait()
+
+        async def list_tools(self):
+            return []
+
+        async def close(self):
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(mcp_service_module, "MCPClient", FakeClient)
+    monkeypatch.setattr(mcp_service_module, "mcp_transport_from_config", lambda config: config)
 
     result = await McpService().list_servers()
 
-    assert len(result) == 1
     assert result[0].status == "error"
-    assert "timed out" in (result[0].error or "").lower()
+    assert "timed out" in (result[0].error or "")
+    assert closed is True

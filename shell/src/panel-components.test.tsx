@@ -89,6 +89,43 @@ test("RunExplorerPanel keeps the panel boundary when no run data exists yet", ()
   assert.match(output, /Esc back/);
 });
 
+test("RunExplorerPanel tolerates incomplete observability fields from a compatible server", () => {
+  const output = stripAnsi(
+    renderToString(
+      <RunExplorerPanel
+        runs={[
+          {
+            run_id: "run-1",
+            agent_id: "smith",
+            created_at: "2026-08-02T00:00:00Z",
+            finished_at: undefined as unknown as string,
+            event_count: 0,
+            tool_call_count: 0,
+            backtrack_count: 0,
+            approval_required_count: 0,
+            total_tokens: 0,
+          },
+        ]}
+        health={{
+          agent_id: "smith",
+          run_count: 1,
+          completed_count: 1,
+          unsuccessful_count: 0,
+          success_rate: 1,
+          tool_call_count: 0,
+          average_backtracks: Number.NaN,
+          total_tokens: 0,
+          tokens_per_run: 0,
+        }}
+        incidents={[]}
+      />,
+    ),
+  );
+
+  assert.match(output, /run-1/);
+  assert.match(output, /0\.0 backtracks\/run/);
+});
+
 function usageDay(date: string, total: number): TokenDay {
   return { date, sessions: 1, input_tokens: total, output_tokens: 0, total_tokens: total };
 }
