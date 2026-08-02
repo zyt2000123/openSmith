@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from app.services.config_service import ConfigService  # noqa: E402
 
 from common import database  # noqa: E402
+from common import config  # noqa: E402
 from common.paths import AppPaths  # noqa: E402
 from common.yaml_utils import YamlConfigError, load_yaml, save_yaml  # noqa: E402
 
@@ -42,6 +43,21 @@ def test_app_paths_honors_explicit_project_root(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setenv("AGENT_SMITH_PROJECT_ROOT", str(project_root))
 
     assert AppPaths.defaults().project_root == project_root.resolve()
+
+
+def test_config_exposes_paths_as_a_lazy_app_paths_value(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    (project_root / "agents").mkdir(parents=True)
+    monkeypatch.setenv("AGENT_SMITH_PROJECT_ROOT", str(project_root))
+    config.reset_paths()
+
+    try:
+        from common.config import PATHS
+
+        assert PATHS == AppPaths.defaults()
+        assert PATHS.project_root == project_root.resolve()
+    finally:
+        config.reset_paths()
 
 
 def test_app_paths_installs_shipped_skills_separately_from_user_skills(tmp_path: Path) -> None:
@@ -87,6 +103,51 @@ def test_app_paths_reconciles_existing_builtin_skill_directory(
     paths.ensure_base_dirs()
 
     assert not obsolete_target_file.exists()
+
+
+def test_app_paths_rejects_symlinked_builtin_skill_target(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project_root = tmp_path / "project"
+    source_skill = project_root / "agents" / "skills" / "demo"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "common.paths.sysconfig.get_path", lambda _name: str(tmp_path / "no-data")
+    )
+
+    data_dir = tmp_path / "data"
+    target_root = data_dir / "builtin" / "skills"
+    target_root.mkdir(parents=True)
+    outside_target = tmp_path / "outside"
+    outside_target.mkdir()
+    (target_root / "demo").symlink_to(outside_target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        AppPaths(data_dir=data_dir, project_root=project_root).ensure_base_dirs()
+
+    assert not (outside_target / "SKILL.md").exists()
+
+
+def test_app_paths_recovers_from_an_invalid_builtin_skill_manifest(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project_root = tmp_path / "project"
+    source_skill = project_root / "agents" / "skills" / "demo"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "common.paths.sysconfig.get_path", lambda _name: str(tmp_path / "no-data")
+    )
+
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=project_root)
+    manifest_path = paths.builtin_skills_dir / ".manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text("[]", encoding="utf-8")
+
+    paths.ensure_base_dirs()
+
+    assert (paths.builtin_skills_dir / "demo" / "SKILL.md").is_file()
 
 
 def test_wheel_data_files_reproduce_every_bundled_skill_file() -> None:
@@ -200,3 +261,29 @@ def test_get_db_initializes_once_for_concurrent_callers(monkeypatch, tmp_path: P
                 await connection.close()
 
     asyncio.run(run())
+
+
+def test_get_db_uses_a_lightweight_liveness_probe_for_cached_connections(
+    monkeypatch,
+) -> None:
+    class Cursor:
+        async def close(self) -> None:
+            return None
+
+    class CachedConnection:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def execute(self, statement: str) -> Cursor:
+            self.statements.append(statement)
+            return Cursor()
+
+    cached = CachedConnection()
+    monkeypatch.setattr(database, "_db", cached)
+
+    async def run() -> None:
+        assert await database.get_db() is cached
+
+    asyncio.run(run())
+
+    assert cached.statements == ["SELECT 1"]
