@@ -62,6 +62,7 @@ TOOL_META = {
 
 # Builtin skills directory — resolved relative to this file
 _BUILTIN_SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
+MAX_SKILL_BYTES = 8 * 1024 * 1024  # 8MB per SKILL.md, mirroring write_file's cap
 
 
 def _agent_skills_dir(agent_skills_dir: str | Path | None) -> Path:
@@ -314,6 +315,11 @@ async def execute(
             return "Error: 'content' is required for create action"
         if _is_builtin(skill_name):
             return f"Error: '{skill_name}' is a built-in skill name. Choose a different name."
+        if len(content.encode("utf-8")) > MAX_SKILL_BYTES:
+            return (
+                f"Error: content exceeds the {MAX_SKILL_BYTES // (1024 * 1024)} MB "
+                "per-skill size limit"
+            )
         content_error = _validate_skill_content_name(skill_name, content)
         if content_error:
             return f"Error: {content_error}"
@@ -342,6 +348,11 @@ async def execute(
             return "Error: 'content' is required for edit action"
         if _is_builtin(skill_name):
             return "Error: built-in skills are read-only. Cannot edit."
+        if len(content.encode("utf-8")) > MAX_SKILL_BYTES:
+            return (
+                f"Error: content exceeds the {MAX_SKILL_BYTES // (1024 * 1024)} MB "
+                "per-skill size limit"
+            )
         content_error = _validate_skill_content_name(skill_name, content)
         if content_error:
             return f"Error: {content_error}"

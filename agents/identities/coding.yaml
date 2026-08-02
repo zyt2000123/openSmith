@@ -37,7 +37,7 @@ skills:
 routes:
   - id: requirements-research
     examples: ["需求调研", "requirements research", "/grill-me"]
-    keywords: [需求调研, 需求研究, requirements research, research requirements, grill-me, 先调研, 调研, 研究一下, 帮我调研, 做调研]
+    keywords: [需求调研, 需求研究, requirements research, research requirements, grill-me, 需求澄清, product discovery]
     pipeline: requirements-research
     priority: 30
 

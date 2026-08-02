@@ -400,20 +400,39 @@ class TestDeliveryGate:
 
 
 class GrillingCompleteGate:
-    """Require an explicit shared-understanding handoff after grilling."""
+    """Require actual shared-understanding evidence after grilling."""
 
-    _COMPLETE = "<!-- agent-smith:grilling-complete -->"
+    _FIELDS = {
+        "scope": r"scope|范围",
+        "non-goals": r"non-goals?|非目标",
+        "constraints": r"constraints?|约束",
+        "acceptance": r"acceptance(?:\s+signal)?|验收(?:标准|信号)?",
+    }
 
     async def check(self, output: str, context: dict) -> GateResult:
-        if self._COMPLETE in output:
+        def has_field_value(field_pattern: str) -> bool:
+            # Accept an inline label ("Scope: …") or a Markdown heading with
+            # a non-empty following line. Bare mentions of a field do not
+            # establish a user decision.
+            return bool(re.search(
+                rf"(?:{field_pattern})[ \t]*(?::|：)[ \t]*\S|"
+                rf"(?:^|\n)[ \t#>*-]*(?:{field_pattern})[ \t]*\n[ \t]*\S",
+                output,
+                re.IGNORECASE,
+            ))
+
+        missing = [
+            label for label, pattern in self._FIELDS.items()
+            if not has_field_value(pattern)
+        ]
+        if not missing:
             return GateResult("pass", "User decisions are ready for research.")
         return GateResult(
             "retry",
-            "Grilling must either ask one user question or explicitly record shared understanding.",
+            "Grilling is missing non-empty decision fields: " + ", ".join(missing) + ".",
             retry_hint=(
-                "If a decision remains, ask exactly one question and end with "
-                "<!-- agent-smith:await-user-input -->. Otherwise summarize the "
-                "decisions and end with <!-- agent-smith:grilling-complete -->."
+                "If a decision remains, ask exactly one question. Otherwise summarize "
+                "scope, non-goals, constraints, and acceptance signal with a value for each."
             ),
         )
 
@@ -421,7 +440,6 @@ class GrillingCompleteGate:
 class ResearchBriefGate:
     """Require a real, local, source-attributed ResearchBrief artifact."""
 
-    _READY = "<!-- agent-smith:research-brief-ready -->"
     _PATH = re.compile(r"(?:^|[`\s(])(?P<path>docs/research/[A-Za-z0-9_./-]+\.md)(?:$|[`\s):,])")
     _HEADINGS = (
         "## problem",
@@ -432,15 +450,6 @@ class ResearchBriefGate:
     )
 
     async def check(self, output: str, context: dict) -> GateResult:
-        if self._READY not in output:
-            return GateResult(
-                "retry",
-                "Research output is missing its ResearchBrief completion marker.",
-                retry_hint=(
-                    "Write the cited ResearchBrief, report its docs/research path, and end with "
-                    "<!-- agent-smith:research-brief-ready -->."
-                ),
-            )
         match = self._PATH.search(output)
         working_dir = context.get("_working_dir")
         if match is None or not isinstance(working_dir, str) or not working_dir:
@@ -476,18 +485,29 @@ class ResearchBriefGate:
 class PlanConfirmedGate:
     """Do not let a requirements plan advance before explicit confirmation."""
 
-    _CONFIRMED = "<!-- agent-smith:plan-confirmed -->"
+    _CONFIRMATION = re.compile(
+        r"\b(?:yes|approved|confirm(?:ed)?|go ahead)\b|"
+        r"(?:^|[\s，,。.!！；;])(?:我)?确认(?:[\s，,。.!！；;]|$)|"
+        r"已确认|同意(?:[\s，,。.!！；;]|$)|批准|按此方案继续|可以开始|继续执行",
+        re.IGNORECASE,
+    )
 
     async def check(self, output: str, context: dict) -> GateResult:
-        if self._CONFIRMED in output:
-            return GateResult("pass", "Requirements plan is explicitly confirmed.")
+        # Confirmation is a user decision, not an LLM-controlled output token.
+        # A resumed paused node receives the answer in ``user_response``; a
+        # single-turn request may include it in ``chain_request`` instead.
+        user_evidence = "\n".join(
+            str(context.get(key) or "")
+            for key in ("user_response", "chain_request", "user_message")
+        )
+        if self._CONFIRMATION.search(user_evidence):
+            return GateResult("pass", "Requirements plan has explicit user confirmation.")
         return GateResult(
             "retry",
             "Plan confirmation is missing.",
             retry_hint=(
-                "Present the grounded plan and wait with "
-                "<!-- agent-smith:await-user-input -->. After explicit user approval, "
-                "end with <!-- agent-smith:plan-confirmed --> without implementing code."
+                "Present the grounded plan, ask for an explicit user decision, and do not "
+                "implement code until the user confirms it."
             ),
         )
 
@@ -526,15 +546,12 @@ class RedLoopGate:
 class TddEvidenceGate:
     """Require both observed RED and observed GREEN in the implementation handoff."""
 
-    _READY = "<!-- agent-smith:tdd-implementation-ready -->"
     _RED = re.compile(r"\bRED\b[\s\S]{0,500}\b(?:failed|failure|error|failing)\b|RED[\s\S]{0,500}(?:失败|报错|异常)", re.IGNORECASE)
     _GREEN = re.compile(r"\bGREEN\b[\s\S]{0,500}\b(?:passed|pass|success)\b|GREEN[\s\S]{0,500}(?:通过|成功)", re.IGNORECASE)
     _COMMAND = re.compile(r"(?:^|\n)\s*(?:\$\s*)?(?:uv\s+run|pytest|python(?:3)?\s|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|go\s+test|cargo\s+test)", re.IGNORECASE)
 
     async def check(self, output: str, context: dict) -> GateResult:
         missing = []
-        if self._READY not in output:
-            missing.append("TddEvidence completion marker")
         if not self._RED.search(output):
             missing.append("observed RED result")
         if not self._GREEN.search(output):
@@ -553,14 +570,11 @@ class TddEvidenceGate:
 class TddVerificationGate:
     """Require an evidence-backed final TddEvidence report."""
 
-    _READY = "<!-- agent-smith:tdd-evidence-ready -->"
     _SECTIONS = ("build:", "types:", "lint:", "tests:", "security:", "diff:", "overall:")
 
     async def check(self, output: str, context: dict) -> GateResult:
         lowered = output.casefold()
         missing = []
-        if self._READY not in output:
-            missing.append("TddEvidence completion marker")
         missing.extend(section for section in self._SECTIONS if section not in lowered)
         if missing:
             return GateResult(
@@ -578,13 +592,9 @@ class TddVerificationGate:
 class ReviewReportGate:
     """Keep Matt's Standards and Spec axes separate in the review artifact."""
 
-    _READY = "<!-- agent-smith:review-ready -->"
-
     async def check(self, output: str, context: dict) -> GateResult:
         lowered = output.casefold()
         missing = []
-        if self._READY not in output:
-            missing.append("ReviewReport completion marker")
         if "## standards" not in lowered:
             missing.append("Standards axis")
         if "## spec" not in lowered:
@@ -606,13 +616,9 @@ class ReviewReportGate:
 class ReviewVerificationGate:
     """Require verification to be appended without collapsing review axes."""
 
-    _READY = "<!-- agent-smith:review-report-ready -->"
-
     async def check(self, output: str, context: dict) -> GateResult:
         lowered = output.casefold()
         missing = []
-        if self._READY not in output:
-            missing.append("ReviewReport completion marker")
         for section in ("## standards", "## spec", "## verification"):
             if section not in lowered:
                 missing.append(section)

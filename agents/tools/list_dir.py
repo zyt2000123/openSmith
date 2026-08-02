@@ -30,6 +30,10 @@ EXCLUDED = {".git", "node_modules", "__pycache__", ".venv", "dist", ".build", ".
 
 
 def _execute_sync(*, path: str = ".", max_depth: int = 2) -> str:
+    if not isinstance(path, str):
+        return "Error: path must be a string"
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+        return "Error: max_depth must be an integer"
     base = os.path.realpath(path)
     if not os.path.isdir(base):
         return f"Error: not a directory: {base}"

@@ -111,7 +111,7 @@ async def execute(*, query: str, max_results: int = 5, provider: str = "duckduck
         with _OPENER.open(req, timeout=15) as resp:
             return resp.read(512 * 1024).decode("utf-8", errors="replace")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         async with _SEARCH_CONCURRENCY:
             page = await asyncio.wait_for(loop.run_in_executor(None, _fetch), timeout=15)

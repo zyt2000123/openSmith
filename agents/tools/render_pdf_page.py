@@ -44,8 +44,54 @@ TOOL_META = {
 }
 
 MAX_RENDER_BYTES = 25 * 1024 * 1024
+MAX_RENDER_FILES = 32
+_SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 
 _render_dir: Path | None = None
+
+
+def _safe_environment(render_dir: Path) -> dict[str, str]:
+    """Minimal env for the Poppler subprocess, mirroring shell/git_ops.
+
+    pdftoppm inherits the server process environment by default; stripping it
+    keeps service credentials out of a subprocess that parses a model-supplied
+    PDF.  ``PATH`` stays so any helper the binary spawns can still be found.
+    """
+    environment = {
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "HOME": str(render_dir),
+    }
+    for key in _SAFE_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
+def _tidy_render_dir() -> None:
+    """Bound the process-global render dir so a long-lived server does not
+    accumulate rendered PNGs forever.
+
+    Re-renders overwrite deterministic file names, so growth tracks distinct
+    PDFs rendered; once the cap is exceeded the oldest files are evicted by
+    mtime.  Callers consume a returned PNG immediately, and re-rendering the
+    same PDF regenerates it, so eviction of old artifacts is safe.
+    """
+    if _render_dir is None or not _render_dir.is_dir():
+        return
+    try:
+        candidates = sorted(
+            (p for p in _render_dir.glob("*.png") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError:
+        return
+    while len(candidates) > MAX_RENDER_FILES:
+        oldest = candidates.pop(0)
+        try:
+            oldest.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _render_output_dir() -> Path:
@@ -121,6 +167,7 @@ def _execute_sync(*, path: str, page: int = 1, dpi: int = 144) -> str:
             text=True,
             timeout=30,
             check=False,
+            env=_safe_environment(output_dir),
         )
     except subprocess.TimeoutExpired:
         return "Error: PDF page rendering timed out after 30 seconds"
@@ -139,6 +186,7 @@ def _execute_sync(*, path: str, page: int = 1, dpi: int = 144) -> str:
         output_path.unlink(missing_ok=True)
         return "Error: rendered page exceeds the 25 MB safety limit"
 
+    _tidy_render_dir()
     return f"Rendered PDF page {page} at {dpi} DPI: {output_path} ({size} bytes)"
 
 

@@ -38,10 +38,19 @@ TOOL_META = {
 }
 
 
+MAX_EDIT_BYTES = 8 * 1024 * 1024  # 8MB file / result cap
+
+
 def _execute_sync(
     *, path: str, old_string: str, new_string: str, replace_all: bool = False,
     _snapshot_tracker: Callable[[str], object] | None = None,
 ) -> str:
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        return "Error: old_string and new_string must be strings"
+    if not old_string:
+        # str.replace("", x) splices x between every character; replace_all on an
+        # empty needle silently mangles the whole file.
+        return "Error: old_string must not be empty"
     if old_string == new_string:
         return "Error: new_string must differ from old_string"
 
@@ -57,8 +66,24 @@ def _execute_sync(
         return f"Error: file not found: {resolved}"
 
     try:
-        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+        if os.path.getsize(resolved) > MAX_EDIT_BYTES:
+            return (
+                f"Error: file exceeds the {MAX_EDIT_BYTES // (1024 * 1024)} MB "
+                "edit limit"
+            )
+    except OSError:
+        return f"Error: cannot inspect file: {resolved}"
+
+    try:
+        # Strict decoding, never errors="replace": a lossy read followed by a
+        # plain write silently corrupts the bytes that failed to decode.
+        with open(resolved, "r", encoding="utf-8") as f:
             content = f.read()
+    except UnicodeDecodeError:
+        return (
+            f"Error: {resolved} is not valid UTF-8 text; edit_file only supports "
+            "UTF-8 text files"
+        )
     except PermissionError:
         return f"Error: permission denied: {resolved}"
 
@@ -91,6 +116,11 @@ def _execute_sync(
             )
 
     updated = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+    if len(updated.encode("utf-8")) > MAX_EDIT_BYTES:
+        return (
+            f"Error: edited content exceeds the {MAX_EDIT_BYTES // (1024 * 1024)} MB "
+            "edit limit"
+        )
 
     try:
         with open(resolved, "w", encoding="utf-8") as f:

@@ -38,13 +38,28 @@ TOOL_META = {
     "execution_environment": "host",
 }
 
-_legacy_todos: list[dict] = []
 _ICONS = {"pending": "○", "in_progress": "◐", "done": "●"}
 
 
-def _load_todos(todo_file: str | Path | None) -> list[dict] | None:
-    if todo_file is None:
-        return _legacy_todos
+def _ensure_private_dir(path: Path) -> None:
+    """Create *path* and every missing ancestor with 0700.
+
+    ``mkdir(parents=True, mode=...)`` applies the mode only to the final
+    component and lets created ancestors fall back to the process umask; only
+    directories this function actually creates are tightened, so an existing
+    shared ancestor is left alone.
+    """
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+
+
+def _load_todos(todo_file: str | Path) -> list[dict] | None:
     path = Path(todo_file)
     if not path.is_file():
         return []
@@ -66,12 +81,9 @@ def _load_todos(todo_file: str | Path | None) -> list[dict] | None:
     return todos
 
 
-def _save_todos(todos: list[dict], todo_file: str | Path | None) -> None:
-    if todo_file is None:
-        _legacy_todos[:] = todos
-        return
+def _save_todos(todos: list[dict], todo_file: str | Path) -> None:
     path = Path(todo_file)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_private_dir(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temp_path = Path(temp_name)
     try:
@@ -100,6 +112,12 @@ def _execute_sync(
     *, action: str, text: str = "", index: int = 0, status: str = "pending",
     todo_file: str | Path | None = None,
 ) -> str:
+    if todo_file is None:
+        return "Error: todo runtime storage was not provided by the engine"
+    if not isinstance(action, str):
+        return "Error: action must be a string"
+    if isinstance(index, bool) or not isinstance(index, int):
+        return "Error: index must be an integer"
     todos = _load_todos(todo_file)
     if todos is None:
         return "Error: Todo state is invalid; refusing to overwrite it"

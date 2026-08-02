@@ -75,6 +75,12 @@ def _safe_environment(cwd: str | None) -> dict[str, str]:
 async def execute(
     *, command: str, timeout: int = 30, cwd: str | None = None, environment=None
 ) -> str:
+    if not isinstance(command, str) or not command.strip():
+        return "Error: command must be a non-empty string"
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return "Error: timeout must be a number"
+    if cwd is not None and not isinstance(cwd, str):
+        return "Error: cwd must be a string"
     timeout = min(max(1, timeout), MAX_TIMEOUT)
 
     if cwd and not os.path.isdir(cwd):
