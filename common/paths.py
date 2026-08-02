@@ -57,8 +57,26 @@ def _default_project_root() -> Path:
 
 
 def _ensure_private_dir(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing to use symlinked private directory: {path}")
     path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
     path.chmod(PRIVATE_DIR_MODE)
+
+
+def _ensure_real_descendant(root: Path, path: Path) -> None:
+    """Reject symlinks anywhere in a managed target path."""
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError as exc:
+        raise RuntimeError(f"Managed path escapes its root: {path}") from exc
+
+    current = root
+    if current.is_symlink():
+        raise RuntimeError(f"Refusing to use symlinked managed path: {current}")
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            raise RuntimeError(f"Refusing to use symlinked managed path: {current}")
 
 
 @dataclass(frozen=True)
@@ -136,13 +154,16 @@ class AppPaths:
         _ensure_private_dir(target)
         manifest_path = target / ".manifest.json"
 
-        # Load previous manifest to check what changed
-        previous_manifest = {}
+        # Load previous file metadata to check what changed. A malformed
+        # manifest is recoverable: sync every shipped file again.
+        previous_files: dict[object, object] = {}
         if manifest_path.is_file():
             try:
-                previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
-                pass  # Treat as first install
+                manifest = None
+            if isinstance(manifest, dict) and isinstance(manifest.get("files"), dict):
+                previous_files = manifest["files"]
 
         shipped = sorted(
             child.name for child in source.iterdir() if (child / "SKILL.md").is_file()
@@ -153,6 +174,7 @@ class AppPaths:
         for name in shipped:
             source_skill = source / name
             target_skill = target / name
+            _ensure_real_descendant(target, target_skill)
             target_skill.mkdir(parents=True, exist_ok=True)
 
             # Incremental copy: only update changed files
@@ -162,17 +184,18 @@ class AppPaths:
 
                 rel_path = source_file.relative_to(source)
                 target_file = target / rel_path
+                _ensure_real_descendant(target, target_file)
 
                 # Check if file needs update
                 source_stat = source_file.stat()
                 file_key = str(rel_path)
                 needs_update = True
 
-                if file_key in previous_manifest.get("files", {}):
-                    prev = previous_manifest["files"][file_key]
+                prev = previous_files.get(file_key)
+                if isinstance(prev, dict):
                     if (target_file.is_file()
-                        and prev["mtime"] == source_stat.st_mtime
-                        and prev["size"] == source_stat.st_size):
+                        and prev.get("mtime") == source_stat.st_mtime
+                        and prev.get("size") == source_stat.st_size):
                         needs_update = False
 
                 if needs_update:
@@ -206,7 +229,10 @@ class AppPaths:
         # Remove obsolete skills
         for child in target.iterdir():
             if child.is_dir() and child.name not in shipped:
-                shutil.rmtree(child)
+                if child.is_symlink():
+                    child.unlink()
+                else:
+                    shutil.rmtree(child)
 
         # Write new manifest
         manifest_path.write_text(
