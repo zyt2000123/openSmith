@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 from engine.execution.events import EventType, ExecutionEvent
-from engine.execution.tool_hooks import HookRegistry
+from engine.execution.hooks import HookRegistry
 from engine.execution.pipeline.backtrack import FailureLoopGuard
 from engine.execution.pipeline.pipeline import CTX_PROVISIONAL_OUTPUTS, run_pipeline
 from engine.execution.pipeline.pipeline_context import (

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from engine.execution.tool_hooks import PreToolHook
+from engine.execution.hooks import PreToolHook
 
 
 class FactGateHook(PreToolHook):
@@ -53,11 +53,11 @@ class FactGateHook(PreToolHook):
         tool_input: dict[str, Any]
     ) -> tuple[bool, str | None]:
         """检查是否在充分调查后才编辑"""
-        # 只检查首次编辑
-        if tool_name not in ["Edit", "Write"]:
+        # 只检查首次编辑（Agent-Smith 工具名；路径参数键是 path）
+        if tool_name not in ["edit_file", "write_file"]:
             return True, None
 
-        file_path = tool_input.get("file_path", "")
+        file_path = tool_input.get("path", "")
         if not file_path:
             return True, None
 

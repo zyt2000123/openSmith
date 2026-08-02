@@ -95,6 +95,18 @@ class TokenStatsService:
             "WHERE source_key LIKE 'message:%' AND session_id=?",
             (session_id,),
         )
+        # A resumed run (server restarted after the trace was imported) would
+        # otherwise keep both its live rows and the trace-imported rows for the
+        # whole process lifetime: sync_from_traces only heals at the next startup.
+        # Trace-imported rows for this run carry source_key '{run_id}:{seq}', so
+        # drop them now that the live path is authoritative for this run again.
+        if run_id:
+            await db.execute(
+                "DELETE FROM token_usage_events "
+                "WHERE run_id=? AND source_key IS NOT NULL "
+                "AND source_key NOT LIKE 'message:%'",
+                (run_id,),
+            )
         await db.commit()
 
     async def record_generation(self, record: "GenerationRecord") -> None:
@@ -305,9 +317,37 @@ class TokenStatsService:
                 [(run_id,) for run_id in stale_cursor_ids],
             )
 
+        # Runs whose usage was already recorded live (source_key IS NULL, written
+        # by record_usage during an SSE stream) must not be re-imported from their
+        # traces: the same token_usage event would then exist twice and get_stats
+        # would double-count every interactive run after the first restart.  Auto
+        # tasks never call record_usage, so they still arrive through this import.
+        live_recorded_run_ids = {
+            str(row["run_id"])
+            for row in await db.execute_fetchall(
+                """
+                SELECT DISTINCT run_id FROM token_usage_events
+                WHERE source_key IS NULL AND run_id IS NOT NULL
+                """
+            )
+        }
+        if live_recorded_run_ids:
+            # Heal any trace-imported rows already persisted for those runs from
+            # an older version that did not skip live-recorded runs.
+            await db.executemany(
+                """
+                DELETE FROM token_usage_events
+                WHERE run_id=? AND source_key IS NOT NULL
+                  AND source_key NOT LIKE 'message:%'
+                """,
+                [(run_id,) for run_id in live_recorded_run_ids],
+            )
+
         def read_new_trace_records():
             batches = []
             for run_id in eligible_run_ids:
+                if run_id in live_recorded_run_ids:
+                    continue
                 cursor = cursors.get(run_id, {})
                 records, next_offset = self._observability.read_trace_from(
                     run_id,

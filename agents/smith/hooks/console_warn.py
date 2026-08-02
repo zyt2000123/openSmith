@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from engine.execution.tool_hooks import PostToolHook
+from engine.execution.hooks import PostToolHook
 
 
 class ConsoleWarnHook(PostToolHook):
@@ -65,11 +65,11 @@ class ConsoleWarnHook(PostToolHook):
         tool_output: Any
     ) -> list[str]:
         """检查编辑的代码是否包含调试语句"""
-        # 只检查 Edit 工具
-        if tool_name != "Edit":
+        # 只检查 edit_file 工具（Agent-Smith 工具名；路径参数键是 path）
+        if tool_name != "edit_file":
             return []
 
-        file_path = tool_input.get("file_path", "")
+        file_path = tool_input.get("path", "")
         new_string = tool_input.get("new_string", "")
 
         if not file_path or not new_string:

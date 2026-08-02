@@ -6,12 +6,34 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from engine.execution.tool_hooks import PostToolHook
+from engine.execution.hooks import PostToolHook
+
+# 单次格式化/lint 检查的硬超时：npx 首次运行可能下载依赖，但没有上限会挂死
+# 事件循环。 超时后放弃本次检查，不阻塞 Agent 响应。
+_CHECK_TIMEOUT_SECONDS = 15.0
+
+# 允许转发给格式化/lint 子进程的父环境键。 其余一律不放行，避免把引擎持有的
+# API key / 数据库凭据泄漏给 npx/black/ruff 等任意工具进程。
+_SAFE_ENV_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR")
+
+
+def _minimal_environment() -> dict[str, str]:
+    """构造格式化/lint 子进程的最小环境（PATH + 少量安全键）。"""
+    environment: dict[str, str] = {
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "HOME": os.environ.get("HOME") or "/",
+    }
+    for key in _SAFE_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
 
 
 class QualityGateHook(PostToolHook):
@@ -62,11 +84,11 @@ class QualityGateHook(PostToolHook):
         tool_output: Any
     ) -> list[str]:
         """运行质量检查"""
-        # 只检查文件编辑工具
-        if tool_name not in ["Edit", "Write", "MultiEdit"]:
+        # 只检查文件编辑工具（Agent-Smith 工具名；路径参数键是 path）
+        if tool_name not in ["edit_file", "write_file"]:
             return []
 
-        file_path = tool_input.get("file_path", "")
+        file_path = tool_input.get("path", "")
         if not file_path:
             return []
 
@@ -91,10 +113,7 @@ class QualityGateHook(PostToolHook):
 
     async def _check_format(self, file_path: str, formatter: str) -> str | None:
         """检查文件格式（简化实现）"""
-        # 实际实现应该调用相应的格式化工具
-        # 这里返回一个提示信息
         try:
-            # 尝试运行格式化工具检查（--check 模式）
             if formatter == "prettier":
                 cmd = ["npx", "prettier", "--check", file_path]
             elif formatter == "black":
@@ -106,13 +125,21 @@ class QualityGateHook(PostToolHook):
             else:
                 return None
 
-            # 使用 asyncio.create_subprocess_exec（安全的参数化执行）
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                cwd=str(Path(file_path).resolve().parent),
+                env=_minimal_environment(),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=_CHECK_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return f"⚠️  Format check timed out for {file_path}"
 
             if proc.returncode != 0:
                 return (
@@ -143,13 +170,21 @@ class QualityGateHook(PostToolHook):
             else:
                 return None
 
-            # 使用 asyncio.create_subprocess_exec（安全的参数化执行）
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                cwd=str(Path(file_path).resolve().parent),
+                env=_minimal_environment(),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=_CHECK_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return f"⚠️  Lint check timed out for {file_path}"
 
             if proc.returncode != 0:
                 output = stdout.decode() if stdout else stderr.decode()

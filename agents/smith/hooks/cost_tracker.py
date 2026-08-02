@@ -6,14 +6,18 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.paths import get_data_root
-from engine.execution.tool_hooks import StopHook
+from engine.execution.hooks import StopHook
+
+# 成本记录含会话 ID 与 token 统计，必须私有（0600）且不被 umask 影响。
+_COST_FILE_MODE = 0o600
 
 
 class CostTrackerHook(StopHook):
@@ -68,7 +72,7 @@ class CostTrackerHook(StopHook):
         # 构建成本记录
         cost_record = {
             "session_id": session_id,
-            "timestamp": time.time(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
@@ -116,6 +120,15 @@ class CostTrackerHook(StopHook):
 
         cost_file = metrics_dir / "costs.jsonl"
 
-        # 追加写入 JSONL
-        with open(cost_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        # 追加写入 JSONL：显式 0600（不受 umask 影响），单次写入保证原子性。
+        fd = os.open(
+            cost_file,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            _COST_FILE_MODE,
+        )
+        try:
+            os.write(fd, (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        if cost_file.stat().st_mode & 0o777 != _COST_FILE_MODE:
+            cost_file.chmod(_COST_FILE_MODE)

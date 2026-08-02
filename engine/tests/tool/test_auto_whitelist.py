@@ -90,8 +90,15 @@ async def test_external_approval_whitelists_only_the_exact_file(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_workspace_approval_keeps_directory_granularity(tmp_path):
-    """Inside the ordinary allowed dirs, directory whitelisting stays a no-op."""
+async def test_high_risk_approval_is_never_whitelist_cached(tmp_path):
+    """High-risk approvals must be re-granted every time.
+
+    A sensitive file (``.env``) inside the workspace still requires approval,
+    and approving it must NOT populate the session whitelist — only elevated
+    boundary approvals are cacheable.  The whitelist never broadened the
+    boundary for high-risk paths (they are not boundary blocks), but the
+    stricter tier gate makes that guarantee explicit.
+    """
     working_dir = tmp_path / "project"
     working_dir.mkdir()
     sub = working_dir / "sub"
@@ -109,12 +116,14 @@ async def test_workspace_approval_keeps_directory_granularity(tmp_path):
     call = ToolCall(id="c1", name="read_file", arguments={"path": str(env_file)})
     decision = guard.check(call)
     assert decision.approval_required and not decision.boundary_block
+    assert decision.risk.value == "high"
     with registry.authorize_execution(
         call, approval_id="a", approval_scope=decision.approval_scope
     ):
         await registry.execute(call)
 
-    # ...and the parent directory is whitelisted (harmless: the whole workspace
-    # was already readable, so this never broadens the boundary).
-    assert guard.whitelist.is_path_allowed(str(sub))
+    # ...but the parent directory is NOT whitelisted: a high-risk approval
+    # must be re-granted on the next attempt regardless of location.
+    assert not guard.whitelist.is_path_allowed(str(sub))
+    assert not guard.whitelist.is_path_allowed(str(env_file))
 

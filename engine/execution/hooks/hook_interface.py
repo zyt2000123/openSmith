@@ -18,6 +18,11 @@ class PreToolHook(ABC):
     Pre Hook 可以阻止工具执行，用于安全防护和策略强制。
     """
 
+    def __init__(self) -> None:
+        # YAML 配置的优先级（数字越小越先执行）；加载器构建实例后注入。
+        # 类级 ``priority`` property 仍是默认值，配置注入优先于它。
+        self._configured_priority: int | None = None
+
     @property
     @abstractmethod
     def id(self) -> str:
@@ -28,9 +33,9 @@ class PreToolHook(ABC):
     def priority(self) -> int:
         """优先级（数字越小越先执行）
 
-        默认为 100。关键安全检查应设置较小的值。
+        默认为 100。关键安全检查应设置较小的值。YAML 配置的 priority 优先。
         """
-        return 100
+        return self._configured_priority if self._configured_priority is not None else 100
 
     @property
     def enabled(self) -> bool:
@@ -46,7 +51,7 @@ class PreToolHook(ABC):
         """检查工具调用是否允许执行
 
         Args:
-            tool_name: 工具名称（如 "Edit", "Bash", "Write"）
+            tool_name: 工具名称（如 "edit_file", "shell"）
             tool_input: 工具输入参数
 
         Returns:

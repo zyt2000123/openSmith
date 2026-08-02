@@ -163,6 +163,7 @@ engine/execution/hooks/
 ├── hook_interface.py    # Abstract base classes
 ├── hook_manager.py      # HookRegistry (registration + execution)
 ├── hook_loader.py       # Dynamic loading from YAML config
+├── engine_hooks.py      # HookManager/HookType — engine-internal extension hooks
 └── __init__.py
 
 agents/smith/hooks/

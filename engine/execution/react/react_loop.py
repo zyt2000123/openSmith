@@ -56,7 +56,7 @@ from .budget import (
 from .smith_ui import smith_ui_fallback, validate_smith_ui_call
 
 if TYPE_CHECKING:
-    from engine.execution.tool_hooks import HookRegistry
+    from engine.execution.hooks import HookRegistry
     from engine.llm.port import LLMPort
     from engine.safety.tool_guard import ToolGuard
     from engine.tool.registry import ToolRegistry
@@ -1154,6 +1154,7 @@ async def react_event_loop(
             conversation.append({"role": "tool", "tool_call_id": result.call_id, "content": result.content})
             result_event = {
                 "id": tc.id,
+                "name": call.name,
                 "error": result.is_error,
                 "blocked": False,
                 "preflight": False,

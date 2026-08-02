@@ -122,6 +122,11 @@ class HashChainLog:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIR_MODE)
             self._handle = open(self.path, "a", encoding="utf-8")
             self._handle_path = self.path
+            # open("a") 受 umask 影响；审计日志必须 0600，与 O_APPEND 分支一致。
+            try:
+                os.chmod(self.path, CHAIN_FILE_MODE)
+            except OSError:
+                logger.warning("failed to chmod chain log: %s", self.path, exc_info=True)
         return self._handle
 
     def append(self, record: dict, *, sync: bool = False) -> dict:
@@ -140,6 +145,8 @@ class HashChainLog:
             if handle is not None:
                 handle.write(payload.decode("utf-8"))
                 handle.flush()
+                if sync:
+                    os.fsync(handle.fileno())
             else:
                 created = not self.path.exists()
                 fd = os.open(
@@ -323,11 +330,13 @@ def verify_chain(
             )
         return ChainVerification(ok=True, records=0, anchored=False, anchor_matches=None)
 
-    records: list[dict] = []
-    line_number = 0
+    prev_chained_seq: int | None = None
+    prev_chained_hash: str | None = None
+    last_legacy: dict | None = None
+    chain_started = False
+    record_count = 0
     with path.open(encoding="utf-8") as handle:
         for line in handle:
-            line_number += 1
             if not line.strip():
                 continue
             try:
@@ -335,69 +344,65 @@ def verify_chain(
             except (UnicodeDecodeError, json.JSONDecodeError):
                 return ChainVerification(
                     ok=False,
-                    records=len(records),
-                    failure=f"unparseable record at line {line_number}",
+                    records=record_count,
+                    failure=f"unparseable record at line {record_count + 1}",
                 )
             if not isinstance(value, dict):
                 return ChainVerification(
                     ok=False,
-                    records=len(records),
-                    failure=f"record at line {line_number} is not an object",
+                    records=record_count,
+                    failure=f"record at line {record_count + 1} is not an object",
                 )
-            records.append(value)
+            record_count += 1
+            index = record_count
 
-    prev_chained_seq: int | None = None
-    prev_chained_hash: str | None = None
-    last_legacy: dict | None = None
-    chain_started = False
-    for index, record in enumerate(records, start=1):
-        if "hash" not in record:
-            if chain_started:
+            if "hash" not in value:
+                if chain_started:
+                    return ChainVerification(
+                        ok=False,
+                        records=index - 1,
+                        failure=f"unchained record {index} appears after the chain started",
+                    )
+                last_legacy = value
+                continue
+            chain_started = True
+
+            seq = value.get("seq")
+            if not isinstance(seq, int) or isinstance(seq, bool):
                 return ChainVerification(
                     ok=False,
                     records=index - 1,
-                    failure=f"unchained record {index} appears after the chain started",
+                    failure=f"chained record {index} has an invalid seq",
                 )
-            last_legacy = record
-            continue
-        chain_started = True
-
-        seq = record.get("seq")
-        if not isinstance(seq, int) or isinstance(seq, bool):
-            return ChainVerification(
-                ok=False,
-                records=index - 1,
-                failure=f"chained record {index} has an invalid seq",
-            )
-        if prev_chained_seq is not None and seq != prev_chained_seq + 1:
-            return ChainVerification(
-                ok=False,
-                records=index - 1,
-                failure=(
-                    f"sequence gap at record {index}: expected "
-                    f"{prev_chained_seq + 1}, got {seq}"
-                ),
-            )
-        if record.get("hash") != record_hash(record):
-            return ChainVerification(
-                ok=False,
-                records=index - 1,
-                failure=f"hash mismatch at record {index}",
-            )
-        if prev_chained_hash is None:
-            expected_prev = (
-                record_hash(last_legacy) if last_legacy is not None else genesis_hash(namespace)
-            )
-        else:
-            expected_prev = prev_chained_hash
-        if record.get("prev_hash") != expected_prev:
-            return ChainVerification(
-                ok=False,
-                records=index - 1,
-                failure=f"prev_hash mismatch at record {index}",
-            )
-        prev_chained_seq = seq
-        prev_chained_hash = record["hash"]
+            if prev_chained_seq is not None and seq != prev_chained_seq + 1:
+                return ChainVerification(
+                    ok=False,
+                    records=index - 1,
+                    failure=(
+                        f"sequence gap at record {index}: expected "
+                        f"{prev_chained_seq + 1}, got {seq}"
+                    ),
+                )
+            if value.get("hash") != record_hash(value):
+                return ChainVerification(
+                    ok=False,
+                    records=index - 1,
+                    failure=f"hash mismatch at record {index}",
+                )
+            if prev_chained_hash is None:
+                expected_prev = (
+                    record_hash(last_legacy) if last_legacy is not None else genesis_hash(namespace)
+                )
+            else:
+                expected_prev = prev_chained_hash
+            if value.get("prev_hash") != expected_prev:
+                return ChainVerification(
+                    ok=False,
+                    records=index - 1,
+                    failure=f"prev_hash mismatch at record {index}",
+                )
+            prev_chained_seq = seq
+            prev_chained_hash = value["hash"]
 
     anchored = anchor is not None
     anchor_matches: bool | None = None
@@ -409,7 +414,7 @@ def verify_chain(
         if not anchor_matches:
             return ChainVerification(
                 ok=False,
-                records=len(records),
+                records=record_count,
                 failure=(
                     f"anchor mismatch: log head (seq={prev_chained_seq}) does not "
                     f"match the sealed anchor (seq={anchor.get('seq')})"
@@ -419,7 +424,7 @@ def verify_chain(
             )
     return ChainVerification(
         ok=True,
-        records=len(records),
+        records=record_count,
         anchored=anchored,
         anchor_matches=anchor_matches,
     )

@@ -239,6 +239,13 @@ test("SkillChain lifecycle stays visible while awaiting the user's reply", () =>
     to: "grilling",
     reason: "Scope is ambiguous.",
   });
+  // The engine emits SKILL_END(status="awaiting_input") before AWAITING_INPUT;
+  // the block must land on "waiting", not fall through to "done".
+  entries = applyStreamEvent(entries, {
+    type: "skill",
+    name: "grilling",
+    status: "awaiting_input",
+  });
   entries = applyStreamEvent(entries, {
     type: "awaiting_input",
     skill: "grilling",
@@ -259,6 +266,33 @@ test("SkillChain lifecycle stays visible while awaiting the user's reply", () =>
   // block state but never renders a separate system notice.
   const notices = entries.filter((entry) => entry.kind === "system").map((entry) => entry.text);
   assert.deepEqual(notices, []);
+});
+
+test("resuming an awaiting-input run reuses the waiting skill card", () => {
+  // Round 1: the run pauses at a skill node (block -> waiting).
+  let entries = freshTurn();
+  entries = applyStreamEvent(entries, { type: "skill", name: "grilling", status: "start" });
+  entries = applyStreamEvent(entries, {
+    type: "skill",
+    name: "grilling",
+    status: "awaiting_input",
+  });
+  entries = applyStreamEvent(entries, {
+    type: "awaiting_input",
+    skill: "grilling",
+    reason: "awaiting_user_input",
+  });
+  entries = applyStreamEvent(entries, { type: "done", status: "incomplete", reason: "awaiting_user_input" });
+
+  // Round 2: the user replies; the engine re-enters the same skill.  The
+  // resumed SKILL_START must reuse the waiting card, not append a duplicate.
+  entries = applyStreamEvent(entries, { type: "skill", name: "grilling", status: "start" });
+
+  const turn = entries.find((entry) => entry.kind === "turn");
+  assert.ok(turn?.kind === "turn");
+  const skillBlocks = turn.blocks.filter((block) => block.type === "skill");
+  assert.equal(skillBlocks.length, 1, "resumed skill must reuse the waiting card");
+  assert.equal(skillBlocks[0]?.type === "skill" && skillBlocks[0].state, "running");
 });
 
 test("a direct route produces no route notice", () => {

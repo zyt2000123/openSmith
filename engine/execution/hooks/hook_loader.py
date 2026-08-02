@@ -74,6 +74,9 @@ class HookLoader:
         # 加载 Pre Hook
         if "pre" in hooks_config:
             for hook_def in hooks_config["pre"]:
+                if not isinstance(hook_def, dict):
+                    logger.warning("Skipping non-mapping pre hook definition: %r", hook_def)
+                    continue
                 if not hook_def.get("enabled", True):
                     logger.debug("Skipping disabled pre hook: %s", hook_def.get("id"))
                     continue
@@ -93,6 +96,9 @@ class HookLoader:
         # 加载 Post Hook
         if "post" in hooks_config:
             for hook_def in hooks_config["post"]:
+                if not isinstance(hook_def, dict):
+                    logger.warning("Skipping non-mapping post hook definition: %r", hook_def)
+                    continue
                 if not hook_def.get("enabled", True):
                     logger.debug("Skipping disabled post hook: %s", hook_def.get("id"))
                     continue
@@ -112,6 +118,9 @@ class HookLoader:
         # 加载 Stop Hook
         if "stop" in hooks_config:
             for hook_def in hooks_config["stop"]:
+                if not isinstance(hook_def, dict):
+                    logger.warning("Skipping non-mapping stop hook definition: %r", hook_def)
+                    continue
                 if not hook_def.get("enabled", True):
                     logger.debug("Skipping disabled stop hook: %s", hook_def.get("id"))
                     continue
@@ -163,6 +172,7 @@ class HookLoader:
 
         # 实例化 Hook
         hook_instance = hook_class()
+        self._apply_configured_priority(hook_instance, hook_def)
         return hook_instance
 
     def _load_post_hook(
@@ -292,3 +302,14 @@ class HookLoader:
                 exc_info=True
             )
             return None
+
+    @staticmethod
+    def _apply_configured_priority(hook_instance: Any, hook_def: dict[str, Any]) -> None:
+        """把 YAML 配置的 ``priority`` 注入实例，使其优先于类默认值。
+
+        ``priority`` 在接口上是只读 property；实例的 ``_configured_priority``
+        字段允许配置覆盖（数字越小越先执行）。
+        """
+        configured = hook_def.get("priority")
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            setattr(hook_instance, "_configured_priority", configured)

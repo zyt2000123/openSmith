@@ -156,6 +156,12 @@ function nextSkillState(status: string): SkillState {
   if (status === "retry") return "retry";
   if (status === "blocked") return "blocked";
   if (status === "error" || status === "incomplete") return "error";
+  // The engine emits SKILL_END(status="awaiting_input") immediately before the
+  // AWAITING_INPUT event when a chain node pauses for the user.  Without this
+  // mapping the block falls through to "done", and by the time the awaiting_input
+  // event tries to flip it to "waiting" it is already terminal — the workflow
+  // card would claim "Agent complete" while the run is paused.
+  if (status === "awaiting_input") return "waiting";
   return "done";
 }
 
@@ -533,16 +539,20 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
 
         const name = event.name || "skill";
 
-        // Reuse the most recent non-terminal (running/retry) block for this
-        // skill instead of appending a duplicate. A domain-gate retry re-emits
-        // SKILL_START after a "retry" status; matching retry as well as running
-        // lets that repeated start reuse the block, so it can't leave a phantom
-        // block stuck forever in the retry state.
+        // Reuse the most recent non-terminal (running/retry/waiting) block for
+        // this skill instead of appending a duplicate. A domain-gate retry
+        // re-emits SKILL_START after a "retry" status; matching retry as well
+        // as running lets that repeated start reuse the block, so it can't
+        // leave a phantom block stuck forever in the retry state.  "waiting"
+        // is included so a resumed awaiting-input run (the block paused at
+        // "waiting") reuses the same card instead of appending a second one.
         const reversedIndex = [...blocks]
           .reverse()
           .findIndex(
             (block) =>
-              block.type === "skill" && block.name === name && (block.state === "running" || block.state === "retry"),
+              block.type === "skill" &&
+              block.name === name &&
+              (block.state === "running" || block.state === "retry" || block.state === "waiting"),
           );
 
         if (reversedIndex >= 0) {

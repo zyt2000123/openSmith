@@ -150,7 +150,9 @@ class HookRegistry:
         for hook in hooks:
             try:
                 if hook.async_execution:
-                    # 异步执行，不阻塞
+                    # 异步执行：不阻塞本轮工具调用返回，但必须保留任务引用并
+                    # 在返回前等待，否则任务可能被 GC 中途销毁（"Task was
+                    # destroyed but it is pending"），或等待中的子进程被孤儿化。
                     task = asyncio.create_task(
                         self._run_post_hook_async(
                             hook, tool_name, tool_input, tool_output
@@ -170,8 +172,17 @@ class HookRegistry:
                 )
                 # Post Hook 失败不应中断流程，记录错误后继续
 
-        # 异步 Hook 不会阻塞，警告信息也不会立即返回
-        # 这里只返回同步 Hook 的警告
+        # 等待异步任务完成并收集其警告（契约：警告须注入 Agent 下一轮输入）。
+        for task in async_tasks:
+            try:
+                warnings = await task
+                if warnings:
+                    all_warnings.extend(warnings)
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            except Exception as e:
+                logger.error("Async post hook failed: %s", e, exc_info=True)
         return all_warnings
 
     async def _run_post_hook_async(
@@ -180,7 +191,7 @@ class HookRegistry:
         tool_name: str,
         tool_input: dict[str, Any],
         tool_output: Any
-    ) -> None:
+    ) -> list[str]:
         """异步执行 Post Hook（在后台）"""
         try:
             warnings = await hook.check(tool_name, tool_input, tool_output)
@@ -190,6 +201,7 @@ class HookRegistry:
                     hook.id,
                     warnings
                 )
+            return warnings
         except Exception as e:
             logger.error(
                 "Async post hook %s failed: %s",
@@ -197,6 +209,7 @@ class HookRegistry:
                 str(e),
                 exc_info=True
             )
+            return []
 
     async def run_stop_hooks(
         self,
@@ -225,7 +238,8 @@ class HookRegistry:
         for hook in hooks:
             try:
                 if hook.async_execution:
-                    # 异步执行，不阻塞
+                    # 异步执行：保留任务引用并在返回前等待，避免任务被 GC 中途
+                    # 销毁或等待中的子进程被孤儿化。
                     task = asyncio.create_task(
                         self._run_stop_hook_async(
                             hook, session_id, session_context
@@ -243,6 +257,15 @@ class HookRegistry:
                     str(e),
                     exc_info=True
                 )
+
+        for task in async_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            except Exception as e:
+                logger.error("Async stop hook failed: %s", e, exc_info=True)
 
     async def _run_stop_hook_async(
         self,

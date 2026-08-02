@@ -54,7 +54,14 @@ def risk_for_approval(
     network_access: bool = False,
     rule_hit: bool = False,
 ) -> RiskTier:
-    """Derive the risk tier of one approval-gated tool call."""
+    """Derive the risk tier of one approval-gated tool call.
+
+    ``execute`` is deliberately NOT elevated to HIGH here: permission levels
+    default to EXECUTE for tools that do not declare one, so the level alone
+    cannot distinguish an arbitrary host command from an ordinary read.
+    Genuinely high-risk host execution is already caught by the dangerous-rule
+    (CRITICAL), sensitive-path (HIGH), and opaque-command scope bindings.
+    """
     if rule_hit or level == "destructive":
         return RiskTier.CRITICAL
     if high_risk or network_access:

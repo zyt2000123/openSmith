@@ -12,7 +12,7 @@ from typing import Any
 
 # 动态导入 PreToolHook（避免循环导入）
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from engine.execution.tool_hooks import PreToolHook
+from engine.execution.hooks import PreToolHook
 
 
 class ConfigProtectionHook(PreToolHook):
@@ -64,11 +64,12 @@ class ConfigProtectionHook(PreToolHook):
         tool_input: dict[str, Any]
     ) -> tuple[bool, str | None]:
         """检查是否尝试修改配置文件"""
-        # 只检查文件编辑工具
-        if tool_name not in ["Edit", "Write", "MultiEdit"]:
+        # 只检查文件编辑工具（Agent-Smith 的工具名是 edit_file / write_file，
+        # 路径参数键是 path）。
+        if tool_name not in ["edit_file", "write_file"]:
             return True, None
 
-        file_path = tool_input.get("file_path", "")
+        file_path = tool_input.get("path", "")
         if not file_path:
             return True, None
 

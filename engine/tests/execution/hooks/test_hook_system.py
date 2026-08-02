@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from engine.execution.tool_hooks import HookLoader, HookRegistry, PreToolHook
+from engine.execution.hooks import HookLoader, HookRegistry, PreToolHook
 
 
 class MockPreHook(PreToolHook):
@@ -21,9 +21,9 @@ class MockPreHook(PreToolHook):
     async def check(
         self, tool_name: str, tool_input: dict
     ) -> tuple[bool, str | None]:
-        # Block Edit tool
-        if tool_name == "Edit":
-            return False, "Edit blocked by mock hook"
+        # Block edit_file tool
+        if tool_name == "edit_file":
+            return False, "edit_file blocked by mock hook"
         return True, None
 
 
@@ -45,7 +45,7 @@ async def test_pre_hook_allows_tool():
     registry.register_pre_hook(hook)
 
     # Read tool should be allowed
-    allowed, reason = await registry.run_pre_hooks("Read", {"file_path": "test.py"})
+    allowed, reason = await registry.run_pre_hooks("read_file", {"path": "test.py"})
 
     assert allowed is True
     assert reason is None
@@ -58,14 +58,14 @@ async def test_pre_hook_blocks_tool():
     hook = MockPreHook()
     registry.register_pre_hook(hook)
 
-    # Edit tool should be blocked
+    # edit_file tool should be blocked
     allowed, reason = await registry.run_pre_hooks(
-        "Edit", {"file_path": "test.py", "old_string": "a", "new_string": "b"}
+        "edit_file", {"path": "test.py", "old_string": "a", "new_string": "b"}
     )
 
     assert allowed is False
     assert reason is not None
-    assert "Edit blocked" in reason
+    assert "edit_file blocked" in reason
 
 
 @pytest.mark.asyncio
@@ -119,3 +119,61 @@ def test_hook_registry_list():
 
     assert "pre" in hooks_list
     assert "mock-pre-hook" in hooks_list["pre"]
+
+
+@pytest.mark.asyncio
+async def test_builtin_config_protection_hook_fires_on_engine_tool_names(tmp_path):
+    """Regression: the built-in config-protection hook must match the engine's
+    real tool name (edit_file) and path argument key (path) — not the
+    Claude-Code-style "Edit"/"file_path" it was written against.  With the old
+    contract the top-priority safety hook never fired and configs could be
+    edited freely."""
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[4]
+    sys.path.insert(0, str(repo_root))
+    from agents.smith.hooks.config_protection import ConfigProtectionHook
+
+    hook = ConfigProtectionHook()
+    registry = HookRegistry()
+    registry.register_pre_hook(hook)
+
+    # Editing a protected config through the real tool contract must be blocked.
+    allowed, reason = await registry.run_pre_hooks(
+        "edit_file",
+        {"path": str(tmp_path / "pyproject.toml"), "old_string": "a", "new_string": "b"},
+    )
+    assert allowed is False
+    assert reason is not None
+    assert "Config file modification blocked" in reason
+
+    # Editing ordinary source through the real contract must be allowed.
+    allowed, reason = await registry.run_pre_hooks(
+        "edit_file",
+        {"path": str(tmp_path / "main.py"), "old_string": "a", "new_string": "b"},
+    )
+    assert allowed is True
+
+
+def test_loader_injects_configured_priority_over_class_default(tmp_path):
+    """YAML priority must take effect even when the hook class relies on the
+    base-class default (100)."""
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[4]
+    sys.path.insert(0, str(repo_root))
+    from agents.smith.hooks.config_protection import ConfigProtectionHook
+
+    loader = HookLoader()
+    hook_def = {
+        "id": "config-protection",
+        "module": "agents/smith/hooks/config_protection.py",
+        "class": "ConfigProtectionHook",
+        "priority": 1,
+    }
+    hook = loader._load_pre_hook(hook_def, repo_root / "agents" / "smith")
+
+    assert hook is not None
+    assert hook.priority == 1
