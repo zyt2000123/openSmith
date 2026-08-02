@@ -19,8 +19,9 @@ type ScannerState = {
 };
 
 function fenceStart(line: string): Fence | null {
-  const match = line.match(/^( {0,3})(`{3,}|~{3,})/);
+  const match = line.match(/^( {0,3})(`{3,}|~{3,})(.*)$/);
   if (!match?.[2]) return null;
+  if (match[2][0] === "`" && match[3]?.includes("`")) return null;
   return { marker: match[2][0] as "`" | "~", length: match[2].length };
 }
 

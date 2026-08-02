@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
-from common.config import AGENT_DIR
+from common import config as common_config
 from engine.observability import ObservabilityReader
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ class TokenStatsService:
         trace_root: Path | None = None,
     ) -> None:
         self._db_provider = db_provider
-        self._trace_root = Path(trace_root or AGENT_DIR)
+        self._trace_root = Path(trace_root or common_config.PATHS.agent_dir)
         self._observability = ObservabilityReader(self._trace_root)
 
     @staticmethod
@@ -418,12 +418,21 @@ class TokenStatsService:
                     WHERE e.session_id=m.session_id
                       AND (e.source_key IS NULL OR e.source_key NOT LIKE 'message:%')
                 )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM token_usage_events e
+                    WHERE e.source_key = 'message:' || m.id
+                )
                 ORDER BY m.created_at ASC
                 """
             )
         except aiosqlite.OperationalError:
             # Keep the service usable with a minimal/custom database in tests or
             # during a partially completed schema migration.
+            return 0
+
+        if not rows:
+            await db.commit()
             return 0
 
         try:

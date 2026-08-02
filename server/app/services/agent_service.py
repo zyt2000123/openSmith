@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, AsyncGenerator
 
-from common.config import AGENT_DIR
+from common import config as common_config
 from engine.execution import RunStateStore
 from engine.observability import ObservabilityReader
 from engine.llm.model_config import SMITH_TEMPLATE_ID
@@ -53,7 +53,7 @@ class AgentService:
         session_repo = SessionRepo()
         auto_task_repo = AutoTaskRepo()
         run_state_store = (
-            RunStateStore(AGENT_DIR)
+            RunStateStore(common_config.PATHS.agent_dir)
             if session_service is None or run_state_service is None
             else None
         )
@@ -71,9 +71,11 @@ class AgentService:
             session_repo,
         )
         self.skill_service = skill_service or SkillService(agent_profile_repo)
-        self.run_state_service = run_state_service or RunStateService(run_state_store or RunStateStore(AGENT_DIR))
+        self.run_state_service = run_state_service or RunStateService(
+            run_state_store or RunStateStore(common_config.PATHS.agent_dir)
+        )
         self.observability_service = observability_service or ObservabilityService(
-            ObservabilityReader(AGENT_DIR)
+            ObservabilityReader(common_config.PATHS.agent_dir)
         )
         self.mcp_service = mcp_service or McpService()
         self.project_instruction_service = project_instruction_service or ProjectInstructionService()
@@ -138,7 +140,9 @@ class AgentService:
         """
         from engine.memory import memory_maintenance_status
 
-        return MemoryMaintenanceOut(**memory_maintenance_status(AGENT_DIR / "memory"))
+        return MemoryMaintenanceOut(
+            **memory_maintenance_status(common_config.PATHS.agent_dir / "memory")
+        )
 
     async def list_messages(
         self,
@@ -153,27 +157,6 @@ class AgentService:
             limit=limit,
             offset=offset,
         )
-
-    async def stream_message(
-        self,
-        session_id: str,
-        content: str,
-        *,
-        context: str | None = None,
-        skill_name: str | None = None,
-        identity_id: str | None = None,
-        working_dir: str | None = None,
-    ) -> AsyncGenerator[dict, None]:
-        stream = await self.prepare_stream_message(
-            session_id,
-            content,
-            context=context,
-            skill_name=skill_name,
-            identity_id=identity_id,
-            working_dir=working_dir,
-        )
-        async for event in stream:
-            yield event
 
     async def prepare_stream_message(
         self,
@@ -194,11 +177,6 @@ class AgentService:
             identity_id=identity_id,
             working_dir=working_dir,
         )
-
-    async def resume_run(self, run_id: str) -> AsyncGenerator[dict, None]:
-        stream = await self.prepare_resume_run(run_id)
-        async for event in stream:
-            yield event
 
     async def prepare_resume_run(self, run_id: str) -> AsyncGenerator[dict, None]:
         return await self.session_service.prepare_resume_run(
@@ -221,7 +199,6 @@ class AgentService:
         return result.model_dump()
 
     async def get_token_stats(self, year: int | None = None) -> dict:
-        await self.token_stats_service.sync_from_traces()
         return await self.token_stats_service.get_stats(await self._profile_id(), year=year)
 
     async def get_run(self, run_id: str):

@@ -78,7 +78,6 @@ function handleSetupInput(key: Key, options: ShellInputOptions): void {
 export function handleCtrlC(input: string, key: Key, options: ShellInputOptions): boolean {
   if (!key.ctrl || input !== "c") return false;
 
-  if (options.compressing || options.inputLocked) return true;
   if (options.busy && options.bridge.cancelRequest()) return true;
 
   options.exit();
@@ -412,7 +411,12 @@ function cyclePanel(key: Key, options: ShellInputOptions): void {
   if (!key.tab || options.slashMenuOpen) return;
 
   const panels: Panel[] = ["welcome", "sessions", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"];
-  const index = panels.indexOf(options.panel);
+  const parentPanel: Partial<Record<Panel, Panel>> = {
+    skills: "skill-actions",
+    "skill-toggle": "skill-actions",
+    "hook-details": "hooks",
+  };
+  const index = panels.indexOf(parentPanel[options.panel] ?? options.panel);
   const next = panels[(index + 1) % panels.length];
 
   // The data-backed panels load through the bridge; setting `panel` alone would
@@ -442,9 +446,13 @@ function handlePickerInput(key: Key, options: ShellInputOptions): boolean {
   return handleSkillsNavigation(key, options);
 }
 
-function routeInput(input: string, key: Key, options: ShellInputOptions): void {
+export function routeInput(input: string, key: Key, options: ShellInputOptions): void {
   if (handleCtrlC(input, key, options)) return;
-  if (options.compressing || options.inputLocked) return;
+  if (options.compressing) {
+    if (key.escape) options.bridge.cancelRequest();
+    return;
+  }
+  if (options.inputLocked) return;
   if (options.mode === "setup") {
     handleSetupInput(key, options);
     return;

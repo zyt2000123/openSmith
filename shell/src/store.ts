@@ -203,6 +203,10 @@ function appendTranscript(state: AppState, entry: TranscriptEntry): Partial<AppS
   return boundedTranscript(state, [...state.transcript, entry]);
 }
 
+function applyBoundedStreamEvent(state: AppState, event: StreamEvent): Partial<AppState> {
+  return boundedTranscript(state, applyStreamEvent(state.transcript, event));
+}
+
 /**
  * Close out an approval once its tool reports back.
  *
@@ -223,6 +227,22 @@ function clearApprovalOnToolResult(state: AppState, event: StreamEvent, next: Pa
     approvalResolving: false,
     statusLine: "",
     transcript: removeApprovalNotice(next.transcript ?? state.transcript, state.pendingApproval.approvalId),
+  };
+}
+
+function applyDoneStreamState(state: AppState, event: Extract<StreamEvent, { type: "done" }>): Partial<AppState> {
+  const bounded = applyBoundedStreamEvent(state, event);
+  const transcript = bounded.transcript ?? state.transcript;
+  return {
+    ...bounded,
+    pendingApproval: null,
+    approvalResolving: false,
+    recoverableRunId: event.status === "completed" ? null : (event.runId ?? state.recoverableRunId),
+    // A tool whose result never arrived would otherwise stay in the running
+    // map for the rest of the session, leaving the HUD spinner on for every
+    // later turn. The transcript converges the same blocks on done.
+    toolActivity: cancelRunningToolActivity(applyToolActivity(state.toolActivity, event)),
+    transcript: state.pendingApproval ? removeApprovalNotice(transcript, state.pendingApproval.approvalId) : transcript,
   };
 }
 
@@ -259,27 +279,13 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
     };
   }
 
-  if (event.type === "done") {
-    const transcript = applyStreamEvent(state.transcript, event);
-    return {
-      pendingApproval: null,
-      approvalResolving: false,
-      recoverableRunId: event.status === "completed" ? null : (event.runId ?? state.recoverableRunId),
-      // A tool whose result never arrived would otherwise stay in the running
-      // map for the rest of the session, leaving the HUD spinner on for every
-      // later turn.  The transcript converges the same blocks on done.
-      toolActivity: cancelRunningToolActivity(applyToolActivity(state.toolActivity, event)),
-      transcript: state.pendingApproval
-        ? removeApprovalNotice(transcript, state.pendingApproval.approvalId)
-        : transcript,
-    };
-  }
+  if (event.type === "done") return applyDoneStreamState(state, event);
 
   if (event.type === "run_started") {
     return {
       recoverableRunId: event.runId || state.recoverableRunId,
       toolActivity: applyToolActivity(state.toolActivity, event),
-      transcript: applyStreamEvent(state.transcript, event),
+      ...applyBoundedStreamEvent(state, event),
     };
   }
 
@@ -294,15 +300,13 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
       ...(state.panel === "tokens" || state.panel === "runs" ? { panel: "chat" as const } : {}),
       statusLine: "Approval required. Review the request and choose Allow or Deny.",
       toolActivity: applyToolActivity(state.toolActivity, event),
-      // The only stream event that appends an entry, so it needs the same bound
-      // as pushTurn/pushSystemLine — every other event edits the turn in place.
-      ...boundedTranscript(state, applyStreamEvent(state.transcript, event)),
+      ...applyBoundedStreamEvent(state, event),
     };
   }
 
   return {
     toolActivity: applyToolActivity(state.toolActivity, event),
-    transcript: applyStreamEvent(state.transcript, event),
+    ...applyBoundedStreamEvent(state, event),
   };
 }
 

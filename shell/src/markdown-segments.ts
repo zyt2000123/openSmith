@@ -13,7 +13,6 @@ type OpenFence = {
   body: string[];
 };
 
-const FENCE_PATTERN = /^( {0,3})(`{3,}|~{3,})\s*([^\s`~]*)/;
 function pushMarkdown(segments: MarkdownSegment[], lines: string[]): void {
   const text = lines.join("\n");
   if (text.length > 0) segments.push({ type: "markdown", text });
@@ -32,12 +31,16 @@ function fencedSegment(fence: OpenFence): MarkdownSegment {
   return { type: "code", language: fence.language, text };
 }
 
-function openFence(line: string, opening: RegExpMatchArray): OpenFence {
+function openFence(line: string): OpenFence | null {
+  const opening = line.match(/^( {0,3})(`{3,}|~{3,})(.*)$/);
+  if (!opening?.[2]) return null;
+  const info = opening[3]?.trim() ?? "";
+  if (opening[2][0] === "`" && info.includes("`")) return null;
   return {
     marker: opening[2][0] as "`" | "~",
     length: opening[2].length,
     line,
-    language: opening[3]?.toLowerCase() || "text",
+    language: info.split(/\s+/, 1)[0]?.toLowerCase() || "text",
     body: [],
   };
 }
@@ -50,10 +53,10 @@ export function splitMarkdownBlocks(markdown: string): MarkdownSegment[] {
 
   for (const line of markdown.split("\n")) {
     if (!fence) {
-      const opening = line.match(FENCE_PATTERN);
+      const opening = openFence(line);
       if (opening) {
         pushMarkdown(segments, pendingMarkdown.splice(0));
-        fence = openFence(line, opening);
+        fence = opening;
         continue;
       }
 

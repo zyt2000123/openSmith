@@ -15,8 +15,22 @@ class YamlConfigError(ValueError):
 
 
 def _ensure_private_parent(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
-    path.chmod(PRIVATE_DIR_MODE)
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    if not current.is_dir():
+        raise NotADirectoryError(f"YAML parent is not a directory: {current}")
+
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=PRIVATE_DIR_MODE)
+        except FileExistsError:
+            if not directory.is_dir():
+                raise NotADirectoryError(f"YAML parent is not a directory: {directory}")
+        else:
+            directory.chmod(PRIVATE_DIR_MODE)
 
 
 def load_yaml(path: Path | str) -> dict[str, Any]:
@@ -38,6 +52,8 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
 
 def save_yaml(path: Path | str, data: Any) -> None:
     p = Path(path)
+    if not isinstance(data, dict):
+        raise YamlConfigError(f"YAML root for {p} must be a mapping")
     try:
         content = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
     except yaml.YAMLError as exc:

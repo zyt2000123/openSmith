@@ -84,6 +84,23 @@ test("transcript history is bounded for long-running shell sessions", () => {
   assert.equal(last?.kind === "system" ? last.text : "", `line-${TRANSCRIPT_LIMIT + 19}`);
 });
 
+test("SkillChain lifecycle notices obey the transcript bound", () => {
+  const store = createAppStore();
+
+  for (let index = 0; index <= TRANSCRIPT_LIMIT; index += 1) {
+    store.getState().applyEvent({
+      type: "route_decided",
+      identityId: "coding",
+      identityName: "Coding",
+      routeId: `route-${index}`,
+      pipelineId: "coding",
+    });
+  }
+
+  assert.equal(store.getState().transcript.length <= TRANSCRIPT_LIMIT, true);
+  assert.equal(store.getState().transcriptEpoch, 1);
+});
+
 test("token usage tracks the current turn separately from the session total", () => {
   const store = createAppStore();
 

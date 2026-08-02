@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
-from common.config import SMITH_PROFILE_DIR
+from common import config as common_config
+from engine.llm.model_config import SMITH_TEMPLATE_ID
 
 from ..schemas.agent_profile import AgentProfileCreate, AgentProfileUpdate, AgentProfileOut
 from ..infrastructure.profile_files import (
     init_smith_profile_files,
 )
 from ..infrastructure.repositories.agent_profile_repo import AgentProfileRepo
-from .template_service import ACTIVE_TEMPLATE_IDS
+
+ACTIVE_TEMPLATE_IDS = {SMITH_TEMPLATE_ID}
 
 
 class AgentProfileService:
@@ -37,7 +39,7 @@ class AgentProfileService:
         if is_new:
             try:
                 init_smith_profile_files(
-                    profile_seed_dir=SMITH_PROFILE_DIR,
+                    profile_seed_dir=common_config.PATHS.smith_profile_dir,
                     name=body.name,
                     role=body.role,
                     description=body.description,

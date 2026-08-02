@@ -45,6 +45,13 @@ test("SSE decoder exposes context usage and compression state", () => {
   });
 });
 
+test("SSE decoder falls back from non-finite context usage values", () => {
+  const event = decodeSseEvent('event: context_usage\ndata: {"context_percent":"not-a-number"}');
+
+  assert.equal(event?.type, "context_usage");
+  assert.equal(event?.type === "context_usage" && event.context_percent, 0);
+});
+
 test("SSE decoder exposes the SkillChain lifecycle", () => {
   assert.deepEqual(
     decodeSseEvent(

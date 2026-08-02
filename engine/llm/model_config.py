@@ -5,10 +5,11 @@ import math
 import os
 import socket
 from enum import Enum
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from common.config import AGENT_DIR, DATA_DIR, SMITH_PROFILE_DIR
+from common import config as common_config
 from common.yaml_utils import YamlConfigError, load_yaml, merge_configs
 
 from .contracts import (
@@ -21,6 +22,22 @@ from .factory import create_llm_client, normalize_provider_name
 from .port import LLMPort
 
 SMITH_TEMPLATE_ID = "personal-assistant"
+
+# Optional test overrides.  Production resolution deliberately goes through
+# ``common.config.PATHS`` at call time so ``reset_paths()`` takes effect even
+# after this module has already been imported.
+DATA_DIR: Path | None = None
+SMITH_PROFILE_DIR: Path | None = None
+AGENT_DIR: Path | None = None
+
+
+def _config_paths() -> tuple[Path, Path, Path]:
+    paths = common_config.PATHS
+    return (
+        DATA_DIR if DATA_DIR is not None else paths.data_dir,
+        SMITH_PROFILE_DIR if SMITH_PROFILE_DIR is not None else paths.smith_profile_dir,
+        AGENT_DIR if AGENT_DIR is not None else paths.agent_dir,
+    )
 
 
 class LLMUsage(str, Enum):
@@ -304,9 +321,10 @@ def resolve_price_table() -> dict[str, dict[str, float]]:
     ``cache_read`` and ``cache_write`` tokens.  Prices always come from local
     configuration — never from a gateway or provider API.
     """
-    platform = load_yaml(DATA_DIR / "config.yaml")
-    template = load_yaml(SMITH_PROFILE_DIR / "config.yaml")
-    agent = load_yaml(AGENT_DIR / "config.yaml")
+    data_dir, smith_profile_dir, agent_dir = _config_paths()
+    platform = load_yaml(data_dir / "config.yaml")
+    template = load_yaml(smith_profile_dir / "config.yaml")
+    agent = load_yaml(agent_dir / "config.yaml")
     merged = merge_configs(platform, template, agent)
     llm = merged.get("llm")
     pricing = llm.get("pricing") if isinstance(llm, dict) else None
@@ -361,10 +379,10 @@ def resolve_llm_config(
     if env_llm:
         env_defaults["llm"] = env_llm
 
-    platform = load_yaml(DATA_DIR / "config.yaml")
-
-    template = load_yaml(SMITH_PROFILE_DIR / "config.yaml")
-    agent = load_yaml(AGENT_DIR / "config.yaml")
+    data_dir, smith_profile_dir, agent_dir = _config_paths()
+    platform = load_yaml(data_dir / "config.yaml")
+    template = load_yaml(smith_profile_dir / "config.yaml")
+    agent = load_yaml(agent_dir / "config.yaml")
 
     merged = merge_configs(env_defaults, platform, template, agent, session_override or {})
 
