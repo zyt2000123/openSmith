@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from engine.execution.events import ExecutionEvent, RunObservationContext
+from engine.execution.events import EventType, ExecutionEvent, RunObservationContext
 
 from .recorder import EventProjection, RunEventRecorder
 from .summary_store import RunMetadata, RunSummaryStore
@@ -24,9 +24,11 @@ class RunObservation:
         recorder: RunEventRecorder,
         *,
         identity_binder: Callable[[str], None] | None = None,
+        route_binder: Callable[[str | None, str | None], None] | None = None,
     ) -> None:
         self._recorder = recorder
         self._identity_binder = identity_binder
+        self._route_binder = route_binder
 
     @classmethod
     def start(
@@ -68,6 +70,13 @@ class RunObservation:
                 identity_id=identity_id,
             )
 
+        def bind_route(route_id: str | None, pipeline_id: str | None) -> None:
+            metadata_holder[0] = replace(
+                metadata_holder[0],
+                route_id=route_id or None,
+                pipeline_id=pipeline_id or None,
+            )
+
         return cls(
             RunEventRecorder(
                 context.run_id,
@@ -76,9 +85,20 @@ class RunObservation:
                 summary_sinks=summary_sinks,
             ),
             identity_binder=bind_identity,
+            route_binder=bind_route,
         )
 
     def record(self, event: ExecutionEvent) -> None:
+        if event.type is EventType.ROUTE_DECIDED:
+            identity_id = event.data.get("identity_id")
+            if isinstance(identity_id, str) and identity_id:
+                self.bind_identity(identity_id)
+            route_id = event.data.get("route_id")
+            pipeline_id = event.data.get("pipeline_id")
+            self.bind_route(
+                route_id if isinstance(route_id, str) else None,
+                pipeline_id if isinstance(pipeline_id, str) else None,
+            )
         self._recorder.record(event)
 
     def append_prompt_manifest(self, manifest: dict[str, object]) -> None:
@@ -87,3 +107,7 @@ class RunObservation:
     def bind_identity(self, identity_id: str) -> None:
         if self._identity_binder is not None:
             self._identity_binder(identity_id)
+
+    def bind_route(self, route_id: str | None, pipeline_id: str | None) -> None:
+        if self._route_binder is not None:
+            self._route_binder(route_id, pipeline_id)

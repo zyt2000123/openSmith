@@ -258,22 +258,31 @@ class IdentityCatalog:
 
     @staticmethod
     def _keyword_hit(keyword: str, normalized: str) -> bool:
-        """Match a route keyword, requiring word boundaries for Latin script.
+        """Match a route keyword, requiring ASCII word boundaries for Latin script.
 
         A bare substring test let ``git`` match "di*git*al" and "le*git*imate",
         and because the git route carries the highest priority it then stole
         ordinary feature/refactor requests and dropped them into a pipeline-less
         ReAct run.
 
-        Both boundaries are asserted, with an explicit inflection suffix in
-        between.  Neither boundary alone suffices:
+        Both boundaries are asserted with ASCII-only lookarounds, with an
+        explicit inflection suffix in between. Python's ``\\b`` treats every
+        Unicode letter/digit — including CJK ideographs — as a word character,
+        so it never fires between "git" and "提交": Latin keywords silently stop
+        matching in mixed-script text like "用git提交" while a space-separated
+        phrase still matches. Restricting the word-character alphabet to
+        [A-Za-z0-9_] (which is exactly what keywords are built from) makes the
+        boundary fire on CJK adjacency while embedded English words stay
+        rejected.
 
-        * A trailing ``\\b`` with no suffix allowance breaks every English
-          inflection — ``\\bcommit\\b`` misses "squash these commits", since the
-          plural "s" is itself a word character.
-        * A leading ``\\b`` alone lets the keyword match as a *prefix*, so
-          ``\\bpush`` hits "pushback" and ``\\bcommit`` hits "committee" — the same
-          misrouting defect, just triggered from the other side.
+        Neither boundary alone suffices:
+
+        * A trailing ``(?<![A-Za-z0-9_])`` with no suffix allowance breaks every
+          English inflection — ``commit(?![A-Za-z0-9_])`` misses "squash these
+          commits", since the plural "s" is itself a word character.
+        * A leading ``(?<![A-Za-z0-9_])`` alone lets the keyword match as a
+          *prefix*, so ``push`` hits "pushback" and ``commit`` hits "committee" —
+          the same misrouting defect, just triggered from the other side.
 
         The optional doubled letter is restricted to a repeat of the stem's own
         last character (debug → debu**gg**ing).  Allowing *any* single letter
@@ -293,7 +302,11 @@ class IdentityCatalog:
             if not stem:
                 return folded in normalized
             doubled = re.escape(stem[-1])
-            pattern = rf"\b{re.escape(stem)}(?:{doubled}?(?:e|es|ed|ing|s|d|ly))?\b"
+            pattern = (
+                rf"(?<![A-Za-z0-9_]){re.escape(stem)}"
+                rf"(?:{doubled}?(?:e|es|ed|ing|s|d|ly))?"
+                rf"(?![A-Za-z0-9_])"
+            )
             return re.search(pattern, normalized) is not None
         return folded in normalized
 

@@ -40,6 +40,8 @@ class RunMetadata:
     created_at: str
     session_id: str | None = None
     identity_id: str | None = None
+    route_id: str | None = None
+    pipeline_id: str | None = None
     working_dir: str | None = None
     forced_skill: str | None = None
 
@@ -92,6 +94,8 @@ class RunSummaryRecord:
                 created_at=str(metadata.get("created_at") or ""),
                 session_id=_optional_text(metadata.get("session_id")),
                 identity_id=_optional_text(metadata.get("identity_id")),
+                route_id=_optional_text(metadata.get("route_id")),
+                pipeline_id=_optional_text(metadata.get("pipeline_id")),
                 working_dir=_optional_text(metadata.get("working_dir")),
                 forced_skill=_optional_text(metadata.get("forced_skill")),
             ),
@@ -312,6 +316,8 @@ def _merge_metadata(previous: RunMetadata, current: RunMetadata) -> RunMetadata:
         created_at=previous.created_at,
         session_id=previous.session_id or current.session_id,
         identity_id=previous.identity_id or current.identity_id,
+        route_id=previous.route_id or current.route_id,
+        pipeline_id=previous.pipeline_id or current.pipeline_id,
         working_dir=previous.working_dir or current.working_dir,
         forced_skill=previous.forced_skill or current.forced_skill,
     )

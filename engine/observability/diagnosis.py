@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .incidents import IncidentDetector, RunIncident
+from .incidents import IncidentDetector, RunIncident, is_timeout
 from .summary_store import RunSummaryRecord
 
 
@@ -71,7 +71,7 @@ def _failure_node(incident: RunIncident, trace: list[dict[str, Any]]) -> str:
             if event.get("type") != "tool_call_result" or not isinstance(event.get("data"), dict):
                 continue
             data = event["data"]
-            if str(data.get("status") or "").lower() == "timeout":
+            if is_timeout(data):
                 name = data.get("name")
                 if isinstance(name, str) and name:
                     return f"tool:{name}"
@@ -103,7 +103,7 @@ def _evidence(incident: RunIncident, trace: list[dict[str, Any]]) -> list[str]:
             if event.get("type") == "tool_call_result"
             and isinstance(event.get("data"), dict)
             and event["data"].get("name")
-            and str(event["data"].get("status") or "").lower() == "timeout"
+            and is_timeout(event["data"])
         ]
         evidence.extend(f"tool={name}" for name in sorted(set(names)))
     return evidence
@@ -131,6 +131,5 @@ def _recommendation(incident: RunIncident) -> str:
         "repeated_backtracks": "Review routing rules and the skill's exit criteria to avoid cycling between steps.",
         "run_cancelled": "Resume only when the user still expects the incomplete work to continue.",
         "run_incomplete": "Review the terminal reason and resume the run only if its prerequisites are still valid.",
-        "run_blocked": "Resolve the blocking approval or prerequisite, then retry through the normal approval gate.",
     }
     return recommendations[incident.category]

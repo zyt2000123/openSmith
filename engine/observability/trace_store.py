@@ -136,6 +136,7 @@ class TraceStore:
             "data": _bounded_trace_value(data),
         }
         payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        created = not path.exists()
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
         try:
             os.write(fd, payload)
@@ -143,7 +144,10 @@ class TraceStore:
                 os.fsync(fd)
         finally:
             os.close(fd)
-        path.chmod(PRIVATE_FILE_MODE)
+        # O_CREAT already applies PRIVATE_FILE_MODE on creation; re-chmodding on
+        # every append is wasted syscalls on an already-private file.
+        if created:
+            path.chmod(PRIVATE_FILE_MODE)
 
     def read(self, run_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         path = self._path(run_id)

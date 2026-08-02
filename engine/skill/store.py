@@ -16,10 +16,35 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 _MAX_VERSIONS = 10
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write *content* to *path* atomically (temp file + ``os.replace``).
+
+    A crash between truncate and write must not leave a partial SKILL.md or
+    version snapshot on disk.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _safe_skill_name(skill_name: str) -> str:
@@ -94,7 +119,7 @@ class SkillStore:
             version_id = f"{ts}_{seq}"
             target = vdir / f"{version_id}.md"
 
-        target.write_text(content, encoding="utf-8")
+        _atomic_write_text(target, content)
         self._prune(skill_name)
         return version_id
 
@@ -114,12 +139,27 @@ class SkillStore:
         if not skill_file.is_file():
             return False
 
-        # Save current as a version before rolling back
-        current = skill_file.read_text(encoding="utf-8")
-        self._save_version_sync(skill_name, current)
+        # Read the snapshot *before* saving/pruning current: at _MAX_VERSIONS
+        # the prune triggered by _save_version_sync deletes the oldest
+        # snapshot — the very file we are about to restore.  Guard the read so
+        # a vanished snapshot is a False result, never a raised exception.
+        try:
+            snapshot_content = snapshot.read_text(encoding="utf-8")
+        except OSError:
+            return False
 
-        # Restore
-        skill_file.write_text(snapshot.read_text(encoding="utf-8"), encoding="utf-8")
+        # Save current as a version before rolling back, unless it already
+        # matches the snapshot being restored.  Skipping the identical save
+        # keeps repeated rollbacks from growing the version set.
+        try:
+            current = skill_file.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        if current != snapshot_content:
+            self._save_version_sync(skill_name, current)
+
+        # Restore atomically so a crash cannot leave a partial SKILL.md.
+        _atomic_write_text(skill_file, snapshot_content)
         return True
 
     async def rollback(self, skill_name: str, version_id: str) -> bool:
