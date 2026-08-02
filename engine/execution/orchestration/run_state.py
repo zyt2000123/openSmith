@@ -500,6 +500,43 @@ class RunStateStore:
             self.save(state)
             return state
 
+    def resolve_approval_if_waiting(
+        self,
+        run_id: str,
+        approval_id: str,
+        *,
+        approved: bool,
+        event_type: str | None = None,
+        reason: str | None = None,
+    ) -> RunState:
+        """Atomically resolve a pending approval only when still waiting.
+
+        Unlike :meth:`resolve_approval`, this never raises for a run that has
+        already left ``WAITING_APPROVAL`` (e.g. a concurrent resolution won);
+        it returns the current state unchanged.  Replaying a
+        ``TOOL_CALL_RESULT`` approval outcome must be idempotent: the engine's
+        worker thread and the server's event loop both touch the same run, so
+        a separate lock-free read followed by a locked write is a TOCTOU race.
+        """
+        with self._lock:
+            state = self._require(run_id)
+            if state.status is not RunStatus.WAITING_APPROVAL:
+                return state
+            if state.approval_id != approval_id:
+                return state
+            state.approval_id = None
+            state.approval_tool = None
+            state.approval_level = None
+            state.approval_reason = None
+            resolution = "approval_granted" if approved else "approval_denied"
+            state.record_event(event_type or resolution)
+            state.transition(
+                RunStatus.RUNNING,
+                reason=reason or resolution,
+            )
+            self.save(state)
+            return state
+
     def recover_interrupted(self) -> list[str]:
         """Mark runs left active by a previous server process as resumable.
 
@@ -691,34 +728,29 @@ def project_execution_event(
                 return
             approval_outcome = str(event.data.get("approval_outcome") or "")
             if approval_outcome == "granted":
-                state = store.get(run_id)
-                if state is not None and state.status is RunStatus.WAITING_APPROVAL:
-                    store.resolve_approval(
-                        run_id,
-                        str(event.data.get("approval_id") or ""),
-                        approved=True,
-                        event_type=event_type,
-                        reason="approval_granted",
-                    )
-                    # resolve_approval records the event and clears the pending
-                    # approval; request_approval already cleared the tool.  One
-                    # source TOOL_CALL_RESULT must produce exactly one event_seq
-                    # increment (the denied/timed_out path returns below after
-                    # its own single resolve_approval record).
-                    return
+                store.resolve_approval_if_waiting(
+                    run_id,
+                    str(event.data.get("approval_id") or ""),
+                    approved=True,
+                    event_type=event_type,
+                    reason="approval_granted",
+                )
+                # resolve_approval_if_waiting records the event and clears the
+                # pending approval atomically; request_approval already cleared
+                # the tool.  One source TOOL_CALL_RESULT must produce exactly
+                # one event_seq increment, and a run that already left
+                # WAITING_APPROVAL falls through to clear_tool below.
+                return
                 # Fall through to clear_tool: the tool has executed and completed.
             elif approval_outcome in {"denied", "timed_out"}:
-                state = store.get(run_id)
-                if state is not None and state.status is RunStatus.WAITING_APPROVAL:
-                    approval_id = str(event.data.get("approval_id") or "")
-                    store.resolve_approval(
-                        run_id,
-                        approval_id,
-                        approved=False,
-                        event_type=event_type,
-                        reason=f"approval_{approval_outcome}",
-                    )
-                    return
+                store.resolve_approval_if_waiting(
+                    run_id,
+                    str(event.data.get("approval_id") or ""),
+                    approved=False,
+                    event_type=event_type,
+                    reason=f"approval_{approval_outcome}",
+                )
+                return
             kwargs["clear_tool"] = True
         store.record_event(run_id, event_type, **kwargs)
     except (RunStateError, ValueError, TypeError):
