@@ -215,10 +215,6 @@ class SessionService:
         prior_rows = await self.session_repo.get_messages_before(
             session_id, message_id, limit=_HISTORY_LIMIT
         )
-        if not prior_rows:
-            # The resume path guarantees the message exists; a missing prior row
-            # simply means it is the first message.
-            prior_rows = []
         context_reader = getattr(self.session_repo, "get_context", None)
         context = await context_reader(session_id) if context_reader is not None else {}
         summary = context.get("context_summary") if isinstance(context, dict) else ""

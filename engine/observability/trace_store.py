@@ -9,7 +9,6 @@ chain head at run end, making a later rollback detectable too.
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections import deque
 from datetime import datetime, timezone
@@ -17,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from common.hash_chain import ChainVerification, HashChainLog
-from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
+from common.paths import PRIVATE_DIR_MODE
 from engine.execution.events import EventType, ExecutionEvent
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization)", re.I)

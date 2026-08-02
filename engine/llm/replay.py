@@ -286,10 +286,6 @@ class ReplayLLM:
             max_output_tokens_declared=self.max_output_tokens_declared,
         )
 
-    @property
-    def turns_consumed(self) -> int:
-        return self._index
-
     def _next_turn(self) -> RecordedTurn:
         if self._index >= len(self._turns):
             raise ReplayExhaustedError(
