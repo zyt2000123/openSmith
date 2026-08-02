@@ -7,6 +7,5 @@ __all__ = [
     "ConfigProtectionHook",
     "ConsoleWarnHook",
     "CostTrackerHook",
-    "FactGateHook",
     "QualityGateHook",
 ]
