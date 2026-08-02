@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from engine.safety.approval import ApprovalScope
+from engine.safety.risk import RiskTier
 from engine.sandbox import ExecutionEnvironment, LocalExecutionEnvironment
 
 from .interface import ToolCall, ToolDefinition, ToolResult
@@ -322,12 +323,25 @@ class ToolRegistry:
             allowed_filenames=_BUILTIN_PROVIDER_FILENAMES,
         )
 
-    def get_schemas(self, enabled: list[str] | None = None) -> list[dict]:
-        """Return OpenAI-compatible tool schemas."""
+    def get_schemas(
+        self,
+        enabled: list[str] | None = None,
+        *,
+        include_hidden: bool = False,
+    ) -> list[dict]:
+        """Return OpenAI-compatible tool schemas.
+
+        Hidden tools are metadata-only (registry helpers the model must not
+        call directly).  They are excluded here — not just by the callers — so
+        a scoped or explicitly-enabled view can never widen a model-facing
+        schema list into the hidden set.
+        """
         active = set(enabled) if enabled is not None else self._enabled
         result: list[dict] = []
         for name, (defn, _) in self._tools.items():
             if active is not None and name not in active:
+                continue
+            if defn.hidden and not include_hidden:
                 continue
             result.append({
                 "type": "function",
@@ -696,9 +710,15 @@ class ToolRegistry:
             # an arbitrary directory (/etc, ~/Library, ...) — including
             # credential-bearing names the name-based sensitive checks do not
             # cover (master.passwd, shadow).  External approvals therefore
-            # whitelist exactly one path.  High-risk paths (.ssh, .aws, .env,
-            # .git/config) always require approval each time regardless.
-            if approval_granted and approval_scope is not None and approval_scope.kind == "path":
+            # whitelist exactly one path.  HIGH/CRITICAL approvals are never
+            # cached: sensitive paths (.ssh, .aws, .env, .git/config) and
+            # destructive operations require approval each time regardless.
+            if (
+                approval_granted
+                and approval_scope is not None
+                and approval_scope.kind == "path"
+                and decision.risk is RiskTier.ELEVATED
+            ):
                 from pathlib import Path
                 try:
                     target_path = Path(approval_scope.target).expanduser().resolve()
@@ -816,7 +836,12 @@ class ScopedToolRegistry:
     def working_directory(self) -> Path | None:
         return self._registry.working_directory
 
-    def get_schemas(self, enabled: list[str] | None = None) -> list[dict]:
+    def get_schemas(
+        self,
+        enabled: list[str] | None = None,
+        *,
+        include_hidden: bool = False,
+    ) -> list[dict]:
         active = self._active_names()
         if enabled is not None:
             active.intersection_update(
@@ -824,7 +849,10 @@ class ScopedToolRegistry:
                 for name in enabled
                 if isinstance(name, str) and name
             )
-        return self._registry.get_schemas(sorted(active))
+        return self._registry.get_schemas(
+            sorted(active),
+            include_hidden=include_hidden,
+        )
 
     def list_tools(self) -> list[ToolDefinition]:
         active = self._active_names()

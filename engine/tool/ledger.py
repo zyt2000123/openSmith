@@ -13,6 +13,20 @@ from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
 from engine.tool.interface import ToolResult
 
 
+def _ledger_redacted_content(content: str, *, limit: int = 4096) -> str:
+    """Persist tool output without round-tripping embedded credentials.
+
+    The ledger is a disk sink that may later be replayed into the model's
+    context, so it must carry the same embedded-secret redaction as the audit
+    trail.  ``_redact_secret_text`` hides whole-string credentials entirely and
+    replaces embedded high-confidence tokens in place, keeping the rest of the
+    output readable.
+    """
+    from engine.safety.approval import _redact_secret_text
+
+    return _redact_secret_text(content)[:limit]
+
+
 @dataclass(frozen=True)
 class ToolLedgerDecision:
     claimed: bool
@@ -234,7 +248,7 @@ class ToolExecutionLedger:
                 (
                     "completed" if successful else "uncertain",
                     call_id,
-                    result.content[:4096],
+                    _ledger_redacted_content(result.content),
                     int(result.is_error),
                     result.error_kind,
                     "completed" if successful else "unknown",

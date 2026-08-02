@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ._files import atomic_write_text, sanitize_memory_text
+from ._files import append_private_lines, atomic_write_text, sanitize_memory_text
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,10 @@ def append_memory_history(
     }
     try:
         memory_dir.mkdir(parents=True, exist_ok=True)
-        with (memory_dir / "memory_history.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        append_private_lines(
+            memory_dir / "memory_history.jsonl",
+            [json.dumps(entry, ensure_ascii=False, sort_keys=True)],
+        )
         return True
     except OSError:
         logger.warning("failed to append memory history", exc_info=True)

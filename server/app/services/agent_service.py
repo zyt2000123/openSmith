@@ -202,7 +202,7 @@ class AgentService:
         return await self.token_stats_service.get_stats(await self._profile_id(), year=year)
 
     async def get_run(self, run_id: str):
-        return self.run_state_service.get_run(await self._profile_id(), run_id)
+        return await self.run_state_service.get_run(await self._profile_id(), run_id)
 
     async def list_observability_runs(self, *, limit: int):
         return self.observability_service.list_runs(await self._profile_id(), limit=limit)
@@ -226,7 +226,7 @@ class AgentService:
         return self.observability_service.get_improvement_proposal(await self._profile_id(), run_id)
 
     async def resolve_run_approval(self, run_id: str, decision: ApprovalDecision):
-        return self.run_state_service.resolve_approval(
+        return await self.run_state_service.resolve_approval(
             await self._profile_id(),
             run_id,
             decision.approval_id,

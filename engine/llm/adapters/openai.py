@@ -358,6 +358,11 @@ class OpenAIAdapter(HTTPAdapterMixin):
         if request.tools:
             body["tools"] = request.tools
         body["max_tokens"] = self.max_output_tokens
+        if stream:
+            # Without this flag the OpenAI Chat Completions API omits the
+            # terminal usage chunk entirely, so every streaming call would
+            # record all-zero tokens even though the caller charges by them.
+            body["stream_options"] = {"include_usage": True}
         if request.prefix_cache_key:
             # Providers document a top-level ``prefix_cache_key`` field.
             # ``extra_body`` is an SDK client-side param, not a wire field, and

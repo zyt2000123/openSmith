@@ -138,7 +138,7 @@ def test_llm_does_not_depend_on_execution_implementation() -> None:
 def test_runtime_helpers_live_with_their_owning_packages() -> None:
     moves = {
         ENGINE_ROOT / "identity_catalog.py": ENGINE_ROOT / "identity" / "catalog.py",
-        ENGINE_ROOT / "hook.py": ENGINE_ROOT / "execution" / "hooks.py",
+        ENGINE_ROOT / "hook.py": ENGINE_ROOT / "execution" / "hooks" / "__init__.py",
         ENGINE_ROOT / "replay.py": ENGINE_ROOT / "llm" / "replay.py",
         ENGINE_ROOT / "snapshot.py": ENGINE_ROOT / "tool" / "snapshot.py",
         (

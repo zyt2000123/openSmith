@@ -34,13 +34,14 @@ def disabled_skill_names(agent_dir: Path) -> set[str]:
 
 
 def set_skill_enabled(agent_dir: Path, skill_name: str, *, enabled: bool) -> set[str]:
-    if not skill_name.strip():
+    stripped = skill_name.strip()
+    if not stripped:
         raise SkillSettingsError("skill name must not be empty")
 
     disabled = disabled_skill_names(agent_dir)
     if enabled:
-        disabled.discard(skill_name)
+        disabled.discard(stripped)
     else:
-        disabled.add(skill_name)
+        disabled.add(stripped)
     save_yaml(_settings_path(agent_dir), {"disabled": sorted(disabled)})
     return disabled

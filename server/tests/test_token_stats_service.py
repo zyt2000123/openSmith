@@ -453,3 +453,216 @@ async def test_record_usage_clears_message_estimates_for_the_session() -> None:
 
     stats = await service.get_stats("agent-1", year=2026)
     assert stats["total_tokens"] == 143  # 125 exact + 18 estimate for s2, no double count
+
+
+@pytest.mark.asyncio
+async def test_sync_from_traces_skips_live_recorded_runs(tmp_path: Path) -> None:
+    """S2 regression: a run whose usage was recorded live (source_key IS NULL)
+    must not be re-imported from its trace, or every interactive run is counted
+    twice after the first server restart."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE token_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            source_key TEXT,
+            project_name TEXT NOT NULL DEFAULT '',
+            project_path TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            occurred_at TEXT NOT NULL
+        );
+        INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1');
+        """
+    )
+    runs = tmp_path / "runs"
+    traces = tmp_path / "traces"
+    runs.mkdir()
+    traces.mkdir()
+    (runs / "run-live.json").write_text(
+        json.dumps({"run_id": "run-live", "session_id": "s1"}),
+        encoding="utf-8",
+    )
+    (traces / "run-live.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({
+                    "seq": 1,
+                    "timestamp": "2026-07-14T10:00:00+00:00",
+                    "type": "run_started",
+                    "data": {"project_path": "/tmp/demo-project"},
+                }),
+                json.dumps({
+                    "seq": 2,
+                    "timestamp": "2026-07-14T10:00:01+00:00",
+                    "type": "token_usage",
+                    "data": {"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+                }),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    service = TokenStatsService(db_provider, trace_root=tmp_path)
+    # Live path already recorded this run during its SSE stream.
+    await service.record_usage(
+        session_id="s1",
+        run_id="run-live",
+        project_name="demo-project",
+        project_path="/tmp/demo-project",
+        model="gpt-test",
+        usage={"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+        occurred_at=datetime.fromisoformat("2026-07-14T10:00:01+00:00"),
+    )
+
+    # A restart imports traces; the live-recorded run must be skipped.
+    assert await service.sync_from_traces() == 0
+
+    rows = await db.execute_fetchall(
+        "SELECT source_key, total_tokens FROM token_usage_events WHERE run_id='run-live'"
+    )
+    assert len(rows) == 1
+    assert rows[0]["source_key"] is None
+    assert rows[0]["total_tokens"] == 125
+
+    stats = await service.get_stats("agent-1", year=2026)
+    assert stats["total_tokens"] == 125
+
+
+@pytest.mark.asyncio
+async def test_sync_from_traces_heals_legacy_double_count(tmp_path: Path) -> None:
+    """S2 regression: rows imported from an older version that did not skip
+    live-recorded runs are cleaned up so get_stats stops counting them twice."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE token_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            source_key TEXT,
+            project_name TEXT NOT NULL DEFAULT '',
+            project_path TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            occurred_at TEXT NOT NULL
+        );
+        CREATE TABLE observability_trace_cursors (
+            run_id TEXT PRIMARY KEY,
+            byte_offset INTEGER NOT NULL DEFAULT 0,
+            project_path TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1');
+        INSERT INTO token_usage_events
+            (session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at)
+        VALUES
+            ('s1', 'run-live', NULL, 'gpt-test', 100, 25, 125, '2026-07-14T10:00:01+00:00'),
+            ('s1', 'run-live', 'run-live:2', 'gpt-test', 100, 25, 125, '2026-07-14T10:00:01+00:00');
+        """
+    )
+    runs = tmp_path / "runs"
+    traces = tmp_path / "traces"
+    runs.mkdir()
+    traces.mkdir()
+    (runs / "run-live.json").write_text(
+        json.dumps({"run_id": "run-live", "session_id": "s1"}),
+        encoding="utf-8",
+    )
+    (traces / "run-live.jsonl").write_text(
+        json.dumps({
+            "seq": 2,
+            "timestamp": "2026-07-14T10:00:01+00:00",
+            "type": "token_usage",
+            "data": {"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    service = TokenStatsService(db_provider, trace_root=tmp_path)
+    await service.sync_from_traces()
+
+    rows = await db.execute_fetchall(
+        "SELECT source_key, total_tokens FROM token_usage_events WHERE run_id='run-live'"
+    )
+    assert len(rows) == 1
+    assert rows[0]["source_key"] is None
+
+    stats = await service.get_stats("agent-1", year=2026)
+    assert stats["total_tokens"] == 125
+
+
+@pytest.mark.asyncio
+async def test_record_usage_clears_own_trace_imported_rows(tmp_path: Path) -> None:
+    """F4 regression: when a resumed run records usage live, any trace-imported
+    rows for the same run must be dropped immediately instead of surviving for
+    the whole process lifetime (get_stats would double-count until the next
+    startup's sync_from_traces heals them)."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE token_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            source_key TEXT,
+            project_name TEXT NOT NULL DEFAULT '',
+            project_path TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            occurred_at TEXT NOT NULL
+        );
+        INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1');
+        INSERT INTO token_usage_events
+            (session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at)
+        VALUES
+            ('s1', 'run-resumed', 'run-resumed:2', 'gpt-test', 100, 25, 125, '2026-07-14T10:00:01+00:00');
+        """
+    )
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    service = TokenStatsService(db_provider, trace_root=tmp_path)
+    await service.record_usage(
+        session_id="s1",
+        run_id="run-resumed",
+        project_name="demo-project",
+        project_path="/tmp/demo-project",
+        model="gpt-test",
+        usage={"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+        occurred_at=datetime.fromisoformat("2026-07-14T10:00:01+00:00"),
+    )
+
+    rows = await db.execute_fetchall(
+        "SELECT source_key FROM token_usage_events WHERE run_id='run-resumed'"
+    )
+    assert len(rows) == 1
+    assert rows[0]["source_key"] is None
+
+    stats = await service.get_stats("agent-1", year=2026)
+    assert stats["total_tokens"] == 125
+

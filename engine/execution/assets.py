@@ -20,10 +20,10 @@ def validate_execution_assets(
     """Validate every shipped identity's executable asset closure.
 
     A route that names a pipeline is a promise that the pipeline can actually
-    run.  Checking only the YAML filename leaves a deployment with a missing
-    stage to silently fall back to generic ReAct at request time.  Keep this
-    check at startup, where the content catalog, parsed chain, and registered
-    skill names are all available together.
+    run. Checking only the YAML filename would defer a missing stage until the
+    request reaches its blocked node. Keep this check at startup, where the
+    content catalog, parsed chain, and registered skill names are all available
+    together.
     """
     available_skills = set(skill_names)
     available_tools = set(tool_names) if tool_names is not None else None

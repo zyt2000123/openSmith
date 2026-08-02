@@ -90,11 +90,15 @@ class LLMGate:
             )
 
         try:
-            prompt = self._prompt_template.format(output=output[:2000])
+            # Substitute only the ``{output}`` placeholder literally so a gate
+            # template containing JSON samples or other literal braces (a
+            # common content-authoring mistake) cannot make str.format raise
+            # and silently turn every check into a permanent gate failure.
+            template = self._prompt_template.replace("{output}", output[:2000])
             with llm_purpose("gate"):
                 resp = await self._llm.chat([
                     {"role": "system", "content": "You are a quality gate. Evaluate the output and respond with ONLY 'PASS' or 'FAIL: <reason>'. Be strict."},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": template},
                 ])
             text = resp.text.strip()
             verdict = _normalized_llm_verdict(text)
@@ -102,7 +106,10 @@ class LLMGate:
                 reason = text[len("FAIL"):].strip(":： \t\r\n")
                 return GateResult("fail", f"LLM verification: {reason}", retry_hint=reason)
             if verdict.startswith("PASS"):
-                return result
+                # The heuristic pre-filter passed or was uncertain (retry);
+                # the LLM has now explicitly verified the output, so the gate
+                # passes regardless of the pre-filter verdict.
+                return GateResult("pass", "LLM verification passed")
             return GateResult(
                 "fail",
                 "LLM verification returned an invalid verdict",

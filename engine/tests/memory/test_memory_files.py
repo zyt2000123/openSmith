@@ -1,4 +1,4 @@
-from engine.memory._files import contains_injection, sanitize_memory_text
+from engine.memory._files import append_private_lines, contains_injection, sanitize_memory_text
 
 
 def test_injection_detection_spans_line_breaks():
@@ -51,3 +51,27 @@ def test_sanitize_memory_text_redacts_a_key_only_message():
 
     assert cleaned == ""
     assert secrets_removed >= 3
+
+
+def test_append_private_lines_creates_private_file_with_all_lines(tmp_path):
+    """Memory append logs carry raw conversation content, so they must be
+    created 0600 (not umask-dependent) and preserve every newline-terminated
+    line exactly."""
+    import os
+
+    target = tmp_path / "memory" / "recent.jsonl"
+    append_private_lines(target, ["line one", "line two"])
+
+    assert os.stat(target).st_mode & 0o777 == 0o600
+    assert target.read_text(encoding="utf-8") == "line one\nline two\n"
+
+
+def test_append_private_lines_appends_and_keeps_mode_on_existing_file(tmp_path):
+    import os
+
+    target = tmp_path / "recent.jsonl"
+    append_private_lines(target, ["first"])
+    append_private_lines(target, ["second"])
+
+    assert os.stat(target).st_mode & 0o777 == 0o600
+    assert target.read_text(encoding="utf-8") == "first\nsecond\n"

@@ -62,6 +62,17 @@ class RunEventRecorder:
                     exc_info=True,
                 )
         if event.type is EventType.RUN_FINISHED:
+            if self._trace_store is not None:
+                try:
+                    # Anchor this run's trace chain so a later rollback or edit
+                    # of a finished run is detectable by a compliance reader.
+                    self._trace_store.seal(self.run_id)
+                except Exception:
+                    logger.warning(
+                        "failed to seal run trace (run=%s)",
+                        self.run_id,
+                        exc_info=True,
+                    )
             summary = self._summary.snapshot()
             for sink in self._summary_sinks:
                 try:

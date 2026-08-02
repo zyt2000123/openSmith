@@ -644,9 +644,16 @@ function objectPayload(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
+// FastAPI 422 bodies embed the failing input value verbatim, which can be a
+// megabyte-sized message or a secret; cap display text so an error body can
+// never flood the status line or the persisted transcript.
+const TERMINAL_TEXT_MAX_LENGTH = 2_000;
+
 /** Convert a decoded wire value into terminal-safe display text. */
 function terminalText(value: unknown): string {
-  return sanitizeTerminalText(typeof value === "string" ? value : String(value ?? ""));
+  const text = sanitizeTerminalText(typeof value === "string" ? value : String(value ?? ""));
+  if (text.length <= TERMINAL_TEXT_MAX_LENGTH) return text;
+  return text.slice(0, TERMINAL_TEXT_MAX_LENGTH) + "…";
 }
 
 function approvalPresentation(payload: Record<string, unknown>): ApprovalPresentation | undefined {
@@ -898,7 +905,10 @@ async function* streamRequest(
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text || response.statusText}`);
+      // Same treatment as request(): terminal escape sequences must not reach
+      // the renderer, and a 422 body embeds the failing input (which can be a
+      // large message or a secret), so sanitize and cap it.
+      throw new Error(`HTTP ${response.status}: ${terminalText(text || response.statusText)}`);
     }
 
     if (!response.body) {

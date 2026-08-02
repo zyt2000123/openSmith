@@ -615,6 +615,7 @@ async def _run_events_with_runtime(
                 gate_llm=services.gate_llm,
                 disabled_skill_names=getattr(s, "disabled_skill_names", frozenset()),
                 prefix_cache_key=getattr(s, "prefix_cache_key", None),
+                hook_registry=services.hook_registry,
             ):
                 if event.type == EventType.TEXT_DELTA:
                     full_text.append(str(event.data.get("text", "")))
@@ -701,6 +702,22 @@ async def _run_events_with_runtime(
                 "reason": "consumer_disconnected",
             })
             boundary.record(cancelled_event)
+        # Stop hooks 在每轮响应结束时批量处理（成本跟踪、状态持久化等）。
+        # 调用在资源清理之前，让写入型 StopHook 能拿到完整的会话上下文。
+        if services.hook_registry is not None:
+            try:
+                await services.hook_registry.run_stop_hooks(
+                    runtime.session_id or "",
+                    {
+                        "session_id": runtime.session_id or "",
+                        "run_id": run_id,
+                        "session_stats": {},
+                    },
+                )
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except Exception:
+                logger.warning("failed to run stop hooks (run=%s)", run_id, exc_info=True)
         try:
             await services.close()
         except asyncio.CancelledError as exc:

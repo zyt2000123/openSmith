@@ -87,3 +87,23 @@ def test_series_merge_infers_list_shape_without_an_initial_value() -> None:
     result = asyncio.run(manager.apply("tools", HookType.SERIES_MERGE))
 
     assert result == [{"name": "first"}, {"name": "second"}]
+
+
+def test_series_merge_dict_result_drops_non_dict_partials() -> None:
+    """A dict accumulator cannot merge a list partial; the partial must be
+    dropped with a warning rather than silently corrupting the result."""
+    class DictHook:
+        def tools(self):
+            return {"alpha": 1}
+
+    class ListHook:
+        def tools(self):
+            return ["not-a-dict"]
+
+    manager = HookManager()
+    manager.register(DictHook())
+    manager.register(ListHook())
+
+    result = asyncio.run(manager.apply("tools", HookType.SERIES_MERGE))
+
+    assert result == {"alpha": 1}

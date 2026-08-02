@@ -140,6 +140,11 @@ class RunSummaryStore:
         self.root.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
         self.root.chmod(PRIVATE_DIR_MODE)
         self._retention = retention or ObservabilityRetentionPolicy.from_environment()
+        # A failed index write marks the index stale.  bootstrap() is idempotent
+        # (ON CONFLICT upserts), so the next _ensure_index() reconciles the
+        # previously-failed row instead of leaving the run invisible to list()
+        # forever.
+        self._index_stale = False
         try:
             self._index: ObservabilityIndex | None = ObservabilityIndex(
                 self.profile_dir
@@ -169,12 +174,14 @@ class RunSummaryStore:
             try:
                 self._index.upsert(self._index_entry(record))
                 self._apply_retention()
+                self._index_stale = False
             except (OSError, sqlite3.Error):
                 logger.warning(
                     "failed to update observability index (run=%s)",
                     metadata.run_id,
                     exc_info=True,
                 )
+                self._index_stale = True
         return record
 
     def get(self, run_id: str) -> RunSummaryRecord | None:
@@ -212,7 +219,7 @@ class RunSummaryStore:
         if self._index is None:
             return
         try:
-            if self._index.is_bootstrapped():
+            if self._index.is_bootstrapped() and not self._index_stale:
                 return
             entries = [
                 self._index_entry(record)
@@ -220,6 +227,7 @@ class RunSummaryStore:
                 if (record := self._read_path(path)) is not None
             ]
             self._index.bootstrap(entries)
+            self._index_stale = False
         except (OSError, sqlite3.Error):
             logger.warning("failed to bootstrap observability index", exc_info=True)
             self._index = None

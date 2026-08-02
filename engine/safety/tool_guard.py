@@ -6,20 +6,22 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Optional
 
+from common.hash_chain import ChainVerification, HashChainLog, verify_chain
 from engine.safety.approval import (
     ApprovalScope,
     _SECRET_FLAG_RE,
     _is_sensitive_argument_name,
     _is_secret_value,
+    _redact_secret_text,
     current_approval_context,
 )
+from engine.safety.risk import RiskTier, risk_for_approval
 from engine.tool.interface import ToolCall, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,9 @@ class GuardResult:
     # The user-visible, one-shot capability requested for this call. It is
     # carried through the approval broker and re-checked by ToolRegistry.
     approval_scope: ApprovalScope | None = None
+    # Risk tier used to triage the approval flow (see engine.safety.risk).
+    # HIGH/CRITICAL approvals are never eligible for session-whitelist caching.
+    risk: RiskTier = RiskTier.ROUTINE
 
 
 # ── Path guard (req #3: symlink, traversal, sensitive files) ──
@@ -289,6 +294,10 @@ class FileGuard:
                 writing=writing,
                 high_risk=high_risk,
             ),
+            risk=risk_for_approval(
+                level=PermissionLevel.WRITE.value if writing else PermissionLevel.READ.value,
+                high_risk=high_risk,
+            ),
         )
 
     def check_path(self, path_str: str, writing: bool = False) -> GuardResult:
@@ -310,6 +319,7 @@ class FileGuard:
                     "[runtime-secret-001] Agent runtime credential files are not "
                     "delegable to model tools"
                 ),
+                risk=RiskTier.CRITICAL,
             )
         if _shares_inode_with_runtime_credential(target):
             return GuardResult(
@@ -318,6 +328,7 @@ class FileGuard:
                     "[runtime-secret-001] Agent runtime credential files are not "
                     "delegable through a hard-link alias"
                 ),
+                risk=RiskTier.CRITICAL,
             )
 
         if writing and self._is_non_delegable_write_target(target, lexical):
@@ -327,6 +338,7 @@ class FileGuard:
                     "[runtime-provider-001] Agent runtime tool provider files are "
                     "not delegable to model tools"
                 ),
+                risk=RiskTier.CRITICAL,
             )
 
         # Check the literal path as well as the resolved one: a credential
@@ -440,6 +452,7 @@ class FileGuard:
                         f"[unsafe-alias-001] Cannot safely represent the write to "
                         f"{target.name}: it is a hard link to a protected file."
                     ),
+                    risk=RiskTier.CRITICAL,
                 )
 
         if any(target.is_relative_to(d) for d in self._allowed):
@@ -470,18 +483,18 @@ class FileGuard:
 # ── Audit log (req #6: every tool call logged) ──────────────
 
 class AuditLog:
-    """Append-only JSONL audit sink holding a single file handle.
+    """Append-only, tamper-evident JSONL audit sink.
 
-    ``record`` runs synchronously from the guard on the event loop; opening
-    and closing the file on every call is pure syscall overhead.  The handle
-    is opened lazily on first use — so callers may point ``_path`` at a fresh
-    file before any record — and stays open afterwards, flushed after each
-    append so entries are durable and immediately visible to synchronous
-    readers.  A bounded queue drained by a writer thread would take the I/O
-    off the loop entirely, but consumers (including this repo's own regression
-    tests) read the audit file synchronously right after ``check()``, so the
-    write must stay deterministic.
+    Every entry is hash-chained (``seq``/``prev_hash``/``hash``) so editing,
+    reordering, or deleting a prior entry is detectable via :meth:`verify`.
+    The chain head is anchored (``<log>.head``) at each run boundary and on
+    :meth:`close`, so a rollback to a shorter-but-consistent chain is also
+    detected.  ``record`` runs synchronously from the guard on the event loop;
+    chaining adds only SHA-256 hashing, not extra fsync, on top of the existing
+    per-append flush.
     """
+
+    _CHAIN_NAMESPACE = "agent-smith-audit"
 
     def __init__(self, log_path: Optional[Path] = None):
         if log_path is None:
@@ -491,18 +504,27 @@ class AuditLog:
             except Exception:
                 log_path = Path.home() / ".agent-smith" / "audit.jsonl"
         self._path = log_path
-        self._lock = threading.Lock()
-        self._handle: Optional[TextIO] = None
-        self._handle_path: Optional[Path] = None
+        self._chain: HashChainLog | None = None
+        self._sealed_run: str | None = None
 
-    def _ensure_handle(self) -> TextIO:
-        if self._handle is None or self._handle_path != self._path:
-            if self._handle is not None:
-                self._handle.close()
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle = open(self._path, "a", encoding="utf-8")
-            self._handle_path = self._path
-        return self._handle
+    def _ensure_chain(self) -> HashChainLog:
+        """Return the chain for the current path, reopening on a path change."""
+        if self._chain is None or self._chain.path != self._path:
+            if self._chain is not None:
+                self._chain.close()
+            self._chain = HashChainLog(
+                self._path,
+                namespace=self._CHAIN_NAMESPACE,
+                keep_handle=True,
+            )
+        return self._chain
+
+    @property
+    def _handle(self):
+        """The persistent append handle, opened lazily (test-facing seam)."""
+        chain = self._ensure_chain()
+        chain.ensure_handle()
+        return chain.file_handle
 
     def record(self, tool_name: str, arguments: dict, result: GuardResult, **extra: object) -> None:
         entry = {
@@ -511,28 +533,58 @@ class AuditLog:
             "args_summary": _summarize_args(arguments),
             "allowed": result.allowed,
             "level": result.level.value,
+            "risk": result.risk.value,
             "reason": result.reason or None,
             **_summarize_args(extra),
         }
         try:
-            with self._lock:
-                handle = self._ensure_handle()
-                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                handle.flush()
+            chain = self._ensure_chain()
+            run_id = extra.get("run_id")
+            if (
+                isinstance(run_id, str)
+                and self._sealed_run is not None
+                and run_id != self._sealed_run
+            ):
+                # Anchor the previous run's chain at the boundary so a later
+                # rollback of that run is detectable.
+                chain.seal()
+            self._sealed_run = run_id if isinstance(run_id, str) else self._sealed_run
+            chain.append(entry)
         except Exception:
             logger.warning("failed to append tool safety audit", exc_info=True)
 
+    def verify(self) -> ChainVerification:
+        """Walk the chain and report the first integrity failure."""
+        anchor = None
+        anchor_path = self._path.with_name(self._path.name + ".head")
+        if anchor_path.is_file():
+            try:
+                anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                anchor = None
+        return verify_chain(
+            self._path,
+            namespace=self._CHAIN_NAMESPACE,
+            anchor=anchor if isinstance(anchor, dict) else None,
+        )
+
+    def seal(self) -> None:
+        """Anchor the chain head at the current path."""
+        self._ensure_chain().seal()
+
     def flush(self) -> None:
-        with self._lock:
-            if self._handle is not None:
-                self._handle.flush()
+        chain = self._ensure_chain()
+        if chain.file_handle is not None:
+            chain.file_handle.flush()
 
     def close(self) -> None:
-        with self._lock:
-            if self._handle is not None:
-                self._handle.close()
-                self._handle = None
-                self._handle_path = None
+        if self._chain is not None:
+            try:
+                if self._path.is_file():
+                    self._chain.seal()
+            finally:
+                self._chain.close()
+                self._chain = None
 
 
 def _summarize_sequence(values: list | tuple, max_len: int) -> list[object]:
@@ -570,8 +622,16 @@ def _summarize_value(value: object, max_len: int) -> object:
         return _summarize_args(value, max_len=max_len)
     if isinstance(value, (list, tuple)):
         return _summarize_sequence(value, max_len)
-    if isinstance(value, str) and len(value) > max_len:
-        return value[:max_len] + f"...({len(value)} chars)"
+    if isinstance(value, str):
+        # Mirror approval._summarize_value: a credential embedded in an
+        # otherwise-innocuous string (a shell command carrying a bearer token,
+        # a URL with userinfo) must be redacted before it lands in the
+        # persistent audit trail.  Whole-string credentials are hidden
+        # entirely by _redact_secret_text.
+        safe = _redact_secret_text(value)
+        if len(safe) > max_len:
+            return safe[:max_len] + f"...({len(value)} chars)"
+        return safe
     return value
 
 
@@ -801,24 +861,38 @@ class ToolGuard:
 
         for arg_name in path_args:
             path_val = tool_call.arguments.get(arg_name)
-            if path_val:
-                paths_to_check.append((str(path_val), is_write))
-            elif (
-                self.file_guard.is_working_directory_scoped
-                and self._path_arg_uses_nonempty_default(tool_call.name, arg_name)
-            ):
-                # The registry must first materialize the provider's default
-                # (such as ``path='.'``) within the workspace.  Letting a raw
-                # optional path through here would make the provider use the
-                # server process CWD instead.
+            if path_val is None or path_val == "":
+                if (
+                    self.file_guard.is_working_directory_scoped
+                    and self._path_arg_uses_nonempty_default(tool_call.name, arg_name)
+                ):
+                    # The registry must first materialize the provider's default
+                    # (such as ``path='.'``) within the workspace.  Letting a raw
+                    # optional path through here would make the provider use the
+                    # server process CWD instead.
+                    return GuardResult(
+                        allowed=False,
+                        reason=(
+                            f"Path argument '{arg_name}' must be canonicalized "
+                            "before policy checks"
+                        ),
+                        boundary_block=True,
+                    )
+                continue
+            if not isinstance(path_val, str):
+                # A scalar path argument must be a single string.  A list or
+                # dict here would be str()-stringified into one bogus path the
+                # guard checks, while the provider reads the real (possibly
+                # sensitive) value differently — a check/execute divergence.
+                # Reject rather than approximate.
                 return GuardResult(
                     allowed=False,
                     reason=(
-                        f"Path argument '{arg_name}' must be canonicalized "
-                        "before policy checks"
+                        f"Path argument '{arg_name}' must be a string, "
+                        f"got {type(path_val).__name__}"
                     ),
-                    boundary_block=True,
                 )
+            paths_to_check.append((path_val, is_write))
 
         cwd_val = tool_call.arguments.get("cwd")
         cwd = str(cwd_val) if cwd_val else ""
@@ -1001,6 +1075,7 @@ class ToolGuard:
                     "delegable to model tools"
                 ),
                 level=level,
+                risk=RiskTier.CRITICAL,
             )
             record(result)
             return result
@@ -1037,6 +1112,7 @@ class ToolGuard:
                         needs_confirmation=True,
                         approval_required=True,
                         approval_scope=self._approval_scope_for(tool_call, high_risk=True),
+                        risk=RiskTier.CRITICAL,
                     )
                     record(result, rule_id=rule.get("id"))
                     return result
@@ -1048,16 +1124,54 @@ class ToolGuard:
         file_result = self._check_file_paths(tool_call)
         if file_result is not None:
             file_result.level = level
+            file_result.risk = self._risk_for_file_result(file_result)
             record(file_result)
             return file_result
 
         approval_required = self._requires_approval(tool_call)
+        approval_scope = self._approval_scope_for(tool_call) if approval_required else None
+        definition = self._tool_registry.get(tool_call.name)
+        network_access = bool(
+            definition is not None and getattr(definition, "network_access", False)
+        )
         result = GuardResult(
             allowed=True,
             level=level,
             reason=f"Approval required for {tool_call.name}" if approval_required else "",
             approval_required=approval_required,
-            approval_scope=(self._approval_scope_for(tool_call) if approval_required else None),
+            approval_scope=approval_scope,
+            risk=(
+                risk_for_approval(
+                    level=level.value,
+                    high_risk=bool(
+                        approval_scope is not None and approval_scope.high_risk
+                    ),
+                    network_access=network_access,
+                )
+                if approval_required
+                else RiskTier.ROUTINE
+            ),
         )
         record(result, whitelisted=tool_whitelisted)
         return result
+
+    @staticmethod
+    def _risk_for_file_result(result: GuardResult) -> RiskTier:
+        """Derive the risk tier of a path-check result for the approval flow.
+
+        Hard denials carry no approval flow, but the tier still records why the
+        call was refused in the audit trail.
+        """
+        if result.approval_required:
+            return risk_for_approval(
+                level=result.level.value,
+                high_risk=bool(
+                    result.approval_scope is not None and result.approval_scope.high_risk
+                ),
+            )
+        if result.level is PermissionLevel.DESTRUCTIVE or any(
+            marker in (result.reason or "")
+            for marker in ("runtime-secret", "unsafe-alias", "runtime-provider")
+        ):
+            return RiskTier.CRITICAL
+        return RiskTier.ROUTINE

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from ._files import (
+    append_private_lines,
     atomic_write_text,
     interprocess_file_lock,
     safe_file_in_dir,
@@ -400,9 +401,10 @@ async def save_conversation_memory(
             signal_entry["signals"] = stable_signals
         entries.append(signal_entry)
 
-    with open(recent_file, "a", encoding="utf-8") as f:
-        for entry in entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    append_private_lines(
+        recent_file,
+        [json.dumps(entry, ensure_ascii=False) for entry in entries],
+    )
 
     # Periodic compilation (recent + durable)
     counter_file = memory_dir / ".compile_counter"

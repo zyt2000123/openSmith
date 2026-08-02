@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
@@ -94,8 +95,15 @@ def dump_event(event: ProviderEvent) -> dict[str, Any]:
 
 
 def load_event(payload: dict[str, Any]) -> ProviderEvent:
+    try:
+        event_type = ProviderEventType(payload["type"])
+    except (ValueError, TypeError, KeyError):
+        # A future release can rename or remove an event type; one such line
+        # must not make every old recording unloadable.  Skip it, mirroring the
+        # malformed-line tolerance of load_recording.
+        raise ValueError(f"unknown provider event type: {payload.get('type')!r}")
     return ProviderEvent(
-        ProviderEventType(payload["type"]),
+        event_type,
         payload.get("data") or {},
     )
 
@@ -137,11 +145,17 @@ def load_recording(path: Path | str) -> list[RecordedTurn]:
             )
             continue
         if "events" in payload:
-            turns.append(
-                RecordedTurn(
-                    events=tuple(load_event(item) for item in payload["events"])
-                )
-            )
+            events: list[ProviderEvent] = []
+            for item in payload["events"]:
+                try:
+                    events.append(load_event(item))
+                except ValueError:
+                    logger.warning(
+                        "skipping unknown event in %s", recording_path.name
+                    )
+                    continue
+            if events:
+                turns.append(RecordedTurn(events=tuple(events)))
         else:
             turns.append(RecordedTurn(response=load_response(payload["response"])))
     return turns
@@ -164,6 +178,7 @@ class RecordingLLM:
     def __init__(self, inner: Any, path: Path | str) -> None:
         self._inner = inner
         self._path = Path(path)
+        self._lock = threading.Lock()
         if hasattr(inner, "chat_events"):
             self.chat_events = self._recording_chat_events
 
@@ -177,13 +192,17 @@ class RecordingLLM:
         # crash mid-write cannot leave a truncated final line that would make
         # the whole recording unloadable.  load_recording skips malformed lines
         # as a second line of defense for files written by older versions.
-        tmp = self._path.with_name(f"{self._path.name}.tmp")
-        try:
-            existing = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
-        except FileNotFoundError:
-            existing = ""
-        tmp.write_text(existing + line, encoding="utf-8")
-        os.replace(tmp, self._path)
+        # The lock serializes the read-modify-write: two overlapping turns
+        # (e.g. a compaction summary while the main loop records) must not both
+        # read the same tail and silently drop one line.
+        with self._lock:
+            tmp = self._path.with_name(f"{self._path.name}.tmp")
+            try:
+                existing = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
+            except FileNotFoundError:
+                existing = ""
+            tmp.write_text(existing + line, encoding="utf-8")
+            os.replace(tmp, self._path)
 
     async def chat(
         self,

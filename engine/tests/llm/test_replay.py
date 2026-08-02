@@ -224,6 +224,25 @@ def test_load_recording_skips_a_truncated_final_line(tmp_path) -> None:
     assert [turn.response.text for turn in turns] == ["ok", "also ok"]
 
 
+def test_load_recording_skips_unknown_event_types(tmp_path) -> None:
+    """A future release can rename an event type; one such line must not make
+    every old recording unloadable."""
+    path = tmp_path / "future.jsonl"
+    path.write_text(
+        '{"events":[{"type":"response.output_text.delta","data":{"delta":"known"}},'
+        '{"type":"completely.new.event.type","data":{"x":1}}]}\n'
+        '{"response":{"text":"plain turn"}}\n',
+        encoding="utf-8",
+    )
+
+    turns = load_recording(path)
+
+    assert turns[0].is_streaming
+    assert [event.type.value for event in turns[0].events] == ["response.output_text.delta"]
+    assert turns[1].response is not None
+    assert turns[1].response.text == "plain turn"
+
+
 def test_recorder_appends_atomically_without_leaving_temp_file(tmp_path) -> None:
     """原子追加:录制文件恒可加载,且不残留临时文件。"""
     path = tmp_path / "atomic.jsonl"

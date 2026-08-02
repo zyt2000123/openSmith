@@ -1371,6 +1371,7 @@ def test_granted_approval_resolves_waiting_approval_to_running(tmp_path: Path) -
     )
     waiting = store.get("run-1")
     assert waiting is not None and waiting.status is RunStatus.WAITING_APPROVAL
+    seq_before_grant = waiting.event_seq
 
     project_execution_event(
         store,
@@ -1390,6 +1391,11 @@ def test_granted_approval_resolves_waiting_approval_to_running(tmp_path: Path) -
     assert resolved.status is RunStatus.RUNNING
     assert resolved.approval_id is None
     assert resolved.reason == "approval_granted"
+    # One source TOOL_CALL_RESULT event must yield exactly one event_seq
+    # increment (the granted resolution records the event and clears the
+    # pending approval in a single record, mirroring denied/timed_out).
+    assert resolved.event_seq == seq_before_grant + 1
+    assert resolved.current_tool is None
 
     project_execution_event(
         store,

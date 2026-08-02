@@ -181,6 +181,29 @@ def test_summary_list_reads_only_the_index_selected_records(
     assert summary_reads == ["run-3.summary.json"]
 
 
+def test_summary_index_reconciles_after_a_failed_upsert(tmp_path, monkeypatch) -> None:
+    """A run whose index upsert failed (e.g. SQLITE_BUSY) must not stay hidden
+    from list() forever: the next access re-bootstraps the idempotent index."""
+    store = RunSummaryStore(tmp_path)
+    _save_completed_summary(store, "run-1")
+
+    # Simulate the concurrent-writer failure on the next upsert.
+    import sqlite3
+
+    def failing_bootstrap_entry(entry):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store._index, "bootstrap_entry", failing_bootstrap_entry)
+    _save_completed_summary(store, "run-2")
+    assert store._index_stale is True
+
+    # The next access re-bootstraps the idempotent index from the summary
+    # files on disk, so run-2 is no longer hidden.
+    records = store.list("smith", limit=10)
+    assert store._index_stale is False
+    assert {record.metadata.run_id for record in records} == {"run-1", "run-2"}
+
+
 def test_observability_retention_removes_oldest_completed_run_files(
     tmp_path,
 ) -> None:
@@ -372,3 +395,54 @@ def test_health_tool_success_rate_ignores_approval_required_events() -> None:
     assert health.tool_success_rate == 1.0
     assert health.run_count == 1
     assert health.completed_count == 1
+
+
+def test_health_tool_success_rate_ignores_denied_approvals() -> None:
+    """A user-denied tool call never executed, so it must not count as a tool
+    failure — only the one real successful tool is measured."""
+    record = RunSummaryRecord(
+        schema_version=1,
+        metadata=RunMetadata(
+            run_id="run-1",
+            agent_id="smith",
+            created_at="2026-08-02T00:00:00+00:00",
+        ),
+        finished_at="2026-08-02T00:01:00+00:00",
+        summary=RunSummary(
+            run_id="run-1",
+            event_count=3,
+            event_counts={"tool_call_result": 2, "run_finished": 1},
+            tool_call_count=1,
+            backtrack_count=0,
+            approval_required_count=1,
+            token_usage={},
+            outcome="completed",
+            reason=None,
+        ),
+    )
+    traces = [
+        [
+            {"type": "tool_call_result", "data": {
+                "blocked": True,
+                "approval_required": True,
+                "error": False,
+            }},
+            {"type": "tool_call_result", "data": {
+                "blocked": True,
+                "approval_outcome": "denied",
+                "error": False,
+            }},
+            {"type": "tool_call_result", "data": {
+                "error": False,
+                "content": "ok",
+                "approval_outcome": "granted",
+            }},
+            {"type": "run_finished", "data": {"status": "completed"}},
+        ]
+    ]
+
+    health = HealthCalculator().calculate("smith", [record], traces)
+
+    # The gate probe and the denied approval are non-executions; only the
+    # granted, successful tool counts — 100%, not 33%.
+    assert health.tool_success_rate == 1.0

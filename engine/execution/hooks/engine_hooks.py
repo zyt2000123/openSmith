@@ -1,4 +1,10 @@
-"""Execution hook system — 5 modes for extensibility.
+"""Engine-internal extension hooks (the legacy HookManager dispatch system).
+
+These are *engine extension* hooks — intercepting prompt assembly, memory
+lifecycle ticks, and after-turn persistence — as opposed to the tool-lifecycle
+hooks in this same package (PreToolHook / PostToolHook / StopHook).  They are
+co-located here so the whole hook surface has one import path:
+``engine.execution.hooks``.
 
 Hooks let registered handlers intercept and modify behavior at key points:
 - system_prompt: modify prompt before LLM call (SERIES_LAST)
@@ -7,6 +13,7 @@ Hooks let registered handlers intercept and modify behavior at key points:
 - tools: inject additional tools (SERIES_MERGE)
 - after_turn: post-process conversation after each turn (SERIES_LAST)
 - stop: after loop ends (SERIES)
+- memory_*_tick / memory_after_turn_*: memory maintenance lifecycle (PARALLEL)
 """
 
 from __future__ import annotations
@@ -113,10 +120,21 @@ class HookManager:
                         result = [] if isinstance(partial, list) else {}
                     if isinstance(result, list):
                         result = result + (partial if isinstance(partial, list) else [partial])
-                    elif isinstance(result, dict) and isinstance(partial, dict):
-                        merged = dict(result)
-                        merged.update(partial)
-                        result = merged
+                    elif isinstance(result, dict):
+                        if isinstance(partial, dict):
+                            merged = dict(result)
+                            merged.update(partial)
+                            result = merged
+                        else:
+                            # A non-dict partial cannot merge into a dict
+                            # accumulator.  Log it instead of silently
+                            # dropping a handler's contribution.
+                            logger.warning(
+                                "hook %s.SERIES_MERGE dropped a %s partial "
+                                "that cannot merge into a dict result",
+                                hook,
+                                type(partial).__name__,
+                            )
                 except Exception:
                     logger.debug("hook %s.SERIES_MERGE error", hook, exc_info=True)
             return result
@@ -154,3 +172,10 @@ async def _call(fn: Callable, *args: Any) -> Any:
 
 async def _call_with_timeout(fn: Callable, timeout_seconds: float, *args: Any) -> Any:
     return await asyncio.wait_for(_call(fn, *args), timeout=timeout_seconds)
+
+
+__all__ = (
+    "DEFAULT_HOOK_TIMEOUT_SECONDS",
+    "HookManager",
+    "HookType",
+)

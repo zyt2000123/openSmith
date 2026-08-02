@@ -1,0 +1,37 @@
+# Hook Configuration for Smith
+
+hooks:
+  pre:
+    - id: config-protection
+      enabled: true
+      module: "agents/smith/hooks/config_protection.py"
+      class: "ConfigProtectionHook"
+      priority: 1
+      description: "Block modifications to linter/formatter/type-checker config files"
+
+    - id: fact-gate
+      enabled: false  # 默认禁用，需要 session context 集成
+      module: "agents/smith/hooks/fact_gate.py"
+      class: "FactGateHook"
+      priority: 2
+      description: "Require investigation before first file edit"
+
+  post:
+    - id: console-warn
+      enabled: true
+      module: "agents/smith/hooks/console_warn.py"
+      class: "ConsoleWarnHook"
+      description: "Warn about debug statements (console.log, print, etc.)"
+
+    - id: quality-gate
+      enabled: true
+      module: "agents/smith/hooks/quality_gate.py"
+      class: "QualityGateHook"
+      description: "Run format and lint checks after file edits"
+
+  stop:
+    - id: cost-tracker
+      enabled: true
+      module: "agents/smith/hooks/cost_tracker.py"
+      class: "CostTrackerHook"
+      description: "Track token usage and costs per session"

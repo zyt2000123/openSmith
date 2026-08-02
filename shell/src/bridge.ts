@@ -995,12 +995,15 @@ export class NodeBridge {
         // Resuming into the current session skips loadSession, so this is the only
         // place that rewinds the turn. Replayed events re-add every tool call and
         // token, so the counters have to start from zero alongside the transcript.
+        // tokenUsage (the HUD session-total) must reset too, or the replayed token
+        // events would inflate it on top of the pre-pause total.
         clearTerminal();
         this.s.set({
           transcript: restartLatestTurn(this.s.transcript),
           transcriptEpoch: this.s.transcriptEpoch + 1,
           toolActivity: createToolActivity(),
           turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+          tokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
           recoverableRunId: runId,
         });
         reset = true;

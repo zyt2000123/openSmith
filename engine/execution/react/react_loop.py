@@ -12,6 +12,7 @@ from engine.context.compression import (
     compaction_policy_for_llm,
     trim_conversation_for_context_limit,
 )
+from engine.execution.evidence import tool_result_hash
 from engine.execution.events import EventType, ExecutionEvent
 from engine.execution.runtime_control import tool_blocked_prompt
 from engine.llm.contracts import (
@@ -55,6 +56,7 @@ from .budget import (
 from .smith_ui import smith_ui_fallback, validate_smith_ui_call
 
 if TYPE_CHECKING:
+    from engine.execution.hooks import HookRegistry
     from engine.llm.port import LLMPort
     from engine.safety.tool_guard import ToolGuard
     from engine.tool.registry import ToolRegistry
@@ -355,6 +357,7 @@ async def react_loop(
     *,
     fact_gate: FactGate | None = None,
     prefix_cache_key: str | None = None,
+    hook_registry: "HookRegistry | None" = None,
 ) -> str:
     """Run the canonical ReAct event loop and collect final assistant text."""
     chunks: list[str] = []
@@ -366,6 +369,7 @@ async def react_loop(
         max_iters,
         fact_gate=fact_gate,
         prefix_cache_key=prefix_cache_key,
+        hook_registry=hook_registry,
     ):
         if event.type == EventType.TEXT_DELTA:
             chunks.append(str(event.data.get("text", "")))
@@ -389,6 +393,7 @@ async def react_stream_loop(
     *,
     fact_gate: FactGate | None = None,
     prefix_cache_key: str | None = None,
+    hook_registry: "HookRegistry | None" = None,
 ) -> AsyncGenerator[str, None]:
     """Run the canonical ReAct event loop and expose text deltas only.
 
@@ -403,6 +408,7 @@ async def react_stream_loop(
         max_iters,
         fact_gate=fact_gate,
         prefix_cache_key=prefix_cache_key,
+        hook_registry=hook_registry,
     ):
         if event.type == EventType.TEXT_DELTA:
             text = event.data.get("text", "")
@@ -428,6 +434,7 @@ async def react_event_loop(
     fact_gate: FactGate | None = None,
     provisional_lifecycle: bool = True,
     prefix_cache_key: str | None = None,
+    hook_registry: "HookRegistry | None" = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """ReAct loop: model response, tool calls, results, and next turn in one history."""
     tools = tool_registry.get_schemas() or None
@@ -590,6 +597,17 @@ async def react_event_loop(
                         })
                         return
                     context_recoveries += 1
+                    # The abandoned draft was streamed to the client but is
+                    # being discarded by this recovery.  Retract it before the
+                    # retried stream runs, or both the old and new ids would be
+                    # committed at finish and the client would keep rendering
+                    # text that no longer exists.
+                    for provision_id in active_provision_ids:
+                        yield _provisional_retract_event(
+                            provision_id,
+                            "context_limit",
+                        )
+                    active_provision_ids.clear()
                     yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
                     conversation = _recover_context_after_provider_rejection(
                         conversation,
@@ -997,6 +1015,7 @@ async def react_event_loop(
                                 reason=decision.reason,
                                 arguments_summary=arguments_summary,
                                 scope=decision.approval_scope,
+                                risk=decision.risk,
                                 presentation=presentation,
                             )
                         )
@@ -1012,6 +1031,7 @@ async def react_event_loop(
                             "approval_id": approval_request.approval_id,
                             "tool": approval_request.tool_name,
                             "arguments": approval_request.arguments_summary,
+                            "risk": approval_request.risk.value if approval_request.risk is not None else None,
                             "presentation": presentation.to_dict(),
                             "scope": (
                                 approval_request.scope.to_dict()
@@ -1049,6 +1069,7 @@ async def react_event_loop(
                                 "needs_confirmation": False,
                                 "approval_id": approval_request.approval_id,
                                 "approval_outcome": approval_outcome,
+                                "risk": decision.risk.value,
                             })
                             round_had_failure = True
                             consecutive_errors += 1
@@ -1064,6 +1085,7 @@ async def react_event_loop(
                             "reason": "Approval broker unavailable",
                             "level": decision.level.value,
                             "needs_confirmation": True,
+                            "risk": decision.risk.value,
                         })
                         round_had_failure = True
                         consecutive_errors += 1
@@ -1079,6 +1101,29 @@ async def react_event_loop(
                         "reason": decision.reason,
                         "level": decision.level.value,
                         "needs_confirmation": decision.needs_confirmation,
+                        "risk": decision.risk.value,
+                    })
+                    round_had_failure = True
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        conversation.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                        consecutive_errors = 0
+                    continue
+
+            # ========== PreToolUse Hook 检查 ==========
+            if hook_registry is not None:
+                allowed, denial_reason = await hook_registry.run_pre_hooks(
+                    call.name,
+                    call.arguments
+                )
+                if not allowed:
+                    # Pre Hook 阻止了工具执行
+                    yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                        "id": tc.id,
+                        "error": True,
+                        "blocked": True,
+                        "preflight": False,
+                        "reason": denial_reason or "Blocked by pre-tool hook",
                     })
                     round_had_failure = True
                     consecutive_errors += 1
@@ -1093,12 +1138,36 @@ async def react_event_loop(
                 approval_scope=decision.approval_scope,
             ):
                 result = await tool_registry.execute(call)
+
+            # ========== PostToolUse Hook 检查 ==========
+            if hook_registry is not None:
+                warnings = await hook_registry.run_post_hooks(
+                    call.name,
+                    call.arguments,
+                    result
+                )
+                if warnings:
+                    # 将警告注入到对话中（作为 system 消息）
+                    warning_text = "\n\n".join(warnings)
+                    conversation.append({"role": "system", "content": warning_text})
+
             conversation.append({"role": "tool", "tool_call_id": result.call_id, "content": result.content})
             result_event = {
                 "id": tc.id,
+                "name": call.name,
                 "error": result.is_error,
                 "blocked": False,
                 "preflight": False,
+                # Evidence binding: hash the FULL result (content is truncated
+                # below for transport) so a gate verdict can be checked against
+                # the exact output this call produced.  Only the hash is stored.
+                "result_hash": tool_result_hash(
+                    tool_name=call.name,
+                    call_id=result.call_id,
+                    arguments=call.arguments,
+                    content=result.content,
+                    is_error=result.is_error,
+                ),
                 "content": result.content[:200],
                 "error_kind": result.error_kind,
                 "retryable": result.retryable,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -17,6 +18,32 @@ _DISCOVERY_TIMEOUT_SECONDS = 35.0
 # Compatibility seam for tests embedding a temporary runtime profile.
 AGENT_DIR: Path | None = None
 
+# httpx error messages embed the full request URL, including basic-auth userinfo
+# and query parameters.  An MCP config that stores a token in its URL (explicitly
+# supported by the transport) would otherwise leak that token through the API.
+_URL_CREDENTIAL_RE = re.compile(
+    r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)?"
+    r"(?P<userinfo>[^/@\s]+@)",
+)
+_QUERY_FRAGMENT_RE = re.compile(r"[?#].*$")
+_ERROR_MAX_LENGTH = 300
+
+
+def _safe_error_text(message: str) -> str:
+    """Strip URL credentials/query strings and cap the length of an error body.
+
+    Transport exceptions are str()'d directly by httpx, which embeds the full
+    request URL.  Redact anything that looks like userinfo or a query/fragment so
+    a token-carrying MCP URL can never be returned by the API, then bound the size.
+    """
+    if not message:
+        return ""
+    text = _URL_CREDENTIAL_RE.sub(r"\g<scheme><redacted>@", message)
+    text = _QUERY_FRAGMENT_RE.sub("", text)
+    if len(text) <= _ERROR_MAX_LENGTH:
+        return text
+    return text[:_ERROR_MAX_LENGTH] + "…"
+
 def _agent_dir() -> Path:
     return AGENT_DIR if AGENT_DIR is not None else common_config.PATHS.agent_dir
 
@@ -28,7 +55,7 @@ class McpService:
         try:
             profile = load_yaml(_agent_dir() / "config.yaml")
         except YamlConfigError as exc:
-            return [McpServerOut(name="config", type="unknown", status="error", error=str(exc))]
+            return [McpServerOut(name="config", type="unknown", status="error", error=_safe_error_text(str(exc)))]
 
         configured = profile.get("mcp_servers", [])
         if not isinstance(configured, list):
@@ -115,4 +142,4 @@ class McpService:
                 error=f"MCP server {name} connect/list_tools timed out",
             )
         except Exception as exc:
-            return McpServerOut(**common, status="error", error=str(exc))
+            return McpServerOut(**common, status="error", error=_safe_error_text(str(exc)))

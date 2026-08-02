@@ -526,6 +526,9 @@ class SessionService:
                             "reason": ev.data.get("reason", "Approval required"),
                             "arguments": ev.data.get("arguments") if isinstance(ev.data.get("arguments"), dict) else {},
                         }
+                        risk = ev.data.get("risk")
+                        if isinstance(risk, str) and risk:
+                            approval_payload["risk"] = risk
                         if isinstance(presentation, dict):
                             approval_payload["presentation"] = presentation
                         yield sse("approval_required", approval_payload)
@@ -539,10 +542,21 @@ class SessionService:
                         "pipeline_id": str(ev.data.get("pipeline_id") or ""),
                     })
                 elif t == "gate_result":
-                    yield sse("gate_result", {
+                    payload: dict[str, object] = {
                         "skill": str(ev.data.get("skill") or ""),
                         "verdict": str(ev.data.get("verdict") or ""),
                         "reason": str(ev.data.get("reason") or ""),
+                    }
+                    if isinstance(ev.data.get("evidence_hash"), str):
+                        payload["evidence_hash"] = ev.data["evidence_hash"]
+                    yield sse("gate_result", payload)
+                elif t == "gate_evidence":
+                    yield sse("gate_evidence", {
+                        "skill": str(ev.data.get("skill") or ""),
+                        "evidence": ev.data.get("evidence")
+                        if isinstance(ev.data.get("evidence"), list)
+                        else [],
+                        "evidence_hash": ev.data.get("evidence_hash"),
                     })
                 elif t == "backtrack":
                     yield sse("backtrack", {

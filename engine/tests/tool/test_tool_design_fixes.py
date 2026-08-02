@@ -653,6 +653,20 @@ def test_registry_excludes_metadata_hidden_tools_from_default_visibility():
     assert registry.list_visible_tool_names(include_disabled=True, include_hidden=True) == [
         "public_tool", "runtime_tool",
     ]
+    # get_schemas must never surface hidden tools to a model-facing view.
+    assert [schema["function"]["name"] for schema in registry.get_schemas()] == ["public_tool"]
+
+
+def test_scoped_registry_does_not_expose_hidden_tool_schemas():
+    """A pipeline node that lists a hidden tool must not widen the model-facing
+    schema list into the hidden set — hidden is an API-level filter, not a
+    caller convention."""
+    registry = ToolRegistry()
+    registry.register("public_tool", "", {}, lambda: "OK")
+    registry.register("runtime_tool", "", {}, lambda: "OK", hidden=True)
+    scoped = registry.scoped_to(["public_tool", "runtime_tool"])
+
+    assert [schema["function"]["name"] for schema in scoped.get_schemas()] == ["public_tool"]
 
 
 def test_register_rejects_invalid_permission_level():

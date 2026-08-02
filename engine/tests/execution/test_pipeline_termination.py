@@ -187,7 +187,7 @@ def test_backtrack_target_missing_terminates_blocked() -> None:
     assert blocked and "not found" in blocked[0].data["reason"]
 
 
-def test_user_disabled_pipeline_skill_is_skipped_without_generic_fallback() -> None:
+def test_user_disabled_pipeline_skill_blocks_without_skipping_the_declared_node() -> None:
     class PassingGate:
         async def check(self, output, context):
             return GateResult("pass", "")
@@ -205,22 +205,38 @@ def test_user_disabled_pipeline_skill_is_skipped_without_generic_fallback() -> N
 
     events = asyncio.run(run())
 
-    assert all(event.type is not EventType.SKILL_START for event in events)
-    assert all(event.type is not EventType.SKILL_END for event in events)
-    assert events[-1].type is EventType.DONE
+    assert [event.type for event in events] == [
+        EventType.ROUTE_DECIDED,
+        EventType.SKILL_START,
+        EventType.SKILL_END,
+        EventType.BLOCKED,
+        EventType.DONE,
+    ]
+    blocked = next(event for event in events if event.type is EventType.BLOCKED)
+    assert "disabled" in blocked.data["reason"]
 
 
-def test_pipeline_with_a_missing_skill_falls_back_to_direct_react() -> None:
-    """An incomplete workflow installation must not run its strict gates as generic ReAct."""
+def test_pipeline_with_a_missing_skill_blocks_without_running_generic_react() -> None:
+    """A declared node must resolve to its Skill; pipelines cannot degrade to ReAct."""
 
     class MissingSkillRegistry:
         def get(self, name):
             return None
 
+    class UnexpectedLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls += 1
+            return ChatResponse(text=_RUBRIC_PASSING_TEXT)
+
+    llm = UnexpectedLLM()
+
     async def run() -> list[ExecutionEvent]:
         events: list[ExecutionEvent] = []
         async for event in run_agent_stream(
-            FakeLLM(), "system prompt", "inspect the configured provider",
+            llm, "system prompt", "inspect the configured provider",
             FakeToolRegistry(), MissingSkillRegistry(), FEATURE_ROUTE,
             SkillChain([SkillNode("understanding", AlwaysFailGate())]), FailureLoopGuard(),
         ):
@@ -229,11 +245,20 @@ def test_pipeline_with_a_missing_skill_falls_back_to_direct_react() -> None:
 
     events = asyncio.run(run())
 
-    assert EventType.BLOCKED not in [event.type for event in events]
-    assert not [event for event in events if event.type is EventType.SKILL_START]
-    assert [event.data["text"] for event in events if event.type is EventType.TEXT_DELTA] == [
-        _RUBRIC_PASSING_TEXT,
+    assert [event.type for event in events] == [
+        EventType.ROUTE_DECIDED,
+        EventType.SKILL_START,
+        EventType.SKILL_END,
+        EventType.BLOCKED,
+        EventType.DONE,
     ]
+    assert next(event for event in events if event.type is EventType.SKILL_END).data == {
+        "skill": "understanding",
+        "status": "blocked",
+    }
+    blocked = next(event for event in events if event.type is EventType.BLOCKED)
+    assert "requires installed Skill" in blocked.data["reason"]
+    assert llm.calls == 0
 
 
 def test_guard_escalates_per_node() -> None:
@@ -451,67 +476,6 @@ def test_backtrack_re_run_handoff_has_no_stale_future_node_output() -> None:
     assert "PLAN-OUTPUT-A" not in planning_rerun
 
 
-# --- P4: retry hint must not leak past a skipped backtrack target ----------
-
-
-def test_backtrack_hint_does_not_leak_when_target_skill_is_disabled() -> None:
-    class FailingThenPassingGate:
-        def __init__(self) -> None:
-            self.failures = 0
-
-        async def check(self, output, context):
-            self.failures += 1
-            if self.failures <= 2:
-                return GateResult("fail", "rejected", retry_hint="LEAK-HINT-MARKER")
-            return GateResult("pass", "ok")
-
-    llm = RecordingLLM([
-        "P-1", "P-2", "P-3",  # planning 三次执行（前两次带 hint 重试/回溯）
-        "F-1",               # final 节点
-    ])
-    chain = SkillChain(
-        [
-            SkillNode("review", PassingGate()),
-            SkillNode("planning", FailingThenPassingGate()),
-            SkillNode("final", PassingGate()),
-        ],
-        backtrack_map={"planning": "review"},
-    )
-
-    async def run():
-        return [
-            event
-            async for event in run_agent_stream(
-                llm,
-                "system prompt",
-                "build a feature",
-                FakeToolRegistry(),
-                FakeSkillRegistry(),
-                FEATURE_ROUTE,
-                chain,
-                FailureLoopGuard(),
-                disabled_skill_names=frozenset({"review"}),
-            )
-        ]
-
-    events = asyncio.run(run())
-
-    # planning 的第二次重试确实拿到了 hint（重试机制本身在起作用）……
-    retry_call = "".join(str(m.get("content", "")) for m in llm.calls[1])
-    assert "LEAK-HINT-MARKER" in retry_call
-    # ……但 review 被禁用跳过时 hint 必须被清掉，planning 回溯后的重跑与
-    # final 节点都不得把它当成自己的 rubric feedback。
-    assert "LEAK-HINT-MARKER" not in "".join(
-        str(m.get("content", "")) for m in llm.calls[2]
-    )
-    assert "LEAK-HINT-MARKER" not in "".join(
-        str(m.get("content", "")) for m in llm.calls[3]
-    )
-    assert [event.data["status"] for event in events if event.type is EventType.SKILL_END] == [
-        "retry", "passed", "passed",
-    ]
-
-
 # --- P3: budget message surfaced on incomplete/failed node ------------------
 
 
@@ -581,29 +545,40 @@ def test_incomplete_node_does_not_surface_a_provider_draft(
     assert EventType.INCOMPLETE in [e.type for e in events]
 
 
-# --- P7: missing-skill fallback replaces the trailing user turn -------------
+# --- P7: a missing pipeline Skill fails closed ------------------------------
 
 
-def test_missing_skill_fallback_replaces_user_turn_instead_of_appending() -> None:
-    class RecordingMissingSkillLLM:
+def test_missing_pipeline_skill_blocks_before_react_or_gate() -> None:
+    """The node has no executable workflow when its declared Skill is absent."""
+
+    class GateMustNotRun:
         def __init__(self) -> None:
-            self.calls: list[list[dict]] = []
+            self.calls = 0
+
+        async def check(self, output, context):
+            self.calls += 1
+            raise AssertionError("a missing Skill must block before its gate")
+
+    class LLMMustNotRun:
+        def __init__(self) -> None:
+            self.calls = 0
 
         async def chat(self, messages, tools=None, prefix_cache_key=None):
-            self.calls.append([dict(m) for m in messages])
-            return ChatResponse(text=_RUBRIC_PASSING_TEXT)
+            self.calls += 1
+            raise AssertionError("a missing Skill must not start generic ReAct")
 
     class MissingSkillRegistry:
         def get(self, name):
             return None
 
-    llm = RecordingMissingSkillLLM()
+    llm = LLMMustNotRun()
+    gate = GateMustNotRun()
 
     async def run():
         return [
             event
             async for event in run_pipeline(
-                SkillChain([SkillNode("planning", AlwaysFailGate())]),
+                SkillChain([SkillNode("planning", gate)]),
                 llm,
                 "build a feature",
                 [
@@ -619,14 +594,16 @@ def test_missing_skill_fallback_replaces_user_turn_instead_of_appending() -> Non
             )
         ]
 
-    asyncio.run(run())
+    events = asyncio.run(run())
 
-    # 兜底 ReAct 复用 base_messages，必须替换末尾 user turn 而不是追加一条
-    # 重复的 user 消息（部分 provider 拒绝连续 user turn）。
-    for call in llm.calls:
-        user_messages = [m for m in call if m.get("role") == "user"]
-        assert len(user_messages) == 1
-        assert user_messages[0]["content"] == "[Skill: planning] build a feature"
+    assert [event.type for event in events] == [
+        EventType.SKILL_START,
+        EventType.SKILL_END,
+        EventType.BLOCKED,
+        EventType.DONE,
+    ]
+    assert gate.calls == 0
+    assert llm.calls == 0
 
 
 # --- P6: provisional ledger survives checkpoint resume ----------------------

@@ -59,7 +59,14 @@ def truncate_output(text: str, tool_name: str = "") -> str:
     filepath = output_dir / filename
 
     try:
-        filepath.write_text(text, encoding="utf-8")
+        # The full output file is a persistent disk sink the model may later
+        # read back via read_file, so it must carry the same embedded-secret
+        # redaction as the audit trail — a grep/read of a credential file
+        # must not round-trip the token onto disk verbatim.
+        from engine.safety.approval import _redact_secret_text
+
+        filepath.write_text(_redact_secret_text(text), encoding="utf-8")
+        filepath.chmod(0o600)
         hint = f"Full output saved to: {filepath}\nUse read_file with offset/limit to view specific sections."
     except Exception:
         hint = "(Failed to save full output to file)"

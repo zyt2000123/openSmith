@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from engine.safety.risk import RiskTier
+
 # Substring parts, matched against a key stripped of non-alphanumerics, so
 # ``db_password``/``clientSecret``/``auth_token`` redact just like ``password``.
 # Exact full-name matching used to let every such variant through into the
@@ -206,6 +208,9 @@ class ApprovalRequest:
     arguments_summary: dict[str, object]
     scope: ApprovalScope | None = None
     presentation: ApprovalPresentation | None = None
+    # Risk tier triaging this approval (see engine.safety.risk).  Carried so
+    # the consumer can render/route the flow without re-deriving it.
+    risk: "RiskTier | None" = None
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -216,6 +221,8 @@ class ApprovalRequest:
             "reason": self.reason,
             "arguments": self.arguments_summary,
         }
+        if self.risk is not None:
+            payload["risk"] = self.risk.value
         if self.scope is not None:
             payload["scope"] = self.scope.to_dict()
         if self.presentation is not None:
@@ -238,14 +245,19 @@ class ApprovalPresentation:
     summary: str
     details: tuple[ApprovalDetail, ...]
     reason: str
+    # Optional risk tier label so a consumer can render the card distinctly.
+    risk: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "title": self.title,
             "summary": self.summary,
             "details": [detail.to_dict() for detail in self.details],
             "reason": self.reason,
         }
+        if self.risk is not None:
+            payload["risk"] = self.risk
+        return payload
 
 
 @dataclass
@@ -350,9 +362,17 @@ _EMBEDDED_SECRET_RE = re.compile(
     r"sk-[A-Za-z0-9_\-]{20,}"
     r"|gh[pousr]_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{22,}"
+    r"|glpat-[A-Za-z0-9_\-]{20,}"
     r"|xox[baprs]-[A-Za-z0-9\-]{16,}"
     r"|AKIA[0-9A-Z]{16}"
+    r"|AIza[0-9A-Za-z_\-]{30,}"
     r"|eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{1,}\.[A-Za-z0-9_\-]{1,}"
+    # A bare Bearer token that is not itself a recognized key family: keep the
+    # word visible ("Bearer ***"), never the credential.  The negative
+    # lookahead lets sk-/gh_/… tokens fall through to their own branch above so
+    # the readable frame stays consistent with the other families.
+    r"|\bBearer\s+(?!sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|AIza|eyJ)"
+    r"[A-Za-z0-9._~+/=\-]{8,}"
     r")"
 )
 

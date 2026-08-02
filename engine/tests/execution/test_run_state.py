@@ -145,6 +145,23 @@ def test_run_state_recovers_interrupted_active_runs_as_resumable(tmp_path: Path)
     assert resumed.status is RunStatus.RUNNING
 
 
+def test_run_state_recovery_skips_a_corrupt_state_file(tmp_path: Path) -> None:
+    """One torn state file must not abort startup recovery of every other run."""
+    store = RunStateStore(tmp_path)
+    store.create("good", agent_id="smith-id")
+    store.transition("good", RunStatus.RUNNING)
+    corrupt = tmp_path / "broken.json"
+    corrupt.write_text("{not-valid-json", encoding="utf-8")
+
+    recovered = store.recover_interrupted()
+
+    assert recovered == ["good"]
+    good = store.get("good")
+    assert good is not None and good.status is RunStatus.CANCELLED
+    # The corrupt file is left untouched for the operator, not overwritten.
+    assert "not-valid-json" in corrupt.read_text(encoding="utf-8")
+
+
 def test_run_state_store_uses_private_atomic_files(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path)
     store.create("run-1", agent_id="smith-id")
