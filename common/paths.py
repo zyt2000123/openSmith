@@ -16,51 +16,60 @@ PRIVATE_FILE_MODE = 0o600
 logger = logging.getLogger(__name__)
 
 
+def _is_agent_smith_root(project_root: Path) -> bool:
+    agents_dir = project_root / "agents"
+    return (
+        (agents_dir / "smith" / "config.yaml").is_file()
+        and (agents_dir / "identities" / "smith.yaml").is_file()
+        and any((agents_dir / "skills").glob("*/SKILL.md"))
+    )
+
+
+def _ensure_real_path(path: Path, *, label: str = "path") -> None:
+    """Reject a symlink at any existing component of a filesystem path."""
+    absolute_path = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute_path.anchor)
+    for part in absolute_path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise RuntimeError(f"Refusing to use symlinked {label}: {current}")
+
+
 def _default_project_root() -> Path:
     configured_root = os.environ.get(PROJECT_ROOT_ENV)
     if configured_root:
         project_root = Path(configured_root).expanduser().resolve()
-        if not (project_root / "agents").is_dir():
+        if not _is_agent_smith_root(project_root):
             raise RuntimeError(
-                f"{PROJECT_ROOT_ENV} must point to an Agent-Smith root containing agents/"
+                f"{PROJECT_ROOT_ENV} must point to an Agent-Smith root with runtime assets"
             )
         return project_root
 
     source_root = Path(__file__).resolve().parent.parent
-    if (source_root / "agents").is_dir():
+    if _is_agent_smith_root(source_root):
         return source_root
 
     # Stricter validation: check for Agent-Smith signature files
     # to avoid mistaking another project's agents/ directory
     working_dir = Path.cwd().resolve()
     for candidate in (working_dir, *working_dir.parents):
-        agents_dir = candidate / "agents"
-        if not agents_dir.is_dir():
+        if not (candidate / "agents").is_dir():
             continue
 
-        # A project root must have every Smith runtime asset. Requiring only
-        # one generic ``agents`` subdirectory can select an unrelated project.
-        is_agent_smith = (
-            (agents_dir / "smith" / "config.yaml").is_file()
-            and (agents_dir / "identities" / "smith.yaml").is_file()
-            and any((agents_dir / "skills").glob("*/SKILL.md"))
-        )
-
-        if is_agent_smith:
+        if _is_agent_smith_root(candidate):
             return candidate
 
-        # Log warning if we skip a candidate (helpful for debugging mismatches)
-        import logging
-        logging.getLogger(__name__).debug(
-            f"Skipping {candidate}: has agents/ but missing Agent-Smith markers"
-        )
+        # Log skipped candidates to make root-discovery mismatches diagnosable.
+        logger.debug("Skipping %s: has agents/ but missing Agent-Smith markers", candidate)
 
-    return source_root
+    raise RuntimeError(
+        "Unable to locate an Agent-Smith project root with runtime assets; "
+        f"set {PROJECT_ROOT_ENV} to a root with runtime assets"
+    )
 
 
 def _ensure_private_dir(path: Path) -> None:
-    if path.is_symlink():
-        raise RuntimeError(f"Refusing to use symlinked private directory: {path}")
+    _ensure_real_path(path, label="private runtime path")
     if path.exists():
         if not path.is_dir():
             raise NotADirectoryError(f"Private runtime path is not a directory: {path}")
@@ -71,6 +80,7 @@ def _ensure_private_dir(path: Path) -> None:
 
 def _ensure_real_descendant(root: Path, path: Path) -> None:
     """Reject symlinks anywhere in a managed target path."""
+    _ensure_real_path(root, label="managed path")
     try:
         parts = path.relative_to(root).parts
     except ValueError as exc:
@@ -86,6 +96,16 @@ def _ensure_real_descendant(root: Path, path: Path) -> None:
 
 
 def _remove_managed_path(root: Path, path: Path) -> None:
+    """Remove a managed path without following a symlink at the final path."""
+    # A stale leaf symlink is safe to unlink: unlink() removes the link itself
+    # and cannot touch its target.  Its parents must still be real managed
+    # directories, otherwise a path such as ``target/link/stale`` could escape
+    # the managed tree.
+    _ensure_real_descendant(root, path.parent)
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+        return
+
     _ensure_real_descendant(root, path)
     if path.is_dir():
         shutil.rmtree(path)
@@ -127,13 +147,43 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_metadata(path: Path) -> dict[str, int]:
+    stat_result = path.stat()
+    return {"mtime_ns": stat_result.st_mtime_ns, "size": stat_result.st_size}
+
+
+def _matches_file_metadata(path: Path, metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    expected_mtime = metadata.get("mtime_ns")
+    expected_size = metadata.get("size")
+    if not isinstance(expected_mtime, int) or not isinstance(expected_size, int):
+        return False
+    actual = _file_metadata(path)
+    return actual["mtime_ns"] == expected_mtime and actual["size"] == expected_size
+
+
+def _manifest_entry_matches(
+    source_file: Path, target_file: Path, entry: object
+) -> bool:
+    if not target_file.is_file() or not isinstance(entry, dict):
+        return False
+    source = entry.get("source")
+    target = entry.get("target")
+    if not isinstance(source, dict) or not isinstance(source.get("sha256"), str):
+        return False
+    return _matches_file_metadata(source_file, source) and _matches_file_metadata(
+        target_file, target
+    )
+
+
 @dataclass(frozen=True)
 class AppPaths:
     data_dir: Path
     project_root: Path
 
     @classmethod
-    def defaults(cls) -> "AppPaths":
+    def defaults(cls) -> AppPaths:
         return cls(
             data_dir=Path.home() / ".agent-smith",
             project_root=_default_project_root(),
@@ -191,8 +241,9 @@ class AppPaths:
         The shipped set is discovered from the bundled directory, so adding a
         skill there needs no second declaration in this layer.
 
-        Incremental sync verifies every shipped file by SHA-256, so an altered
-        managed skill is restored even if its size and timestamp were preserved.
+        Incremental sync uses the manifest's size and nanosecond mtime metadata
+        to skip unchanged files.  When metadata differs, SHA-256 verification
+        decides whether the managed copy must be restored.
         """
         source = self.bundled_skills_dir
         if not source.is_dir():
@@ -203,6 +254,14 @@ class AppPaths:
         _ensure_private_dir(target)
         manifest_path = target / ".manifest.json"
         _prepare_managed_file(target, manifest_path)
+        previous_files: dict[str, object] = {}
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                manifest = None
+            if isinstance(manifest, dict) and isinstance(manifest.get("files"), dict):
+                previous_files = manifest["files"]
 
         shipped = sorted(
             child.name for child in source.iterdir() if (child / "SKILL.md").is_file()
@@ -231,24 +290,22 @@ class AppPaths:
                 _prepare_managed_file(target, target_file)
 
                 # Check if file needs update
-                source_stat = source_file.stat()
                 file_key = str(rel_path)
-                source_digest = _file_digest(source_file)
-                needs_update = (
-                    not target_file.is_file()
-                    or _file_digest(target_file) != source_digest
-                )
+                previous_entry = previous_files.get(file_key)
+                if _manifest_entry_matches(source_file, target_file, previous_entry):
+                    current_manifest["files"][file_key] = previous_entry
+                    continue
 
-                if needs_update:
+                source_digest = _file_digest(source_file)
+                if not target_file.is_file() or _file_digest(target_file) != source_digest:
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source_file, target_file)
                     target_file.chmod(PRIVATE_FILE_MODE)
 
                 # Record in new manifest
                 current_manifest["files"][file_key] = {
-                    "mtime": source_stat.st_mtime,
-                    "size": source_stat.st_size,
-                    "sha256": source_digest,
+                    "source": {**_file_metadata(source_file), "sha256": source_digest},
+                    "target": _file_metadata(target_file),
                 }
 
             # Prune stale files in this skill
@@ -267,7 +324,7 @@ class AppPaths:
 
         # Remove obsolete skills
         for child in target.iterdir():
-            if child.is_dir() and child.name not in shipped:
+            if (child.is_dir() or child.is_symlink()) and child.name not in shipped:
                 _remove_managed_path(target, child)
 
         # Write new manifest

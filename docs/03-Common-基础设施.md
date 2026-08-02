@@ -58,7 +58,7 @@ common/
 
 ### 3.2 `_default_project_root() -> Path`
 
-私有函数，用于确定项目根目录。采用三级回退策略：
+私有函数，用于确定项目根目录。采用环境变量、源码位置和 cwd 搜索三层策略；若都不能定位完整运行时资源，则明确失败而不是返回一个不可用目录。
 
 **第一优先：环境变量**
 
@@ -68,7 +68,7 @@ configured_root = os.environ.get(PROJECT_ROOT_ENV)
 
 若设置了 `AGENT_SMITH_PROJECT_ROOT` 环境变量：
 1. 对路径做 `expanduser()` + `resolve()` 得到绝对路径
-2. 校验该路径下必须存在 `agents/` 子目录，否则抛出 `RuntimeError`
+2. 校验该路径具备 Smith 标记：`agents/smith/config.yaml`、`agents/identities/smith.yaml` 和至少一个 `agents/skills/*/SKILL.md`，否则抛出 `RuntimeError`
 3. 校验通过则返回该路径
 
 **第二优先：源码位置推断**
@@ -77,7 +77,11 @@ configured_root = os.environ.get(PROJECT_ROOT_ENV)
 source_root = Path(__file__).resolve().parent.parent
 ```
 
-取 `paths.py` 所在目录（`common/`）的父目录。若该目录下存在 `agents/` 子目录，则认定为项目根目录并返回。
+取 `paths.py` 所在目录（`common/`）的父目录。仅当该目录同时包含以下 Smith 标记时，才认定为项目根目录并返回：
+
+- `agents/smith/config.yaml`
+- `agents/identities/smith.yaml`
+- 至少一个 `agents/skills/*/SKILL.md`
 
 这是最常见的命中路径 — 在开发环境中从源码目录运行时，`common/` 的父目录就是仓库根。
 
@@ -86,27 +90,32 @@ source_root = Path(__file__).resolve().parent.parent
 ```python
 working_dir = Path.cwd().resolve()
 for candidate in (working_dir, *working_dir.parents):
-    if (candidate / "agents").is_dir():
+    if has_all_smith_markers(candidate):
         return candidate
 ```
 
-从当前工作目录开始，逐级向父目录搜索，找到第一个包含 `agents/` 子目录的目录即返回。
+从当前工作目录开始逐级向父目录搜索，找到第一个具备全部 Smith 标记的目录即返回。单独存在通用的 `agents/` 目录不会命中，避免误将其他项目当作 Smith 根目录。
 
 **兜底**
 
-如果三级策略全部未命中，返回 `source_root`（第二优先级计算的路径）。此时 `agents/` 可能不存在，但至少有一个确定性路径可用。
+如果三层策略全部未命中，抛出 `RuntimeError` 并提示设置 `AGENT_SMITH_PROJECT_ROOT`。这尤其适用于只安装了 `common` wheel 的场景：该 wheel 只携带内置技能 data files，不携带完整的 `agents/` 运行时资产，不能把 `site-packages` 当作项目根目录。
 
 ### 3.3 `_ensure_private_dir(path: Path) -> None`
 
-私有函数，创建目录并强制设置 `0o700` 权限：
+私有函数，创建新的私有目录并拒绝不安全的路径类型：
 
 ```python
 def _ensure_private_dir(path: Path) -> None:
+    _ensure_real_path(path, label="private runtime path")
+    if path.exists():
+        if not path.is_dir():
+            raise NotADirectoryError(...)
+        return
     path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
     path.chmod(PRIVATE_DIR_MODE)
 ```
 
-注意：调用 `mkdir()` 后再次调用 `chmod()` 是因为 `mkdir()` 的 `mode` 参数会被进程的 umask 修改。显式 `chmod()` 确保权限一定是 `0o700`，不受 umask 影响。
+`_ensure_real_path()` 会逐段检查已有祖先和路径本身，拒绝任何符号链接，因此不会通过 `data_dir` 的符号链接父目录在外部创建运行时文件。新建目录后会调用 `chmod()`，避免 `mkdir()` 的 `mode` 被 umask 放宽。已有的真实目录保留原权限，不会被静默收紧；已有普通文件会触发 `NotADirectoryError`。
 
 ### 3.4 `AppPaths` 数据类
 
@@ -166,7 +175,7 @@ def ensure_base_dirs(self) -> None:
     self._install_builtin_skills()
 ```
 
-确保三个关键数据目录存在且权限为 `0o700`，并同步内置技能：
+确保三个关键数据目录存在；新建目录的权限为 `0o700`，已有真实目录保持现有权限，并同步内置技能：
 
 1. `~/.agent-smith/` — 数据根目录
 2. `~/.agent-smith/agent/` — Agent 实例目录
@@ -176,31 +185,36 @@ def ensure_base_dirs(self) -> None:
 
 wheel 安装时，分发来源是 `sysconfig.get_path("data")` 下的 `agent_smith_common/builtin_skills/`；源码开发时才回退到仓库的 `agents/skills/`。若分发来源不存在，技能同步安全地跳过。`agent/skills/` 仍保留给用户安装的技能，不会被此同步覆盖。
 
+`.manifest.json` 记录每个分发文件的 source/target `mtime_ns`、`size` 和源文件 SHA-256。两端元数据均未变化时，后续同步不会重新读取文件内容；任一元数据变化时才计算 SHA-256 并按内容决定是否复制。这样可以恢复普通篡改，同时保留重复启动的低 I/O 路径；刻意伪造时间戳和大小的攻击不在该元数据快路径的完整性保证内。
+
+数据目录及分发目标中的符号链接始终不被跟随：`data_dir` 的任一既有祖先为符号链接时初始化直接失败；若链接占用了本次分发应写入的位置，同步会失败；若它只是 stale 文件或过期技能目录，则只 `unlink()` 链接本身，不会触及外部目标。
+
 ---
 
 ## 4. config.py — 路径常量再导出与初始化
 
-`config.py` 是上层模块引用路径常量的主入口。它的全部逻辑是：
+`config.py` 是上层模块引用路径的主入口。它将 `AppPaths` 延迟初始化，并为旧的模块级常量名称提供兼容访问：
 
-1. 创建一个 `AppPaths.defaults()` 单例
-2. 将所有派生路径展开为模块级常量
-3. 提供 `ensure_dirs()` 初始化函数
+1. 首次访问时创建并缓存一个 `AppPaths.defaults()` 实例
+2. 通过模块级 `__getattr__` 从当前实例派生 `PATHS`、`DATA_DIR` 等兼容名称
+3. 提供 `reset_paths()` 和 `ensure_dirs()`
 
 ### 4.1 模块级常量
 
 ```python
 from .paths import AppPaths
 
-PATHS = AppPaths.defaults()
+_paths_instance: AppPaths | None = None
 
-DATA_DIR = PATHS.data_dir
-AGENT_DIR = PATHS.agent_dir
-SQLITE_PATH = PATHS.sqlite_path
-SMITH_PROFILE_DIR = PATHS.smith_profile_dir
-BUILTIN_IDENTITIES_DIR = PATHS.builtin_identities_dir
-BUILTIN_SKILLS_DIR = PATHS.builtin_skills_dir
-BUILTIN_TOOLS_DIR = PATHS.builtin_tools_dir
-SAFETY_RULES_PATH = PATHS.safety_rules_path
+def _get_paths() -> AppPaths:
+    global _paths_instance
+    if _paths_instance is None:
+        _paths_instance = AppPaths.defaults()
+    return _paths_instance
+
+def __getattr__(name: str):
+    paths = _get_paths()
+    # PATHS and legacy derived-path names are mapped here.
 ```
 
 导出的常量与 `AppPaths` 属性一一对应：
@@ -217,21 +231,23 @@ SAFETY_RULES_PATH = PATHS.safety_rules_path
 | `BUILTIN_TOOLS_DIR` | `builtin_tools_dir` | `<repo>/agents/tools/` |
 | `SAFETY_RULES_PATH` | `safety_rules_path` | `<repo>/agents/safety/dangerous_commands.json` |
 
+`reset_paths(paths)` 可替换缓存实例，供测试或运行时重配置使用。通过 `config.PATHS`、`config.DATA_DIR` 等模块属性访问的代码会观察到替换后的值；`from common.config import PATHS` 遵循 Python 导入绑定语义，会保留导入时的快照，不能用来观察之后的 `reset_paths()`。
+
 ### 4.2 `ensure_dirs() -> None`
 
 ```python
 def ensure_dirs() -> None:
-    PATHS.ensure_base_dirs()
+    _get_paths().ensure_base_dirs()
 ```
 
-委托给 `AppPaths.ensure_base_dirs()`。上层模块（特别是 `database.py`）在首次连接数据库前调用此函数，确保数据目录就绪。
+委托给 `AppPaths.ensure_base_dirs()`。上层可直接调用它确保数据目录就绪；`database.py` 在首次连接时从当前 `config.PATHS` 取得 `AppPaths`，并在线程中直接调用该实例的方法，避免阻塞事件循环。
 
 ### 4.3 设计考量
 
 为什么不直接让上层 `from common.paths import AppPaths` ？
 
 - **简化消费方代码** — `from common.config import SQLITE_PATH` 比 `AppPaths.defaults().sqlite_path` 更简洁
-- **单例语义** — `PATHS` 在模块加载时创建一次，后续所有 import 共享同一实例
+- **惰性单例语义** — 首次访问才创建 `AppPaths`，随后模块属性访问共享缓存实例；`reset_paths()` 是有意的替换点
 - **兼容性** — 上层已大量使用 `from common.config import ...`，此模块作为稳定的公开接口
 
 ---
@@ -242,11 +258,15 @@ def ensure_dirs() -> None:
 
 ```python
 _db: aiosqlite.Connection | None = None
+_db_path: Path | None = None
 _db_lock = asyncio.Lock()
+_db_init_lock = asyncio.Lock()
 ```
 
 - `_db` — 单例连接引用，初始为 `None`
-- `_db_lock` — 异步互斥锁，防止并发初始化竞态
+- `_db_path` — 缓存连接对应的 SQLite 路径；路径切换时旧连接会被关闭
+- `_db_lock` — 保护连接引用、路径和健康检查
+- `_db_init_lock` — 串行化目录准备与新连接创建，避免并发初始化重复工作
 
 ### 5.2 `get_db() -> aiosqlite.Connection`
 
@@ -254,26 +274,28 @@ _db_lock = asyncio.Lock()
 async def get_db() -> aiosqlite.Connection:
 ```
 
-获取全局 SQLite 连接。采用双重检查锁定（Double-Checked Locking）模式：
+获取全局 SQLite 连接。流程如下：
 
 ```
-第一次检查 _db（无锁）
-  └─ 非 None → 直接返回
-  └─ None → 加锁
-      └─ 第二次检查 _db（有锁）
-          └─ 非 None → 释放锁，返回
-          └─ None → 创建连接
+解析当前 config.PATHS 和 sqlite_path
+  └─ 同路径缓存连接 → 执行 SELECT 1
+      ├─ 成功：返回缓存连接
+      └─ 失败：关闭并清除缓存
+  └─ 无可用缓存 → 进入初始化锁并再次检查
+      └─ 在线程中准备目录和同步技能
+      └─ 创建、配置并缓存新连接
 ```
 
 **连接初始化流程：**
 
-1. 调用 `ensure_dirs()` 确保 `~/.agent-smith/sqlite/` 目录存在
-2. `aiosqlite.connect(str(SQLITE_PATH))` 创建连接
+1. 在线程中调用 `paths.ensure_base_dirs()` 确保 `~/.agent-smith/sqlite/` 目录存在，并避免技能哈希/复制阻塞事件循环；此步骤不持有 `_db_lock`
+2. `aiosqlite.connect(str(sqlite_path))` 创建连接
 3. 设置 `db.row_factory = aiosqlite.Row` — 查询结果以 `Row` 对象返回（支持按列名访问）
 4. 执行 `PRAGMA journal_mode=WAL` — 启用 Write-Ahead Logging，允许读写并发
 5. 执行 `PRAGMA foreign_keys=ON` — 启用外键约束（SQLite 默认关闭外键）
 6. 执行 `PRAGMA busy_timeout=5000` — Server 与 Shell 共享数据库文件时，写竞争最多等待 5 秒而非立即报 `database is locked`
-7. 若初始化过程中任何步骤抛异常，立即 `await db.close()` 关闭连接后重新抛出
+7. 缓存连接每次返回前执行轻量 `SELECT 1` 探活；失效连接自动关闭并重建
+8. 若初始化过程中任何步骤抛异常，立即 `await db.close()` 关闭连接后重新抛出
 
 ### 5.3 `close_db() -> None`
 
@@ -283,12 +305,12 @@ async def close_db() -> None:
 
 关闭全局连接并将 `_db` 置为 `None`：
 
-1. 加锁
+1. 获取初始化锁，避免关闭操作与新连接创建交错
 2. 检查 `_db is None` — 若已关闭则直接返回
 3. 将 `_db` 引用取出、置 `None`
 4. 调用 `await db.close()`
 
-先置 `None` 再 `close()` 的顺序确保后续调用不会返回一个正在关闭的连接。`_db_lock` 会让发现 `_db is None` 的并发 `get_db()` 等待关闭完成，再串行创建新连接。
+先置 `None` 再 `close()` 的顺序确保后续调用不会返回一个正在关闭的连接。`_db_lock` 保护缓存状态，`_db_init_lock` 则保证关闭完成后才会开始下一次连接创建。
 
 ### 5.4 WAL 模式说明
 
@@ -322,18 +344,20 @@ class YamlConfigError(ValueError):
 - `load_yaml`: YAML 解析失败
 - `load_yaml`: YAML 根元素不是 mapping（字典）
 - `save_yaml`: Python 对象无法序列化为 YAML
+- `save_yaml`: 写入数据不是 mapping
 
 ### 6.3 `_ensure_private_parent(path: Path) -> None`
 
-私有函数，确保指定路径存在且权限为 `0o700`：
+私有函数，确保指定父目录可安全写入：
 
 ```python
 def _ensure_private_parent(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
-    path.chmod(PRIVATE_DIR_MODE)
+    _ensure_real_path(path)  # 拒绝路径链中的符号链接
+    # 只创建缺失的目录；已有目录保持权限
+    ...
 ```
 
-与 `paths.py` 中的 `_ensure_private_dir` 使用同一套权限常量，但封装为文件父目录的初始化操作。调用者传入的是文件所在目录（即 `p.parent`），而非文件路径本身。
+它复用 `paths.py` 的 `_ensure_real_path()` 逐段检查已有父目录，任一符号链接都会抛出 `RuntimeError`，从而避免 `mkstemp(dir=...)` 经由链接写到外部位置。`save_yaml()` 会额外检查目标文件本身。只对新建目录设置 `0o700`；已有目录保留既有权限；普通文件占据父目录位置时抛出 `NotADirectoryError`。
 
 ### 6.4 `load_yaml(path: Path | str) -> dict[str, Any]`
 
@@ -369,19 +393,20 @@ def save_yaml(path: Path | str, data: Any) -> None:
 
 **原子写入流程：**
 
-1. 调用 `yaml.safe_dump(data, allow_unicode=True, sort_keys=False)` 序列化
+1. 拒绝目标文件或父链中的符号链接，并要求 `data` 为 mapping
+2. 调用 `yaml.safe_dump(data, allow_unicode=True, sort_keys=False)` 序列化
    - `allow_unicode=True` — 中文等非 ASCII 字符直接输出，不转义
    - `sort_keys=False` — 保持字典键的插入顺序
-2. 调用 `_ensure_private_parent(p.parent)` 确保父目录存在且权限为 `0o700`
-3. 在同目录下创建临时文件（`tempfile.mkstemp`）
+3. 调用 `_ensure_private_parent(p.parent)` 确保父目录存在且可安全写入
+4. 在同目录下创建临时文件（`tempfile.mkstemp`）
    - 前缀为 `.<原文件名>.`
    - 后缀为 `.tmp`
    - 同目录确保后续 `os.replace()` 是同文件系统操作（原子性保证）
-4. 将序列化内容写入临时文件
-5. 调用 `f.flush()` + `os.fsync(f.fileno())` 确保数据落盘
-6. 设置临时文件权限为 `0o600`（Owner 可读可写）
-7. 调用 `os.replace(temp_path, p)` 原子替换目标文件
-8. 若任何步骤失败，删除临时文件（`temp_path.unlink(missing_ok=True)`）后重新抛出异常
+5. 将序列化内容写入临时文件
+6. 调用 `f.flush()` + `os.fsync(f.fileno())` 确保数据落盘
+7. 设置临时文件权限为 `0o600`（Owner 可读可写）
+8. 调用 `os.replace(temp_path, p)` 原子替换目标文件
+9. 若任何步骤失败，删除临时文件（`temp_path.unlink(missing_ok=True)`）后重新抛出异常
 
 **原子性保证：**
 - `os.replace()` 在 POSIX 系统上是原子操作
@@ -448,10 +473,10 @@ from common.paths import AppPaths  # 需要自定义路径时
 ```
 config.py ──import──→ paths.py
 database.py ──import──→ config.py ──import──→ paths.py
-yaml_utils.py ──────→ (无内部依赖)
+yaml_utils.py ──import──→ paths.py（复用私有权限常量和符号链接防护）
 ```
 
-`yaml_utils.py` 是完全独立的，不依赖 `common/` 内的其他模块。
+`yaml_utils.py` 不依赖配置或数据库层，只复用 `paths.py` 中的权限常量和路径安全辅助函数。
 
 ### 8.2 谁依赖 common
 
@@ -477,19 +502,19 @@ yaml_utils.py ──────→ (无内部依赖)
 
 | 契约 | 具体要求 |
 |------|---------|
-| 路径稳定性 | `SMITH_PROFILE_DIR`、`BUILTIN_SKILLS_DIR` 等路径在进程生命周期内不变 |
-| 数据库可用性 | `get_db()` 返回已启用 WAL、外键和 5 秒 busy timeout 的连接 |
-| YAML 安全性 | `load_yaml()` 使用 `safe_load`，不会执行危险的 YAML 构造 |
+| 路径稳定性 | 同一缓存 `AppPaths` 实例的派生路径稳定；`reset_paths()` 是显式重配置边界 |
+| 数据库可用性 | `get_db()` 返回已启用 WAL、外键和 5 秒 busy timeout 的可探活连接；缓存失效会自动重连 |
+| YAML 安全性 | `load_yaml()` 使用 `safe_load`，`save_yaml()` 拒绝目标及父链中的符号链接 |
 | 合并确定性 | `merge_configs()` 的覆盖语义一致，`None` 值不覆盖 |
-| 目录就绪 | 调用 `ensure_dirs()` 后，`data_dir`、`agent_dir`、`sqlite/` 目录已存在且权限正确；可用分发资源会同步到 `builtin/skills/` |
+| 目录就绪 | 调用 `ensure_dirs()` 后，`data_dir`、`agent_dir`、`sqlite/` 目录已存在；新建目录为私有权限，可用分发资源会同步到 `builtin/skills/` |
 
 ### 9.2 server 对 common 的期望
 
 | 契约 | 具体要求 |
 |------|---------|
 | 连接生命周期 | `close_db()` 安全关闭连接，支持 FastAPI 的 shutdown 事件 |
-| 幂等初始化 | `ensure_dirs()` 和 `get_db()` 可多次调用，不会出错 |
-| 原子写入 | `save_yaml()` 不会在崩溃时产生半写文件 |
+| 幂等初始化 | `ensure_dirs()` 和 `get_db()` 可多次调用；过期 managed 符号链接会被安全移除 |
+| 原子写入 | `save_yaml()` 不会在崩溃时产生半写文件，也不会跟随目标或父链符号链接 |
 
 ### 9.3 common 不提供的东西
 
@@ -520,7 +545,7 @@ Python 版本要求 `>=3.11`（使用了 `X | Y` 联合类型语法等 3.10+ 特
 
 ### 10.1 内置技能 data files
 
-`[tool.setuptools.data-files]` 将每个内置技能的 `SKILL.md` 以及需要随技能分发的引用文件写入 wheel 的 `agent_smith_common/builtin_skills/` 目录。安装后的 `bundled_skills_dir` 优先读取该位置，因此源码目录存在技能并不等于安装包已经包含它。
+`[tool.setuptools.data-files]` 将每个内置技能的 `SKILL.md` 以及需要随技能分发的引用文件写入 wheel 的 `agent_smith_common/builtin_skills/` 目录。安装后的 `bundled_skills_dir` 优先读取该位置，因此源码目录存在技能并不等于安装包已经包含它。该 `common` wheel 不携带完整的 `agents/smith`、`agents/identities`、tools 或 safety 资源；脱离源码树运行时必须通过 `AGENT_SMITH_PROJECT_ROOT` 指向完整资源根目录。
 
 新增内置技能或其引用文件时，必须同步更新该清单；`server/tests/test_common_infrastructure.py` 会比较包含顶层 `SKILL.md` 的源码技能目录与已声明的技能根目录，防止遗漏技能本体。
 
@@ -542,4 +567,4 @@ uv run pytest tests/test_config_service.py -q
 uv build --wheel common
 ```
 
-验证重点是：私有目录/文件权限、无效 YAML 的错误边界、原子写入、首次 SQLite 初始化的并发收敛，以及 wheel 中的内置技能资源。
+验证重点是：私有目录/文件权限、managed/YAML 符号链接边界、manifest 增量同步、缓存连接探活与异步初始化、无效 YAML 的错误边界、原子写入，以及 wheel 中的内置技能资源。
