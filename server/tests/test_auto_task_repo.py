@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib
 
 import aiosqlite
@@ -205,4 +205,84 @@ async def test_schema_migrates_legacy_space_timestamps_to_iso_format() -> None:
     rows = await db.execute_fetchall("SELECT id, created_at FROM sessions ORDER BY id")
     assert dict(rows[0])["created_at"] == "2026-07-20T12:00:00"
 
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_reset_only_reclaims_expired_leases() -> None:
+    """ensure_schema must not steal a *live* lease from a running worker.
+
+    The shared DB can be opened by several processes (server workers, CLI,
+    dev-reloads); resetting a live lease lets a second process reclaim a task
+    that is still executing, running the same instruction twice.
+    """
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await schema_module.ensure_schema(db)
+    now = datetime.now(timezone.utc).isoformat()
+    future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    await db.execute(
+        "INSERT INTO auto_tasks (id, agent_id, title, description, trigger_type, "
+        "trigger_config, instruction, enabled, status, next_run_at, created_at, "
+        "working_dir, lease_until, lease_token) VALUES "
+        "('live', 'a', 't', '', 'manual', '', 'x', 1, 'running', NULL, ?, ?, ?, ?), "
+        "('expired', 'a', 't', '', 'manual', '', 'x', 1, 'running', NULL, ?, ?, ?, ?)",
+        (now, "wd", future, "live-token", now, "wd", past, "old-token"),
+    )
+    await db.commit()
+
+    # A second process booting now must leave the live lease untouched.
+    await schema_module.ensure_schema(db)
+
+    async with db.execute("SELECT id, status, lease_token FROM auto_tasks ORDER BY id") as cursor:
+        rows = {row["id"]: row for row in await cursor.fetchall()}
+    assert rows["live"]["status"] == "running"
+    assert rows["live"]["lease_token"] == "live-token"
+    assert rows["expired"]["status"] == "idle"
+    assert rows["expired"]["lease_token"] is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_run_is_gated_on_the_owning_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker that lost its lease must not record a stale run row."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await schema_module.ensure_schema(db)
+    repo_module = importlib.import_module("app.infrastructure.repositories.auto_task_repo")
+
+    async def fake_get_app_db():
+        return db
+
+    monkeypatch.setitem(repo_module.AutoTaskRepo.create.__globals__, "get_app_db", fake_get_app_db)
+    repo = AutoTaskRepo()
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO auto_tasks (id, agent_id, title, description, trigger_type, "
+        "trigger_config, instruction, enabled, status, next_run_at, created_at, "
+        "working_dir, lease_until, lease_token) VALUES "
+        "('task-1', 'a', 't', '', 'manual', '', 'x', 1, 'running', NULL, ?, ?, ?, ?)",
+        (now, "wd", now, "current-token"),
+    )
+    run = await repo.create_run("task-1")
+    await db.commit()
+
+    # The current owner records its run fine...
+    finished = await repo.finish_run(
+        run["id"], "completed", "ok", auto_task_id="task-1", lease_token="current-token"
+    )
+    assert finished is not None
+    # ...but a superseded worker (wrong token) cannot overwrite it.
+    await db.execute(
+        "UPDATE auto_tasks SET status='running', lease_token='new-token', lease_until=? "
+        "WHERE id='task-1'",
+        (now,),
+    )
+    await db.commit()
+    stale = await repo.finish_run(
+        run["id"], "completed", "stale", auto_task_id="task-1", lease_token="old-token"
+    )
+    assert stale is None
     await db.close()

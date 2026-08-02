@@ -84,9 +84,13 @@ test("transcript history is bounded for long-running shell sessions", () => {
   assert.equal(last?.kind === "system" ? last.text : "", `line-${TRANSCRIPT_LIMIT + 19}`);
 });
 
-test("SkillChain lifecycle notices obey the transcript bound", () => {
+test("pipeline telemetry does not grow the transcript", () => {
   const store = createAppStore();
 
+  // route_decided is pipeline telemetry: the workflow card already reflects the
+  // running route, so it deliberately renders no system line (transcript-state
+  // applyStreamEvent returns the entries unchanged).  A flood of them must not
+  // grow the transcript or trigger a trim.
   for (let index = 0; index <= TRANSCRIPT_LIMIT; index += 1) {
     store.getState().applyEvent({
       type: "route_decided",
@@ -97,8 +101,8 @@ test("SkillChain lifecycle notices obey the transcript bound", () => {
     });
   }
 
-  assert.equal(store.getState().transcript.length <= TRANSCRIPT_LIMIT, true);
-  assert.equal(store.getState().transcriptEpoch, 1);
+  assert.equal(store.getState().transcript.length, 0);
+  assert.equal(store.getState().transcriptEpoch, 0);
 });
 
 test("token usage tracks the current turn separately from the session total", () => {

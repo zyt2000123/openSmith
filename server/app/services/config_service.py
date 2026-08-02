@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 from collections.abc import Mapping
 from pathlib import Path
@@ -18,6 +20,9 @@ from engine.llm.contracts import UnsupportedProviderError
 # Derived from the engine's own usage enum, never restated so the public
 # configuration contract stays aligned with the engine's supported routes.
 _USAGES = frozenset(usage.value for usage in LLMUsage)
+# A misconfigured or hostile relay must not be able to exhaust server memory
+# through GET /models: cap the accepted body well above any real model list.
+_MAX_RELAY_BODY_BYTES = 5 * 1024 * 1024
 _BASE_STRING_FIELDS = ("provider", "api_key", "base_url", "model")
 _VENDOR_FIELD = "vendor"
 _ROUTE_STRING_FIELDS = _BASE_STRING_FIELDS
@@ -256,18 +261,31 @@ class ConfigService:
         base_url = self._string_or_empty(effective("base_url")).strip().rstrip("/")
         if not api_key or not base_url:
             self._invalid("interactive LLM route needs an API key and base URL to list relay models")
-        self._validate_base_url(base_url, "llm.routes.interactive.base_url")
+        # validate_llm_base_url performs a blocking DNS lookup; run it on a worker
+        # thread so a slow/unresolvable host never stalls the event loop.
+        await asyncio.to_thread(self._validate_base_url, base_url, "llm.routes.interactive.base_url")
 
         try:
             async with httpx.AsyncClient(timeout=5.0, follow_redirects=False, trust_env=False) as client:
-                response = await client.get(f"{base_url}/models", headers={"Authorization": f"Bearer {api_key}"})
-                response.raise_for_status()
+                async with client.stream(
+                    "GET", f"{base_url}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                ) as response:
+                    response.raise_for_status()
+                    content_length = response.headers.get("content-length")
+                    if content_length and content_length.isdigit() and int(content_length) > _MAX_RELAY_BODY_BYTES:
+                        raise HTTPException(502, "Configured relay returned an oversized model list")
+                    body = b""
+                    async for chunk in response.aiter_bytes():
+                        body += chunk
+                        if len(body) > _MAX_RELAY_BODY_BYTES:
+                            raise HTTPException(502, "Configured relay returned an oversized model list")
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="Unable to list models from the configured relay") from exc
 
         try:
-            payload = response.json()
-        except ValueError as exc:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
             raise HTTPException(status_code=502, detail="Configured relay returned an invalid model list") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
             raise HTTPException(status_code=502, detail="Configured relay returned an invalid model list")

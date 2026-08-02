@@ -200,3 +200,38 @@ def test_run_state_fsyncs_the_parent_directory_after_replace(
     restored = store.get("run-1")
     assert restored is not None and restored.status is RunStatus.QUEUED
     assert not list((tmp_path / "runs").glob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_run_event_boundary_preserves_stream_order(tmp_path: Path) -> None:
+    """Concurrent async record() calls must write the trace in stream order.
+
+    The boundary offloads the blocking trace/state I/O to worker threads;
+    asyncio.to_thread alone does not guarantee execution order, which would
+    scramble the hash-chain sequence numbers and the byte-offset cursor.
+    """
+    import asyncio
+
+    from engine.execution.events import EventType, ExecutionEvent
+    from engine.execution.orchestration.lifecycle import _RunEventBoundary
+    from engine.observability.recorder import RunEventRecorder
+    from engine.observability.runtime import RunObservation
+    from engine.observability.trace_store import TraceStore
+
+    trace_store = TraceStore(tmp_path)
+    observation = RunObservation(RunEventRecorder("run-1", trace_store=trace_store))
+    boundary = _RunEventBoundary(None, "run-1", observer=observation)
+
+    async def fire(index: int) -> None:
+        await boundary.record(ExecutionEvent(EventType.TOOL_CALL_START, {"name": f"tool-{index}"}))
+
+    await asyncio.gather(*[fire(index) for index in range(20)])
+
+    records = trace_store.read("run-1")
+    assert len(records) == 20
+    assert [record["data"].get("name") for record in records] == [f"tool-{index}" for index in range(20)]
+    # The hash chain must remain verifiable and the seq strictly ascending.
+    verification = trace_store.verify("run-1")
+    assert verification.ok
+    seqs = [int(record["seq"]) for record in records]
+    assert seqs == sorted(seqs)

@@ -35,7 +35,11 @@ export function oneLine(value: unknown, maxLength = 240): string {
 
 function detailLabel(key: string): string {
   if (DETAIL_LABELS[key]) return DETAIL_LABELS[key];
-  return key.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+  // The key is a raw model-authored tool-argument name; sanitize it like the
+  // values so escape sequences can never reach the terminal through a label.
+  return sanitizeTerminalText(key)
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 export function approvalSummary(approval: PendingApproval): string {

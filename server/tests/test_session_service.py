@@ -62,6 +62,34 @@ class FakeSessionRepo:
     async def get_messages(self, session_id: str, limit: int = 0, offset: int = 0) -> list[dict]:
         return self.messages[offset:] if limit == 0 else self.messages[offset : offset + limit]
 
+    async def get_message(self, session_id: str, message_id: str) -> dict | None:
+        return next(
+            (m for m in self.messages if m["id"] == message_id),
+            None,
+        )
+
+    async def get_messages_since(
+        self, session_id: str, message_id: str, limit: int = 20
+    ) -> list[dict]:
+        try:
+            start = next(
+                index for index, m in enumerate(self.messages) if m["id"] == message_id
+            )
+        except StopIteration:
+            return []
+        return self.messages[start + 1 : start + 1 + limit]
+
+    async def get_messages_before(
+        self, session_id: str, message_id: str, limit: int
+    ) -> list[dict]:
+        try:
+            end = next(
+                index for index, m in enumerate(self.messages) if m["id"] == message_id
+            )
+        except StopIteration:
+            return []
+        return self.messages[max(0, end - limit) : end]
+
     async def get_recent_messages(self, session_id: str, limit: int) -> list[dict]:
         return []
 

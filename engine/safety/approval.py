@@ -127,9 +127,13 @@ class ApprovalScope:
         return "Access limited to this exact approved request"
 
     def to_dict(self) -> dict[str, object]:
+        # Redact secrets in the serialized target: the host_command target is
+        # the raw shell command and may carry tokens/keys that must not cross
+        # the server boundary (approval matching still uses the unredacted
+        # internal ``self.target``).
         return {
             "kind": self.kind,
-            "target": self.target,
+            "target": _redact_secret_text(self.target),
             "access": list(self.access),
             "high_risk": self.high_risk,
         }

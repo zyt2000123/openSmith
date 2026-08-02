@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -20,5 +20,20 @@ export async function localAuthHeaders(): Promise<Record<string, string>> {
   }
 
   if (!token) throw new Error("Local Smith auth token is empty.");
+
+  // The token authenticates this machine's API.  If it is group/world readable,
+  // warn once so a loose umask does not silently leak it to other local users.
+  try {
+    const info = await stat(AUTH_TOKEN_PATH);
+    if (info.mode & 0o077) {
+      console.warn(
+        `Warning: ${AUTH_TOKEN_PATH} is readable by other users (mode 0${(info.mode & 0o777).toString(8)}); ` +
+          "chmod 600 it to keep the local API token private.",
+      );
+    }
+  } catch {
+    // Permission problems surface at the read above; do not fail auth over a stat.
+  }
+
   return buildAuthHeaders(token);
 }

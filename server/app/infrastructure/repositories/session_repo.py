@@ -144,17 +144,46 @@ class SessionRepo:
 
     async def get_messages(self, session_id: str, limit: int = 0, offset: int = 0) -> list[dict]:
         db = await get_app_db()
-        if limit > 0 or offset > 0:
-            effective_limit = limit if limit > 0 else -1
-            rows = await db.execute_fetchall(
-                "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
-                (session_id, effective_limit, offset),
-            )
-        else:
-            rows = await db.execute_fetchall(
-                "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC",
-                (session_id,),
-            )
+        # 0 historically meant "everything", which buffers a whole long session
+        # into memory on every call.  Treat it as a bounded default; callers that
+        # genuinely need the full transcript pass an explicit limit.
+        effective_limit = limit if limit > 0 else 200
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
+            (session_id, effective_limit, offset),
+        )
+        return [dict(r) for r in rows]
+
+    async def get_message(self, session_id: str, message_id: str) -> dict | None:
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND id=?", (session_id, message_id)
+        )
+        return dict(rows[0]) if rows else None
+
+    async def get_messages_since(
+        self, session_id: str, message_id: str, limit: int = 20
+    ) -> list[dict]:
+        """Rows strictly after ``message_id`` (by rowid), bounded and ascending."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND rowid > "
+            "(SELECT rowid FROM messages WHERE id=?) ORDER BY created_at ASC LIMIT ?",
+            (session_id, message_id, limit),
+        )
+        return [dict(r) for r in rows]
+
+    async def get_messages_before(
+        self, session_id: str, message_id: str, limit: int
+    ) -> list[dict]:
+        """Rows strictly before ``message_id`` (by rowid), bounded, ascending."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND rowid < "
+            "(SELECT rowid FROM messages WHERE id=?) ORDER BY created_at DESC LIMIT ?",
+            (session_id, message_id, limit),
+        )
+        rows.reverse()
         return [dict(r) for r in rows]
 
     async def add_message(self, session_id: str, role: str, content: str) -> dict:

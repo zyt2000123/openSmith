@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncGenerator
 from uuid import uuid4
@@ -269,13 +269,25 @@ def _fact_gate_for_request(
 
 @dataclass(frozen=True)
 class _RunEventBoundary:
-    """Fan events into execution state and an optional observer Adapter."""
+    """Fan events into execution state and an optional observer Adapter.
+
+    The async methods offload the (deliberately fsynced) persistence I/O to a
+    worker thread so a busy disk never stalls the server's event loop.  The
+    per-boundary lock serializes the offloads: ``asyncio.to_thread`` alone does
+    not guarantee execution order, and the run trace's sequence numbers and the
+    byte-offset cursor depend on records being written in stream order.
+    """
 
     state_store: RunStateStore | None
     run_id: str
     observer: RunEventObserver | None = None
+    _serial: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def record(self, event: ExecutionEvent) -> None:
+    async def record(self, event: ExecutionEvent) -> None:
+        async with self._serial:
+            await asyncio.to_thread(self._record_sync, event)
+
+    def _record_sync(self, event: ExecutionEvent) -> None:
         project_execution_event(self.state_store, self.run_id, event)
         if self.observer is not None:
             try:
@@ -288,18 +300,26 @@ class _RunEventBoundary:
                     exc_info=True,
                 )
 
-    def append_prompt_manifest(self, manifest: dict[str, object]) -> None:
-        if self.observer is not None:
-            try:
-                self.observer.append_prompt_manifest(manifest)
-            except Exception:
-                logger.warning(
-                    "run observer rejected prompt manifest (run=%s)",
-                    self.run_id,
-                    exc_info=True,
-                )
+    async def append_prompt_manifest(self, manifest: dict[str, object]) -> None:
+        if self.observer is None:
+            return
+        async with self._serial:
+            await asyncio.to_thread(self._append_manifest_sync, manifest)
 
-    def bind_identity(self, identity_id: str) -> None:
+    def _append_manifest_sync(self, manifest: dict[str, object]) -> None:
+        try:
+            self.observer.append_prompt_manifest(manifest)
+        except Exception:
+            logger.warning(
+                "run observer rejected prompt manifest (run=%s)",
+                self.run_id,
+                exc_info=True,
+            )
+
+    async def bind_identity(self, identity_id: str) -> None:
+        async with self._serial:
+            await asyncio.to_thread(self._bind_identity_sync, identity_id)
+    def _bind_identity_sync(self, identity_id: str) -> None:
         if self.state_store is not None:
             try:
                 self.state_store.bind_identity(self.run_id, identity_id)
@@ -436,8 +456,15 @@ async def _cancel_unstarted_run(
         "status": RunStatus.CANCELLED.value,
         "reason": "consumer_disconnected",
     })
-    event_boundary.record(cancelled_event)
     cancellation: asyncio.CancelledError | None = None
+    try:
+        await event_boundary.record(cancelled_event)
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+    except Exception:
+        logger.warning(
+            "failed to record cancelled run event (run=%s)", run_id, exc_info=True
+        )
     try:
         await services.close()
     except asyncio.CancelledError as exc:
@@ -476,7 +503,7 @@ def _failed_setup_stream(
                     {"run_id": run_id, "status": "failed", "reason": reason},
                 ),
             ):
-                boundary.record(event)
+                await boundary.record(event)
                 yield event
         finally:
             try:
@@ -589,14 +616,14 @@ async def _run_events_with_runtime(
                 "project_path": request.working_dir or "",
             },
         )
-        boundary.record(run_started)
+        await boundary.record(run_started)
         yield run_started
         s = await prepare_runtime(request, runtime, services)
-        boundary.bind_identity(s.identity.id)
+        await boundary.bind_identity(s.identity.id)
         execution_stage = "agent_execution"
         state_dir = s.state_dir
         if hasattr(s, "prompt_manifest"):
-            boundary.append_prompt_manifest(s.prompt_manifest)
+            await boundary.append_prompt_manifest(s.prompt_manifest)
         guard = FailureLoopGuard()
         with use_fact_gate(_fact_gate_for_request(request, runtime, services)), use_approval_context(
             APPROVAL_BROKER, run_id
@@ -639,7 +666,7 @@ async def _run_events_with_runtime(
                     terminal_reason = "awaiting_user_input"
                 elif _has_successful_tool_evidence(event):
                     had_tools = True
-                boundary.record(event)
+                await boundary.record(event)
                 yield event
         drained = True
     except Exception as exc:
@@ -654,16 +681,16 @@ async def _run_events_with_runtime(
         failure_text = ExecutionEvent(EventType.TEXT_DELTA, {
             "text": f"⚠️ 执行失败：{type(exc).__name__}（详情见服务端日志）",
         })
-        boundary.record(failure_text)
+        await boundary.record(failure_text)
         yield failure_text
         failure_event = ExecutionEvent(EventType.FAILED, {
             "reason": terminal_reason,
             "error": terminal_error,
         })
-        boundary.record(failure_event)
+        await boundary.record(failure_event)
         yield failure_event
         done_event = ExecutionEvent(EventType.DONE, {})
-        boundary.record(done_event)
+        await boundary.record(done_event)
         yield done_event
         drained = True
     finally:
@@ -701,7 +728,16 @@ async def _run_events_with_runtime(
                 "status": RunStatus.CANCELLED.value,
                 "reason": "consumer_disconnected",
             })
-            boundary.record(cancelled_event)
+            try:
+                await boundary.record(cancelled_event)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except Exception:
+                logger.warning(
+                    "failed to record cancelled run event (run=%s)",
+                    run_id,
+                    exc_info=True,
+                )
         # Stop hooks 在每轮响应结束时批量处理（成本跟踪、状态持久化等）。
         # 调用在资源清理之前，让写入型 StopHook 能拿到完整的会话上下文。
         if services.hook_registry is not None:
@@ -742,7 +778,7 @@ async def _run_events_with_runtime(
             # 让前端有机会提示"本轮未写入长期记忆"。
             terminal_data["memory_persist_failed"] = True
         finished_event = ExecutionEvent(EventType.RUN_FINISHED, terminal_data)
-        boundary.record(finished_event)
+        await boundary.record(finished_event)
         yield finished_event
 
 

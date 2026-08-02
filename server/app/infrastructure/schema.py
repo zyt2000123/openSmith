@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import aiosqlite
 
 # All rows are written with explicit ISO-8601 timestamps by the repositories;
@@ -199,14 +201,32 @@ async def _ensure_token_usage_columns(db: aiosqlite.Connection) -> None:
 
 
 async def _reset_stuck_auto_tasks(db: aiosqlite.Connection) -> None:
-    """Reset tasks stuck at 'running' from a prior crash."""
+    """Reset tasks stuck at 'running' from a prior crash.
+
+    Only rows whose lease has expired (or that never got one) are reset.  The
+    shared DB can be opened by several processes (server workers, CLI sessions,
+    dev-reloads); resetting a *live* lease would let a second process reclaim a
+    task that is still executing, so two workers would run the same instruction.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT id FROM auto_tasks WHERE status='running' "
+        "AND (lease_until IS NULL OR lease_until <= ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    expired_ids = [str(row["id"]) for row in rows]
+    if not expired_ids:
+        return
+    placeholders = ",".join("?" for _ in expired_ids)
     await db.execute(
         "UPDATE auto_tasks SET status='idle', lease_until=NULL, lease_token=NULL "
-        "WHERE status='running'"
+        f"WHERE id IN ({placeholders})",
+        expired_ids,
     )
     await db.execute(
         "UPDATE auto_task_runs SET status='failed', error='interrupted by restart', "
-        f"finished_at={_ISO_NOW} WHERE status='running'"
+        f"finished_at={_ISO_NOW} WHERE status='running' "
+        f"AND auto_task_id IN ({placeholders})",
+        expired_ids,
     )
 
 

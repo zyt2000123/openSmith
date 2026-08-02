@@ -109,6 +109,8 @@ export type AppState = {
   pendingApproval: PendingApproval | null;
   approvalIndex: number;
   approvalResolving: boolean;
+  /** Tool call whose result may settle the pending approval prompt. */
+  lastToolCallId: string | null;
   modelPicker: ModelPickerState | null;
   inputValue: string;
   inputHistory: string[];
@@ -221,6 +223,14 @@ function applyBoundedStreamEvent(state: AppState, event: StreamEvent): Partial<A
 function clearApprovalOnToolResult(state: AppState, event: StreamEvent, next: Partial<AppState>): Partial<AppState> {
   if (event.type !== "tool_result" || !state.pendingApproval) return next;
 
+  // Only the tool that the pending approval is FOR may settle the prompt.  A
+  // stray or duplicate result (SSE retry, gate-blocked, a different overlapping
+  // stream) must not silently discard the user's Allow/Deny.  When no tool_call
+  // has been seen for this run (lastToolCallId null), fall back to clearing.
+  if (state.lastToolCallId !== null && event.id && event.id !== state.lastToolCallId) {
+    return next;
+  }
+
   return {
     ...next,
     pendingApproval: null,
@@ -289,22 +299,50 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
     };
   }
 
-  if (event.type === "approval_required") {
+  if (event.type === "tool_call") {
     return {
-      pendingApproval: event,
-      approvalIndex: 0,
-      approvalResolving: false,
-      // The full-screen tokens/runs panels replace the footer that renders the
-      // approval prompt, so leaving the panel up would ask the user to approve
-      // a tool call they cannot see.  Return to chat and let them read it.
-      ...(state.panel === "tokens" || state.panel === "runs" ? { panel: "chat" as const } : {}),
-      statusLine: "Approval required. Review the request and choose Allow or Deny.",
+      lastToolCallId: event.id,
       toolActivity: applyToolActivity(state.toolActivity, event),
       ...applyBoundedStreamEvent(state, event),
     };
   }
 
+  if (event.type === "approval_required") {
+    return applyApprovalRequired(state, event);
+  }
+
   return {
+    toolActivity: applyToolActivity(state.toolActivity, event),
+    ...applyBoundedStreamEvent(state, event),
+  };
+}
+
+function applyApprovalRequired(
+  state: AppState,
+  event: Extract<StreamEvent, { type: "approval_required" }>,
+): Partial<AppState> {
+  // A stale approval_required (resumed stream, replayed buffer) must never
+  // display run A's command while the user's decision resolves run B: only
+  // accept it when it names the run currently being streamed.
+  if (state.recoverableRunId && event.runId && event.runId !== state.recoverableRunId) {
+    return {
+      toolActivity: applyToolActivity(state.toolActivity, event),
+      ...applyBoundedStreamEvent(state, event),
+    };
+  }
+  // A duplicate re-emission of the SAME approval while a resolve POST is in
+  // flight must not drop the in-flight lock (which would let a second Enter
+  // race the first).
+  const duplicateWhileResolving = state.approvalResolving && state.pendingApproval?.approvalId === event.approvalId;
+  return {
+    pendingApproval: event,
+    approvalIndex: 0,
+    approvalResolving: duplicateWhileResolving ? state.approvalResolving : false,
+    // The full-screen tokens/runs panels replace the footer that renders the
+    // approval prompt, so leaving the panel up would ask the user to approve
+    // a tool call they cannot see.  Return to chat and let them read it.
+    ...(state.panel === "tokens" || state.panel === "runs" ? { panel: "chat" as const } : {}),
+    statusLine: "Approval required. Review the request and choose Allow or Deny.",
     toolActivity: applyToolActivity(state.toolActivity, event),
     ...applyBoundedStreamEvent(state, event),
   };
@@ -350,6 +388,7 @@ export function createAppStore(initialHistory: string[] = []) {
     pendingApproval: null,
     approvalIndex: 0,
     approvalResolving: false,
+    lastToolCallId: null,
     modelPicker: null,
     inputValue: "",
     inputHistory: initialHistory,
@@ -380,7 +419,16 @@ export function createAppStore(initialHistory: string[] = []) {
     skillMentionIndex: 0,
     welcomeNotice: null,
 
-    set: (partial) => set(partial),
+    set: (partial) => {
+      if (partial && "statusLine" in partial && typeof partial.statusLine === "string") {
+        // statusLine embeds server-derived paths, MCP error text, and model
+        // names; sanitise it at the single store boundary so no caller has to
+        // remember.
+        set({ ...partial, statusLine: sanitizeTerminalText(partial.statusLine) });
+      } else {
+        set(partial);
+      }
+    },
 
     pushHistory: (text) =>
       set((s) => ({

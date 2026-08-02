@@ -226,11 +226,20 @@ llm:
     calls: list[tuple[str, dict[str, str]]] = []
 
     class FakeResponse:
+        headers: dict[str, str] = {}
+
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> object:
-            return {"object": "list", "data": [{"id": "GLM-5.2"}, {"id": "gpt-4.1"}, {"id": "GLM-5.2"}]}
+        async def aiter_bytes(self):
+            yield b'{"object": "list", "data": [{"id": "GLM-5.2"}, {"id": "gpt-4.1"}, {"id": "GLM-5.2"}]}'
+
+    class FakeStream:
+        async def __aenter__(self) -> FakeResponse:
+            return FakeResponse()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
 
     class FakeClient:
         async def __aenter__(self):
@@ -243,10 +252,14 @@ llm:
             calls.append((url, headers))
             return FakeResponse()
 
+        def stream(self, _method: str, url: str, *, headers: dict[str, str]) -> FakeStream:
+            calls.append((url, headers))
+            return FakeStream()
+
     monkeypatch.setattr(
         config_service_module,
         "httpx",
-        SimpleNamespace(AsyncClient=lambda **_kwargs: FakeClient()),
+        SimpleNamespace(AsyncClient=lambda **_kwargs: FakeClient(), HTTPError=Exception),
         raising=False,
     )
 
@@ -307,11 +320,20 @@ llm:
     monkeypatch.setattr(ConfigService, "_config_path", config_path)
 
     class FakeResponse:
+        headers: dict[str, str] = {}
+
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> object:
-            return {"models": ["GLM-5.2"]}
+        async def aiter_bytes(self):
+            yield b'{"models": ["GLM-5.2"]}'
+
+    class FakeStream:
+        async def __aenter__(self) -> FakeResponse:
+            return FakeResponse()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
 
     class FakeClient:
         async def __aenter__(self):
@@ -324,10 +346,13 @@ llm:
             assert headers == {"Authorization": "Bearer relay-secret"}
             return FakeResponse()
 
+        def stream(self, *_args: object, **_kwargs: object) -> FakeStream:
+            return FakeStream()
+
     monkeypatch.setattr(
         config_service_module,
         "httpx",
-        SimpleNamespace(AsyncClient=lambda **_kwargs: FakeClient()),
+        SimpleNamespace(AsyncClient=lambda **_kwargs: FakeClient(), HTTPError=Exception),
     )
 
     with pytest.raises(HTTPException, match="invalid model list") as exc_info:

@@ -88,8 +88,8 @@ async def delete_session(
 @router.get("/sessions/{session_id}/messages", response_model=list[MessageOut])
 async def list_messages(
     session_id: str,
-    limit: int = Query(default=0, ge=0),
-    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=0, ge=0, le=1000),
+    offset: int = Query(default=0, ge=0, le=100_000),
     svc: AgentService = Depends(get_agent_service),
 ):
     return await svc.list_messages(session_id, limit=limit, offset=offset)

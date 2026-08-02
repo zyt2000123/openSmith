@@ -92,7 +92,12 @@ function changedRanges(left: string, right: string): { left: ChangedRange[]; rig
 function hunkStart(line: string): { old: number; next: number } | null {
   const match = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/u);
   if (!match?.[1] || !match[2]) return null;
-  return { old: Number(match[1]), next: Number(match[2]) };
+  // A 400-digit line number in a hostile patch parses to Infinity and renders
+  // "Infinity" gutters; clamp to what line counters can ever produce.
+  const old = Number(match[1]);
+  const next = Number(match[2]);
+  if (!Number.isFinite(old) || !Number.isFinite(next)) return null;
+  return { old, next };
 }
 
 type DiffCursor = {

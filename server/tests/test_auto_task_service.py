@@ -76,7 +76,16 @@ class FakeAutoTaskRepo:
             "error": None,
         }
 
-    async def finish_run(self, run_id: str, status: str, output: str, error: str | None = None) -> dict:
+    async def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        output: str,
+        error: str | None = None,
+        *,
+        auto_task_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> dict:
         row = {
             "id": run_id,
             "auto_task_id": "task-1",
@@ -634,3 +643,58 @@ async def test_hung_engine_run_times_out_and_releases_the_slot(
 
     assert finished["status"] == "failed"
     assert "timed out" in (finished["error"] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_manual_trigger_respects_the_concurrency_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual trigger must not start more detached runs than _MAX_CONCURRENT_RUNS.
+
+    The cap was enforced only in tick(); the /trigger path bypassed it, so a
+    caller could loop over N tasks and run N engine turns with no bound.
+    """
+    release = asyncio.Event()
+
+    async def blocking_reply(request, runtime, services):
+        await release.wait()
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    task_repo = FakeAutoTaskRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+
+    started = []
+    for _ in range(auto_task_service_module._MAX_CONCURRENT_RUNS):
+        started.append(await service.start_auto_task(_task()))
+    assert all(item is not None for item in started)
+    # At the cap, start_auto_task must refuse rather than spawn a 5th run.
+    assert await service.start_auto_task(_task()) is None
+
+    release.set()
+    await _drain_background_runs()
+
+
+@pytest.mark.asyncio
+async def test_trigger_returns_429_when_at_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    async def blocking_reply(request, runtime, services):
+        await release.wait()
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    task_repo = FakeAutoTaskRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+
+    for _ in range(auto_task_service_module._MAX_CONCURRENT_RUNS):
+        assert await service.start_auto_task(_task()) is not None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.trigger_auto_task("smith-id", "task-1")
+    assert exc_info.value.status_code == 429
+
+    release.set()
+    await _drain_background_runs()

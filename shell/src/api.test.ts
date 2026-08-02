@@ -255,6 +255,40 @@ test("streamMessage ignores events after the first terminal event", async () => 
   }
 });
 
+test("trailing token_usage after done is not dropped", async () => {
+  const originalFetch = globalThis.fetch;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        new TextEncoder().encode(
+          'event: done\ndata: {"id":"message-1"}\n\nevent: token_usage\ndata: {"input_tokens":1,"output_tokens":2,"total_tokens":3}\n\n',
+        ),
+      );
+    },
+  });
+
+  globalThis.fetch = async () =>
+    new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+
+  try {
+    const events = [];
+    for await (const event of streamMessage("http://127.0.0.1:8140", "session-1", "hello", { timeoutMs: 1_000 })) {
+      events.push(event);
+    }
+    // The terminal event is still the stream terminator; usage counters framed
+    // after it in the same buffer must still reach the store.
+    assert.deepEqual(events, [
+      { type: "done", id: "message-1", status: "completed" },
+      { type: "token_usage", input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("SSE decoder retains a tool preflight result", () => {
   const event = decodeSseEvent('event: tool_result\ndata: {"id":"tool-1","preflight":true,"summary":"facts first"}');
 

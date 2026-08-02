@@ -443,16 +443,41 @@ def _is_read_only_git(args: list[str]) -> bool:
 def _is_read_only_sed(args: list[str]) -> bool:
     if any(arg.startswith("-i") or arg.startswith("--in-place") for arg in args):
         return False
-    scripts = [arg for arg in args if arg not in {"-n", "--quiet", "--silent", "-e", "--expression"}]
+    # Collect scripts from `-e`/`--expression` pairs and positionals.  The old
+    # filter-based approach only validated ``scripts[0]``, so
+    # ``sed -e '1p' -e 'w /tmp/pwn' /etc/hosts`` slipped through with an
+    # unvalidated write script.  Every script (explicit or positional) must
+    # consist only of read-only print commands.
+    scripts: list[str] = []
+    input_files: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in {"-n", "--quiet", "--silent"}:
+            i += 1
+        elif arg in {"-e", "--expression"}:
+            if i + 1 >= len(args) or not args[i + 1]:
+                return False
+            scripts.append(args[i + 1])
+            i += 2
+        elif arg.startswith("-"):
+            # Unrecognized flag: be conservative and treat as mutating.
+            return False
+        else:
+            input_files.append(arg)
+            i += 1
     if not scripts:
-        return False
-    # The first positional is the script (subsequent positionals are input
-    # files). A script may contain ``;``/newline-separated sub-commands; every
-    # one of them must be a read-only print command for the whole call to be
-    # treated as read-only, otherwise a hidden write command (e.g. ``w``)
-    # could slip through.
+        # No explicit `-e`; the first positional is the script and the rest
+        # are input files.
+        if not input_files:
+            return False
+        scripts = [input_files[0]]
+        input_files = input_files[1:]
     pattern = re.compile(r"(?:\d+|\$)(?:,(?:\d+|\$))?p")
-    sub_cmds = [part.strip() for part in re.split(r"[;\n]", scripts[0]) if part.strip()]
-    if not sub_cmds:
-        return False
-    return all(pattern.fullmatch(cmd) for cmd in sub_cmds)
+    for script in scripts:
+        sub_cmds = [part.strip() for part in re.split(r"[;\n]", script) if part.strip()]
+        if not sub_cmds:
+            return False
+        if not all(pattern.fullmatch(cmd) for cmd in sub_cmds):
+            return False
+    return True

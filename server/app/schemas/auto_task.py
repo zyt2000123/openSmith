@@ -4,21 +4,28 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 TriggerType = Literal["manual", "cron", "interval"]
 
+# Bounds keep a single task from becoming a permanent retry loop (unbounded LLM
+# spend) or growing the database without limit.  Keep these in sync with
+# auto_task_service limits if they ever change.
+MAX_RETRIES_CAP = 10
+MIN_INTERVAL_SECONDS = 60
+_TITLE_MAX = 200
+_DESCRIPTION_MAX = 2000
+_INSTRUCTION_MAX = 100_000
+
 
 class AutoTaskCreate(BaseModel):
-    title: str
-    description: str = ""
+    title: str = Field(max_length=_TITLE_MAX)
+    description: str = Field(default="", max_length=_DESCRIPTION_MAX)
     trigger_type: TriggerType = "manual"
     trigger_config: str = ""
-    instruction: str
-    working_dir: str = Field(min_length=1)
+    instruction: str = Field(max_length=_INSTRUCTION_MAX)
+    working_dir: str = Field(min_length=1, max_length=2000)
     enabled: bool = True
-    max_retries: int = 2
+    max_retries: int = Field(default=2, ge=0, le=MAX_RETRIES_CAP)
 
     @model_validator(mode="after")
     def _validate_trigger_config(self) -> "AutoTaskCreate":
-        if self.max_retries < 0:
-            raise ValueError("max_retries must be non-negative")
         if self.trigger_type == "cron" and not self.trigger_config.strip():
             raise ValueError("trigger_config is required for cron trigger_type")
         if self.trigger_type == "interval":
@@ -29,8 +36,10 @@ class AutoTaskCreate(BaseModel):
                 val = int(cfg)
             except ValueError:
                 raise ValueError("trigger_config must be an integer (seconds) for interval trigger_type")
-            if val <= 0:
-                raise ValueError("interval trigger_config must be a positive integer")
+            if val < MIN_INTERVAL_SECONDS:
+                raise ValueError(
+                    f"interval trigger_config must be at least {MIN_INTERVAL_SECONDS}s"
+                )
         return self
 
     @field_validator("working_dir")
@@ -42,14 +51,14 @@ class AutoTaskCreate(BaseModel):
 
 
 class AutoTaskUpdate(BaseModel):
-    title: str | None = None
-    description: str | None = None
+    title: str | None = Field(default=None, max_length=_TITLE_MAX)
+    description: str | None = Field(default=None, max_length=_DESCRIPTION_MAX)
     trigger_type: TriggerType | None = None
     trigger_config: str | None = None
-    instruction: str | None = None
-    working_dir: str | None = None
+    instruction: str | None = Field(default=None, max_length=_INSTRUCTION_MAX)
+    working_dir: str | None = Field(default=None, min_length=1, max_length=2000)
     enabled: bool | None = None
-    max_retries: int | None = None
+    max_retries: int | None = Field(default=None, ge=0, le=MAX_RETRIES_CAP)
 
     @field_validator("max_retries")
     @classmethod

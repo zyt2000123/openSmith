@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -23,6 +24,24 @@ from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
 from engine.execution.events import EventType, ExecutionEvent
 
 logger = logging.getLogger(__name__)
+
+# A RunStateStore can be written from the engine's streaming turn (offloaded to
+# a worker thread so the blocking fsync never stalls the server event loop) and
+# concurrently from the server event loop itself (resolve_approval).  Each is a
+# read-modify-write of the same JSON file; without a per-root lock two writers
+# can interleave and lose an update.  The lock is shared across store instances
+# for the same root so engine threads and the server loop serialize.
+_ROOT_LOCKS: dict[Path, threading.RLock] = {}
+_ROOT_LOCKS_GUARD = threading.Lock()
+
+
+def _root_lock(root: Path) -> threading.RLock:
+    with _ROOT_LOCKS_GUARD:
+        lock = _ROOT_LOCKS.get(root)
+        if lock is None:
+            lock = threading.RLock()
+            _ROOT_LOCKS[root] = lock
+        return lock
 
 
 class RunStatus(str, Enum):
@@ -331,6 +350,7 @@ class RunStateStore:
         self.root = Path(profile_dir) / "runs"
         self.root.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
         self.root.chmod(PRIVATE_DIR_MODE)
+        self._lock = _root_lock(self.root)
 
     @staticmethod
     def _validate_run_id(run_id: str) -> str:
@@ -352,20 +372,21 @@ class RunStateStore:
         working_dir: str | None = None,
         forced_skill: str | None = None,
     ) -> RunState:
-        path = self._path(run_id)
-        if path.exists():
-            raise RunStateError(f"Run state already exists for {run_id!r}")
-        state = RunState(
-            run_id=run_id,
-            agent_id=_bounded_text(agent_id) or "unknown",
-            session_id=_bounded_text(session_id),
-            message_id=_bounded_text(message_id),
-            identity_id=_bounded_text(identity_id),
-            working_dir=_bounded_text(working_dir, limit=1024),
-            forced_skill=_bounded_text(forced_skill),
-        )
-        self.save(state)
-        return state
+        with self._lock:
+            path = self._path(run_id)
+            if path.exists():
+                raise RunStateError(f"Run state already exists for {run_id!r}")
+            state = RunState(
+                run_id=run_id,
+                agent_id=_bounded_text(agent_id) or "unknown",
+                session_id=_bounded_text(session_id),
+                message_id=_bounded_text(message_id),
+                identity_id=_bounded_text(identity_id),
+                working_dir=_bounded_text(working_dir, limit=1024),
+                forced_skill=_bounded_text(forced_skill),
+            )
+            self.save(state)
+            return state
 
     def validate_resume(
         self,
@@ -394,28 +415,30 @@ class RunStateStore:
 
     def resume(self, run_id: str, *, scope: RunScope | None = None) -> RunState:
         """Resume a recoverable run without allowing completed work to rerun."""
-        state = self.validate_resume(run_id, scope=scope)
-        state.transition(RunStatus.RUNNING, reason="resumed")
-        state.record_event("run_resumed")
-        self.save(state)
-        return state
+        with self._lock:
+            state = self.validate_resume(run_id, scope=scope)
+            state.transition(RunStatus.RUNNING, reason="resumed")
+            state.record_event("run_resumed")
+            self.save(state)
+            return state
 
     def bind_identity(self, run_id: str, identity_id: str) -> RunState:
         """Persist the identity selected during runtime preparation."""
-        state = self._require(run_id)
-        normalized = _bounded_text(identity_id)
-        if normalized is None:
-            raise ValueError("identity id is required")
-        if state.identity_id not in {None, normalized}:
-            raise RunScopeMismatchError(
-                f"Run {run_id!r} is already bound to a different identity"
-            )
-        if state.identity_id == normalized:
+        with self._lock:
+            state = self._require(run_id)
+            normalized = _bounded_text(identity_id)
+            if normalized is None:
+                raise ValueError("identity id is required")
+            if state.identity_id not in {None, normalized}:
+                raise RunScopeMismatchError(
+                    f"Run {run_id!r} is already bound to a different identity"
+                )
+            if state.identity_id == normalized:
+                return state
+            state.identity_id = normalized
+            state.updated_at = _now()
+            self.save(state)
             return state
-        state.identity_id = normalized
-        state.updated_at = _now()
-        self.save(state)
-        return state
 
     def request_approval(
         self,
@@ -426,19 +449,20 @@ class RunStateStore:
         level: str,
         reason: str,
     ) -> RunState:
-        state = self._require(run_id)
-        if state.status is not RunStatus.RUNNING:
-            raise RunStateTransitionError(
-                f"Run {run_id!r} cannot request approval from {state.status.value!r}"
-            )
-        state.approval_id = _bounded_text(approval_id)
-        state.approval_tool = _bounded_text(tool_name)
-        state.approval_level = _bounded_text(level)
-        state.approval_reason = _bounded_text(reason)
-        state.record_event("approval_required", clear_tool=True)
-        state.transition(RunStatus.WAITING_APPROVAL, reason=reason)
-        self.save(state)
-        return state
+        with self._lock:
+            state = self._require(run_id)
+            if state.status is not RunStatus.RUNNING:
+                raise RunStateTransitionError(
+                    f"Run {run_id!r} cannot request approval from {state.status.value!r}"
+                )
+            state.approval_id = _bounded_text(approval_id)
+            state.approval_tool = _bounded_text(tool_name)
+            state.approval_level = _bounded_text(level)
+            state.approval_reason = _bounded_text(reason)
+            state.record_event("approval_required", clear_tool=True)
+            state.transition(RunStatus.WAITING_APPROVAL, reason=reason)
+            self.save(state)
+            return state
 
     def resolve_approval(
         self,
@@ -455,25 +479,26 @@ class RunStateStore:
         resolutions such as an approval timeout without pretending that the
         user explicitly denied the request.
         """
-        state = self._require(run_id)
-        if state.status is not RunStatus.WAITING_APPROVAL:
-            raise RunStateTransitionError(
-                f"Run {run_id!r} is not waiting for approval"
+        with self._lock:
+            state = self._require(run_id)
+            if state.status is not RunStatus.WAITING_APPROVAL:
+                raise RunStateTransitionError(
+                    f"Run {run_id!r} is not waiting for approval"
+                )
+            if state.approval_id != approval_id:
+                raise RunStateError("Approval request does not match the pending run")
+            state.approval_id = None
+            state.approval_tool = None
+            state.approval_level = None
+            state.approval_reason = None
+            resolution = "approval_granted" if approved else "approval_denied"
+            state.record_event(event_type or resolution)
+            state.transition(
+                RunStatus.RUNNING,
+                reason=reason or resolution,
             )
-        if state.approval_id != approval_id:
-            raise RunStateError("Approval request does not match the pending run")
-        state.approval_id = None
-        state.approval_tool = None
-        state.approval_level = None
-        state.approval_reason = None
-        resolution = "approval_granted" if approved else "approval_denied"
-        state.record_event(event_type or resolution)
-        state.transition(
-            RunStatus.RUNNING,
-            reason=reason or resolution,
-        )
-        self.save(state)
-        return state
+            self.save(state)
+            return state
 
     def recover_interrupted(self) -> list[str]:
         """Mark runs left active by a previous server process as resumable.
@@ -484,35 +509,36 @@ class RunStateStore:
         preserves the existing ledger-based replay safeguards.
         """
         recovered: list[str] = []
-        for path in sorted(self.root.glob("*.json")):
-            run_id = path.stem
-            if not _RUN_ID_RE.fullmatch(run_id):
-                continue
-            try:
-                state = self.get(run_id)
-            except RunStateError:
-                # A torn or edited state file must not abort startup recovery
-                # of every other run.  Leave it untouched for the operator
-                # rather than silently writing a second copy over it.
-                logger.warning(
-                    "skipping unrecoverable run state file %s", path.name,
-                    exc_info=True,
-                )
-                continue
-            if state is None or state.status not in {
-                RunStatus.QUEUED,
-                RunStatus.RUNNING,
-                RunStatus.WAITING_APPROVAL,
-            }:
-                continue
-            state.approval_id = None
-            state.approval_tool = None
-            state.approval_level = None
-            state.approval_reason = None
-            state.record_event("run_interrupted", clear_skill=True, clear_tool=True)
-            state.transition(RunStatus.CANCELLED, reason="server_restarted")
-            self.save(state)
-            recovered.append(run_id)
+        with self._lock:
+            for path in sorted(self.root.glob("*.json")):
+                run_id = path.stem
+                if not _RUN_ID_RE.fullmatch(run_id):
+                    continue
+                try:
+                    state = self.get(run_id)
+                except RunStateError:
+                    # A torn or edited state file must not abort startup recovery
+                    # of every other run.  Leave it untouched for the operator
+                    # rather than silently writing a second copy over it.
+                    logger.warning(
+                        "skipping unrecoverable run state file %s", path.name,
+                        exc_info=True,
+                    )
+                    continue
+                if state is None or state.status not in {
+                    RunStatus.QUEUED,
+                    RunStatus.RUNNING,
+                    RunStatus.WAITING_APPROVAL,
+                }:
+                    continue
+                state.approval_id = None
+                state.approval_tool = None
+                state.approval_level = None
+                state.approval_reason = None
+                state.record_event("run_interrupted", clear_skill=True, clear_tool=True)
+                state.transition(RunStatus.CANCELLED, reason="server_restarted")
+                self.save(state)
+                recovered.append(run_id)
         return recovered
 
     def get(self, run_id: str) -> RunState | None:
@@ -566,17 +592,18 @@ class RunStateStore:
         error: str | None = None,
         error_details: dict[str, object] | None = None,
     ) -> RunState:
-        state = self._require(run_id)
-        if event_type is not None:
-            state.record_event(event_type)
-        state.transition(
-            status,
-            reason=reason,
-            error=error,
-            error_details=error_details,
-        )
-        self.save(state)
-        return state
+        with self._lock:
+            state = self._require(run_id)
+            if event_type is not None:
+                state.record_event(event_type)
+            state.transition(
+                status,
+                reason=reason,
+                error=error,
+                error_details=error_details,
+            )
+            self.save(state)
+            return state
 
     def record_event(
         self,
@@ -588,16 +615,17 @@ class RunStateStore:
         clear_skill: bool = False,
         clear_tool: bool = False,
     ) -> RunState:
-        state = self._require(run_id)
-        state.record_event(
-            event_type,
-            current_skill=current_skill,
-            current_tool=current_tool,
-            clear_skill=clear_skill,
-            clear_tool=clear_tool,
-        )
-        self.save(state)
-        return state
+        with self._lock:
+            state = self._require(run_id)
+            state.record_event(
+                event_type,
+                current_skill=current_skill,
+                current_tool=current_tool,
+                clear_skill=clear_skill,
+                clear_tool=clear_tool,
+            )
+            self.save(state)
+            return state
 
     def _require(self, run_id: str) -> RunState:
         state = self.get(run_id)

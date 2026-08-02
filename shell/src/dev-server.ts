@@ -64,6 +64,9 @@ type ServerTarget = {
 };
 
 const SERVER_TERMINATION_GRACE_MS = 1_000;
+// If SIGTERM (and the follow-up SIGKILL) still cannot reap the child, give up
+// rather than hanging the shell in raw mode forever.
+const SERVER_TERMINATION_HARD_TIMEOUT_MS = 5_000;
 const STDERR_KEEP_CHUNKS = 40;
 const STDERR_TAIL_LINES = 8;
 const STDERR_TAIL_CHARS = 800;
@@ -76,6 +79,32 @@ function stderrTail(chunks: string[]): string {
   return tail.length > STDERR_TAIL_CHARS ? tail.slice(-STDERR_TAIL_CHARS) : tail;
 }
 
+const LOOPBACK_HOST_RE = /^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?)$/;
+
+/** Refuse a SMITH_SERVER_URL that would exfiltrate the local auth token.
+ *
+ * Every request carries `Authorization: Bearer <~/.agent-smith/auth_token>` and
+ * setup can POST the user's LLM API key.  Sending those in cleartext to a
+ * non-loopback host is never acceptable; an explicit https:// remote is the
+ * user's deployment choice, but a plaintext http:// one is refused outright.
+ */
+function assertSafeServerTarget(target: ServerTarget): void {
+  if (!target.envOverride) return;
+  let parsed: URL;
+  try {
+    parsed = new URL(target.baseUrl);
+  } catch {
+    throw new Error(`SMITH_SERVER_URL is not a valid URL: ${target.baseUrl}`);
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (parsed.protocol === "http:" && !LOOPBACK_HOST_RE.test(host)) {
+    throw new Error(
+      `SMITH_SERVER_URL=${target.baseUrl} would send the local auth token over cleartext ` +
+        "HTTP to a remote host; set it to a loopback address or use https://.",
+    );
+  }
+}
+
 type LaunchedServer = {
   child: ChildProcess;
   getSpawnError: () => Error | undefined;
@@ -84,6 +113,7 @@ type LaunchedServer = {
 
 let ownedServer: ChildProcess | null = null;
 let cleanupRegistered = false;
+let stopPromise: Promise<void> | null = null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -91,24 +121,76 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+/** Send a signal to the child's whole process group.
+ *
+ * `uv run uvicorn ...` spawns uvicorn as a grandchild; signalling only the `uv`
+ * wrapper lets the port-holding uvicorn survive as an orphan.  The child is
+ * spawned detached so it leads its own process group and a negative pid reaches
+ * every descendant.
+ */
+function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): boolean {
+  if (!child.pid) return false;
+  try {
+    process.kill(-child.pid, signal);
+    return true;
+  } catch {
+    try {
+      return child.kill(signal);
+    } catch {
+      return false;
+    }
+  }
+}
+
 function cleanupOwnedServer(): void {
   const child = ownedServer;
   ownedServer = null;
   if (!child || child.exitCode !== null) return;
 
-  // SIGTERM alone left a busy uvicorn running as an orphan holding the port,
-  // so the next /reconnect failed for a reason nothing reported. kill() returns
-  // false when the signal could not be delivered at all.
-  if (!child.kill("SIGTERM")) {
-    child.kill("SIGKILL");
+  // Synchronous best-effort fallback for paths that cannot await (the process
+  // 'exit' event).  SIGTERM alone left a busy uvicorn running as an orphan
+  // holding the port, so escalate to SIGKILL via an unref'd timer; the async
+  // stopOwnedServer() covers the paths that CAN wait.
+  if (!signalProcessGroup(child, "SIGTERM")) {
+    signalProcessGroup(child, "SIGKILL");
     return;
   }
-  // These handlers run on process exit, where waiting is not an option, so the
-  // follow-up is best-effort and unref'd.
   const escalation = setTimeout(() => {
-    if (child.exitCode === null) child.kill("SIGKILL");
+    if (child.exitCode === null) signalProcessGroup(child, "SIGKILL");
   }, SERVER_TERMINATION_GRACE_MS);
   escalation.unref?.();
+}
+
+/** Stop the owned server and await its exit.  Safe to call multiple times. */
+export function stopOwnedServer(): Promise<void> {
+  if (stopPromise === null) {
+    stopPromise = performStopOwnedServer().finally(() => {
+      stopPromise = null;
+    });
+  }
+  return stopPromise;
+}
+
+async function performStopOwnedServer(): Promise<void> {
+  const child = ownedServer;
+  if (!child || child.exitCode !== null) return;
+  ownedServer = null;
+  const finished = new Promise<void>((resolve) => {
+    const escalation = setTimeout(() => {
+      signalProcessGroup(child, "SIGKILL");
+    }, SERVER_TERMINATION_GRACE_MS);
+    const finish = (): void => {
+      clearTimeout(escalation);
+      clearTimeout(hard);
+      resolve();
+    };
+    const hard = setTimeout(finish, SERVER_TERMINATION_HARD_TIMEOUT_MS);
+    hard.unref?.();
+    child.once("exit", finish);
+    child.once("error", finish);
+  });
+  signalProcessGroup(child, "SIGTERM");
+  await finished;
 }
 
 function registerCleanup(): void {
@@ -116,14 +198,6 @@ function registerCleanup(): void {
 
   cleanupRegistered = true;
   process.once("exit", cleanupOwnedServer);
-  process.once("SIGINT", () => {
-    cleanupOwnedServer();
-    process.exit(130);
-  });
-  process.once("SIGTERM", () => {
-    cleanupOwnedServer();
-    process.exit(143);
-  });
 }
 
 export function resolveRepoRoot(): string {
@@ -237,6 +311,10 @@ function launchLocalServer(baseUrl: string): LaunchedServer {
 
   const child = spawn("uv", ["run", "uvicorn", "app.main:app", "--port", port], {
     cwd: serverDir,
+    // Detached so `uv` leads its own process group: signalling the group (a
+    // negative pid) also reaches the uvicorn grandchild that actually holds
+    // the port.  Without this, killing the wrapper orphans uvicorn.
+    detached: true,
     // stderr is piped, not ignored: first startup is where a port clash, a
     // broken venv or an import error shows up, and discarding uvicorn's own
     // message left the user with "exited before becoming healthy" and no way to
@@ -300,6 +378,7 @@ async function waitForCompatibleServer(
 
 export async function ensureLocalServer(): Promise<ServerConnection> {
   const target = serverTarget();
+  assertSafeServerTarget(target);
   const existing = await inspectExistingServer(target);
   if (existing.connection) return existing.connection;
   if (target.envOverride) throw new Error(`Configured SMITH_SERVER_URL is unreachable: ${target.baseUrl}`);

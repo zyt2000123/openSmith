@@ -41,7 +41,12 @@ class TokenStatsService:
         if isinstance(value, bool):
             return 0
         if isinstance(value, (int, float)) and value >= 0:
-            return int(value)
+            try:
+                return int(value)
+            except (OverflowError, ValueError):
+                # A corrupt trace may carry Infinity (json.loads parses it by
+                # default); one such record must not abort the whole import.
+                return 0
         return 0
 
     async def record_usage(
@@ -136,7 +141,7 @@ class TokenStatsService:
                 self._non_negative_int(usage.get("cache_write_tokens")),
                 self._non_negative_int(usage.get("reasoning_tokens")),
                 record.ttft_ms,
-                max(0, int(record.total_ms)),
+                max(0, self._non_negative_int(record.total_ms)),
                 1 if record.stream else 0,
                 1 if record.ok else 0,
                 record.occurred_at,

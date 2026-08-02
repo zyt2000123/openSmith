@@ -195,9 +195,33 @@ class AutoTaskRepo:
         }
 
     async def finish_run(
-        self, run_id: str, status: str, output: str, error: str | None = None
+        self,
+        run_id: str,
+        status: str,
+        output: str,
+        error: str | None = None,
+        *,
+        auto_task_id: str | None = None,
+        lease_token: str | None = None,
     ) -> dict | None:
+        """Record a run outcome only while the caller still owns the task lease.
+
+        Without the gate, a worker whose 15-minute lease expired mid-run (and so
+        lost the task to a reclaim) could still write a stale run row while a
+        second worker executes the same instruction.
+        """
         db = await get_app_db()
+        if auto_task_id is not None:
+            rows = await db.execute_fetchall(
+                "SELECT status, lease_token FROM auto_tasks WHERE id=?",
+                (auto_task_id,),
+            )
+            if (
+                not rows
+                or rows[0]["status"] != "running"
+                or rows[0]["lease_token"] != lease_token
+            ):
+                return None
         now = datetime.now(timezone.utc).isoformat()
         await db.execute(
             "UPDATE auto_task_runs SET status=?, output=?, finished_at=?, error=? WHERE id=?",

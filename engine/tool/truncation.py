@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 
@@ -55,7 +56,10 @@ def truncate_output(text: str, tool_name: str = "") -> str:
     preview = "\n".join(out)
 
     output_dir = _get_output_dir()
-    filename = f"tool_{tool_name}_{int(time.time())}_{os.getpid()}.txt"
+    # Sanitize the tool name so an unvalidated provider/registry name cannot
+    # smuggle separators or ``..`` and escape the output directory.
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", tool_name)
+    filename = f"tool_{safe_name}_{int(time.time())}_{os.getpid()}.txt"
     filepath = output_dir / filename
 
     try:
