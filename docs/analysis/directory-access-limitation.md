@@ -2,7 +2,7 @@
 
 **问题**: Smith 启动后只能访问当前工作目录，无法访问其他目录（如用户的其他项目、文档等）
 
-**日期**: 2026-08-02  
+**日期**: 2026-08-02
 **状态**: 已分析，待解决
 
 ---
@@ -213,7 +213,7 @@ def load_trusted_directories() -> list[Path]:
 def set_working_directory(self, working_dir: Path) -> None:
     root = Path(working_dir).expanduser().resolve()
     self._working_dir = root
-    
+
     # 扩展允许目录：工作目录 + 信任目录
     trusted = load_trusted_directories()
     self.set_allowed_dirs([root, *trusted])
@@ -250,7 +250,7 @@ smith> /trust --clear
     state.set({ statusLine: `Trusted: ${list.join(", ")}` });
     return;
   }
-  
+
   // 添加到白名单
   await context.bridge.trustPath(path);
   state.set({ statusLine: `✓ Added ${path} to session whitelist` });
@@ -327,8 +327,8 @@ async def on_approval_granted(self, approval_scope: ApprovalScope):
 
 Smith 的目录访问限制是**设计良好的安全特性**，但缺少**便利性机制**。
 
-**现状**: 有完整的白名单基础设施，但未充分利用  
-**问题**: 每次跨目录访问都需手动审批  
+**现状**: 有完整的白名单基础设施，但未充分利用
+**问题**: 每次跨目录访问都需手动审批
 **解决**: 审批后自动加入会话白名单（10行代码）
 
 **建议**: 立即实施 Phase 1，用户体验将显著改善，安全性不降低。
