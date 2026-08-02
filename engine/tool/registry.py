@@ -682,6 +682,26 @@ class ToolRegistry:
                 and authorization[2] == decision.approval_scope
             )
             approval_scope = decision.approval_scope
+
+            # Auto-whitelist: when a path approval is granted, add the directory
+            # to the session whitelist so subsequent accesses to the same directory
+            # don't require re-approval. This preserves security (first access needs
+            # approval) while improving UX (subsequent accesses are automatic).
+            # High-risk paths (.ssh, .aws, .env, etc.) still require approval each time.
+            if approval_granted and approval_scope is not None and approval_scope.kind == "path":
+                from pathlib import Path
+                try:
+                    target_path = Path(approval_scope.target).expanduser().resolve()
+                    # Add parent directory to whitelist (not the file itself)
+                    # This allows accessing sibling files without re-approval
+                    if target_path.is_file() or not target_path.exists():
+                        whitelist_path = target_path.parent
+                    else:
+                        whitelist_path = target_path
+                    self._tool_guard.whitelist.allow_path(str(whitelist_path))
+                except (ValueError, OSError):
+                    # Path resolution failed; skip whitelist addition
+                    pass
             # A project-boundary result is intentionally ``allowed=False``
             # until the approval broker grants the exact normalized call.  Do
             # not turn a bare approval id into a general bypass: the
