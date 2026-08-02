@@ -629,6 +629,74 @@ def test_missing_skill_fallback_replaces_user_turn_instead_of_appending() -> Non
         assert user_messages[0]["content"] == "[Skill: planning] build a feature"
 
 
+def test_missing_skill_fallback_merges_retry_hint_into_the_single_user_turn() -> None:
+    """When the domain gate retries with a hint, the degraded (missing-skill)
+    fallback must fold the hint into the single prefixed user turn rather than
+    appending a second consecutive user message, which role-alternating
+    providers (e.g. Anthropic) reject."""
+
+    class RetryThenPassGate:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def check(self, output, context):
+            self.calls += 1
+            if self.calls == 1:
+                return GateResult(
+                    "retry",
+                    "need more evidence",
+                    retry_hint="Include the actual command output.",
+                )
+            return GateResult("pass", "ok")
+
+    class RecordingMissingSkillLLM:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls.append([dict(m) for m in messages])
+            return ChatResponse(text="evidence shown")
+
+    class MissingSkillRegistry:
+        def get(self, name):
+            return None
+
+    llm = RecordingMissingSkillLLM()
+    gate = RetryThenPassGate()
+
+    async def run():
+        return [
+            event
+            async for event in run_pipeline(
+                SkillChain([SkillNode("planning", gate)]),
+                llm,
+                "build a feature",
+                [
+                    {"role": "system", "content": "system prompt"},
+                    {"role": "user", "content": "build a feature"},
+                ],
+                FakeToolRegistry(),
+                MissingSkillRegistry(),
+                None,
+                FailureLoopGuard(),
+                5,
+                {},
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert gate.calls == 2
+    assert [e.type for e in events].count(EventType.BLOCKED) == 0
+    for call in llm.calls:
+        user_messages = [m for m in call if m.get("role") == "user"]
+        assert len(user_messages) == 1, call
+        content = user_messages[0]["content"]
+        assert content.startswith("[Skill: planning] build a feature")
+        if "Feedback" in content:
+            assert "Include the actual command output." in content
+
+
 # --- P6: provisional ledger survives checkpoint resume ----------------------
 
 

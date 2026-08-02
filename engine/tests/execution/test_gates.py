@@ -112,6 +112,46 @@ def test_llm_gate_parses_fail_and_carries_the_reason():
     assert "evidence is missing" in result.reason
 
 
+def test_llm_gate_accepts_literal_braces_in_the_prompt_template():
+    """A gate template containing JSON samples or other literal braces must
+    not make the check raise (and silently fail forever)."""
+
+    class RetryGate:
+        async def check(self, output, context):
+            return GateResult("retry", "heuristic uncertain")
+
+    class VerdictLLM:
+        async def chat(self, messages):
+            return ChatResponse(text="PASS")
+
+    gate = LLMGate(RetryGate(), 'Check {output} against {"required": "evidence"}')
+    gate.set_llm(VerdictLLM())
+    result = asyncio.run(gate.check("output", {}))
+
+    assert result.verdict == "pass"
+
+
+def test_llm_gate_pass_escalates_a_heuristic_retry_to_pass():
+    """When the heuristic pre-filter is uncertain (retry) but the LLM then
+    explicitly verifies the output, the gate must pass — the LLM verdict must
+    be able to de-escalate retry, not only escalate fail."""
+
+    class RetryGate:
+        async def check(self, output, context):
+            return GateResult("retry", "heuristic uncertain")
+
+    class VerdictLLM:
+        async def chat(self, messages):
+            return ChatResponse(text="PASS")
+
+    gate = LLMGate(RetryGate(), "check {output}")
+    gate.set_llm(VerdictLLM())
+    result = asyncio.run(gate.check("output", {}))
+
+    assert result.verdict == "pass"
+    assert "LLM verification passed" in result.reason
+
+
 def test_coerce_gate_result_validates_gate_result_instances():
     """A concrete GateResult must not bypass verdict/reason validation."""
     with pytest.raises(TypeError):

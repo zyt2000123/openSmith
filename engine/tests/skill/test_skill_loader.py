@@ -41,6 +41,39 @@ def test_parse_skill_md_tolerates_invalid_yaml_frontmatter(tmp_path: Path):
     assert skill.content == "Body"
 
 
+def test_parse_skill_md_with_bom_prefix(tmp_path: Path):
+    """A UTF-8 BOM must not defeat the frontmatter fence detection: without
+    utf-8-sig the whole file (frontmatter included) would become the body."""
+    f = _write_skill(tmp_path, "bom", "placeholder")
+    text = "---\nname: bomskill\ndescription: works\n---\nBody after BOM"
+    # utf-8-sig on write emits the leading BOM, exactly like a Windows editor.
+    f.write_text(text, encoding="utf-8-sig")
+    skill = parse_skill_md(f)
+    assert skill.meta.name == "bomskill"
+    assert skill.meta.description == "works"
+    assert skill.content == "Body after BOM"
+
+
+def test_parse_skill_md_with_fence_inside_frontmatter_block_scalar(tmp_path: Path):
+    """A ``---`` line inside a YAML block scalar (multi-line description) must
+    not be treated as the closing fence."""
+    text = (
+        "---\n"
+        "name: blockdesc\n"
+        "description: |\n"
+        "  Line one\n"
+        "  ---\n"
+        "  Line three\n"
+        "---\n"
+        "Body content"
+    )
+    f = _write_skill(tmp_path, "blockdesc", text)
+    skill = parse_skill_md(f)
+    assert skill.meta.name == "blockdesc"
+    assert "Line one" in skill.meta.description
+    assert skill.content == "Body content"
+
+
 def test_registry_skips_unreadable_skill_and_loads_the_rest(tmp_path: Path):
     _write_skill(tmp_path, "good", "---\nname: good\n---\nOK")
     bad_dir = tmp_path / "bad"

@@ -48,6 +48,32 @@ def test_trace_store_keeps_non_secret_token_metrics(tmp_path):
     }
 
 
+def test_trace_store_keeps_cache_and_reasoning_token_metrics(tmp_path):
+    """cache_read/write and reasoning tokens are numeric metrics, not secrets;
+    they must persist as values in the trace (matching the summary projection)
+    instead of being name-redacted to '[REDACTED]'."""
+    store = TraceStore(tmp_path)
+    store.append(
+        "run-cache",
+        ExecutionEvent(
+            EventType.TOKEN_USAGE,
+            {
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "total_tokens": 150,
+                "cache_read_tokens": 60,
+                "cache_write_tokens": 10,
+                "reasoning_tokens": 40,
+            },
+        ),
+    )
+
+    record = store.read("run-cache")[0]
+    assert record["data"]["cache_read_tokens"] == 60
+    assert record["data"]["cache_write_tokens"] == 10
+    assert record["data"]["reasoning_tokens"] == 40
+
+
 @pytest.mark.parametrize(
     "credential",
     [

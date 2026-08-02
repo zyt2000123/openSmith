@@ -395,3 +395,54 @@ def test_health_tool_success_rate_ignores_approval_required_events() -> None:
     assert health.tool_success_rate == 1.0
     assert health.run_count == 1
     assert health.completed_count == 1
+
+
+def test_health_tool_success_rate_ignores_denied_approvals() -> None:
+    """A user-denied tool call never executed, so it must not count as a tool
+    failure — only the one real successful tool is measured."""
+    record = RunSummaryRecord(
+        schema_version=1,
+        metadata=RunMetadata(
+            run_id="run-1",
+            agent_id="smith",
+            created_at="2026-08-02T00:00:00+00:00",
+        ),
+        finished_at="2026-08-02T00:01:00+00:00",
+        summary=RunSummary(
+            run_id="run-1",
+            event_count=3,
+            event_counts={"tool_call_result": 2, "run_finished": 1},
+            tool_call_count=1,
+            backtrack_count=0,
+            approval_required_count=1,
+            token_usage={},
+            outcome="completed",
+            reason=None,
+        ),
+    )
+    traces = [
+        [
+            {"type": "tool_call_result", "data": {
+                "blocked": True,
+                "approval_required": True,
+                "error": False,
+            }},
+            {"type": "tool_call_result", "data": {
+                "blocked": True,
+                "approval_outcome": "denied",
+                "error": False,
+            }},
+            {"type": "tool_call_result", "data": {
+                "error": False,
+                "content": "ok",
+                "approval_outcome": "granted",
+            }},
+            {"type": "run_finished", "data": {"status": "completed"}},
+        ]
+    ]
+
+    health = HealthCalculator().calculate("smith", [record], traces)
+
+    # The gate probe and the denied approval are non-executions; only the
+    # granted, successful tool counts — 100%, not 33%.
+    assert health.tool_success_rate == 1.0

@@ -166,16 +166,16 @@ async def run_pipeline(
                     # trailing user turn with the skill-prefixed variant.
                     messages = list(base_messages)
                     prefixed = f"[Skill: {node.skill_name}] {user_message}"
+                    # attempt==1：base gate 重试；attempt==0 且有 hint：域门禁
+                    # retry 重进本节点（见下方 retry 分支写入 CTX_RETRY_HINT）。
+                    if attempt <= 1 and context.get(CTX_RETRY_HINT):
+                        prefixed = f"{prefixed}\n\n[Feedback]\n{context[CTX_RETRY_HINT]}"
+                    elif attempt == 2:
+                        prefixed = f"{prefixed}\n\nSwitch strategy: try a completely different approach."
                     if messages and messages[-1].get("role") == "user":
                         messages[-1] = {**messages[-1], "content": prefixed}
                     else:
                         messages.append({"role": "user", "content": prefixed})
-                    # attempt==1：base gate 重试；attempt==0 且有 hint：域门禁
-                    # retry 重进本节点（见下方 retry 分支写入 CTX_RETRY_HINT）。
-                    if attempt <= 1 and context.get(CTX_RETRY_HINT):
-                        messages.append({"role": "user", "content": context[CTX_RETRY_HINT]})
-                    elif attempt == 2:
-                        messages.append({"role": "user", "content": "Switch strategy: try a completely different approach."})
                     event_stream = react_event_loop(
                         llm, messages, node_tool_registry, tool_guard, max_react_iters,
                         provisional_lifecycle=False,

@@ -14,6 +14,10 @@ from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
 from engine.execution.events import EventType, ExecutionEvent
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization)", re.I)
+# Numeric token-metric keys are not secrets and must persist as values, not
+# "[REDACTED]" (the name-based redaction would otherwise hit the "token"
+# substring).  Keep this in sync with projections.RunSummaryProjection's
+# token keys so summary and trace agree about the same run.
 _SAFE_METRIC_KEYS = {
     "input_tokens",
     "output_tokens",
@@ -21,6 +25,9 @@ _SAFE_METRIC_KEYS = {
     "prompt_tokens",
     "completion_tokens",
     "context_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
 }
 _MAX_VALUE_CHARS = 4096
 _MAX_DEPTH = 4

@@ -2178,6 +2178,32 @@ def test_episode_search_short_terms_are_ored_not_anded(tmp_path: Path) -> None:
     assert [hit["id"] for hit in asyncio.run(run())] == ["topic"]
 
 
+def test_episode_search_honors_top_k_when_both_match_and_like_hit(
+    tmp_path: Path,
+) -> None:
+    """The combined MATCH + LIKE result must still respect the caller's top_k
+    limit instead of returning up to 2x (one MATCH page + one LIKE page)."""
+    episodes_dir = tmp_path / "memory" / "episodes"
+    episodes_dir.mkdir(parents=True)
+    for index in range(8):
+        (episodes_dir / f"episode{index}.md").write_text(
+            f"记忆 甲 内容 #{index} 我们讨论过部署方案", encoding="utf-8"
+        )
+
+    async def run() -> list[dict]:
+        idx = SearchIndex(episodes_dir)
+        await idx.open()
+        try:
+            await _sync_episode_index(idx, episodes_dir)
+            # "记忆" hits all via MATCH; "甲" (2 chars) additionally triggers
+            # the LIKE scan.  With top_k=3 the result must be exactly 3.
+            return await idx.search("记忆 甲", top_k=3)
+        finally:
+            await idx.close()
+
+    assert len(asyncio.run(run())) == 3
+
+
 def test_generate_and_review_tolerates_malformed_reviewer_shapes() -> None:
     """Non-dict JSON and non-list fail fields from the reviewer must not crash."""
     class ShapeShiftReviewer:

@@ -43,12 +43,18 @@ class HealthCalculator:
         # is a gate probe, not an executed tool: the real result arrives later
         # under a separate event.  Counting both would double-count one approved
         # call as a failure plus a success, so skip the gate probe entirely.
+        # A denied/timed-out approval (blocked=True, approval_outcome in
+        # {denied, timed_out}) likewise never executed a tool — the user refused
+        # it before any side effect — so it must not drag tool_success_rate down
+        # either.  A granted approval emits the real result under
+        # approval_outcome="granted" and must still be counted.
         tool_results = [
             event["data"]
             for event in trace_events
             if event.get("type") == "tool_call_result"
             and isinstance(event.get("data"), dict)
             and not event["data"].get("approval_required")
+            and event["data"].get("approval_outcome") not in {"denied", "timed_out"}
         ]
         successful_tools = sum(_tool_succeeded(result) for result in tool_results)
         return AgentHealth(

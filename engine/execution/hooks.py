@@ -113,10 +113,21 @@ class HookManager:
                         result = [] if isinstance(partial, list) else {}
                     if isinstance(result, list):
                         result = result + (partial if isinstance(partial, list) else [partial])
-                    elif isinstance(result, dict) and isinstance(partial, dict):
-                        merged = dict(result)
-                        merged.update(partial)
-                        result = merged
+                    elif isinstance(result, dict):
+                        if isinstance(partial, dict):
+                            merged = dict(result)
+                            merged.update(partial)
+                            result = merged
+                        else:
+                            # A non-dict partial cannot merge into a dict
+                            # accumulator.  Log it instead of silently
+                            # dropping a handler's contribution.
+                            logger.warning(
+                                "hook %s.SERIES_MERGE dropped a %s partial "
+                                "that cannot merge into a dict result",
+                                hook,
+                                type(partial).__name__,
+                            )
                 except Exception:
                     logger.debug("hook %s.SERIES_MERGE error", hook, exc_info=True)
             return result

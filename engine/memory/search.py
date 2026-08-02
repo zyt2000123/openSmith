@@ -251,6 +251,11 @@ class SearchIndex:
                 if like_rows:
                     seen = {row["entry_id"] for row in rows}
                     rows = [*rows, *[row for row in like_rows if row["entry_id"] not in seen]]
+                # MATCH alone may return up to top_k rows and LIKE may add up to
+                # top_k more; the combined result must still honor the caller's
+                # top_k limit, or the episode reader receives up to 2x the
+                # requested context.
+                rows = rows[:top_k]
         except Exception:
             logger.warning("memory search query failed", exc_info=True)
             return []
