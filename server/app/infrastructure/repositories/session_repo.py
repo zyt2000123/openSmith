@@ -142,17 +142,40 @@ class SessionRepo:
             return None
         return await self.get_owned(session_id, agent_id)
 
-    async def get_messages(self, session_id: str, limit: int = 0, offset: int = 0) -> list[dict]:
+    async def get_messages(
+        self,
+        session_id: str,
+        limit: int = 0,
+        offset: int = 0,
+        max_content_bytes: int | None = None,
+    ) -> list[dict]:
         db = await get_app_db()
         # 0 historically meant "everything", which buffers a whole long session
         # into memory on every call.  Treat it as a bounded default; callers that
         # genuinely need the full transcript pass an explicit limit.
         effective_limit = limit if limit > 0 else 200
-        rows = await db.execute_fetchall(
+        if max_content_bytes is None:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
+                (session_id, effective_limit, offset),
+            )
+            return [dict(r) for r in rows]
+        # Byte-bounded fetch: stop accumulating once the conversation's content
+        # exceeds the budget, so an enormous session cannot be buffered whole.
+        rows: list[dict] = []
+        total = 0
+        cursor = await db.execute(
             "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC LIMIT ? OFFSET ?",
             (session_id, effective_limit, offset),
         )
-        return [dict(r) for r in rows]
+        async for row in cursor:
+            content = row["content"] if isinstance(row["content"], str) else ""
+            total += len(content)
+            if total > max_content_bytes:
+                break
+            rows.append(dict(row))
+        await cursor.close()
+        return rows
 
     async def get_message(self, session_id: str, message_id: str) -> dict | None:
         db = await get_app_db()

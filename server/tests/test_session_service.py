@@ -59,8 +59,27 @@ class FakeSessionRepo:
         self.identity_id = identity_id
         return True
 
-    async def get_messages(self, session_id: str, limit: int = 0, offset: int = 0) -> list[dict]:
-        return self.messages[offset:] if limit == 0 else self.messages[offset : offset + limit]
+    async def get_messages(
+        self,
+        session_id: str,
+        limit: int = 0,
+        offset: int = 0,
+        max_content_bytes: int | None = None,
+    ) -> list[dict]:
+        rows = self.messages[offset:]
+        if limit > 0:
+            rows = rows[:limit]
+        if max_content_bytes is not None:
+            total = 0
+            bounded: list[dict] = []
+            for row in rows:
+                content = row.get("content", "")
+                total += len(content) if isinstance(content, str) else 0
+                if total > max_content_bytes:
+                    break
+                bounded.append(row)
+            return bounded
+        return rows
 
     async def get_message(self, session_id: str, message_id: str) -> dict | None:
         return next(

@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -35,21 +36,38 @@ from .token_stats_service import TokenStatsService
 # just-inserted turn and the two assistant replies interleave into a corrupted
 # conversation.  Serialize turns per session: a fast retry queues behind the
 # in-flight turn instead of cross-wiring it.
+#
+# The map is guarded by a threading lock so it stays safe even if the server
+# ever runs the handlers from more than one thread/loop, and it is bounded: an
+# abandoned (never-deleted) session must not leak a lock per session forever.
+# Only unlocked locks are evicted — a lock that is held (or has waiters queued)
+# can never be removed while a stream is mid-turn.
 _SESSION_STREAM_LOCKS: dict[str, asyncio.Lock] = {}
+_SESSION_STREAM_LOCKS_GUARD = threading.Lock()
+_SESSION_STREAM_LOCKS_MAX = 64
 
 
 def _session_stream_lock(session_id: str) -> asyncio.Lock:
-    lock = _SESSION_STREAM_LOCKS.get(session_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _SESSION_STREAM_LOCKS[session_id] = lock
-    return lock
+    with _SESSION_STREAM_LOCKS_GUARD:
+        lock = _SESSION_STREAM_LOCKS.get(session_id)
+        if lock is None:
+            if len(_SESSION_STREAM_LOCKS) >= _SESSION_STREAM_LOCKS_MAX:
+                for key, candidate in list(_SESSION_STREAM_LOCKS.items()):
+                    if not candidate.locked():
+                        del _SESSION_STREAM_LOCKS[key]
+            lock = asyncio.Lock()
+            _SESSION_STREAM_LOCKS[session_id] = lock
+        return lock
 
 # Recent messages passed to the engine as short-term conversational context
 _HISTORY_LIMIT = 10
 # Upper bound for one compress call; far beyond any real session while still
-# bounding memory (compression already loads the conversation into memory).
+# bounding the row count (compression already loads the conversation into memory).
 _COMPRESS_MESSAGE_CAP = 50_000
+# Byte budget for a compress call: stop fetching once the conversation content
+# exceeds this, so an enormous session cannot be buffered whole and sent to the
+# summarizer.
+_COMPRESS_BYTE_CAP = 20_000_000
 logger = logging.getLogger(__name__)
 
 
@@ -250,9 +268,14 @@ class SessionService:
             raise HTTPException(404, "Session not found")
 
         # Compression summarizes the WHOLE conversation, so fetch it all
-        # explicitly: the get_messages default cap (200) would otherwise silently
-        # drop the tail of a long session from both summary and context.
-        rows = await self.session_repo.get_messages(session_id, limit=_COMPRESS_MESSAGE_CAP)
+        # explicitly (the get_messages default cap of 200 would silently drop the
+        # tail), bounded by both row count and content bytes so a pathological
+        # session cannot be buffered whole.
+        rows = await self.session_repo.get_messages(
+            session_id,
+            limit=_COMPRESS_MESSAGE_CAP,
+            max_content_bytes=_COMPRESS_BYTE_CAP,
+        )
         if not rows:
             raise HTTPException(400, "Cannot compress an empty session")
 
