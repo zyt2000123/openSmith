@@ -179,7 +179,11 @@ class HookRegistry:
                 if warnings:
                     all_warnings.extend(warnings)
             except asyncio.CancelledError:
-                task.cancel()
+                # The awaiting task is being cancelled; do not leave the
+                # remaining background hooks orphaned as pending tasks.
+                for pending in async_tasks:
+                    if not pending.done() and pending is not task:
+                        pending.cancel()
                 raise
             except Exception as e:
                 logger.error("Async post hook failed: %s", e, exc_info=True)
@@ -262,7 +266,11 @@ class HookRegistry:
             try:
                 await task
             except asyncio.CancelledError:
-                task.cancel()
+                # Cancel every outstanding background hook, not just the one
+                # that was being awaited, so none is left pending at shutdown.
+                for pending in async_tasks:
+                    if not pending.done() and pending is not task:
+                        pending.cancel()
                 raise
             except Exception as e:
                 logger.error("Async stop hook failed: %s", e, exc_info=True)
