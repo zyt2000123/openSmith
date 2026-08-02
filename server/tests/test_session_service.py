@@ -1495,3 +1495,47 @@ async def test_get_messages_byte_budget_stops_fetching_at_the_cap(monkeypatch) -
     assert total <= 30
     assert len(rows) < 10
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_stream_lock_serializes_concurrent_turns() -> None:
+    """Many turns on the SAME session must serialize (one holder at a time),
+    while turns on DIFFERENT sessions proceed concurrently."""
+    module = session_service_module
+    module._SESSION_STREAM_LOCKS.clear()
+
+    same_session = module._session_stream_lock("session-1")
+    other_session = module._session_stream_lock("session-2")
+
+    peak_same = 0
+    active_same = 0
+    peak_total = 0
+    active_total = 0
+
+    async def turn(lock: asyncio.Lock, *, cross: bool) -> None:
+        nonlocal active_same, peak_same, active_total, peak_total
+        async with lock:
+            active_total += 1
+            peak_total = max(peak_total, active_total)
+            if not cross:
+                active_same += 1
+                peak_same = max(peak_same, active_same)
+            await asyncio.sleep(0.005)
+            if not cross:
+                active_same -= 1
+            active_total -= 1
+
+    # 10 turns on the same session: strict mutual exclusion.
+    await asyncio.gather(*[turn(same_session, cross=False) for _ in range(10)])
+    assert peak_same == 1
+
+    # Turns on another session overlap with a turn on session-1: the per-session
+    # lock must never serialize across sessions.
+    await asyncio.gather(
+        turn(same_session, cross=False),
+        turn(other_session, cross=True),
+        turn(other_session, cross=True),
+    )
+    assert peak_total >= 2
+
+    module._SESSION_STREAM_LOCKS.clear()

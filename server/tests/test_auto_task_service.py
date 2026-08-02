@@ -744,3 +744,46 @@ async def test_concurrent_starts_respect_the_cap_without_a_toctou_window(
 
     release.set()
     await _drain_background_runs()
+
+
+@pytest.mark.asyncio
+async def test_reserved_slots_drain_when_starts_are_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a start_auto_task in the middle of the claim must release the
+    reserved slot; a leaked reservation would permanently shrink the cap."""
+    claim_gate = asyncio.Event()
+
+    class GatedRepo(FakeAutoTaskRepo):
+        async def claim_running(self, task_id: str) -> str | None:
+            await claim_gate.wait()
+            return "lease-token"
+
+    async def blocking_reply(request, runtime, services):
+        await asyncio.sleep(0.01)
+        return SimpleNamespace(text="done")
+
+    _stub_engine(monkeypatch, blocking_reply)
+    service = AutoTaskService(GatedRepo(), FakeProfileRepo(), FakeSessionRepo())
+
+    tasks = [
+        asyncio.create_task(service.start_auto_task(_task(task_id=f"task-{index}")))
+        for index in range(auto_task_service_module._MAX_CONCURRENT_RUNS)
+    ]
+    await asyncio.sleep(0)  # all reach the claim await and hold a reservation
+    assert auto_task_service_module._RESERVED_SLOTS == auto_task_service_module._MAX_CONCURRENT_RUNS
+
+    # The cap is fully reserved, so a new start refuses.
+    assert await service.start_auto_task(_task(task_id="overflow")) is None
+
+    # Cancel the in-flight starts; every finally must release its reservation.
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert auto_task_service_module._RESERVED_SLOTS == 0
+
+    # A subsequent start succeeds once the slots drained.
+    claim_gate.set()
+    assert await service.start_auto_task(_task(task_id="after-drain")) is not None
+    await _drain_background_runs()
+    assert auto_task_service_module._RESERVED_SLOTS == 0

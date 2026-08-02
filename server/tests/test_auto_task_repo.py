@@ -286,3 +286,110 @@ async def test_finish_run_is_gated_on_the_owning_lease(monkeypatch: pytest.Monke
     )
     assert stale is None
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_lease_claim_is_atomic_under_concurrent_contention(monkeypatch) -> None:
+    """Ten concurrent workers claiming one task must yield exactly one winner.
+
+    claim_running's atomic UPDATE ... WHERE lease guard is the fencing primitive:
+    under real concurrency, a second worker must never observe the task as
+    claimable while the first still holds a live lease.
+    """
+    import asyncio
+    import importlib
+
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await schema_module.ensure_schema(db)
+    repo_module = importlib.import_module("app.infrastructure.repositories.auto_task_repo")
+
+    async def fake_get_app_db():
+        return db
+
+    monkeypatch.setitem(repo_module.AutoTaskRepo.create.__globals__, "get_app_db", fake_get_app_db)
+    repo = AutoTaskRepo()
+    await repo.create(
+        "smith",
+        {
+            "title": "probe",
+            "instruction": "check",
+            "working_dir": "/tmp/project",
+            "trigger_type": "interval",
+            "trigger_config": "60",
+            "next_run_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    task = (await repo.list_by_agent("smith"))[0]
+
+    tokens = await asyncio.gather(*[repo.claim_running(task["id"]) for _ in range(10)])
+    winners = [token for token in tokens if token is not None]
+    assert len(winners) == 1
+
+    # The superseded workers cannot renew or finish the lease they never won.
+    assert await repo.renew_lease(task["id"], "not-the-winner") is False
+    assert await repo.finish_task(task["id"], "idle", None, "not-the-winner") is False
+    # A second claim while the winner holds a live lease still fails.
+    assert await repo.claim_running(task["id"]) is None
+
+    # After the winner releases, the task is claimable again.
+    assert await repo.finish_task(task["id"], "idle", None, winners[0]) is True
+    assert await repo.claim_running(task["id"]) is not None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_lease_expiry_reclaim_is_fenced_by_token(monkeypatch) -> None:
+    """A lease that expired is re-claimable, but the superseded worker's token
+    can never release the new holder's lease (fencing by token, not by time)."""
+    import importlib
+
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await schema_module.ensure_schema(db)
+    repo_module = importlib.import_module("app.infrastructure.repositories.auto_task_repo")
+
+    async def fake_get_app_db():
+        return db
+
+    monkeypatch.setitem(repo_module.AutoTaskRepo.create.__globals__, "get_app_db", fake_get_app_db)
+    repo = AutoTaskRepo()
+    await repo.create(
+        "smith",
+        {
+            "title": "probe",
+            "instruction": "check",
+            "working_dir": "/tmp/project",
+            "trigger_type": "interval",
+            "trigger_config": "60",
+            "next_run_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    task = (await repo.list_by_agent("smith"))[0]
+
+    old_worker = await repo.claim_running(task["id"])
+    assert old_worker is not None
+
+    # Simulate the 15-minute lease lapsing (worker A stalls past expiry).
+    past = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()
+    await db.execute(
+        "UPDATE auto_tasks SET lease_until=? WHERE id=?",
+        (past, task["id"]),
+    )
+    await db.commit()
+
+    # Worker B reclaims the expired lease.
+    new_worker = await repo.claim_running(task["id"])
+    assert new_worker is not None
+    assert new_worker != old_worker
+
+    # A (superseded) cannot renew or release B's lease; only B's token works.
+    assert await repo.renew_lease(task["id"], old_worker) is False
+    assert await repo.finish_task(task["id"], "idle", None, old_worker) is False
+    assert await repo.renew_lease(task["id"], new_worker) is True
+    assert await repo.finish_task(task["id"], "idle", None, new_worker) is True
+    await db.close()
