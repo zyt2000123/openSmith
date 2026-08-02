@@ -18,6 +18,7 @@ from engine.safety.approval import (
     _SECRET_FLAG_RE,
     _is_sensitive_argument_name,
     _is_secret_value,
+    _redact_secret_text,
     current_approval_context,
 )
 from engine.tool.interface import ToolCall, ToolDefinition
@@ -570,8 +571,16 @@ def _summarize_value(value: object, max_len: int) -> object:
         return _summarize_args(value, max_len=max_len)
     if isinstance(value, (list, tuple)):
         return _summarize_sequence(value, max_len)
-    if isinstance(value, str) and len(value) > max_len:
-        return value[:max_len] + f"...({len(value)} chars)"
+    if isinstance(value, str):
+        # Mirror approval._summarize_value: a credential embedded in an
+        # otherwise-innocuous string (a shell command carrying a bearer token,
+        # a URL with userinfo) must be redacted before it lands in the
+        # persistent audit trail.  Whole-string credentials are hidden
+        # entirely by _redact_secret_text.
+        safe = _redact_secret_text(value)
+        if len(safe) > max_len:
+            return safe[:max_len] + f"...({len(value)} chars)"
+        return safe
     return value
 
 
@@ -801,24 +810,38 @@ class ToolGuard:
 
         for arg_name in path_args:
             path_val = tool_call.arguments.get(arg_name)
-            if path_val:
-                paths_to_check.append((str(path_val), is_write))
-            elif (
-                self.file_guard.is_working_directory_scoped
-                and self._path_arg_uses_nonempty_default(tool_call.name, arg_name)
-            ):
-                # The registry must first materialize the provider's default
-                # (such as ``path='.'``) within the workspace.  Letting a raw
-                # optional path through here would make the provider use the
-                # server process CWD instead.
+            if path_val is None or path_val == "":
+                if (
+                    self.file_guard.is_working_directory_scoped
+                    and self._path_arg_uses_nonempty_default(tool_call.name, arg_name)
+                ):
+                    # The registry must first materialize the provider's default
+                    # (such as ``path='.'``) within the workspace.  Letting a raw
+                    # optional path through here would make the provider use the
+                    # server process CWD instead.
+                    return GuardResult(
+                        allowed=False,
+                        reason=(
+                            f"Path argument '{arg_name}' must be canonicalized "
+                            "before policy checks"
+                        ),
+                        boundary_block=True,
+                    )
+                continue
+            if not isinstance(path_val, str):
+                # A scalar path argument must be a single string.  A list or
+                # dict here would be str()-stringified into one bogus path the
+                # guard checks, while the provider reads the real (possibly
+                # sensitive) value differently — a check/execute divergence.
+                # Reject rather than approximate.
                 return GuardResult(
                     allowed=False,
                     reason=(
-                        f"Path argument '{arg_name}' must be canonicalized "
-                        "before policy checks"
+                        f"Path argument '{arg_name}' must be a string, "
+                        f"got {type(path_val).__name__}"
                     ),
-                    boundary_block=True,
                 )
+            paths_to_check.append((path_val, is_write))
 
         cwd_val = tool_call.arguments.get("cwd")
         cwd = str(cwd_val) if cwd_val else ""

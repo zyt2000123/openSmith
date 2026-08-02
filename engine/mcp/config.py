@@ -47,12 +47,18 @@ async def register_configured_mcp_tools(
             servers = await session_pool.acquire(session_id, valid_servers)
             from engine.mcp.client import register_mcp_tools_with_prefix
             registered_tools = 0
+
+            async def _evict_dead_session() -> None:
+                """Reconnect the next acquire instead of reusing a dead client."""
+                await session_pool.evict(session_id)
+
             for server in servers:
                 registered_tools += await register_mcp_tools_with_prefix(
                     tool_registry,
                     server.client,
                     prefix=server.prefix,
                     tools=server.tools,
+                    on_connection_failure=_evict_dead_session,
                 )
             return MCPRegistration(
                 clients=tuple(server.client for server in servers),

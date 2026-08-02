@@ -350,9 +350,17 @@ _EMBEDDED_SECRET_RE = re.compile(
     r"sk-[A-Za-z0-9_\-]{20,}"
     r"|gh[pousr]_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{22,}"
+    r"|glpat-[A-Za-z0-9_\-]{20,}"
     r"|xox[baprs]-[A-Za-z0-9\-]{16,}"
     r"|AKIA[0-9A-Z]{16}"
+    r"|AIza[0-9A-Za-z_\-]{30,}"
     r"|eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{1,}\.[A-Za-z0-9_\-]{1,}"
+    # A bare Bearer token that is not itself a recognized key family: keep the
+    # word visible ("Bearer ***"), never the credential.  The negative
+    # lookahead lets sk-/gh_/… tokens fall through to their own branch above so
+    # the readable frame stays consistent with the other families.
+    r"|\bBearer\s+(?!sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|AIza|eyJ)"
+    r"[A-Za-z0-9._~+/=\-]{8,}"
     r")"
 )
 

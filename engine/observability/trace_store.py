@@ -41,7 +41,10 @@ _SECRET_IN_VALUE = re.compile(
     (?: \b(?:bearer|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])
           [A-Za-z0-9._~+/=-]{16,}                                     # auth headers
       | sk-[A-Za-z0-9_-]{16,}                                         # OpenAI/Anthropic style
-      | gh[pousr]_[A-Za-z0-9]{20,}                                    # GitHub
+      | gh[pousr]_[A-Za-z0-9]{20,}                                    # GitHub classic
+      | github_pat_[A-Za-z0-9_]{20,}                                  # GitHub fine-grained PAT
+      | glpat-[A-Za-z0-9_-]{16,}                                      # GitLab PAT
+      | AIza[0-9A-Za-z_-]{30,}                                        # Google API key
       | AKIA[0-9A-Z]{12,}                                             # AWS key id
       | xox[abprs]-[A-Za-z0-9-]{10,}                                  # Slack
       | eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+     # JWT

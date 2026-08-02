@@ -37,6 +37,14 @@ _FRAMING_BROKEN_MESSAGE = (
     "MCP stdio transport retired: an earlier response exceeded the maximum "
     "size and left the stream desynchronized"
 )
+# Messages that mark a stdio connection as unusable for any later request.
+# A dead subprocess surfaces as EOF, and a retired transport refuses all
+# future requests.  Both mean the session must reconnect, not retry.
+_STDIO_DEAD_CONNECTION_MESSAGES = frozenset({
+    "MCP server closed stdout unexpectedly",
+    "MCP stdio transport not connected",
+    _FRAMING_BROKEN_MESSAGE,
+})
 
 
 def _require_json_object(value: Any, *, label: str) -> dict[str, Any]:
@@ -81,6 +89,24 @@ class MCPSessionExpiredError(RuntimeError):
     The transport clears its stale session id before raising so a later
     request can re-initialize; callers may evict the connection from a pool.
     """
+
+
+def is_fatal_connection_error(exc: BaseException) -> bool:
+    """Whether an MCP tool-call exception means the connection is unusable.
+
+    A session that expires server-side (HTTP 404), a stdio subprocess that
+    closed stdout, and a framing-retired transport can never serve another
+    request: the caller must drop and reconnect rather than retry against a
+    dead connection.  Tool-level failures (``MCPToolError``), timeouts, and
+    other transient errors are explicitly NOT fatal — they do not evict.
+    """
+    if isinstance(exc, MCPSessionExpiredError):
+        return True
+    if isinstance(exc, RuntimeError):
+        message = str(exc)
+        if message in _STDIO_DEAD_CONNECTION_MESSAGES:
+            return True
+    return False
 
 
 class MCPTransport(Protocol):
@@ -128,6 +154,34 @@ def _redact_url(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
+# Locale/terminal keys safe to forward to an MCP stdio server.  Everything else
+# is deliberately NOT inherited from the parent process: a configured-but-
+# untrusted server (an arbitrary npx package) must not be able to read the
+# engine's API keys, DB credentials, or other secrets from its environment.
+_MCP_SAFE_ENV_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR")
+
+
+def _mcp_subprocess_environment(env: dict[str, str] | None) -> dict[str, str]:
+    """Build the environment an MCP stdio subprocess receives.
+
+    Mirrors the credential-free ``_safe_environment`` used for model-requested
+    shells: PATH and a small locale/terminal allowlist come from the parent,
+    plus any variables the user explicitly configured for this server.  No
+    other parent variables are forwarded, so a server can only see secrets the
+    operator deliberately granted it.
+    """
+    environment: dict[str, str] = {
+        "PATH": os.environ.get("PATH") or os.defpath,
+    }
+    for key in _MCP_SAFE_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    if env is not None:
+        environment.update(env)
+    return environment
+
+
 class StdioMCPTransport:
     """MCP transport backed by a local subprocess' stdin/stdout."""
 
@@ -139,7 +193,7 @@ class StdioMCPTransport:
         close_timeout: float = 5.0,
     ) -> None:
         self._command = command
-        self._env = {**os.environ, **env} if env is not None else None
+        self._env = _mcp_subprocess_environment(env)
         self._close_timeout = close_timeout
         self._process: asyncio.subprocess.Process | None = None
         self._stderr_drain_task: asyncio.Task[None] | None = None
@@ -584,15 +638,35 @@ async def register_mcp_tools_with_prefix(
     *,
     prefix: str,
     tools: list[MCPTool] | None = None,
+    on_connection_failure: Any | None = None,
 ) -> int:
-    """Discover MCP tools and register them into a ToolRegistry."""
+    """Discover MCP tools and register them into a ToolRegistry.
+
+    ``on_connection_failure`` is an optional async zero-argument callback
+    invoked (before the error re-raises) when a tool call fails because the
+    underlying connection is dead — an expired HTTP session or a closed stdio
+    pipe.  A session pool passes an eviction hook here so the next acquire
+    reconnects instead of reusing a dead server.
+    """
     tools = tools if tools is not None else await client.list_tools()
     count = 0
     taken: set[str] = set()
     for tool in tools:
         # 闭包捕获 — 使用默认参数绑定当前迭代值
         async def _execute(*, _client: MCPClient = client, _name: str = tool.name, **kwargs: Any) -> str:
-            return await _client.call_tool(_name, kwargs)
+            try:
+                return await _client.call_tool(_name, kwargs)
+            except BaseException as exc:
+                if on_connection_failure is not None and is_fatal_connection_error(exc):
+                    try:
+                        await on_connection_failure()
+                    except Exception:
+                        log.warning(
+                            "MCP connection-failure handler raised (tool=%s)",
+                            _name,
+                            exc_info=True,
+                        )
+                raise
 
         # Cap the joined name, not the two halves: a provider applies its
         # 64-character limit to what it actually receives.
