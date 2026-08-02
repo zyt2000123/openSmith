@@ -15,7 +15,7 @@ from engine.skill.registry import SkillRegistry
 from engine.tool.registry import ToolRegistry
 
 if TYPE_CHECKING:
-    from engine.execution.hooks import HookManager, HookRegistry
+    from engine.execution.tool_hooks import HookManager, HookRegistry
 
 logger = logging.getLogger(__name__)
 

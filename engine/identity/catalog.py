@@ -235,10 +235,11 @@ class IdentityCatalog:
     ) -> None:
         """Fail startup if a declared identity references unavailable assets.
 
-        Pipeline nodes may intentionally fall back to generic ReAct execution
-        when a specialized SKILL.md is not installed, so pipeline-internal skill
-        names are not rejected here. An identity's explicit skill allowlist is
-        different: it is a hard security/capability declaration and must exist.
+        Pipeline-internal skills are validated by
+        ``validate_execution_assets()``, which has the parsed chain available.
+        This catalog-level check still verifies identity-owned skill allowlists
+        and route-to-pipeline references. A pipeline node never falls back to
+        generic ReAct when its declared Skill is unavailable.
         """
         pipelines = set(pipeline_ids)
         skills = set(skill_names)

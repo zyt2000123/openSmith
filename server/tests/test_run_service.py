@@ -11,7 +11,8 @@ from engine.execution import RunStateStore
 from engine.safety.approval import APPROVAL_BROKER, ApprovalRequest
 
 
-def test_run_state_service_only_returns_runs_for_current_agent(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_run_state_service_only_returns_runs_for_current_agent(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path)
     state = store.create(
         "run-1",
@@ -20,18 +21,19 @@ def test_run_state_service_only_returns_runs_for_current_agent(tmp_path: Path) -
     )
     service = RunStateService(store)
 
-    result = service.get_run("smith-id", state.run_id)
+    result = await service.get_run("smith-id", state.run_id)
 
     assert result.run_id == "run-1"
     assert result.status == "queued"
     assert result.session_id == "session-1"
 
     with pytest.raises(HTTPException) as exc:
-        service.get_run("another-agent", state.run_id)
+        await service.get_run("another-agent", state.run_id)
     assert exc.value.status_code == 404
 
 
-def test_run_state_service_resolves_live_approval_for_current_agent(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_run_state_service_resolves_live_approval_for_current_agent(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path)
     store.create("run-1", agent_id="smith-id")
     store.transition("run-1", "running")
@@ -53,7 +55,7 @@ def test_run_state_service_resolves_live_approval_for_current_agent(tmp_path: Pa
         )
     )
 
-    resolved = RunStateService(store).resolve_approval(
+    resolved = await RunStateService(store).resolve_approval(
         "smith-id", "run-1", "approval-1", approved=True
     )
 
@@ -61,21 +63,19 @@ def test_run_state_service_resolves_live_approval_for_current_agent(tmp_path: Pa
     assert resolved.reason == "approval_granted"
 
 
-def test_approval_resolution_stays_synchronous_end_to_end() -> None:
-    """审批批复先落库、后唤醒 broker，这个顺序只在整条链全同步时才安全。
+def test_approval_broker_resolve_stays_synchronous() -> None:
+    """审批链中 broker 的检查和唤醒必须是同步的。
 
-    单线程事件循环下 is_pending 检查到 resolve() 之间没有其他协程能插进来，所以
-    当前顺序没有竞态。一旦其中任何一环变成 async（例如把 RunStateStore 换成
-    aiosqlite），落库成功而唤醒失败就会让等待审批的引擎协程永远挂住。把"全同步"
-    钉成不变量，改造存储的人会先撞到这条测试而不是线上挂死。
+    服务端先唤醒 broker（让等待中的引擎协程继续）再异步持久化 run state。
+    broker 的 is_pending→resolve 两段之间不能有 await 点，否则引擎超时线程能在
+    检查与唤醒之间弹出条目，造成"已唤醒但 store 已落库"的错位。这条测试把
+    broker 两段同步钉成不变量。
     """
     for func in (
-        RunStateService.resolve_approval,
-        RunStateStore.resolve_approval,
         APPROVAL_BROKER.is_pending,
         APPROVAL_BROKER.resolve,
     ):
         assert not inspect.iscoroutinefunction(func), (
-            f"{func.__qualname__} 变成 async 会让审批唤醒出现真实竞态；"
-            "改造前请重新审视 RunStateService.resolve_approval 的落库/唤醒顺序"
+            f"{func.__qualname__} 变成 async 会让 is_pending→resolve 之间出现"
+            "await 点，审批唤醒会出现真实竞态；改造前请重新审视顺序"
         )

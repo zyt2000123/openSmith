@@ -13,7 +13,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.paths import get_data_root
-from engine.execution.hooks import StopHook
+from engine.execution.tool_hooks import StopHook
 
 
 class CostTrackerHook(StopHook):

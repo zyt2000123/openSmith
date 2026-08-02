@@ -56,7 +56,7 @@ from .budget import (
 from .smith_ui import smith_ui_fallback, validate_smith_ui_call
 
 if TYPE_CHECKING:
-    from engine.execution.hooks import HookRegistry
+    from engine.execution.tool_hooks import HookRegistry
     from engine.llm.port import LLMPort
     from engine.safety.tool_guard import ToolGuard
     from engine.tool.registry import ToolRegistry

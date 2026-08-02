@@ -12,7 +12,7 @@ from typing import Any
 
 # 动态导入 PreToolHook（避免循环导入）
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from engine.execution.hooks import PreToolHook
+from engine.execution.tool_hooks import PreToolHook
 
 
 class ConfigProtectionHook(PreToolHook):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from engine.execution.hooks import HookLoader, HookRegistry, PreToolHook
+from engine.execution.tool_hooks import HookLoader, HookRegistry, PreToolHook
 
 
 class MockPreHook(PreToolHook):

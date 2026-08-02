@@ -350,7 +350,7 @@ async def prepare_runtime(
     bind_skill_load_tool(services)
 
     # ========== 加载 Hook 系统 ==========
-    from engine.execution.hooks import HookLoader, HookRegistry
+    from engine.execution.tool_hooks import HookLoader, HookRegistry
 
     hook_registry = HookRegistry()
     hook_loader = HookLoader()
@@ -404,7 +404,7 @@ async def prepare_runtime(
         max_tokens=prompt_budget_for_llm(services.llm),
     )
     if services.hooks is not None:
-        from engine.execution.hooks import HookType
+        from engine.execution.tool_hooks import HookType
 
         hooked_prompt = await services.hooks.apply(
             "system_prompt",

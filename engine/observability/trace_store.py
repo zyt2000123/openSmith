@@ -1,4 +1,10 @@
-"""Bounded, local JSONL trace storage for one Agent run."""
+"""Bounded, local JSONL trace storage for one Agent run.
+
+Records are hash-chained (``seq``/``prev_hash``/``hash``) so the trace is
+tamper-evident: editing, reordering, or deleting a record breaks the chain and
+is detected by :meth:`TraceStore.verify`.  :meth:`TraceStore.seal` anchors the
+chain head at run end, making a later rollback detectable too.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from common.hash_chain import ChainVerification, HashChainLog
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
 from engine.execution.events import EventType, ExecutionEvent
 
@@ -89,33 +96,28 @@ def _bounded_trace_value(value: Any, depth: int = 0) -> Any:
 class TraceStore:
     """Append and read bounded execution events without blocking a run."""
 
+    _CHAIN_NAMESPACE = "agent-smith-trace"
+
     def __init__(self, profile_dir: Path) -> None:
         self.root = Path(profile_dir) / "traces"
         self.root.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
         self.root.chmod(PRIVATE_DIR_MODE)
-        self._next_seq: dict[str, int] = {}
+        self._chains: dict[str, HashChainLog] = {}
 
     def _path(self, run_id: str) -> Path:
         if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
             raise ValueError("invalid trace run id")
         return self.root / f"{run_id}.jsonl"
 
-    def _sequence(self, run_id: str, path: Path) -> int:
-        if run_id not in self._next_seq:
-            current = 0
-            if path.is_file():
-                with path.open(encoding="utf-8") as handle:
-                    for line in handle:
-                        try:
-                            current = max(
-                                current,
-                                int(json.loads(line).get("seq", 0)),
-                            )
-                        except (ValueError, TypeError, json.JSONDecodeError):
-                            continue
-            self._next_seq[run_id] = current
-        self._next_seq[run_id] += 1
-        return self._next_seq[run_id]
+    def _chain(self, run_id: str) -> HashChainLog:
+        chain = self._chains.get(run_id)
+        if chain is None:
+            chain = HashChainLog(
+                self._path(run_id),
+                namespace=self._CHAIN_NAMESPACE,
+            )
+            self._chains[run_id] = chain
+        return chain
 
     def append(self, run_id: str, event: ExecutionEvent) -> None:
         self._append_record(
@@ -137,27 +139,23 @@ class TraceStore:
         *,
         sync: bool = True,
     ) -> None:
-        path = self._path(run_id)
         record = {
-            "seq": self._sequence(run_id, path),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": run_id,
             "type": record_type,
             "data": _bounded_trace_value(data),
         }
-        payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-        created = not path.exists()
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
-        try:
-            os.write(fd, payload)
-            if sync:
-                os.fsync(fd)
-        finally:
-            os.close(fd)
-        # O_CREAT already applies PRIVATE_FILE_MODE on creation; re-chmodding on
-        # every append is wasted syscalls on an already-private file.
-        if created:
-            path.chmod(PRIVATE_FILE_MODE)
+        # seq/prev_hash/hash are assigned by the chain under its own lock so
+        # sequence assignment and the append write stay atomic per record.
+        self._chain(run_id).append(record, sync=sync)
+
+    def seal(self, run_id: str) -> dict:
+        """Anchor the chain head so a later rollback of this run is detected."""
+        return self._chain(run_id).seal()
+
+    def verify(self, run_id: str) -> ChainVerification:
+        """Walk this run's chain and report the first integrity failure."""
+        return self._chain(run_id).verify()
 
     def read(self, run_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         path = self._path(run_id)

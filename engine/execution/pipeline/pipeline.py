@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from .backtrack import FailureLoopGuard, FailureSignature
 from engine.execution.events import EventType, ExecutionEvent, raw_text_delta
+from engine.execution.evidence import evidence_hash_of
 from .gate import Gate, GateResult, LLMGate, coerce_gate_result
 from .pipeline_context import (
     CTX_AGENT_ID,
@@ -118,14 +119,31 @@ async def run_pipeline(
             node_idx += 1
             continue
 
-        # A user-disabled skill is distinct from one that is simply absent
-        # from the registry.  The latter keeps the historical generic-ReAct
-        # fallback, while the former must not execute at all.
+        # A Pipeline's declared nodes are its execution contract. A disabled
+        # Skill is therefore no more skippable than a missing one: both make
+        # this node unavailable and must block the chain. `condition: false`
+        # above is the only explicit node-skipping mechanism.
         if node.skill_name in disabled_skill_names:
-            logger.info("skipping user-disabled pipeline skill %r", node.skill_name)
+            logger.warning("pipeline node %r is disabled", node.skill_name)
             context.pop(CTX_RETRY_HINT, None)
-            node_idx += 1
-            continue
+            yield ExecutionEvent(EventType.SKILL_START, {
+                "skill": node.skill_name,
+                "index": node_idx,
+            })
+            _clear_checkpoint(context)
+            yield ExecutionEvent(EventType.SKILL_END, {
+                "skill": node.skill_name,
+                "status": "blocked",
+            })
+            yield ExecutionEvent(EventType.BLOCKED, {
+                "skill": node.skill_name,
+                "reason": (
+                    f"pipeline node requires enabled Skill {node.skill_name!r}; "
+                    "skipping declared nodes is disabled"
+                ),
+            })
+            yield ExecutionEvent(EventType.DONE, {})
+            return
 
         yield ExecutionEvent(EventType.SKILL_START, {"skill": node.skill_name, "index": node_idx})
 
@@ -145,6 +163,27 @@ async def run_pipeline(
                 provision_id = f"{node.skill_name}:{node_idx}:{attempt}:{uuid4().hex}"
                 provision_settled = False
                 skill = skill_registry.get(node.skill_name)
+                if skill is None:
+                    logger.error(
+                        "pipeline node %r cannot execute because its Skill is not installed",
+                        node.skill_name,
+                    )
+                    provision_settled = True
+                    _clear_checkpoint(context)
+                    yield ExecutionEvent(EventType.SKILL_END, {
+                        "skill": node.skill_name,
+                        "status": "blocked",
+                    })
+                    yield ExecutionEvent(EventType.BLOCKED, {
+                        "skill": node.skill_name,
+                        "reason": (
+                            f"pipeline node requires installed Skill {node.skill_name!r}; "
+                            "generic ReAct fallback is disabled"
+                        ),
+                    })
+                    yield ExecutionEvent(EventType.DONE, {})
+                    return
+
                 node_tool_registry = tool_registry
                 if node.allowed_tools is not None:
                     scoped_to = getattr(tool_registry, "scoped_to", None)
@@ -155,57 +194,30 @@ async def run_pipeline(
                         )
                     node_tool_registry = scoped_to(node.allowed_tools)
 
-                if skill is None:
-                    logger.warning(
-                        "skill %r not in registry; node degrades to plain ReAct with a prompt prefix",
-                        node.skill_name,
+                skill_context = dict(context)
+                if attempt <= 1 and skill_context.get(CTX_RETRY_HINT):
+                    skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
+                elif attempt == 2:
+                    skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
+                # Vendored upstream skills stay source-faithful.  A node can
+                # supply only the small runtime-specific contract it needs
+                # (for example, how a one-question interview pauses in
+                # Agent-Smith) without creating a duplicate skill.
+                if node.instructions:
+                    skill = replace(
+                        skill,
+                        content=(
+                            f"{skill.content.rstrip()}\n\n"
+                            "## Agent-Smith chain node contract\n\n"
+                            f"{node.instructions}\n"
+                        ),
                     )
-                    # P7: ``base_messages`` already ends with the user turn;
-                    # appending another consecutive user message duplicates the
-                    # request and is rejected by some providers.  Replace the
-                    # trailing user turn with the skill-prefixed variant.
-                    messages = list(base_messages)
-                    prefixed = f"[Skill: {node.skill_name}] {user_message}"
-                    # attempt==1：base gate 重试；attempt==0 且有 hint：域门禁
-                    # retry 重进本节点（见下方 retry 分支写入 CTX_RETRY_HINT）。
-                    if attempt <= 1 and context.get(CTX_RETRY_HINT):
-                        prefixed = f"{prefixed}\n\n[Feedback]\n{context[CTX_RETRY_HINT]}"
-                    elif attempt == 2:
-                        prefixed = f"{prefixed}\n\nSwitch strategy: try a completely different approach."
-                    if messages and messages[-1].get("role") == "user":
-                        messages[-1] = {**messages[-1], "content": prefixed}
-                    else:
-                        messages.append({"role": "user", "content": prefixed})
-                    event_stream = react_event_loop(
-                        llm, messages, node_tool_registry, tool_guard, max_react_iters,
-                        provisional_lifecycle=False,
-                        prefix_cache_key=prefix_cache_key,
-                    )
-                else:
-                    skill_context = dict(context)
-                    if attempt <= 1 and skill_context.get(CTX_RETRY_HINT):
-                        skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
-                    elif attempt == 2:
-                        skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
-                    # Vendored upstream skills stay source-faithful.  A node
-                    # can supply only the small runtime-specific contract it
-                    # needs (for example, how a one-question interview pauses
-                    # in Agent-Smith) without creating a duplicate skill.
-                    if node.instructions:
-                        skill = replace(
-                            skill,
-                            content=(
-                                f"{skill.content.rstrip()}\n\n"
-                                "## Agent-Smith chain node contract\n\n"
-                                f"{node.instructions}\n"
-                            ),
-                        )
-                    event_stream = execute_skill_events(
-                        skill, llm, node_tool_registry, base_messages, skill_context,
-                        max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
-                        react_event_loop_fn=react_event_loop,
-                        prefix_cache_key=prefix_cache_key,
-                    )
+                event_stream = execute_skill_events(
+                    skill, llm, node_tool_registry, base_messages, skill_context,
+                    max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
+                    react_event_loop_fn=react_event_loop,
+                    prefix_cache_key=prefix_cache_key,
+                )
 
                 result = _NodeResult()
                 async for event in _collect_node_events(event_stream, provision_id):
@@ -288,6 +300,12 @@ async def run_pipeline(
                     return
 
                 # 第一层：兜底门禁。为空则本次产出直接进入领域门禁。
+                if result.evidence_hash is not None:
+                    yield ExecutionEvent(EventType.GATE_EVIDENCE, {
+                        "skill": node.skill_name,
+                        "evidence": result.evidence,
+                        "evidence_hash": result.evidence_hash,
+                    })
                 if not base_gates:
                     base_passed = True
                     break
@@ -310,6 +328,7 @@ async def run_pipeline(
                 yield ExecutionEvent(EventType.BLOCKED, {
                     "skill": node.skill_name,
                     "reason": base_result.reason if base_result else "base gate failed",
+                    "evidence_hash": result.evidence_hash,
                 })
                 yield ExecutionEvent(EventType.DONE, {})
                 return
@@ -318,7 +337,10 @@ async def run_pipeline(
                 node.gate.set_llm(gate_llm or llm)
             gate_result = coerce_gate_result(await node.gate.check(output, context))
             yield ExecutionEvent(EventType.GATE_RESULT, {
-                "skill": node.skill_name, "verdict": gate_result.verdict, "reason": gate_result.reason,
+                "skill": node.skill_name,
+                "verdict": gate_result.verdict,
+                "reason": gate_result.reason,
+                "evidence_hash": result.evidence_hash,
             })
 
             if gate_result.verdict == "pass":
@@ -459,13 +481,26 @@ async def _check_base_gates(
 
 
 class _NodeResult:
-    __slots__ = ("text", "was_provisional", "incomplete_reason", "failed_reason")
+    __slots__ = (
+        "text",
+        "was_provisional",
+        "incomplete_reason",
+        "failed_reason",
+        "evidence",
+        "evidence_hash",
+    )
 
     def __init__(self) -> None:
         self.text = ""
         self.was_provisional = False
         self.incomplete_reason: str | None = None
         self.failed_reason: str | None = None
+        # Ordered tool-result evidence for this node attempt: every real
+        # execution's ``{tool, call_id, result_hash, error}``, bound into one
+        # ``evidence_hash`` so the gate verdict is verifiable against the
+        # exact tool outputs it was computed from.
+        self.evidence: list[dict] = []
+        self.evidence_hash: str | None = None
 
 
 def _ends_with_user_question(output: str) -> bool:
@@ -495,6 +530,7 @@ async def _collect_node_events(
     was_provisional = False
     incomplete_reason: str | None = None
     failed_reason: str | None = None
+    evidence: list[dict] = []
 
     async for event in event_stream:
         if event.type == EventType.TEXT_DELTA:
@@ -508,6 +544,18 @@ async def _collect_node_events(
                     "text": delta, "provision_id": provision_id,
                 })
             continue
+        elif event.type == EventType.TOOL_CALL_RESULT:
+            # Capture evidence for every real tool execution in this node
+            # attempt.  Only executed calls carry ``result_hash``; policy
+            # blocks and preflight challenges produced no output.
+            result_hash = event.data.get("result_hash")
+            if isinstance(result_hash, str) and result_hash:
+                evidence.append({
+                    "tool": str(event.data.get("tool") or event.data.get("name") or ""),
+                    "call_id": str(event.data.get("id") or ""),
+                    "result_hash": result_hash,
+                    "error": bool(event.data.get("error")),
+                })
         elif event.type == EventType.INCOMPLETE:
             incomplete_reason = str(event.data.get("reason", "agent_incomplete"))
         elif event.type == EventType.FAILED:
@@ -519,6 +567,8 @@ async def _collect_node_events(
     result.was_provisional = was_provisional
     result.incomplete_reason = incomplete_reason
     result.failed_reason = failed_reason
+    result.evidence = evidence
+    result.evidence_hash = evidence_hash_of(evidence) if evidence else None
     yield result
 
 

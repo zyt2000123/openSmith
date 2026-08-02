@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from engine.safety.approval import ApprovalScope
 from engine.safety.fact_gate import FactGate
+from engine.safety.risk import RiskTier
 from engine.safety.tool_guard import PermissionLevel
 from engine.tool.interface import ToolCall
 
@@ -30,6 +31,7 @@ class ToolPolicyDecision:
     approval_required: bool = False
     challenged: bool = False
     approval_scope: ApprovalScope | None = None
+    risk: RiskTier = RiskTier.ROUTINE
 
     @property
     def observation(self) -> str:
@@ -68,6 +70,7 @@ class _ToolGuardAdapter:
                 needs_confirmation=True,
                 approval_required=True,
                 approval_scope=result.approval_scope,
+                risk=result.risk,
             )
         return ToolPolicyDecision(
             allowed=result.allowed,
@@ -75,6 +78,7 @@ class _ToolGuardAdapter:
             level=result.level,
             needs_confirmation=result.needs_confirmation,
             approval_scope=result.approval_scope,
+            risk=result.risk,
         )
 
 
@@ -123,6 +127,7 @@ class ToolPolicy:
 
     def evaluate(self, call: ToolCall) -> ToolPolicyDecision:
         level = PermissionLevel.READ
+        risk = RiskTier.ROUTINE
         deferred_approval: ToolPolicyDecision | None = None
         for checker in self._checkers:
             decision = checker.check_policy(call)
@@ -139,6 +144,7 @@ class ToolPolicy:
                         approval_required=True,
                         challenged=decision.challenged,
                         approval_scope=decision.approval_scope,
+                        risk=RiskTier.max(risk, decision.risk),
                     )
                     continue
                 return ToolPolicyDecision(
@@ -149,13 +155,15 @@ class ToolPolicy:
                     approval_required=decision.approval_required,
                     challenged=decision.challenged,
                     approval_scope=decision.approval_scope,
+                    risk=RiskTier.max(risk, decision.risk),
                 )
             # Carry forward the most specific permission level seen so far.
             if _LEVEL_ORDER.get(decision.level, 0) > _LEVEL_ORDER.get(level, 0):
                 level = decision.level
+            risk = RiskTier.max(risk, decision.risk)
         if deferred_approval is not None:
             return deferred_approval
-        return ToolPolicyDecision(allowed=True, level=level)
+        return ToolPolicyDecision(allowed=True, level=level, risk=risk)
 
     def begin_round(self) -> None:
         for checker in self._checkers:

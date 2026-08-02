@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from engine.safety.approval import ApprovalScope
+from engine.safety.risk import RiskTier
 from engine.sandbox import ExecutionEnvironment, LocalExecutionEnvironment
 
 from .interface import ToolCall, ToolDefinition, ToolResult
@@ -709,9 +710,15 @@ class ToolRegistry:
             # an arbitrary directory (/etc, ~/Library, ...) — including
             # credential-bearing names the name-based sensitive checks do not
             # cover (master.passwd, shadow).  External approvals therefore
-            # whitelist exactly one path.  High-risk paths (.ssh, .aws, .env,
-            # .git/config) always require approval each time regardless.
-            if approval_granted and approval_scope is not None and approval_scope.kind == "path":
+            # whitelist exactly one path.  HIGH/CRITICAL approvals are never
+            # cached: sensitive paths (.ssh, .aws, .env, .git/config) and
+            # destructive operations require approval each time regardless.
+            if (
+                approval_granted
+                and approval_scope is not None
+                and approval_scope.kind == "path"
+                and decision.risk is RiskTier.ELEVATED
+            ):
                 from pathlib import Path
                 try:
                     target_path = Path(approval_scope.target).expanduser().resolve()

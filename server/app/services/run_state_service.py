@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import HTTPException
@@ -18,10 +19,10 @@ class RunStateService:
     def __init__(self, store: RunStateStore) -> None:
         self.store = store
 
-    def get_run(self, agent_id: str, run_id: str) -> RunStateOut:
+    async def get_run(self, agent_id: str, run_id: str) -> RunStateOut:
         store = self.store
         try:
-            state = store.get(run_id)
+            state = await asyncio.to_thread(store.get, run_id)
         except ValueError:
             raise HTTPException(404, "Run not found")
         except RunStateError:
@@ -34,7 +35,7 @@ class RunStateService:
             raise HTTPException(404, "Run not found")
         return RunStateOut(**state.to_dict())
 
-    def resolve_approval(
+    async def resolve_approval(
         self,
         agent_id: str,
         run_id: str,
@@ -44,7 +45,7 @@ class RunStateService:
     ) -> RunStateOut:
         store = self.store
         try:
-            state = store.get(run_id)
+            state = await asyncio.to_thread(store.get, run_id)
         except (ValueError, RunStateError) as exc:
             raise HTTPException(404, "Run not found") from exc
 
@@ -55,10 +56,35 @@ class RunStateService:
         if not APPROVAL_BROKER.is_pending(run_id, approval_id):
             raise HTTPException(409, "Approval request is no longer active")
 
-        try:
-            resolved = store.resolve_approval(run_id, approval_id, approved=approved)
-        except (RunStateError, RunStateTransitionError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+        # Resolve the in-memory broker first: it is the gate the engine's tool
+        # call is actually blocked on.  Resolving the store first could leave the
+        # persisted run RUNNING (with its approval cleared) while the broker entry
+        # was already popped by a 300s timeout — the client would get a 409 for an
+        # approval the user did grant, and the tool would never run.  Resolving
+        # the broker first means a 409 never mutates the store.
         if not APPROVAL_BROKER.resolve(run_id, approval_id, approved):
             raise HTTPException(409, "Approval request is no longer active")
+        try:
+            resolved = await asyncio.to_thread(
+                store.resolve_approval,
+                run_id,
+                approval_id,
+                approved=approved,
+            )
+        except (RunStateError, RunStateTransitionError) as exc:
+            # The engine has already been unblocked by broker.resolve above, so
+            # the tool will run; the store write failing must not surface as a
+            # rejection to the user.  The engine's own TOOL_CALL_RESULT projection
+            # will re-sync the persisted state when the tool completes.
+            logger.warning(
+                "approval granted but run state persist failed (run=%s)", run_id,
+                exc_info=True,
+            )
+            try:
+                state = await asyncio.to_thread(store.get, run_id)
+            except (ValueError, RunStateError):
+                state = None
+            if state is None:
+                raise HTTPException(503, "Run state is temporarily unavailable")
+            return RunStateOut(**state.to_dict())
         return RunStateOut(**resolved.to_dict())

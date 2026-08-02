@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from engine.execution.hooks import PreToolHook
+from engine.execution.tool_hooks import PreToolHook
 
 
 class FactGateHook(PreToolHook):

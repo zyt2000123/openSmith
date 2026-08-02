@@ -22,6 +22,7 @@ class EventType(str, Enum):
     SKILL_START = "skill_start"
     SKILL_END = "skill_end"
     GATE_RESULT = "gate_result"
+    GATE_EVIDENCE = "gate_evidence"
     ROUTE_DECIDED = "route_decided"
     BACKTRACK = "backtrack"
     BLOCKED = "blocked"

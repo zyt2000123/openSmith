@@ -60,6 +60,12 @@
 | 身份 | YAML `schema: agentsmith.identity/v1` |
 | Pipeline | YAML `steps:` 节点列表 + 顶层 `base_gate(s)` / `backtrack` |
 
+Pipeline 执行规则：`steps[].skill` 是严格的运行时依赖。引擎必须先从
+`SkillRegistry` 解析出同名 `SKILL.md`，再经 `execute_skill_events()` 进入该
+Skill 的执行上下文；节点缺少 Skill 时以 `blocked` 结束，**不得**退回为通用
+ReAct。被用户禁用的节点 Skill 同样会阻断；只有该节点的 `condition` 返回
+`false` 才可跳过。通用 ReAct 只适用于没有绑定 Pipeline 的 route（`pipeline: null`）。
+
 加载规则：
 
 - `gates/`、`conditions/` 递归扫描 `*.py`，**`_` 开头的文件会被跳过**；重复注册的 key、

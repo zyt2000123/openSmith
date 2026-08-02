@@ -97,7 +97,8 @@ steps:
 
 1. Skill 描述“如何完成一类任务”，不复制系统安全策略；
 2. 所有外部副作用仍由 ToolPolicy、ToolGuard 和审批链决定；
-3. `SkillRegistry` 的 enabled 状态由用户控制，关闭的 skill 不会被 pipeline 执行；
+3. `SkillRegistry` 的 enabled 状态由用户控制；若关闭了 Pipeline 已声明的 skill，
+   该 Pipeline 会在对应节点阻断，不能静默跳过或退回通用 ReAct；
 4. 新 skill 必须附带至少一个可验证示例或相应回归测试。
 
 ## Tool provider：窄接口、统一治理
