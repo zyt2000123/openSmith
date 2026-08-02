@@ -453,14 +453,25 @@ class PromptAssembler:
             # Compatibility path for direct callers predating typed retrieval.
             retrieved_episodes = retrieved_memory
 
+        retrieved_durable = self._sanitize_memory_reference(retrieved_durable)
+        retrieved_episodes = self._sanitize_memory_reference(retrieved_episodes)
+
         # The fallback reads separate files so provenance remains precise.
         if memory_text is not None:
-            recent_memory = memory_text
+            recent_memory = self._sanitize_memory_reference(memory_text)
             legacy_durable_memory = ""
         else:
             memory_dir = agent_dir / "memory"
-            recent_memory = self._read(memory_dir / "recent.md") if memory_dir.is_dir() else ""
-            legacy_durable_memory = self._read(memory_dir / "durable.md") if memory_dir.is_dir() else ""
+            recent_memory = (
+                self._sanitize_memory_reference(self._read(memory_dir / "recent.md"))
+                if memory_dir.is_dir()
+                else ""
+            )
+            legacy_durable_memory = (
+                self._sanitize_memory_reference(self._read(memory_dir / "durable.md"))
+                if memory_dir.is_dir()
+                else ""
+            )
         has_memory = bool(
             recent_memory or legacy_durable_memory or retrieved_durable or retrieved_episodes
         )
@@ -716,6 +727,16 @@ class PromptAssembler:
             )
             if part
         )
+
+    @staticmethod
+    def _sanitize_memory_reference(value: object) -> str:
+        """Apply the memory trust boundary at every prompt-assembly entry point."""
+        if not isinstance(value, str):
+            return ""
+        from engine.memory._files import sanitize_memory_text
+
+        cleaned, _, _ = sanitize_memory_text(value)
+        return cleaned.strip()
 
     @staticmethod
     def _extract_memory_body(f: Path) -> str:

@@ -32,7 +32,16 @@ class _CompactingLLM:
         self.calls.append(messages)
         if self.fail:
             raise RuntimeError("summary unavailable")
-        return type("Response", (), {"text": "dense summary", "finish_reason": "stop"})()
+        return type("Response", (), {
+            "text": (
+                "<context_summary><conversation_overview>overview</conversation_overview>"
+                "<key_knowledge>knowledge</key_knowledge>"
+                "<file_system_state>files</file_system_state>"
+                "<recent_actions>actions</recent_actions>"
+                "<current_plan>plan</current_plan></context_summary>"
+            ),
+            "finish_reason": "stop",
+        })()
 
 
 def test_token_estimate_conservatively_bounds_cjk_byte_fallback() -> None:
@@ -86,9 +95,15 @@ def test_fit_request_counts_assistant_tool_call_arguments() -> None:
 def test_fit_request_compacts_and_remeasures_before_returning() -> None:
     llm = _CompactingLLM()
     system = {"role": "system", "content": "protected system contract"}
+    active_request = {"role": "user", "content": "Continue the investigation safely."}
 
     result = asyncio.run(fit_request(
-        [system, {"role": "user", "content": "证" * 4_000}],
+        [
+            system,
+            {"role": "user", "content": "证" * 4_000},
+            {"role": "assistant", "content": "Earlier investigation."},
+            active_request,
+        ],
         None,
         llm,
     ))
@@ -97,6 +112,7 @@ def test_fit_request_compacts_and_remeasures_before_returning() -> None:
     assert result.fits
     assert len(llm.calls) == 1
     assert result.messages[0] == system
+    assert result.messages[-1] == active_request
     assert result.receipt.estimated_input_tokens <= result.receipt.safe_input_budget
     assert estimate_messages_tokens(llm.calls[0]) <= result.receipt.safe_input_budget
 
@@ -104,9 +120,15 @@ def test_fit_request_compacts_and_remeasures_before_returning() -> None:
 def test_fit_request_uses_deterministic_recovery_when_compaction_fails() -> None:
     llm = _CompactingLLM(fail=True)
     system = {"role": "system", "content": "protected system contract"}
+    active_request = {"role": "user", "content": "Continue the investigation safely."}
 
     result = asyncio.run(fit_request(
-        [system, {"role": "user", "content": "证" * 4_000}],
+        [
+            system,
+            {"role": "user", "content": "证" * 4_000},
+            {"role": "assistant", "content": "Earlier investigation."},
+            active_request,
+        ],
         None,
         llm,
     ))
@@ -114,6 +136,7 @@ def test_fit_request_uses_deterministic_recovery_when_compaction_fails() -> None
     assert result.status is ContextFitStatus.RECOVERED
     assert result.fits
     assert result.messages[0] == system
+    assert result.messages[-1] == active_request
     assert result.receipt.estimated_input_tokens <= result.receipt.safe_input_budget
     assert "compaction_failed" in result.actions
 
@@ -151,3 +174,43 @@ def test_fit_request_treats_all_leading_system_messages_as_protected() -> None:
     assert result.status is ContextFitStatus.UNFIT_STATIC_PROMPT
     assert result.messages[:2] == tuple(contracts)
     assert llm.calls == []
+
+
+def test_fit_request_rejects_an_oversized_active_user_turn_without_summarizing() -> None:
+    """A current request must never be silently replaced by a history summary."""
+    llm = _CompactingLLM()
+    active_request = (
+        "x" * 8_000
+        + "\nCRITICAL CONSTRAINT: never deploy or modify production."
+    )
+    messages = [
+        {"role": "system", "content": "protected system contract"},
+        {"role": "user", "content": active_request},
+    ]
+
+    result = asyncio.run(fit_request(messages, None, llm))
+
+    assert result.status is ContextFitStatus.UNFIT_REQUEST
+    assert result.messages == tuple(messages)
+    assert llm.calls == []
+
+
+def test_deterministic_recovery_preserves_the_active_user_turn_verbatim() -> None:
+    """A failed summary may trim history, never the request being executed."""
+    llm = _CompactingLLM(fail=True)
+    active_request = "Investigate the failure but never deploy or modify production."
+
+    result = asyncio.run(fit_request(
+        [
+            {"role": "system", "content": "protected system contract"},
+            {"role": "user", "content": "x" * 8_000},
+            {"role": "assistant", "content": "Earlier investigation."},
+            {"role": "user", "content": active_request},
+        ],
+        None,
+        llm,
+    ))
+
+    assert result.status is ContextFitStatus.RECOVERED
+    assert result.messages[-1] == {"role": "user", "content": active_request}
+    assert "never deploy or modify production" in str(result.messages)

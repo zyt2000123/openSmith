@@ -32,6 +32,47 @@ CONTEXT_TRIGGER_RATIO = 0.7
 DEFAULT_CONTEXT_LIMIT = DEFAULT_CONTEXT_WINDOW
 CONTEXT_DISPLAY_WINDOW = DEFAULT_CONTEXT_LIMIT
 
+
+def _split_active_context(
+    conversation: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split leading contracts, compactable history, and active work.
+
+    The newest user turn is the request currently being executed. A context
+    fitter may summarize or trim only the preceding history; the active turn
+    and its subsequent assistant/tool trail stay verbatim.
+    """
+    leading_system_count = 0
+    for message in conversation:
+        if message.get("role") != "system":
+            break
+        leading_system_count += 1
+
+    active_start: int | None = None
+    for index in range(len(conversation) - 1, leading_system_count - 1, -1):
+        if conversation[index].get("role") == "user":
+            active_start = index
+            break
+
+    if active_start is None:
+        return (
+            [dict(message) for message in conversation[:leading_system_count]],
+            [dict(message) for message in conversation[leading_system_count:]],
+            [],
+        )
+    return (
+        [dict(message) for message in conversation[:leading_system_count]],
+        [dict(message) for message in conversation[leading_system_count:active_start]],
+        [dict(message) for message in conversation[active_start:]],
+    )
+
+
+def _preserved_active_context(conversation: list[dict]) -> list[dict]:
+    """Return the irreducible contract plus current user request/work."""
+    protected, _, active = _split_active_context(conversation)
+    return [*protected, *active]
+
+
 def prune_tool_outputs(
     conversation: list[dict],
     *,
@@ -129,20 +170,13 @@ def trim_conversation_for_context_limit(
     if token_budget <= 0 or estimate_messages_tokens(copied) <= token_budget:
         return copied
 
-    # The first system message is the runtime contract. Never silently rewrite
-    # it to make a request fit; callers must classify an oversized contract as
-    # an explicit unfit-static-prompt result.
-    protected: list[dict] = []
-    history_start = 0
-    while (
-        history_start < len(copied)
-        and copied[history_start].get("role") == "system"
-    ):
-        protected.append(copied[history_start])
-        history_start += 1
+    # Leading system messages are the runtime contract. The newest user turn
+    # and its current work are equally non-negotiable: replacing either with a
+    # tail slice can reverse a current safety constraint or task objective.
+    protected, history, active = _split_active_context(copied)
 
     history_lines: list[str] = []
-    for message in copied[history_start:]:
+    for message in history:
         role = str(message.get("role", "unknown"))
         content = message.get("content")
         if not isinstance(content, str) or not content:
@@ -164,25 +198,34 @@ def trim_conversation_for_context_limit(
     )
     history_text = "\n".join(history_lines)
 
-    def candidate(keep: int) -> list[dict]:
+    def historical_candidate(keep: int) -> list[dict]:
         tail = history_text[-keep:] if keep else ""
         marker = "[... earlier context truncated ...]\n" if keep < len(history_text) else ""
+        recovered_history = recovery_prefix + marker + tail
+        if not recovered_history.strip():
+            return [*protected, *active]
         return [
             *protected,
-            {"role": "user", "content": recovery_prefix + marker + tail},
+            {"role": "user", "content": recovered_history},
+            {
+                "role": "assistant",
+                "content": "Understood. I have the relevant earlier context.",
+            },
+            *active,
         ]
 
-    minimum = candidate(0)
+    minimum = historical_candidate(0)
     if estimate_messages_tokens(minimum) > token_budget:
-        # Return the protected contract unchanged. The final fitter will fail
-        # closed instead of corrupting it or calling the provider.
-        return protected
+        # Preserve the active request even if no space remains to annotate the
+        # discarded history. The final fitter fails closed when that request
+        # itself exceeds capacity.
+        return [*protected, *active]
 
     low, high = 0, len(history_text)
     best = minimum
     while low <= high:
         keep = (low + high) // 2
-        current = candidate(keep)
+        current = historical_candidate(keep)
         if estimate_messages_tokens(current) <= token_budget:
             best = current
             low = keep + 1
@@ -251,16 +294,17 @@ async def compress(conversation: list[dict], llm: "LLMPort | None" = None) -> li
 async def compact_history(conversation: list[dict], llm: "LLMPort") -> list[dict]:
     """Replace conversation with a compacted summary via LLM.
 
-    Returns a new conversation list: [system_prompt, summary_message].
-    The original system prompt (first message) is preserved.
+    Returns a new conversation with prior history summarized before the active
+    user turn. The leading system contract and current request/work are
+    preserved verbatim.
     """
-    system_messages: list[dict] = []
-    for message in conversation:
-        if message.get("role") != "system":
-            break
-        system_messages.append(message)
+    system_messages, history, active = _split_active_context(conversation)
+    if not history:
+        # A request that is too large by itself cannot be safely compacted: a
+        # summary would replace the very instruction the model must execute.
+        return conversation
 
-    summary_result = await summarize_session(conversation, llm)
+    summary_result = await summarize_session(history, llm)
     if not summary_result.usable:
         # 摘要为空/被截断/被拒答时整体替换历史等于静默失忆——
         # 放弃本轮 compact，保留 prune 后的原始对话。
@@ -280,4 +324,5 @@ async def compact_history(conversation: list[dict], llm: "LLMPort") -> list[dict
         "content": f"[Previous conversation summary]\n{summary_result.summary}",
     })
     result.append({"role": "assistant", "content": "Understood. I have the full context from our previous conversation. How can I help?"})
+    result.extend(active)
     return result

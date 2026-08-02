@@ -7,6 +7,7 @@ from enum import Enum
 import json
 import logging
 from typing import Any
+from xml.etree import ElementTree
 
 from engine.llm.observability import llm_purpose
 
@@ -47,12 +48,20 @@ COMPACT_USER_PROMPT = (
     "Summarize our conversation above. Focus on what we did, what we're doing, "
     "which files we're working on, and what's next. Be dense with information."
 )
+_REQUIRED_SUMMARY_SECTIONS = (
+    "conversation_overview",
+    "key_knowledge",
+    "file_system_state",
+    "recent_actions",
+    "current_plan",
+)
 
 
 class SessionSummaryStatus(str, Enum):
     COMPLETE = "complete"
     EMPTY = "empty"
     TRUNCATED = "truncated"
+    INVALID = "invalid"
     UNFIT = "unfit"
 
 
@@ -102,8 +111,10 @@ async def summarize_session(
     finish_reason = getattr(response, "finish_reason", None)
     if not summary:
         status = SessionSummaryStatus.EMPTY
-    elif finish_reason not in (None, "stop"):
+    elif finish_reason != "stop":
         status = SessionSummaryStatus.TRUNCATED
+    elif not _has_required_summary_structure(summary):
+        status = SessionSummaryStatus.INVALID
     else:
         status = SessionSummaryStatus.COMPLETE
     return SessionSummaryResult(
@@ -114,6 +125,18 @@ async def summarize_session(
         request_tokens=request_tokens,
         safe_input_budget=budget,
         input_was_trimmed=input_was_trimmed,
+    )
+
+
+def _has_required_summary_structure(summary: str) -> bool:
+    """Accept only the summary envelope the compaction prompt requires."""
+    try:
+        root = ElementTree.fromstring(summary)
+    except (ElementTree.ParseError, ValueError):
+        return False
+    return (
+        root.tag == "context_summary"
+        and all(root.find(section) is not None for section in _REQUIRED_SUMMARY_SECTIONS)
     )
 
 

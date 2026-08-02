@@ -15,6 +15,15 @@ from engine.context import SessionSummaryStatus, summarize_session
 from engine.llm.contracts import ModelLimits
 
 
+VALID_SUMMARY = """<context_summary>
+  <conversation_overview>overview</conversation_overview>
+  <key_knowledge>knowledge</key_knowledge>
+  <file_system_state>files</file_system_state>
+  <recent_actions>actions</recent_actions>
+  <current_plan>plan</current_plan>
+</context_summary>"""
+
+
 def test_needs_compaction_uses_actual_conversation_size() -> None:
     conversation = [{"role": "system", "content": "x" * 300_000}]
 
@@ -56,12 +65,16 @@ def test_compress_reserves_output_before_triggering_for_large_declared_windows()
         context_window_declared = True
 
         async def chat(self, messages, tools=None):
-            return SimpleNamespace(text="summary")
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason="stop")
 
     budget, trigger_ratio = compaction_policy_for_llm(LargeWindowLLM())
     threshold = math.ceil(budget * trigger_ratio)
     below_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1))}]
-    at_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1) + 1)}]
+    at_limit = [
+        {"role": "user", "content": "x" * (3 * (threshold - 1) + 1)},
+        {"role": "assistant", "content": "Earlier work."},
+        {"role": "user", "content": "Continue safely."},
+    ]
 
     assert asyncio.run(compress(below_limit, LargeWindowLLM())) is below_limit
     assert asyncio.run(compress(at_limit, LargeWindowLLM())) is not at_limit
@@ -73,12 +86,16 @@ def test_compress_uses_safe_budget_when_window_is_undeclared() -> None:
         context_window_declared = False
 
         async def chat(self, messages, tools=None):
-            return SimpleNamespace(text="summary")
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason="stop")
 
     budget, trigger_ratio = compaction_policy_for_llm(UnconfiguredLLM())
     threshold = math.ceil(budget * trigger_ratio)
     below_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1))}]
-    at_limit = [{"role": "user", "content": "x" * (3 * (threshold - 1) + 1)}]
+    at_limit = [
+        {"role": "user", "content": "x" * (3 * (threshold - 1) + 1)},
+        {"role": "assistant", "content": "Earlier work."},
+        {"role": "user", "content": "Continue safely."},
+    ]
 
     assert asyncio.run(compress(below_limit, UnconfiguredLLM())) is below_limit
     assert asyncio.run(compress(at_limit, UnconfiguredLLM())) is not at_limit
@@ -92,7 +109,7 @@ def test_compact_history_keeps_tool_evidence_in_summary_input() -> None:
     class FakeLLM:
         async def chat(self, messages, tools=None):
             captured["messages"] = messages
-            return SimpleNamespace(text="summary")
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason="stop")
 
     conversation = [
         {"role": "system", "content": "system prompt"},
@@ -100,6 +117,7 @@ def test_compact_history_keeps_tool_evidence_in_summary_input() -> None:
         {"role": "assistant", "content": "", "tool_calls": [
             {"function": {"name": "read_file"}}]},
         {"role": "tool", "content": "DATABASE_URL=postgres://demo"},
+        {"role": "user", "content": "Continue safely."},
     ]
 
     asyncio.run(compact_history(conversation, FakeLLM()))
@@ -153,10 +171,36 @@ def test_compact_history_preserves_all_leading_system_contracts() -> None:
     assert result[:2] == contracts
 
 
+def test_compact_history_summarizes_only_prior_history_and_keeps_active_turn() -> None:
+    """The request currently being executed must remain verbatim after compaction."""
+    captured: list[list[dict]] = []
+    active_request = "Investigate the failure but never deploy production."
+
+    class SummaryLLM:
+        async def chat(self, messages, tools=None):
+            captured.append(messages)
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason="stop")
+
+    result = asyncio.run(compact_history(
+        [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "Earlier task"},
+            {"role": "assistant", "content": "Earlier result"},
+            {"role": "user", "content": active_request},
+        ],
+        SummaryLLM(),
+    ))
+
+    assert active_request not in "\n".join(
+        message["content"] for message in captured[0]
+    )
+    assert result[-1] == {"role": "user", "content": active_request}
+
+
 def test_session_summary_returns_typed_payload_without_synthetic_messages() -> None:
     class SummaryLLM:
         async def chat(self, messages, tools=None):
-            return SimpleNamespace(text="typed summary", finish_reason="stop")
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason="stop")
 
     result = asyncio.run(summarize_session(
         [{"role": "user", "content": "goal"}],
@@ -165,8 +209,36 @@ def test_session_summary_returns_typed_payload_without_synthetic_messages() -> N
 
     assert result.status is SessionSummaryStatus.COMPLETE
     assert result.usable
-    assert result.summary == "typed summary"
+    assert result.summary == VALID_SUMMARY
     assert result.source_message_count == 1
+
+
+def test_session_summary_rejects_a_malformed_completed_response() -> None:
+    class InvalidSummaryLLM:
+        async def chat(self, messages, tools=None):
+            return SimpleNamespace(text="not the required summary structure", finish_reason="stop")
+
+    result = asyncio.run(summarize_session(
+        [{"role": "user", "content": "goal"}],
+        InvalidSummaryLLM(),
+    ))
+
+    assert result.status is SessionSummaryStatus.INVALID
+    assert not result.usable
+
+
+def test_session_summary_rejects_a_response_without_a_stop_reason() -> None:
+    class MissingFinishReasonLLM:
+        async def chat(self, messages, tools=None):
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason=None)
+
+    result = asyncio.run(summarize_session(
+        [{"role": "user", "content": "goal"}],
+        MissingFinishReasonLLM(),
+    ))
+
+    assert result.status is SessionSummaryStatus.TRUNCATED
+    assert not result.usable
 
 
 def test_session_summary_fails_closed_when_its_own_prompt_cannot_fit() -> None:

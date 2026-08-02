@@ -14,6 +14,7 @@ from .budget import (
     model_limits_for,
 )
 from .compression import (
+    _preserved_active_context,
     compact_history,
     prune_tool_outputs,
     trim_conversation_for_context_limit,
@@ -132,6 +133,16 @@ async def fit_request(
     pruned_chars = prune_tool_outputs(candidate)
     if pruned_chars:
         actions.append(f"pruned_tool_output_chars:{pruned_chars}")
+
+    active_receipt = assess(_preserved_active_context(candidate))
+    if active_receipt.estimated_input_tokens > budget.safe_input_budget:
+        return result(
+            ContextFitStatus.UNFIT_REQUEST,
+            candidate,
+            active_receipt,
+            actions,
+        )
+
     receipt = assess(candidate)
 
     if receipt.estimated_input_tokens < budget.compaction_trigger:
@@ -175,7 +186,12 @@ async def fit_request(
 
     # Reserve the exact non-message portions, then make the remaining history
     # fit that message budget. Re-assessment below is the hard postcondition.
-    protocol_reserve = 32 + 4 * 2 + 8 * len(tools or ())
+    # Deterministic recovery may insert a compacted-history user/assistant
+    # pair ahead of the active request. Reserve framing for that complete
+    # shape, otherwise an apparently fitting message payload can still exceed
+    # the provider budget after protocol overhead is added back.
+    recovery_message_count = len(_preserved_active_context(candidate)) + 2
+    protocol_reserve = 32 + 4 * recovery_message_count + 8 * len(tools or ())
     message_budget = max(
         1,
         budget.safe_input_budget
