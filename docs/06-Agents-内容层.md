@@ -87,6 +87,11 @@ steps:
 - `allowed_tools`：该节点可用的工具子集，必须落在 identity 的 `tools.enabled` 内；
 - `instructions`：注入该节点 skill 的执行指令，只能描述流程，不能绕过安全策略。
 
+运行时严格按 YAML 顺序完成每个未被 `condition` 跳过的节点：先执行该节点的 Skill；若
+Skill 缺失、被禁用、运行失败，或产出未通过 gate，则在**当前节点**以 ReAct 继续尝试。回退
+携带已通过节点的产物、当前 `instructions`、`allowed_tools` 和同一套 gate；因此它不是跳过
+节点，也不是把整条链改为直接 ReAct。已发布内容仍在启动时校验 Skill 引用，避免静态配置错误。
+
 不要把 side effect 或真实测试结果只写在 Markdown 说明中：它们必须由 skill 的工具调用和 gate 的事实检查产生。`SkillChain` 引擎支持 gate 失败后按 `backtrack` 映射回退，但当前 shipped pipeline 均未声明 `backtrack`。
 
 ## Skill：任务 SOP
@@ -98,7 +103,7 @@ steps:
 1. Skill 描述“如何完成一类任务”，不复制系统安全策略；
 2. 所有外部副作用仍由 ToolPolicy、ToolGuard 和审批链决定；
 3. `SkillRegistry` 的 enabled 状态由用户控制；若关闭了 Pipeline 已声明的 skill，
-   该 Pipeline 会在对应节点阻断，不能静默跳过或退回通用 ReAct；
+   引擎会在对应节点以 ReAct 补偿，仍必须通过该节点 gate，不能静默跳过；
 4. 新 skill 必须附带至少一个可验证示例或相应回归测试。
 
 ## Tool provider：窄接口、统一治理

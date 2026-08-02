@@ -87,7 +87,7 @@ async def run_pipeline(
     ``start_node_idx`` > 0 resumes a crash-interrupted chain: earlier nodes'
     outputs must already be present in ``context`` (from the checkpoint).
     """
-    from engine.skill.executor import execute_skill_events
+    from engine.skill.executor import execute_react_fallback_events, execute_skill_events
 
     # P5/P11: fail loudly on ambiguous topology instead of silently corrupting
     # output context keys or looping on forward/self backtrack targets.
@@ -108,6 +108,10 @@ async def run_pipeline(
         for index, node in enumerate(chain.nodes)
         if output_key(node.skill_name) in context
     }
+    # A fallback belongs to a node, rather than to the whole chain.  The
+    # mapping survives a gate-driven retry of that node, but is discarded when
+    # a backtrack re-runs an earlier portion of the chain.
+    fallback_reasons: dict[int, str] = {}
 
     while node_idx < len(chain.nodes):
         node = chain.nodes[node_idx]
@@ -118,32 +122,6 @@ async def run_pipeline(
             context.pop(CTX_RETRY_HINT, None)
             node_idx += 1
             continue
-
-        # A Pipeline's declared nodes are its execution contract. A disabled
-        # Skill is therefore no more skippable than a missing one: both make
-        # this node unavailable and must block the chain. `condition: false`
-        # above is the only explicit node-skipping mechanism.
-        if node.skill_name in disabled_skill_names:
-            logger.warning("pipeline node %r is disabled", node.skill_name)
-            context.pop(CTX_RETRY_HINT, None)
-            yield ExecutionEvent(EventType.SKILL_START, {
-                "skill": node.skill_name,
-                "index": node_idx,
-            })
-            _clear_checkpoint(context)
-            yield ExecutionEvent(EventType.SKILL_END, {
-                "skill": node.skill_name,
-                "status": "blocked",
-            })
-            yield ExecutionEvent(EventType.BLOCKED, {
-                "skill": node.skill_name,
-                "reason": (
-                    f"pipeline node requires enabled Skill {node.skill_name!r}; "
-                    "skipping declared nodes is disabled"
-                ),
-            })
-            yield ExecutionEvent(EventType.DONE, {})
-            return
 
         yield ExecutionEvent(EventType.SKILL_START, {"skill": node.skill_name, "index": node_idx})
 
@@ -162,27 +140,19 @@ async def run_pipeline(
             while attempt < max_attempts:
                 provision_id = f"{node.skill_name}:{node_idx}:{attempt}:{uuid4().hex}"
                 provision_settled = False
-                skill = skill_registry.get(node.skill_name)
-                if skill is None:
-                    logger.error(
-                        "pipeline node %r cannot execute because its Skill is not installed",
+                fallback_reason = fallback_reasons.get(node_idx)
+                if fallback_reason is None and node.skill_name in disabled_skill_names:
+                    fallback_reason = f"Skill {node.skill_name!r} is disabled for this run."
+                    fallback_reasons[node_idx] = fallback_reason
+
+                skill = None if fallback_reason else skill_registry.get(node.skill_name)
+                if skill is None and fallback_reason is None:
+                    fallback_reason = f"Skill {node.skill_name!r} is not installed."
+                    fallback_reasons[node_idx] = fallback_reason
+                    logger.warning(
+                        "pipeline node %r has no installed Skill; using node-local ReAct fallback",
                         node.skill_name,
                     )
-                    provision_settled = True
-                    _clear_checkpoint(context)
-                    yield ExecutionEvent(EventType.SKILL_END, {
-                        "skill": node.skill_name,
-                        "status": "blocked",
-                    })
-                    yield ExecutionEvent(EventType.BLOCKED, {
-                        "skill": node.skill_name,
-                        "reason": (
-                            f"pipeline node requires installed Skill {node.skill_name!r}; "
-                            "generic ReAct fallback is disabled"
-                        ),
-                    })
-                    yield ExecutionEvent(EventType.DONE, {})
-                    return
 
                 node_tool_registry = tool_registry
                 if node.allowed_tools is not None:
@@ -199,32 +169,67 @@ async def run_pipeline(
                     skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
                 elif attempt == 2:
                     skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
-                # Vendored upstream skills stay source-faithful.  A node can
-                # supply only the small runtime-specific contract it needs
-                # (for example, how a one-question interview pauses in
-                # Agent-Smith) without creating a duplicate skill.
-                if node.instructions:
-                    skill = replace(
-                        skill,
-                        content=(
-                            f"{skill.content.rstrip()}\n\n"
-                            "## Agent-Smith chain node contract\n\n"
-                            f"{node.instructions}\n"
-                        ),
+                if fallback_reason is not None:
+                    event_stream = execute_react_fallback_events(
+                        node.skill_name,
+                        fallback_reason,
+                        node.instructions,
+                        llm,
+                        node_tool_registry,
+                        base_messages,
+                        skill_context,
+                        max_react_iters,
+                        tool_guard=tool_guard,
+                        provisional_lifecycle=False,
+                        react_event_loop_fn=react_event_loop,
+                        prefix_cache_key=prefix_cache_key,
                     )
-                event_stream = execute_skill_events(
-                    skill, llm, node_tool_registry, base_messages, skill_context,
-                    max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
-                    react_event_loop_fn=react_event_loop,
-                    prefix_cache_key=prefix_cache_key,
-                )
+                else:
+                    assert skill is not None
+                    # Vendored upstream skills stay source-faithful.  A node can
+                    # supply only the small runtime-specific contract it needs
+                    # (for example, how a one-question interview pauses in
+                    # Agent-Smith) without creating a duplicate skill.
+                    if node.instructions:
+                        skill = replace(
+                            skill,
+                            content=(
+                                f"{skill.content.rstrip()}\n\n"
+                                "## Agent-Smith chain node contract\n\n"
+                                f"{node.instructions}\n"
+                            ),
+                        )
+                    event_stream = execute_skill_events(
+                        skill, llm, node_tool_registry, base_messages, skill_context,
+                        max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
+                        react_event_loop_fn=react_event_loop,
+                        prefix_cache_key=prefix_cache_key,
+                    )
 
                 result = _NodeResult()
-                async for event in _collect_node_events(event_stream, provision_id):
-                    if isinstance(event, _NodeResult):
-                        result = event
-                    else:
-                        yield event
+                try:
+                    async for event in _collect_node_events(
+                        event_stream,
+                        provision_id,
+                        suppress_terminal_events=fallback_reason is None,
+                    ):
+                        if isinstance(event, _NodeResult):
+                            result = event
+                        else:
+                            yield event
+                except Exception as exc:
+                    if fallback_reason is not None:
+                        raise
+                    reason = (
+                        f"Skill {node.skill_name!r} raised {type(exc).__name__}: {exc}"
+                    )
+                    logger.warning("%s; using node-local ReAct fallback", reason)
+                    yield ExecutionEvent(EventType.PROVISIONAL_RETRACT, {
+                        "provision_id": provision_id, "reason": "execution_error",
+                    })
+                    provision_settled = True
+                    fallback_reasons[node_idx] = reason
+                    continue
 
                 if result.incomplete_reason or result.failed_reason:
                     reason = result.failed_reason or result.incomplete_reason
@@ -232,6 +237,16 @@ async def run_pipeline(
                         "provision_id": provision_id, "reason": reason,
                     })
                     provision_settled = True
+                    if fallback_reason is None:
+                        fallback_reasons[node_idx] = (
+                            f"Skill {node.skill_name!r} did not complete: {reason}."
+                        )
+                        logger.warning(
+                            "pipeline node %r did not complete (%s); using node-local ReAct fallback",
+                            node.skill_name,
+                            reason,
+                        )
+                        continue
                     # P3: react_loop's budget-exhausted TEXT_DELTA is swallowed
                     # by _collect_node_events, so the user never sees why the
                     # node stopped.  Surface engine budget notices before the
@@ -318,6 +333,16 @@ async def run_pipeline(
                     "provision_id": provision_id, "reason": "rubric_retry",
                 })
                 provision_settled = True
+                if fallback_reason is None:
+                    # The dedicated Skill produced an answer but could not
+                    # satisfy this node's base contract. Retry the *same*
+                    # node through ReAct with the gate feedback and completed
+                    # predecessor outputs, never by skipping ahead.
+                    fallback_reasons[node_idx] = (
+                        f"Skill {node.skill_name!r} failed the base gate: "
+                        f"{base_result.reason}."
+                    )
+                    continue
                 attempt += 1
 
             context.pop(CTX_RETRY_HINT, None)
@@ -346,6 +371,7 @@ async def run_pipeline(
             if gate_result.verdict == "pass":
                 yield ExecutionEvent(EventType.PROVISIONAL_COMMIT, {"provision_id": provision_id})
                 provision_settled = True
+                fallback_reasons.pop(node_idx, None)
                 key = output_key(node.skill_name)
                 context[key] = output
                 committed_provisional_output[key] = result.was_provisional
@@ -359,13 +385,30 @@ async def run_pipeline(
                 node_idx += 1
                 continue
 
-            sig = FailureSignature(error_type=node.skill_name)
-            action = guard.record(sig)
-
             yield ExecutionEvent(EventType.PROVISIONAL_RETRACT, {
                 "provision_id": provision_id, "reason": gate_result.reason,
             })
             provision_settled = True
+
+            if fallback_reason is None:
+                # A failing node-specific gate is still a failure of this
+                # Skill attempt. Let ReAct repair the same node first, with
+                # the gate hint as context. Only a fallback that also fails is
+                # handed to the existing bounded retry/backtrack guard.
+                fallback_reasons[node_idx] = (
+                    f"Skill {node.skill_name!r} failed the node gate: "
+                    f"{gate_result.reason}."
+                )
+                if gate_result.retry_hint:
+                    context[CTX_RETRY_HINT] = gate_result.retry_hint
+                yield ExecutionEvent(EventType.SKILL_END, {
+                    "skill": node.skill_name,
+                    "status": "retry",
+                })
+                continue
+
+            sig = FailureSignature(error_type=node.skill_name)
+            action = guard.record(sig)
 
             if action == "switch" and node.skill_name not in chain.backtrack_map:
                 # 无可切换的回退策略时必须终止，不许退化成同节点无限 retry。
@@ -406,6 +449,8 @@ async def run_pipeline(
                 _evict_outputs_at_or_after(
                     context, committed_output_index, committed_provisional_output, target_idx
                 )
+                for fallback_idx in [index for index in fallback_reasons if index >= target_idx]:
+                    del fallback_reasons[fallback_idx]
                 # 回溯同样要把失败原因带到目标节点。否则 planning 重跑时
                 # messages 仍是最初的原始需求，模型拿不到"为什么被打回"的任何
                 # 信号，大概率复现同一份产出 —— 而 FailureLoopGuard 按 skill
@@ -521,10 +566,15 @@ def _ends_with_user_question(output: str) -> bool:
 async def _collect_node_events(
     event_stream: AsyncGenerator[ExecutionEvent, None],
     provision_id: str,
+    *,
+    suppress_terminal_events: bool = False,
 ) -> AsyncGenerator[ExecutionEvent | _NodeResult, None]:
-    """Collect TEXT_DELTA into result, convert RAW to PROVISIONAL, forward the rest.
+    """Collect a node attempt while retaining control of its terminal events.
 
-    Yields ExecutionEvents to forward, then a final _NodeResult with collected text.
+    For a dedicated Skill attempt, FAILED/INCOMPLETE are held back so the
+    pipeline can perform its same-node ReAct fallback without marking the
+    encompassing run terminal. The fallback attempt itself forwards those
+    events if it also fails.
     """
     parts: list[str] = []
     was_provisional = False
@@ -558,8 +608,12 @@ async def _collect_node_events(
                 })
         elif event.type == EventType.INCOMPLETE:
             incomplete_reason = str(event.data.get("reason", "agent_incomplete"))
+            if suppress_terminal_events:
+                continue
         elif event.type == EventType.FAILED:
             failed_reason = str(event.data.get("reason", "agent_failed"))
+            if suppress_terminal_events:
+                continue
         yield event
 
     result = _NodeResult()

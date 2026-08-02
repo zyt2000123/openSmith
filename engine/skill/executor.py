@@ -101,6 +101,51 @@ async def execute_skill_events(
         yield event
 
 
+async def execute_react_fallback_events(
+    node_name: str,
+    failure_reason: str,
+    instructions: str,
+    llm: "LLMPort",
+    tool_registry: "ToolRegistry",
+    messages: list[dict],
+    context: dict,
+    max_iters: int,
+    tool_guard: "ToolGuard | None" = None,
+    provisional_lifecycle: bool = True,
+    *,
+    react_event_loop_fn: Callable[..., AsyncGenerator[EventT, None]] | None = None,
+    prefix_cache_key: str | None = None,
+) -> AsyncGenerator[EventT, None]:
+    """Run the current pipeline node with generic ReAct after its Skill fails.
+
+    This is deliberately a node-local fallback, not a replacement for the
+    whole chain: it preserves the original system prompt, completed-node
+    handoffs, node tool scope, and node-specific instructions. The caller must
+    still apply the node's gates before advancing the chain.
+    """
+    if react_event_loop_fn is None:
+        raise TypeError(
+            "react_event_loop_fn is required — caller must inject the react event loop implementation"
+        )
+    conversation = _react_fallback_conversation(
+        node_name,
+        failure_reason,
+        instructions,
+        messages,
+        context,
+    )
+    async for event in react_event_loop_fn(
+        llm,
+        conversation,
+        tool_registry,
+        tool_guard,
+        max_iters,
+        provisional_lifecycle=provisional_lifecycle,
+        prefix_cache_key=prefix_cache_key,
+    ):
+        yield event
+
+
 def _skill_conversation(skill: SkillBody, messages: list[dict], context: dict) -> list[dict]:
     """Add one skill workflow layer without replacing assembled context.
 
@@ -110,9 +155,56 @@ def _skill_conversation(skill: SkillBody, messages: list[dict], context: dict) -
     internals stay out of model context; only prior node outputs and current
     gate feedback are eligible for handoff.
     """
-    workflow_prompt = PromptAssembler.render_layers(
-        _workflow_layers(skill, context)
+    workflow_prompt = PromptAssembler.render_layers(_workflow_layers(skill, context))
+    return _conversation_with_workflow_prompt(workflow_prompt, messages)
+
+
+def _react_fallback_conversation(
+    node_name: str,
+    failure_reason: str,
+    instructions: str,
+    messages: list[dict],
+    context: dict,
+) -> list[dict]:
+    """Add a bounded node-fallback prompt without fabricating a Skill body."""
+    reason = failure_reason.strip()[:2_000] or "the dedicated Skill was unavailable"
+    content = (
+        "## Pipeline Node React Fallback\n\n"
+        f"The dedicated Skill for pipeline node `{node_name}` could not complete. "
+        "Complete this same node with general ReAct; do not skip it or advance "
+        "the pipeline until its gate passes.\n\n"
+        f"Failure reason: {reason}"
     )
+    if instructions.strip():
+        content += f"\n\n## Pipeline Node Contract\n\n{instructions.strip()}"
+    layers: list[PromptLayer] = [
+        PromptLayer(
+            name=f"pipeline_react_fallback_{node_name}",
+            content=content,
+            source=PromptSource.RUNTIME,
+            authority=PromptAuthority.ENGINE_CONTROL,
+            trust=PromptTrust.CONFIGURED,
+            source_ref=f"pipeline:{node_name}:react_fallback",
+            scope=PromptScope.RUNTIME,
+            load_reason=PromptLoadReason.RUNTIME_ONLY,
+            display_name=f"Pipeline React Fallback: {node_name}",
+        )
+    ]
+    handoff = _prior_workflow_outputs(context)
+    if handoff:
+        layers.append(_workflow_handoff_layer(handoff))
+    feedback = _gate_feedback(context)
+    if feedback:
+        layers.append(_workflow_feedback_layer(feedback))
+    workflow_prompt = PromptAssembler.render_layers(tuple(layers))
+    return _conversation_with_workflow_prompt(workflow_prompt, messages)
+
+
+def _conversation_with_workflow_prompt(
+    workflow_prompt: str,
+    messages: list[dict],
+) -> list[dict]:
+    """Insert one workflow layer after the leading system messages."""
     first_non_system = next(
         (
             index
@@ -148,35 +240,39 @@ def _workflow_layers(skill: SkillBody, context: dict) -> tuple[PromptLayer, ...]
     ]
     handoff = _prior_workflow_outputs(context)
     if handoff:
-        layers.append(
-            PromptLayer(
-                name="workflow_handoff",
-                content=handoff,
-                source=PromptSource.RUNTIME,
-                authority=PromptAuthority.REFERENCE,
-                trust=PromptTrust.UNTRUSTED_REFERENCE,
-                source_ref="pipeline:prior_node_outputs",
-                scope=PromptScope.RUNTIME,
-                load_reason=PromptLoadReason.RUNTIME_ONLY,
-                display_name="Prior Workflow Outputs",
-            )
-        )
+        layers.append(_workflow_handoff_layer(handoff))
     feedback = _gate_feedback(context)
     if feedback:
-        layers.append(
-            PromptLayer(
-                name="workflow_gate_feedback",
-                content=feedback,
-                source=PromptSource.RUNTIME,
-                authority=PromptAuthority.ENGINE_CONTROL,
-                trust=PromptTrust.CONFIGURED,
-                source_ref="pipeline:rubric_feedback",
-                scope=PromptScope.RUNTIME,
-                load_reason=PromptLoadReason.RUNTIME_ONLY,
-                display_name="Workflow Gate Feedback",
-            )
-        )
+        layers.append(_workflow_feedback_layer(feedback))
     return tuple(layers)
+
+
+def _workflow_handoff_layer(handoff: str) -> PromptLayer:
+    return PromptLayer(
+        name="workflow_handoff",
+        content=handoff,
+        source=PromptSource.RUNTIME,
+        authority=PromptAuthority.REFERENCE,
+        trust=PromptTrust.UNTRUSTED_REFERENCE,
+        source_ref="pipeline:prior_node_outputs",
+        scope=PromptScope.RUNTIME,
+        load_reason=PromptLoadReason.RUNTIME_ONLY,
+        display_name="Prior Workflow Outputs",
+    )
+
+
+def _workflow_feedback_layer(feedback: str) -> PromptLayer:
+    return PromptLayer(
+        name="workflow_gate_feedback",
+        content=feedback,
+        source=PromptSource.RUNTIME,
+        authority=PromptAuthority.ENGINE_CONTROL,
+        trust=PromptTrust.CONFIGURED,
+        source_ref="pipeline:rubric_feedback",
+        scope=PromptScope.RUNTIME,
+        load_reason=PromptLoadReason.RUNTIME_ONLY,
+        display_name="Workflow Gate Feedback",
+    )
 
 
 def _prior_workflow_outputs(context: dict) -> str:

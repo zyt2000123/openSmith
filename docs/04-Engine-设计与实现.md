@@ -36,8 +36,10 @@
 `run_agent_stream()` 有三条互斥路径：
 
 1. 用户显式指定 skill：加载并执行该 skill；
-2. route 无 pipeline 或 pipeline 资源不可用：直接 ReAct；
-3. route 指向可用 pipeline：顺序执行 `SkillChain`，每个节点的 base gate 与领域 gate 都通过后才提交输出。
+2. route 无 pipeline：直接 ReAct；
+3. route 指向 pipeline：顺序执行 `SkillChain`。每个节点先执行声明的 Skill；若 Skill 缺失、被禁用、
+   运行失败或未通过验收，则在该节点以 ReAct 补偿，并沿用前序产物、节点工具范围和同一套 gate；
+   只有 gate 通过后才提交输出并进入下一节点。
 
 当前有三条 shipped pipeline（`agents/pipelines/requirements-research.yaml`、
 `tdd-development.yaml`、`code-review.yaml`），分别对应 `coding` 身份的三条意图路由：

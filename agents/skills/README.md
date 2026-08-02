@@ -35,9 +35,10 @@ agents/skills/
 - 添加 Skill 不会自动把它加入 SkillChain；链路变更必须显式修改并测试 `engine/execution/skill_chain.py`。
 - 主 Prompt 只注入 Skill 的名称和描述；Skill 被选中后，`SKILL.md` 正文才作为独立执行上下文加载。
 - `README.md` 和 `references/` 不会自动进入执行上下文。
-- Pipeline 节点把 `skill:` 视为严格依赖：引擎会按名称解析并执行该 `SKILL.md` 的工作流上下文；
-  缺少或被禁用的对应 Skill 会阻断该节点，绝不降级为通用 ReAct；节点跳过只能由
-  Pipeline 的 `condition` 显式决定。
+- Pipeline 节点会先按 `skill:` 名称解析并执行该 `SKILL.md` 的工作流上下文。若该 Skill
+  缺失、被禁用或执行/验收失败，引擎会在**同一节点**降级为通用 ReAct：保留前序节点产物、
+  当前节点的 `instructions`、工具范围和 gate，gate 通过前不会进入下一节点。只有 Pipeline
+  的 `condition` 可以显式跳过节点。
 
 ## 最小 `SKILL.md`
 

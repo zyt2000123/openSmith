@@ -215,6 +215,54 @@ def test_pipeline_skills_keep_assembled_context_and_bound_prior_output() -> None
     assert len(handoff) < len(predecessor_output)
 
 
+def test_pipeline_react_fallback_keeps_prior_node_output_and_node_contract() -> None:
+    class FirstSkillOnlyRegistry:
+        def get(self, name: str) -> SkillBody | None:
+            if name == "first":
+                return SkillBody(SkillMeta(name="first"), "Produce the first handoff.")
+            return None
+
+    llm = RecordingLLM(["FIRST HANDOFF", "fallback completed second"])
+    chain = SkillChain([
+        SkillNode("first", PassingGate()),
+        SkillNode(
+            "second",
+            PassingGate(),
+            instructions="Preserve the first handoff while completing the second node.",
+        ),
+    ])
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                llm,
+                "IDENTITY=smith",
+                "Run the two-step workflow.",
+                FakeToolRegistry(),
+                FirstSkillOnlyRegistry(),
+                _FEATURE_ROUTE,
+                chain,
+                FailureLoopGuard(),
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert events[-1].type is EventType.DONE
+    assert [event.data["skill"] for event in events if event.type is EventType.SKILL_START] == [
+        "first", "second",
+    ]
+    fallback_system_text = "\n".join(
+        str(message["content"])
+        for message in llm.calls[1]
+        if message.get("role") == "system"
+    )
+    assert "Pipeline Node React Fallback" in fallback_system_text
+    assert "FIRST HANDOFF" in fallback_system_text
+    assert "Preserve the first handoff" in fallback_system_text
+
+
 def test_forced_skill_emits_accumulated_text_before_the_terminal_event() -> None:
     """A consumer that stops at FAILED/INCOMPLETE must still see the output."""
 
