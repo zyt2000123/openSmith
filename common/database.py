@@ -11,9 +11,10 @@ _db_lock = asyncio.Lock()
 
 
 async def _check_connection_health(conn: aiosqlite.Connection) -> bool:
-    """Verify the connection is still usable."""
+    """Verify a cached connection is still usable without scanning the database."""
     try:
-        await conn.execute("PRAGMA quick_check")
+        cursor = await conn.execute("SELECT 1")
+        await cursor.close()
         return True
     except Exception:
         return False

@@ -17,14 +17,8 @@ def reset_paths(paths: AppPaths | None = None) -> None:
     _paths_instance = paths
 
 
-# Lazy properties that resolve on first access
-@property
-def PATHS() -> AppPaths:
-    return _get_paths()
-
-
 # Legacy module-level constants for backward compatibility
-# These now resolve lazily through properties
+# These resolve lazily through module attribute lookup.
 def __getattr__(name: str):
     """Lazy module attribute resolution for backward compatibility."""
     paths = _get_paths()
