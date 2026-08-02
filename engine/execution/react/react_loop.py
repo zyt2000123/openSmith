@@ -1118,13 +1118,20 @@ async def react_event_loop(
                 )
                 if not allowed:
                     # Pre Hook 阻止了工具执行
-                    yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                    blocked_event: dict[str, object] = {
                         "id": tc.id,
                         "error": True,
                         "blocked": True,
                         "preflight": False,
                         "reason": denial_reason or "Blocked by pre-tool hook",
-                    })
+                    }
+                    if granted_approval_id is not None:
+                        # The call already passed the approval gate; carry the
+                        # resolution so run state leaves WAITING_APPROVAL
+                        # instead of staying stuck with a stale approval_id.
+                        blocked_event["approval_id"] = granted_approval_id
+                        blocked_event["approval_outcome"] = "granted"
+                    yield ExecutionEvent(EventType.TOOL_CALL_RESULT, blocked_event)
                     round_had_failure = True
                     consecutive_errors += 1
                     if consecutive_errors >= 3:
