@@ -15,7 +15,7 @@ from engine.skill.registry import SkillRegistry
 from engine.tool.registry import ToolRegistry
 
 if TYPE_CHECKING:
-    from engine.execution.hooks import HookManager
+    from engine.execution.hooks import HookManager, HookRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,7 @@ class RuntimeServices:
     mcp_session_pool: Any | None = None
     owns_mcp_clients: bool = True
     hooks: HookManager | None = None
+    hook_registry: HookRegistry | None = None  # 新增：工具生命周期 Hook 注册中心
     observation_factory: RunObservationFactory | None = None
     owns_llm_clients: bool = True
     _memory_lifecycle_hook: Any | None = field(default=None, init=False, repr=False)

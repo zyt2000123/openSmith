@@ -615,6 +615,7 @@ async def _run_events_with_runtime(
                 gate_llm=services.gate_llm,
                 disabled_skill_names=getattr(s, "disabled_skill_names", frozenset()),
                 prefix_cache_key=getattr(s, "prefix_cache_key", None),
+                hook_registry=services.hook_registry,
             ):
                 if event.type == EventType.TEXT_DELTA:
                     full_text.append(str(event.data.get("text", "")))

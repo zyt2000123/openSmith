@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 from engine.execution.events import EventType, ExecutionEvent
+from engine.execution.hooks import HookRegistry
 from engine.execution.pipeline.backtrack import FailureLoopGuard
 from engine.execution.pipeline.pipeline import CTX_PROVISIONAL_OUTPUTS, run_pipeline
 from engine.execution.pipeline.pipeline_context import (
@@ -54,6 +55,7 @@ async def run_agent_stream(
     gate_llm: LLMPort | None = None,
     disabled_skill_names: frozenset[str] = frozenset(),
     prefix_cache_key: str | None = None,
+    hook_registry: HookRegistry | None = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """Route to the selected execution implementation and yield events."""
     # Matt's user-facing `grill-me` is an entry wrapper around `grilling`.
@@ -98,37 +100,7 @@ async def run_agent_stream(
             tool_guard,
             max_react_iters,
             prefix_cache_key=prefix_cache_key,
-        ):
-            yield event
-        yield ExecutionEvent(EventType.DONE, {})
-        return
-
-    # A pipeline with missing installed skills cannot satisfy its gate
-    # contracts. Fall back to direct ReAct; user-disabled nodes are skipped.
-    missing_skills = sorted(
-        {
-            node.skill_name
-            for node in skill_chain.nodes
-            if (
-                node.skill_name not in disabled_skill_names
-                and skill_registry.get(node.skill_name) is None
-            )
-        }
-    )
-    if missing_skills:
-        logger.warning(
-            "pipeline %r unavailable because skills are not installed: %s; "
-            "falling back to direct ReAct",
-            route.pipeline_id,
-            ", ".join(missing_skills),
-        )
-        async for event in react_event_loop(
-            llm,
-            base_messages,
-            tool_registry,
-            tool_guard,
-            max_react_iters,
-            prefix_cache_key=prefix_cache_key,
+            hook_registry=hook_registry,
         ):
             yield event
         yield ExecutionEvent(EventType.DONE, {})

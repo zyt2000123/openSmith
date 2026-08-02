@@ -349,6 +349,33 @@ async def prepare_runtime(
     )
     bind_skill_load_tool(services)
 
+    # ========== 加载 Hook 系统 ==========
+    from engine.execution.hooks import HookLoader, HookRegistry
+
+    hook_registry = HookRegistry()
+    hook_loader = HookLoader()
+
+    # 1. 加载内置 Hook（agents/smith/hooks.yaml）
+    builtin_hooks_config = runtime.agents_dir / "smith" / "hooks.yaml"
+    if builtin_hooks_config.exists():
+        try:
+            hook_loader.load_hooks_from_config(builtin_hooks_config, hook_registry)
+            logger.info("Loaded built-in hooks from %s", builtin_hooks_config)
+        except Exception as e:
+            logger.error("Failed to load built-in hooks: %s", e, exc_info=True)
+
+    # 2. 加载用户自定义 Hook（~/.agent-smith/hooks.yaml）（可选）
+    user_hooks_config = state_dir / "hooks.yaml"
+    if user_hooks_config.exists():
+        try:
+            hook_loader.load_hooks_from_config(user_hooks_config, hook_registry)
+            logger.info("Loaded user hooks from %s", user_hooks_config)
+        except Exception as e:
+            logger.error("Failed to load user hooks: %s", e, exc_info=True)
+
+    # 将 Hook Registry 存储到 services（供工具执行时使用）
+    services.hook_registry = hook_registry
+
     from engine.memory.compile import assemble_memory, ensure_durable_template
     from engine.memory.store import retrieve_relevant_memory
 
