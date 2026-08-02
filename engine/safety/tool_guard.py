@@ -244,6 +244,19 @@ class FileGuard:
     def is_working_directory_scoped(self) -> bool:
         return self._working_dir is not None
 
+    def is_inside_allowed_dirs(self, target: Path) -> bool:
+        """Whether a resolved path lies within the ordinary allowed directories.
+
+        The registry uses this to decide how much a one-shot path approval may
+        whitelist: inside the workspace every sibling is already accessible, so
+        directory-granularity is harmless; an external path must not silently
+        grant the whole directory.
+        """
+        try:
+            return any(target.is_relative_to(d) for d in self._allowed)
+        except ValueError:
+            return False
+
     def _is_non_delegable_write_target(self, target: Path, lexical: Path) -> bool:
         for root in self._non_delegable_write_roots:
             folded_root = _casefolded(root)

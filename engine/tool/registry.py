@@ -687,22 +687,26 @@ class ToolRegistry:
             )
             approval_scope = decision.approval_scope
 
-            # Auto-whitelist: when a path approval is granted, add the directory
-            # to the session whitelist so subsequent accesses to the same directory
-            # don't require re-approval. This preserves security (first access needs
-            # approval) while improving UX (subsequent accesses are automatic).
-            # High-risk paths (.ssh, .aws, .env, etc.) still require approval each time.
+            # Auto-whitelist: when a path approval is granted, remember the
+            # approved path so subsequent accesses to the same location don't
+            # require re-approval.  Inside the ordinary allowed directories
+            # every sibling is already accessible, so the parent directory may
+            # be whitelisted as a no-op.  For an EXTERNAL path, directory
+            # granularity would silently grant the model every sibling file in
+            # an arbitrary directory (/etc, ~/Library, ...) — including
+            # credential-bearing names the name-based sensitive checks do not
+            # cover (master.passwd, shadow).  External approvals therefore
+            # whitelist exactly one path.  High-risk paths (.ssh, .aws, .env,
+            # .git/config) always require approval each time regardless.
             if approval_granted and approval_scope is not None and approval_scope.kind == "path":
                 from pathlib import Path
                 try:
                     target_path = Path(approval_scope.target).expanduser().resolve()
-                    # Add parent directory to whitelist (not the file itself)
-                    # This allows accessing sibling files without re-approval
-                    if target_path.is_file() or not target_path.exists():
-                        whitelist_path = target_path.parent
+                    inside_allowed = self._tool_guard.file_guard.is_inside_allowed_dirs(target_path)
+                    if inside_allowed and (target_path.is_file() or not target_path.exists()):
+                        self._tool_guard.whitelist.allow_path(str(target_path.parent))
                     else:
-                        whitelist_path = target_path
-                    self._tool_guard.whitelist.allow_path(str(whitelist_path))
+                        self._tool_guard.whitelist.allow_file(str(target_path))
                 except (ValueError, OSError):
                     # Path resolution failed; skip whitelist addition
                     pass
