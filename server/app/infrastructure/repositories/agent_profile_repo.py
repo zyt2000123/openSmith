@@ -5,7 +5,7 @@ import uuid
 import socket
 from datetime import datetime, timezone
 
-from common.config import AGENT_DIR
+from common import config as common_config
 
 from ..database import get_app_db
 
@@ -51,7 +51,7 @@ class AgentProfileRepo:
                 knowledge_json,
                 data.get("environment", "本地"),
                 data.get("accent", ""),
-                str(AGENT_DIR),
+                str(common_config.PATHS.agent_dir),
                 now,
             ),
         )

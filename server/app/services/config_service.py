@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, NoReturn
 
 import httpx
 from fastapi import HTTPException
 
-from common.config import DATA_DIR
+from common import config as common_config
 from common.yaml_utils import YamlConfigError, load_yaml, save_yaml
 from engine.llm.factory import normalize_provider_name
 from engine.llm.model_config import LLMUsage, normalize_legacy_llm_config, validate_llm_base_url
@@ -44,7 +45,12 @@ class ConfigService:
     optional model route.
     """
 
-    _config_path = DATA_DIR / "config.yaml"
+    # Tests may set this explicitly; normal operation resolves paths lazily.
+    _config_path: Path | None = None
+
+    @classmethod
+    def _resolved_config_path(cls) -> Path:
+        return cls._config_path or common_config.PATHS.data_dir / "config.yaml"
 
     @staticmethod
     def _invalid(detail: str) -> NoReturn:
@@ -165,7 +171,7 @@ class ConfigService:
 
     def _load_config(self) -> dict[str, Any]:
         try:
-            config = load_yaml(self._config_path)
+            config = load_yaml(self._resolved_config_path())
         except YamlConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         llm = config.get("llm")
@@ -516,7 +522,7 @@ class ConfigService:
             self._align_interactive_model(llm, updates)
 
         try:
-            save_yaml(self._config_path, cfg)
+            save_yaml(self._resolved_config_path(), cfg)
         except YamlConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         result = self.get_llm_config()

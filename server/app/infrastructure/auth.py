@@ -16,34 +16,42 @@ from pathlib import Path
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from common.config import DATA_DIR
+from common import config as common_config
 from common.paths import PRIVATE_FILE_MODE
 
-_TOKEN_PATH = Path(DATA_DIR) / "auth_token"
+_TOKEN_PATH: Path | None = None
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 _cached_token: str | None = None
+_cached_token_path: Path | None = None
+
+
+def _token_path() -> Path:
+    return _TOKEN_PATH if _TOKEN_PATH is not None else common_config.PATHS.data_dir / "auth_token"
 
 
 def _read_or_create_token() -> str:
-    global _cached_token
-    if _cached_token is not None:
+    global _cached_token, _cached_token_path
+    token_path = _token_path()
+    if _cached_token is not None and _cached_token_path == token_path:
         return _cached_token
 
-    if _TOKEN_PATH.is_file():
-        token = _TOKEN_PATH.read_text().strip()
+    if token_path.is_file():
+        token = token_path.read_text().strip()
         if token:
             _cached_token = token
+            _cached_token_path = token_path
             return token
 
     token = secrets.token_urlsafe(32)
-    _TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(str(_TOKEN_PATH), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, PRIVATE_FILE_MODE)
+    token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(token_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, PRIVATE_FILE_MODE)
     try:
         os.write(fd, token.encode())
     finally:
         os.close(fd)
     _cached_token = token
+    _cached_token_path = token_path
     return token
 
 

@@ -227,6 +227,8 @@ class ToolRegistry:
         self._tools[name] = (defn, func)
         if accepts_environment:
             self._wants_environment.add(name)
+        if self._tool_guard is not None:
+            self._tool_guard.bind_definitions(self.definitions())
 
     def load_providers(
         self,
@@ -413,6 +415,8 @@ class ToolRegistry:
     def bind_tool_guard(self, guard: ToolGuard | None) -> None:
         """Install the runtime hard-safety backstop for direct executions."""
         self._tool_guard = guard
+        if guard is not None:
+            guard.bind_definitions(self.definitions())
 
     @contextmanager
     def authorize_execution(

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
-from common.config import AGENT_DIR
+from common import config as common_config
 from engine.observability import ObservabilityReader
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ class TokenStatsService:
         trace_root: Path | None = None,
     ) -> None:
         self._db_provider = db_provider
-        self._trace_root = Path(trace_root or AGENT_DIR)
+        self._trace_root = Path(trace_root or common_config.PATHS.agent_dir)
         self._observability = ObservabilityReader(self._trace_root)
 
     @staticmethod
