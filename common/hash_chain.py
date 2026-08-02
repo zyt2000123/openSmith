@@ -226,6 +226,24 @@ class HashChainLog:
             anchor=anchor if anchor is not None else self._read_anchor(),
         )
 
+    def unseal(self) -> None:
+        """Remove the sealed anchor so the chain may be legitimately extended.
+
+        A resumed run reuses its run_id: the previous run finished and sealed
+        an anchor, then a recoverable run is continued with new records.  The
+        stale anchor would make any :meth:`verify` report an ``anchor mismatch``
+        for a legitimate extension, so the resume path clears it.  The chain
+        itself is untouched — only the "this run is done" marker is dropped;
+        the final RUN_FINISHED seals a fresh anchor.
+        """
+        with self._lock:
+            try:
+                self.anchor_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "failed to remove chain anchor: %s", self.anchor_path, exc_info=True
+                )
+
     def close(self) -> None:
         with self._lock:
             if self._handle is not None:

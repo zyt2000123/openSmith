@@ -37,6 +37,16 @@ class RunEventRecorder:
         self._projections = projections
         self._summary_sinks = summary_sinks
         self._summary = RunSummaryProjection(run_id)
+        if trace_store is not None:
+            try:
+                # A resumed run reuses this run_id and its previously sealed
+                # anchor; clear it so extending the chain is not reported as
+                # tampering.  No-op for a brand-new run (no trace yet).
+                trace_store.reopen(run_id)
+            except Exception:
+                logger.warning(
+                    "failed to reopen run trace (run=%s)", run_id, exc_info=True
+                )
 
     def record(self, event: ExecutionEvent) -> None:
         """Persist and project an event without leaking recorder failures."""

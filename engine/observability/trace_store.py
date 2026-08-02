@@ -153,6 +153,15 @@ class TraceStore:
         """Anchor the chain head so a later rollback of this run is detected."""
         return self._chain(run_id).seal()
 
+    def reopen(self, run_id: str) -> None:
+        """Drop a stale anchor so a resumed run's chain stays verifiable.
+
+        Called when a recoverable run is resumed: the previous run finished
+        and sealed an anchor, and extending the chain without clearing it would
+        make every verify() report a false ``anchor mismatch``.
+        """
+        self._chain(run_id).unseal()
+
     def verify(self, run_id: str) -> ChainVerification:
         """Walk this run's chain and report the first integrity failure."""
         return self._chain(run_id).verify()
