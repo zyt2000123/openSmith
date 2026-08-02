@@ -1,8 +1,8 @@
-# common/ 模块改进修复报告
+# common/ 模块基础设施改进记录
 
-**分支**: `fix/bug`  
-**日期**: 2026-08-02  
-**测试状态**: ✅ 9/9 通过
+**分支**: `codex/common-runtime-fixes`
+**日期**: 2026-08-02
+**当前状态**: 已由后续运行时加固更新；以 `common/` 源码和 `docs/03-Common-基础设施.md` 为准。
 
 ## 问题与修复总结
 
@@ -18,12 +18,13 @@
 - 19 个技能每次启动都触发全量文件 IO
 
 ### 修复方案
-**文件**: `common/paths.py:96-145`
+**文件**: `common/paths.py`
 
-- **增量复制**：基于 mtime + size 判断文件是否变化
-- **利用 manifest**：记录每个文件的元数据（mtime, size）
-- **仅复制变化文件**：首次启动后，后续启动跳过未变化文件
+- **增量复制**：基于 source/target 的 `mtime_ns` + size 判断文件是否变化
+- **利用 manifest**：记录两端元数据及源文件 SHA-256
+- **按需校验**：仅元数据变化时计算 SHA-256；未变化文件不重新读取内容
 - **保留清理逻辑**：仍然删除 stale 文件和过期技能
+- **链接边界**：stale 链接只删除链接本身；分发写入路径中的链接仍会被拒绝
 
 ### 收益
 - 首次启动：行为不变（全量复制）
@@ -72,10 +73,10 @@ assert PATHS.project_root == Path("/custom/path")
 ### 修复方案
 **文件**: `common/database.py:13-45`
 
-- **健康检查函数**：`_check_connection_health()` 使用 `PRAGMA quick_check`
+- **健康检查函数**：`_check_connection_health()` 使用轻量 `SELECT 1`
 - **返回前验证**：从缓存返回连接前先检查健康状态
 - **自动重连**：检测到损坏连接时，自动关闭并重建
-- **新连接验证**：创建新连接后立即执行健康检查
+- **异步初始化**：目录准备在线程中执行，不阻塞事件循环
 
 ### 收益
 - 防止使用损坏的数据库连接
@@ -95,11 +96,11 @@ assert PATHS.project_root == Path("/custom/path")
 **文件**: `common/paths.py:15-47`
 
 - **严格验证**：检查 Agent-Smith 特征文件：
-  - `agents/smith/` 身份目录
-  - `agents/identities/` 目录
+  - `agents/smith/config.yaml`
+  - `agents/identities/smith.yaml`
   - `agents/skills/*/SKILL.md` 技能标记
 - **调试日志**：跳过候选目录时记录调试信息
-- **保留兜底**：验证失败时仍返回 source_root
+- **明确失败**：未找到完整资源根时抛出错误，要求设置 `AGENT_SMITH_PROJECT_ROOT`
 
 ### 收益
 - 降低误匹配风险
@@ -110,18 +111,16 @@ assert PATHS.project_root == Path("/custom/path")
 
 ## 测试验证
 
-所有 9 个 `test_common_infrastructure.py` 测试通过：
+`test_common_infrastructure.py` 覆盖路径、manifest、数据库、YAML 与 wheel 根目录边界；完整的当前断言以测试文件为准。
 
 ```bash
-✅ test_app_paths_create_private_runtime_dirs_and_exposes_builtin_identities
-✅ test_app_paths_honors_explicit_project_root
-✅ test_app_paths_installs_shipped_skills_separately_from_user_skills
-✅ test_app_paths_reconciles_existing_builtin_skill_directory
-✅ test_wheel_data_files_reproduce_every_bundled_skill_file
-✅ test_yaml_requires_a_mapping_and_preserves_private_atomic_file
-✅ test_yaml_surfaces_invalid_documents_and_unsafe_values
-✅ test_config_service_returns_422_for_an_invalid_config
-✅ test_get_db_initializes_once_for_concurrent_callers
+关键回归包括：
+
+- stale/obsolete managed 符号链接不会阻塞启动且不跟随外部目标
+- manifest 跳过未变文件的内容读取，并在普通修改后恢复分发文件
+- 关闭或失效的缓存 SQLite 连接自动重连
+- YAML 目标和父链符号链接被拒绝
+- wheel 无法定位完整资源根时明确失败，不将 `site-packages` 作为项目根
 ```
 
 ---
@@ -130,7 +129,7 @@ assert PATHS.project_root == Path("/custom/path")
 
 所有修复保持向后兼容：
 
-- **API 不变**：`from common.config import SQLITE_PATH` 仍然有效
+- **API 不变**：`from common.config import SQLITE_PATH` 仍然有效；但 `from ... import PATHS` 会保留导入时快照，重配置代码应使用 `config.PATHS`
 - **行为一致**：首次启动、正常场景下行为与之前相同
 - **仅优化路径**：仅在重复启动、故障恢复、边缘场景下表现更优
 
@@ -149,4 +148,4 @@ assert PATHS.project_root == Path("/custom/path")
 
 1. 添加技能同步性能指标（监控实际节省的 IO 时间）
 2. 为 `reset_paths()` 添加单元测试
-3. 监控数据库健康检查的性能影响（PRAGMA quick_check 开销）
+3. 监控数据库健康检查的性能影响（`SELECT 1` 往返开销）

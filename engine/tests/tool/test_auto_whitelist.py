@@ -60,10 +60,10 @@ async def test_approved_path_adds_directory_to_whitelist(tmp_path):
     decision = guard.check(call)
     print(f"Decision: allowed={decision.allowed}, approval_required={decision.approval_required}, boundary_block={decision.boundary_block}")
     print(f"Approval scope: {decision.approval_scope}")
-    
+
     approval_scope = ApprovalScope.path(str(external_file), writing=False)
     print(f"Created approval_scope: kind={approval_scope.kind}, target={approval_scope.target}")
-    
+
     # Execute with authorization (this should trigger auto-whitelist)
     with registry.authorize_execution(call, approval_id="test-approval", approval_scope=approval_scope):
         result = await registry.execute(call)
