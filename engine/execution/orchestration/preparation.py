@@ -20,7 +20,7 @@ from engine.execution.pipeline.pipeline_context import (
     CTX_WORKING_DIR,
 )
 from engine.execution.pipeline.skill_chain import SkillChain, load_gate_content
-from engine.execution.routing.task_router import route_task, route_task_with_llm
+from engine.execution.routing.task_router import route_task
 from engine.execution.runtime_control import initial_runtime_control_prompt
 from engine.identity import IdentityCatalog, IdentitySpec, RouteDecision
 from engine.safety.eval_guard import EVAL_SENSITIVE_GUIDANCE, detect_eval_sensitive
@@ -72,11 +72,22 @@ def enabled_tools_from_config(
     if enabled is None:
         configured = available
     elif isinstance(enabled, list):
-        configured = [
-            name
-            for name in enabled
-            if isinstance(name, str) and name in available
-        ]
+        known = set(tool_registry.list_tool_names(include_disabled=True))
+        configured = []
+        for name in enabled:
+            if not isinstance(name, str) or not name:
+                continue
+            if name in available:
+                configured.append(name)
+            elif name not in known:
+                # A typo in tools.enabled used to vanish silently: this function
+                # removed the name before set_enabled() could report it, so the
+                # unknown-tool warning in prepare_runtime was unreachable.  Log
+                # here, at the point of filtering, so a misconfigured name is
+                # audible instead of silently disabling the tool.
+                logger.warning(
+                    "agent config enabled unknown tool %r; ignoring it", name
+                )
     else:
         raise ValueError(
             f"tools.enabled must be a list of tool names, got {type(enabled).__name__}"
@@ -248,11 +259,10 @@ async def prepare_runtime(
         if request.identity_id
         else catalog.default
     )
-    # Keyword/example matching first; when nothing hits, let the LLM pick a
-    # declared route as a paraphrase net. The LLM is constrained to declared
-    # identity:route tokens and falls back to the deterministic decision on
-    # any error, so routing can never invent a new identity or pipeline.
-    route = await route_task_with_llm(request.message, catalog, llm=services.llm)
+    # Pipelines require a declared, high-confidence intent. A hidden LLM
+    # classifier on each keyword miss slowed direct-ReAct turns and could
+    # incorrectly start a multi-step workflow.
+    route = route_task(request.message, catalog)
     state_dir = _identity_state_dir(runtime)
     requested_working_dir = request.working_dir or runtime.default_working_dir
     if requested_working_dir is None:

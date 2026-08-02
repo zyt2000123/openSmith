@@ -11,7 +11,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PRIVATE_DIR_MODE = 0o700
@@ -40,6 +40,11 @@ class SessionCheckpoint:
     # intentionally asked one user-owned question sets this flag so the next
     # session message can resume that same node with the answer.
     awaiting_user_input: bool = False
+    # Per-node provisional-streaming ledger (keyed by the node's output
+    # context key).  The final text-delta consumer skips re-rendering text it
+    # already streamed provisionally, so losing this flag across a crash
+    # resume duplicates the final reply.
+    provisional_outputs: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -37,14 +37,25 @@ async def route_task_with_llm(
     llm=None,
     *,
     identity_id: str | None = None,
+    allow_llm_fallback: bool = False,
 ) -> RouteDecision:
-    """Use deterministic catalog matches first, then optionally ask an LLM.
+    """Use deterministic catalog matches, with an opt-in LLM paraphrase net.
 
     The LLM is constrained to route ids already declared in the catalog; it
     cannot invent a new identity or pipeline name.
+
+    Automatic routing sits on the interactive critical path. A keyword miss
+    therefore stays direct by default instead of adding a hidden model round
+    trip to every ordinary message. Explicit route-selection surfaces may opt
+    into the paraphrase net.
     """
     deterministic = route_task(user_message, catalog, identity_id=identity_id)
-    if deterministic.score > 0 or llm is None or identity_id is not None:
+    if (
+        deterministic.score > 0
+        or llm is None
+        or identity_id is not None
+        or not allow_llm_fallback
+    ):
         return deterministic
 
     choices = [
