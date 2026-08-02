@@ -44,6 +44,14 @@ def _provider_error_message(chunk: dict) -> str | None:
     return None
 
 
+class _StreamTruncatedError(LLMResponseError):
+    """The provider dropped the stream before the ``[DONE]`` sentinel.
+
+    Kept distinct from other stream errors so the retry loop can treat a
+    pre-content truncation as transient without retrying malformed payloads.
+    """
+
+
 class OpenAIAdapter(HTTPAdapterMixin):
     """Translate OpenAI Chat Completions HTTP/SSE payloads into internal contracts."""
 
@@ -241,7 +249,9 @@ class OpenAIAdapter(HTTPAdapterMixin):
                         raw_finish_reason = finish_reason
 
                 if not saw_done:
-                    raise LLMResponseError("Provider stream ended before the [DONE] sentinel.")
+                    raise _StreamTruncatedError(
+                        "Provider stream ended before the [DONE] sentinel."
+                    )
 
                 for committed_event in commit_attempt():
                     yield committed_event
@@ -277,6 +287,16 @@ class OpenAIAdapter(HTTPAdapterMixin):
                 logger.warning(
                     "LLM stream attempt %d failed (%s), retrying",
                     attempt + 1, type(exc).__name__,
+                )
+            except _StreamTruncatedError as exc:
+                # A relay that drops the connection before [DONE] — with no
+                # content emitted — is a transient failure: retry, mirroring
+                # the pre-content retry behavior of the HTTP request path.
+                if saw_content_event or attempt >= MAX_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "LLM stream attempt %d ended before [DONE], retrying",
+                    attempt + 1,
                 )
             finally:
                 if response is not None:

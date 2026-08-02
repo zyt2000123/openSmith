@@ -9,6 +9,7 @@ import httpx
 from engine.llm.adapters.openai import OpenAIAdapter
 from engine.llm.client import ProviderClient
 from engine.llm.contracts import LLMProviderConfig
+from engine.llm.events import ProviderEventType
 from engine.llm.observability import (
     GenerationRecord,
     generation_context,
@@ -195,6 +196,46 @@ def test_non_streaming_chat_events_does_not_double_emit() -> None:
     assert len(records) == 1
     assert records[0].stream is False
     assert records[0].model == "served-model"
+
+
+def test_non_streaming_chat_events_do_not_leak_started_event_on_failure() -> None:
+    client = _make_client(stream=False)
+
+    async def send(request: httpx.Request, *, stream: bool = False) -> httpx.Response:
+        return httpx.Response(400, request=request, stream=_SseStream([b'{"error":"bad"}']))
+
+    client.adapter._http.send = send  # type: ignore[assignment]
+
+    seen: list[object] = []
+
+    async def call() -> None:
+        try:
+            async for event in client.chat_events([{"role": "user", "content": "hi"}]):
+                seen.append(event.type)
+        except Exception:
+            pass
+
+    asyncio.run(call())
+    assert seen == [], "a failed non-streaming completion must not leak RESPONSE_CREATED"
+
+
+def test_stream_abandoned_after_completion_records_success() -> None:
+    """A consumer that stops iterating at RESPONSE_COMPLETED is a success, not a failure."""
+    client = _client_with_stream_chunks([
+        b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n',
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ])
+
+    async def call() -> None:
+        async for event in client.chat_events([{"role": "user", "content": "hi"}]):
+            if event.type == ProviderEventType.RESPONSE_COMPLETED:
+                break
+
+    records = _collect(call)
+    assert len(records) == 1
+    assert records[0].ok is True
+    assert records[0].stream is True
 
 
 def test_client_exposes_config_model() -> None:

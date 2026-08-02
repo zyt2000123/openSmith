@@ -142,6 +142,38 @@ def test_half_streamed_turn_is_not_recorded(tmp_path):
     assert not path.exists() or path.read_text(encoding="utf-8").strip() == ""
 
 
+def test_recorder_forwards_prefix_cache_key_to_inner_stream(tmp_path):
+    """react_loop 在 prefix cache 开启时会给 chat_events 传 key,录制器必须透传。"""
+    path = tmp_path / "with-cache.jsonl"
+    seen: dict[str, object] = {}
+
+    class _CacheStreamingProvider:
+        stream = True
+        model = "fake-cache"
+
+        async def chat_events(self, messages, tools=None, prefix_cache_key=None):
+            seen["prefix_cache_key"] = prefix_cache_key
+            yield ProviderEvent(ProviderEventType.RESPONSE_CREATED, {})
+            yield ProviderEvent(ProviderEventType.RESPONSE_COMPLETED, {})
+
+        async def close(self) -> None:
+            pass
+
+    recorder = RecordingLLM(_CacheStreamingProvider(), path)
+
+    async def drain():
+        async for _ in recorder.chat_events(
+            [{"role": "user", "content": "x"}],
+            prefix_cache_key="stable-prefix",
+        ):
+            pass
+
+    asyncio.run(drain())
+
+    assert seen["prefix_cache_key"] == "stable-prefix"
+    assert path.read_text(encoding="utf-8").strip(), "the turn must still be recorded"
+
+
 def test_replaying_a_stream_through_chat_is_refused():
     llm = ReplayLLM([RecordedTurn(events=tuple(_stream_turn()))])
 

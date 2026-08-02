@@ -164,15 +164,22 @@ class RecordingLLM:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        prefix_cache_key: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Relay the event stream while collecting the whole turn.
 
         The write happens once, after the stream ends. Appending per event would
         leave a half turn on the file when a consumer breaks early, and replay
         would then serve that half turn as if it were complete.
+
+        ``prefix_cache_key`` is forwarded only when present so the wrapper also
+        works over minimal inner stubs that predate that parameter.
         """
         collected: list[dict[str, Any]] = []
-        async for event in self._inner.chat_events(messages, tools=tools):
+        kwargs: dict[str, Any] = {"tools": tools}
+        if prefix_cache_key is not None:
+            kwargs["prefix_cache_key"] = prefix_cache_key
+        async for event in self._inner.chat_events(messages, **kwargs):
             collected.append(dump_event(event))
             yield event
         self._append({"events": collected})
@@ -236,7 +243,11 @@ class ReplayLLM:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        prefix_cache_key: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
+        # ``prefix_cache_key`` is accepted for LLMPort signature parity but
+        # deliberately ignored: recorded turns are served in order, they are
+        # never regenerated, so no cache hint is meaningful here.
         turn = self._next_turn()
         if turn.events is None:
             raise ReplayShapeError(
