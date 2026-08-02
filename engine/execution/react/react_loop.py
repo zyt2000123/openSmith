@@ -590,6 +590,17 @@ async def react_event_loop(
                         })
                         return
                     context_recoveries += 1
+                    # The abandoned draft was streamed to the client but is
+                    # being discarded by this recovery.  Retract it before the
+                    # retried stream runs, or both the old and new ids would be
+                    # committed at finish and the client would keep rendering
+                    # text that no longer exists.
+                    for provision_id in active_provision_ids:
+                        yield _provisional_retract_event(
+                            provision_id,
+                            "context_limit",
+                        )
+                    active_provision_ids.clear()
                     yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
                     conversation = _recover_context_after_provider_rejection(
                         conversation,

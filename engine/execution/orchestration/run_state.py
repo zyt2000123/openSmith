@@ -488,7 +488,17 @@ class RunStateStore:
             run_id = path.stem
             if not _RUN_ID_RE.fullmatch(run_id):
                 continue
-            state = self.get(run_id)
+            try:
+                state = self.get(run_id)
+            except RunStateError:
+                # A torn or edited state file must not abort startup recovery
+                # of every other run.  Leave it untouched for the operator
+                # rather than silently writing a second copy over it.
+                logger.warning(
+                    "skipping unrecoverable run state file %s", path.name,
+                    exc_info=True,
+                )
+                continue
             if state is None or state.status not in {
                 RunStatus.QUEUED,
                 RunStatus.RUNNING,
@@ -659,8 +669,15 @@ def project_execution_event(
                         run_id,
                         str(event.data.get("approval_id") or ""),
                         approved=True,
+                        event_type=event_type,
                         reason="approval_granted",
                     )
+                    # resolve_approval records the event and clears the pending
+                    # approval; request_approval already cleared the tool.  One
+                    # source TOOL_CALL_RESULT must produce exactly one event_seq
+                    # increment (the denied/timed_out path returns below after
+                    # its own single resolve_approval record).
+                    return
                 # Fall through to clear_tool: the tool has executed and completed.
             elif approval_outcome in {"denied", "timed_out"}:
                 state = store.get(run_id)
