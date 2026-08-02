@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from common.config import AGENT_DIR
+from common import config as common_config
 from engine.execution import run_memory_idle_tick
 
 from .auto_task_service import AutoTaskService
@@ -26,7 +26,7 @@ def _build_service() -> AutoTaskService:
 async def run_memory_maintenance_tick() -> bool:
     """Retry due memory maintenance even when no new conversation arrives."""
     services = build_memory_maintenance_services()
-    return await run_memory_idle_tick(AGENT_DIR / "memory", services)
+    return await run_memory_idle_tick(common_config.PATHS.agent_dir / "memory", services)
 
 
 async def run_scheduler_tick() -> int:

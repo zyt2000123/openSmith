@@ -6,8 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi import Depends
 
+from common import config as common_config
 from common.database import close_db
-from common.config import AGENT_DIR
 from engine.execution import RunStateError, RunStateStore
 from engine.llm.observability import set_default_generation_sink
 
@@ -32,7 +32,7 @@ async def lifespan(app: FastAPI):
     await get_app_db()
     load_runtime_identity_catalog(force=True)
     try:
-        recovered = RunStateStore(AGENT_DIR).recover_interrupted()
+        recovered = RunStateStore(common_config.PATHS.agent_dir).recover_interrupted()
         if recovered:
             logger.warning("marked interrupted runs as resumable: %s", ", ".join(recovered))
     except (RunStateError, OSError):

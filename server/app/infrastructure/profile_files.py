@@ -3,12 +3,12 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from common.config import AGENT_DIR
+from common import config as common_config
 
 
 def smith_profile_dir() -> Path:
     """Return the one writable runtime profile owned by Smith."""
-    return AGENT_DIR
+    return common_config.PATHS.agent_dir
 
 
 def _safe_child(filename: str) -> Path:

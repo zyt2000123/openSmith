@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from common.config import AGENT_DIR
+from common import config as common_config
 from common.yaml_utils import YamlConfigError, load_yaml
 from engine.mcp.client import MCPClient
 from engine.mcp.config import mcp_server_log_summary, mcp_transport_from_config
 
 from ..schemas.mcp import McpServerOut, McpToolSummaryOut
+
+# Compatibility seam for tests embedding a temporary runtime profile.
+AGENT_DIR: Path | None = None
+
+
+def _agent_dir() -> Path:
+    return AGENT_DIR if AGENT_DIR is not None else common_config.PATHS.agent_dir
 
 
 class McpService:
@@ -16,7 +24,7 @@ class McpService:
 
     async def list_servers(self) -> list[McpServerOut]:
         try:
-            profile = load_yaml(AGENT_DIR / "config.yaml")
+            profile = load_yaml(_agent_dir() / "config.yaml")
         except YamlConfigError as exc:
             return [McpServerOut(name="config", type="unknown", status="error", error=str(exc))]
 

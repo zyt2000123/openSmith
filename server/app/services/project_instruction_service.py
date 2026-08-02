@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from common.config import SAFETY_RULES_PATH
+from common import config as common_config
 from engine.safety.tool_guard import ToolGuard
 from engine.tool.interface import ToolCall, ToolDefinition
 
@@ -46,7 +46,7 @@ class ProjectInstructionService:
             raise HTTPException(409, "Project instruction path is unsafe")
 
         guard = ToolGuard(
-            SAFETY_RULES_PATH,
+            common_config.PATHS.safety_rules_path,
             allowed_dirs=[],
             tool_registry={
                 "write_file": ToolDefinition(

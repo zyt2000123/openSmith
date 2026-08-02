@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from common.config import AGENT_DIR, BUILTIN_IDENTITIES_DIR, BUILTIN_SKILLS_DIR, PATHS, SAFETY_RULES_PATH
+from common import config as common_config
 from engine.execution import RuntimeContext, RuntimeServices, validate_execution_assets
 from engine.identity import IdentityCatalog, load_identity_catalog
 from engine.llm.model_config import LLMUsage, build_llm_client, resolve_llm_config
@@ -114,16 +114,17 @@ def _interactive_model_metadata(config: dict[str, Any]) -> dict[str, str]:
 
 def load_runtime_identity_catalog(*, force: bool = False) -> IdentityCatalog:
     """Load the one catalog and validate its declared assets for every entry point."""
-    catalog = load_identity_catalog(BUILTIN_IDENTITIES_DIR, force=force)
+    paths = common_config.PATHS
+    catalog = load_identity_catalog(paths.builtin_identities_dir, force=force)
     skill_registry = SkillRegistry()
     tool_registry = ToolRegistry()
-    PATHS.ensure_base_dirs()
-    skill_registry.load_builtin(BUILTIN_SKILLS_DIR)
-    skill_registry.load_agent_skills(AGENT_DIR / "skills")
-    tool_registry.load_builtin_providers(PATHS.project_root / "agents" / "tools")
+    paths.ensure_base_dirs()
+    skill_registry.load_builtin(paths.builtin_skills_dir)
+    skill_registry.load_agent_skills(paths.agent_dir / "skills")
+    tool_registry.load_builtin_providers(paths.project_root / "agents" / "tools")
     validate_execution_assets(
         catalog,
-        agents_dir=PATHS.project_root / "agents",
+        agents_dir=paths.project_root / "agents",
         skill_names=(summary["name"] for summary in skill_registry.list_summaries()),
         tool_names=tool_registry.list_tool_names(),
     )
@@ -140,6 +141,7 @@ def build_engine_runtime(
 ) -> tuple[RuntimeContext, RuntimeServices]:
     """Build the engine runtime for the FastAPI product layer."""
     manager = llm_client_manager or _llm_client_manager
+    paths = common_config.PATHS
     interactive_kwargs: dict[str, Any] = {"usage": LLMUsage.INTERACTIVE}
     if model_profile:
         interactive_kwargs["model_profile"] = model_profile
@@ -149,21 +151,21 @@ def build_engine_runtime(
     runtime = RuntimeContext(
         agent_id=agent_id,
         agent_name=agent_name,
-        profile_dir=AGENT_DIR,
-        agents_dir=PATHS.project_root / "agents",
+        profile_dir=paths.agent_dir,
+        agents_dir=paths.project_root / "agents",
         session_id=session_id,
         metadata=_interactive_model_metadata(interactive_config),
         identity_catalog=load_runtime_identity_catalog(),
     )
     skill_registry = SkillRegistry()
-    skill_registry.load_builtin(BUILTIN_SKILLS_DIR)
+    skill_registry.load_builtin(paths.builtin_skills_dir)
     services = RuntimeServices(
         llm=manager.get_for_config(interactive_config),
         gate_llm=manager.get_for_config(gate_config),
         background_llm=manager.get_for_config(background_config),
         tool_registry=ToolRegistry(),
         skill_registry=skill_registry,
-        tool_guard=ToolGuard(SAFETY_RULES_PATH),
+        tool_guard=ToolGuard(paths.safety_rules_path),
         mcp_session_pool=_mcp_client_session_pool,
         owns_mcp_clients=False,
         observation_factory=RunObservation.start,

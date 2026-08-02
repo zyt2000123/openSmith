@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
-from common.config import SMITH_PROFILE_DIR
+from common import config as common_config
 
 from ..schemas.agent_profile import AgentProfileCreate, AgentProfileUpdate, AgentProfileOut
 from ..infrastructure.profile_files import (
@@ -37,7 +37,7 @@ class AgentProfileService:
         if is_new:
             try:
                 init_smith_profile_files(
-                    profile_seed_dir=SMITH_PROFILE_DIR,
+                    profile_seed_dir=common_config.PATHS.smith_profile_dir,
                     name=body.name,
                     role=body.role,
                     description=body.description,
