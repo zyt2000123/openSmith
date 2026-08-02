@@ -161,6 +161,24 @@ class SearchIndex:
         )
         await self._db.commit()
 
+    async def index_entries(self, entries: list[tuple[str, str, str]]) -> None:
+        """Replace a batch of entries in a single transaction.
+
+        ``_sync_episode_index`` runs on the per-query hot path; one transaction
+        per changed episode (DELETE + INSERT + COMMIT each) is needless overhead.
+        """
+        if not self._db or not entries:
+            return
+        for entry_id, _, _ in entries:
+            await self._db.execute(
+                "DELETE FROM memory_fts WHERE entry_id = ?", (entry_id,)
+            )
+        await self._db.executemany(
+            "INSERT INTO memory_fts (entry_id, content, scope) VALUES (?, ?, ?)",
+            entries,
+        )
+        await self._db.commit()
+
     async def remove_entry(self, entry_id: str) -> None:
         if not self._db:
             return
@@ -196,41 +214,43 @@ class SearchIndex:
         if not terms:
             return []
         matchable = [term for term in terms if len(term) >= _TRIGRAM_MIN]
+        # The trigram tokenizer cannot match terms shorter than three characters
+        # (common for CJK words), so those terms are served by a LIKE scan.  The
+        # LIKE scan runs as OR *alongside* the MATCH query so a short CJK term
+        # in a mixed-length query is not silently dropped, and matches the OR
+        # semantics of the MATCH path (relevant retrieval, not verbatim AND).
+        short_terms = [term for term in terms if len(term) < _TRIGRAM_MIN]
         try:
-            if not matchable:
-                # The trigram tokenizer matches nothing for terms shorter than 3
-                # characters (common for CJK words) — fall back to an all-term
-                # LIKE scan over the small episode corpus.  Only when *no* term
-                # is long enough: falling back merely because one short token
-                # slipped in (a greeting, a stray fullwidth comma) would re-impose
-                # near-verbatim matching on the rest of the query.
+            rows: list[dict] = []
+            if matchable:
+                safe_query = " OR ".join(
+                    '"' + term.replace('"', '""') + '"'
+                    for term in matchable
+                )
+                rows = await self._db.execute_fetchall(
+                    "SELECT entry_id, bm25(memory_fts) AS score "
+                    "FROM memory_fts WHERE memory_fts MATCH ? "
+                    "ORDER BY score LIMIT ?",
+                    (safe_query, top_k),
+                )
+            if short_terms:
                 escaped_terms = [
                     term.replace("\\", "\\\\")
                     .replace("%", r"\%")
                     .replace("_", r"\_")
-                    for term in terms
+                    for term in short_terms
                 ]
-                predicates = " AND ".join(
+                predicates = " OR ".join(
                     r"content LIKE ? ESCAPE '\'" for _ in escaped_terms
                 )
-                rows = await self._db.execute_fetchall(
-                    f"SELECT entry_id FROM memory_fts WHERE {predicates} LIMIT ?",
+                like_rows = await self._db.execute_fetchall(
+                    f"SELECT entry_id, 0.0 AS score FROM memory_fts "
+                    f"WHERE {predicates} LIMIT ?",
                     (*[f"%{term}%" for term in escaped_terms], top_k),
                 )
-                return [{"id": r["entry_id"], "score": 0.0} for r in rows]
-            # OR, not AND: this retrieves *relevant* episodes, and a sentence
-            # sliced into trigrams would never have every piece present at once.
-            # bm25 floats the documents matching the most pieces to the top.
-            safe_query = " OR ".join(
-                '"' + term.replace('"', '""') + '"'
-                for term in matchable
-            )
-            rows = await self._db.execute_fetchall(
-                "SELECT entry_id, bm25(memory_fts) AS score "
-                "FROM memory_fts WHERE memory_fts MATCH ? "
-                "ORDER BY score LIMIT ?",
-                (safe_query, top_k),
-            )
+                if like_rows:
+                    seen = {row["entry_id"] for row in rows}
+                    rows = [*rows, *[row for row in like_rows if row["entry_id"] not in seen]]
         except Exception:
             logger.warning("memory search query failed", exc_info=True)
             return []

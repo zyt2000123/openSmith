@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
@@ -45,8 +46,19 @@ _RUNTIME_CONTEXT_FENCE = (
 
 _log = logging.getLogger(__name__)
 
-# Cache: agent_dir -> (content_hash, assembled_prompt)
-_prompt_cache: dict[str, tuple[str, str]] = {}
+# Bounded prefix-cache keyed by (agent_dir, static-profile-file signature) so a
+# profile edit invalidates the entry instead of serving a stale hash. Only the
+# hash is stored; the rendered content is never retained.
+_PROMPT_CACHE_MAX = 128
+_PROFILE_STATIC_FILES = (
+    "role.md",
+    "style.md",
+    "workflow.md",
+    "toolbox.md",
+    "context.md",
+    "output_style.md",
+)
+_prompt_cache: "OrderedDict[tuple[str, tuple[tuple[str, int, int], ...]], str]" = OrderedDict()
 
 _SMITH_MD_MAX_CHARS = 50_000
 
@@ -179,25 +191,6 @@ class AssembledPrompt:
     plan: PromptPlan
 
 
-def build_team_context(
-    group_name: str,
-    members: list[str],
-    recent_messages: list[dict],
-) -> str:
-    """Build a context block for team conversations."""
-    lines: list[str] = [
-        "## Team Context",
-        f'You are in team group "{group_name}" with members: {", ".join(members)}.',
-        "",
-        "Recent conversation:",
-    ]
-    for msg in recent_messages:
-        name = msg.get("sender_name") or msg.get("sender_id", "?")
-        content = msg.get("content", "")
-        lines.append(f"[{name}]: {content}")
-    return "\n".join(lines)
-
-
 class PromptAssembler:
     """Assemble Smith's system prompt from an agent profile directory."""
 
@@ -302,7 +295,11 @@ class PromptAssembler:
             self._render_layer(layer) for layer in rendered_layers[:6]
         )
         stable_hash = hashlib.sha256(stable_content.encode()).hexdigest()
-        _prompt_cache[str(agent_dir)] = (stable_hash, stable_content)
+        cache_key = (str(agent_dir), PromptAssembler._profile_static_signature(agent_dir))
+        _prompt_cache[cache_key] = stable_hash
+        _prompt_cache.move_to_end(cache_key)
+        while len(_prompt_cache) > _PROMPT_CACHE_MAX:
+            _prompt_cache.popitem(last=False)
         manifest = replace(
             self._manifest_for(layers, rendered_layers, text),
             budget=plan.to_trace_data(),
@@ -336,14 +333,14 @@ class PromptAssembler:
 
         # Layer 1: role (identity)
         layers.append(PromptLayer(
-            "role", self._read(agent_dir / "role.md"),
+            "role", self._read(agent_dir / "role.md", root=agent_dir),
             PromptSource.AGENT_PROFILE, PromptAuthority.AGENT_POLICY,
             PromptTrust.CONFIGURED, source_ref="profile:role.md", display_name="Agent Role",
         ))
 
         # Layer 2: style (persona)
         layers.append(PromptLayer(
-            "style", self._read(agent_dir / "style.md"),
+            "style", self._read(agent_dir / "style.md", root=agent_dir),
             PromptSource.AGENT_PROFILE, PromptAuthority.AGENT_POLICY,
             PromptTrust.CONFIGURED, trim_priority=50, source_ref="profile:style.md",
             display_name="Agent Style",
@@ -351,14 +348,14 @@ class PromptAssembler:
 
         # Layer 3: workflow (bible)
         layers.append(PromptLayer(
-            "workflow", self._read(agent_dir / "workflow.md"),
+            "workflow", self._read(agent_dir / "workflow.md", root=agent_dir),
             PromptSource.AGENT_PROFILE, PromptAuthority.AGENT_POLICY,
             PromptTrust.CONFIGURED, source_ref="profile:workflow.md", display_name="Agent Workflow",
         ))
 
         # Layers 4-5: profile-owned tool policy and dynamic registry definitions
         layers.append(PromptLayer(
-            "toolbox_policy", self._read(agent_dir / "toolbox.md"),
+            "toolbox_policy", self._read(agent_dir / "toolbox.md", root=agent_dir),
             PromptSource.AGENT_PROFILE, PromptAuthority.AGENT_POLICY,
             PromptTrust.CONFIGURED, trim_priority=40, source_ref="profile:toolbox.md",
             display_name="Tool Usage Policy",
@@ -394,7 +391,7 @@ class PromptAssembler:
         ))
 
         # Layer 7: learned user context (always retained, but never authority)
-        learned_context = self._read(agent_dir / "context.md")
+        learned_context = self._read(agent_dir / "context.md", root=agent_dir)
         if learned_context:
             from engine.memory._files import sanitize_memory_text
 
@@ -439,10 +436,12 @@ class PromptAssembler:
             load_reason=PromptLoadReason.EVAL_SENSITIVE, display_name="Evaluation Safety Guidance",
         ))
 
-        # Layer 12: output style
+        # Layer 12: output style. An explicitly supplied path is an override and
+        # must resolve inside its own directory; the default is profile-owned.
         style_path = output_style_path or agent_dir / "output_style.md"
+        style_root = agent_dir if output_style_path is None else style_path.parent
         layers.append(PromptLayer(
-            "output_style", self._read(style_path), PromptSource.ENGINE,
+            "output_style", self._read(style_path, root=style_root), PromptSource.ENGINE,
             PromptAuthority.AGENT_POLICY, PromptTrust.CONFIGURED, trim_priority=10,
             source_ref="agents:output_style.md", display_name="Output Style",
         ))
@@ -463,12 +462,16 @@ class PromptAssembler:
         else:
             memory_dir = agent_dir / "memory"
             recent_memory = (
-                self._sanitize_memory_reference(self._read(memory_dir / "recent.md"))
+                self._sanitize_memory_reference(
+                    self._read(memory_dir / "recent.md", root=agent_dir)
+                )
                 if memory_dir.is_dir()
                 else ""
             )
             legacy_durable_memory = (
-                self._sanitize_memory_reference(self._read(memory_dir / "durable.md"))
+                self._sanitize_memory_reference(
+                    self._read(memory_dir / "durable.md", root=agent_dir)
+                )
                 if memory_dir.is_dir()
                 else ""
             )
@@ -630,10 +633,30 @@ class PromptAssembler:
         return tuple(trimmed)
 
     @staticmethod
+    def _profile_static_signature(agent_dir: Path) -> tuple[tuple[str, int, int], ...]:
+        """Digest the static profile files that feed the stable prompt prefix."""
+        signature: list[tuple[str, int, int]] = []
+        for name in _PROFILE_STATIC_FILES:
+            path = agent_dir / name
+            try:
+                if path.is_file() and not path.is_symlink():
+                    stat = path.stat()
+                    signature.append((name, stat.st_mtime_ns, stat.st_size))
+            except (OSError, RuntimeError):
+                continue
+        return tuple(signature)
+
+    @staticmethod
     def get_prefix_cache_key(agent_dir: Path) -> str | None:
         """Return the hash of stable prompt layers for LLM prefix caching."""
-        cached = _prompt_cache.get(str(agent_dir))
-        return cached[0] if cached else None
+        cache_key = (
+            str(agent_dir),
+            PromptAssembler._profile_static_signature(agent_dir),
+        )
+        cached = _prompt_cache.get(cache_key)
+        if cached is not None:
+            _prompt_cache.move_to_end(cache_key)
+        return cached
 
     @staticmethod
     def _find_project_smith_md(working_dir: Path) -> Path | None:
@@ -717,17 +740,6 @@ class PromptAssembler:
                     return "## Project Instructions\n\n" + project_text
         return ""
 
-    def _read_smith_instructions(self, working_dir: Path | None) -> str:
-        """Backward-compatible combined view for direct legacy callers."""
-        return "\n\n".join(
-            part
-            for part in (
-                self._read_global_smith_instructions(),
-                self._read_project_smith_instructions(working_dir),
-            )
-            if part
-        )
-
     @staticmethod
     def _sanitize_memory_reference(value: object) -> str:
         """Apply the memory trust boundary at every prompt-assembly entry point."""
@@ -739,20 +751,25 @@ class PromptAssembler:
         return cleaned.strip()
 
     @staticmethod
-    def _extract_memory_body(f: Path) -> str:
-        """Read a memory .md file and return a truncated body line."""
-        content = f.read_text(encoding="utf-8").strip()
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            body = parts[2].strip() if len(parts) >= 3 else content
-        else:
-            body = content
-        if len(body) > 150:
-            body = body[:150] + "..."
-        return f"- {body}"
+    def _read(path: Path, root: Path | None = None) -> str:
+        """Read a profile-owned file, rejecting symlinks and boundary escapes.
 
-    @staticmethod
-    def _read(path: Path) -> str:
-        if path.is_file():
-            return path.read_text(encoding="utf-8").strip()
-        return ""
+        Profile files are declarative/third-party content injected as
+        CONFIGURED / AGENT_POLICY layers, so they receive the same treatment as
+        SMITH.md: a symlinked file is ignored, and when ``root`` is given the
+        resolved file must stay inside it. A symlinked directory that escapes
+        the profile is caught by the resolution check. Returns "" on any
+        refusal or OS error.
+        """
+        try:
+            if not path.is_file() or path.is_symlink():
+                return ""
+            if root is not None:
+                path.resolve(strict=True).relative_to(root.resolve(strict=False))
+        except (ValueError, OSError, RuntimeError):
+            _log.warning(
+                "Ignoring profile file outside profile boundary or symlink: %s",
+                path,
+            )
+            return ""
+        return path.read_text(encoding="utf-8").strip()

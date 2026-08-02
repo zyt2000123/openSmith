@@ -133,7 +133,10 @@ class UserPreferenceLearner:
 
             counters = state.setdefault("counters", {})
             key_counters = counters.setdefault(key, {})
-            key_counters[value] = key_counters.get(value, 0) + 1
+            key_counters[value] = min(
+                key_counters.get(value, 0) + 1,
+                _CONFIDENCE_THRESHOLD,
+            )
 
             emitted_map = state.get("emitted")
             if not isinstance(emitted_map, dict):
@@ -145,6 +148,10 @@ class UserPreferenceLearner:
                 and emitted_map.get(key) != value
             ):
                 observations.append(f"{key}={value}")
+                # Reset once emitted so the same signal cannot re-emit every
+                # matching turn when acknowledge() is skipped after a failed
+                # write.  Reaching confidence again requires fresh evidence.
+                key_counters[value] = 0
 
         self._save_state(state)
         return observations

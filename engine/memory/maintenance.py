@@ -27,6 +27,39 @@ _NUDGE_PENDING_FILE = ".nudge_pending"
 _DREAM_PENDING_FILE = ".dream_pending"
 MAINTENANCE_KINDS: tuple[str, ...] = ("compile", "nudge", "dream")
 
+# Review/content rejections deserve a fresh attempt soon; transport/provider
+# failures (timeouts, unreachable providers, disk errors) back off so a
+# due-but-failing lane cannot hammer the LLM every turn.
+_REVIEW_REJECTION_MARKERS = (
+    "did not pass review",
+    "contains sensitive information",
+    "instruction-injection",
+    "exceeded character budget",
+    "LLM returned insufficient output",
+    "requires a reviewer",
+)
+
+
+def _failure_needs_backoff(
+    *,
+    exc: BaseException | None = None,
+    error_text: str | None = None,
+) -> bool:
+    """Whether a maintenance failure should enter the retry cooldown."""
+    if exc is not None:
+        from engine.memory._review import MemoryCompilationError
+        from engine.memory.nudge import MemoryNudgeError
+        from engine.memory.policy import MemoryPolicyError
+
+        if isinstance(exc, (MemoryCompilationError, MemoryNudgeError, MemoryPolicyError)):
+            return False
+        return True
+    if error_text is not None:
+        return not any(
+            marker in error_text for marker in _REVIEW_REJECTION_MARKERS
+        )
+    return True
+
 
 @dataclass(frozen=True)
 class MemoryMaintenanceService:
@@ -133,6 +166,10 @@ class MemoryMaintenanceService:
             return compiled and nudged and dreamed
 
     async def _run_compilation_unlocked(self, memory_dir: Path) -> bool:
+        from engine.memory.store import _in_retry_cooldown, _record_retry_attempt
+
+        if _in_retry_cooldown(memory_dir, "compile"):
+            return False
         try:
             from engine.memory.compile import run_compilation
 
@@ -152,8 +189,10 @@ class MemoryMaintenanceService:
             if result.get("recent") and not result.get("durable"):
                 logger.info("recent memory compiled; durable memory remains pending review")
             return not errors
-        except Exception:
+        except Exception as exc:
             logger.warning("conversation-memory compilation failed", exc_info=True)
+            if _failure_needs_backoff(exc=exc):
+                _record_retry_attempt(memory_dir, "compile")
             return False
 
     async def _schedule_compilation(self, memory_dir: Path) -> bool:
@@ -172,9 +211,15 @@ class MemoryMaintenanceService:
         return False
 
     def _schedule_background(self, kind: str, memory_dir: Path) -> None:
+        from engine.memory.store import _in_retry_cooldown
+
         key = (memory_dir.resolve(), kind)
         existing = self._background_tasks.get(key)
         if existing is not None and not existing.done():
+            return
+        if _in_retry_cooldown(memory_dir, kind):
+            # A recently failed attempt is inside its cooldown; do not spawn a
+            # fresh background task that would hit the provider again this turn.
             return
 
         runners = {
@@ -187,7 +232,7 @@ class MemoryMaintenanceService:
         self._background_tasks[key] = task
 
         def finish(completed: asyncio.Task[None]) -> None:
-            self._background_tasks.pop(key, None)
+            self._discard_completed_task(key, completed)
             try:
                 completed.result()
             except asyncio.CancelledError:
@@ -196,6 +241,21 @@ class MemoryMaintenanceService:
                 logger.warning("background memory %s failed", kind, exc_info=True)
 
         task.add_done_callback(finish)
+
+    @classmethod
+    def _discard_completed_task(
+        cls,
+        key: tuple[Path, str],
+        completed: asyncio.Task[None],
+    ) -> None:
+        """Pop a finished task only when it is still the registered one.
+
+        The done-callback of an old task may run after a new task was registered
+        under the same key; popping unconditionally would silently evict the new
+        task and leave it running unobserved.
+        """
+        if cls._background_tasks.get(key) is completed:
+            cls._background_tasks.pop(key, None)
 
     async def _run_background_compilation(self, memory_dir: Path) -> None:
         async with self._operation_lock(memory_dir):
@@ -219,6 +279,10 @@ class MemoryMaintenanceService:
         and invokes the existing compiler; no code in this method writes a
         durable view directly.
         """
+        from engine.memory.store import _in_retry_cooldown, _record_retry_attempt
+
+        if _in_retry_cooldown(memory_dir, "nudge"):
+            return False
         try:
             from engine.memory.nudge import run_nudge
 
@@ -229,6 +293,8 @@ class MemoryMaintenanceService:
             if not report.completed:
                 reason = report.error or report.status
                 logger.warning("periodic memory nudge did not complete: %s", reason)
+                if report.status == "failed":
+                    _record_retry_attempt(memory_dir, "nudge")
                 return False
             if report.candidates_written:
                 self._mark_pending("compile", memory_dir)
@@ -250,6 +316,8 @@ class MemoryMaintenanceService:
             except Exception:
                 logger.warning("could not audit periodic nudge failure", exc_info=True)
             logger.warning("periodic memory nudge failed", exc_info=True)
+            if _failure_needs_backoff(exc=exc):
+                _record_retry_attempt(memory_dir, "nudge")
             return False
 
     async def wait_for_pending_tasks(self, memory_dir: Path) -> None:
@@ -264,6 +332,10 @@ class MemoryMaintenanceService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run_dream_unlocked(self, memory_dir: Path) -> bool:
+        from engine.memory.store import _in_retry_cooldown, _record_retry_attempt
+
+        if _in_retry_cooldown(memory_dir, "dream"):
+            return False
         try:
             from engine.memory.dream import dream_report_completed, run_dream
 
@@ -271,9 +343,18 @@ class MemoryMaintenanceService:
                 run_dream(memory_dir, self.llm, reviewer=self.reviewer),
                 timeout=_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
             )
+            # Dream runs on a low-frequency cadence: apply audit-log retention here.
+            try:
+                from engine.memory.history import trim_memory_history
+
+                trim_memory_history(memory_dir)
+            except Exception:
+                logger.warning("could not trim memory history", exc_info=True)
             if not dream_report_completed(report):
                 reason = "; ".join(report.errors) if report.errors else report.skipped
                 logger.warning("conversation-memory Dream did not complete: %s", reason)
+                if _failure_needs_backoff(error_text=reason):
+                    _record_retry_attempt(memory_dir, "dream")
                 return False
             return True
         except Exception as exc:
@@ -287,6 +368,8 @@ class MemoryMaintenanceService:
             except Exception:
                 logger.warning("could not audit Dream maintenance failure", exc_info=True)
             logger.warning("conversation-memory Dream consolidation failed", exc_info=True)
+            if _failure_needs_backoff(exc=exc):
+                _record_retry_attempt(memory_dir, "dream")
             return False
 
     @classmethod
@@ -326,10 +409,11 @@ class MemoryMaintenanceService:
 
     @classmethod
     def _mark_completed(cls, kind: str, memory_dir: Path) -> None:
-        from engine.memory.store import _reset_counter
+        from engine.memory.store import _clear_retry_attempt, _reset_counter
 
         cls._clear_pending(kind, memory_dir)
         _reset_counter(memory_dir / f".{kind}_counter")
+        _clear_retry_attempt(memory_dir, kind)
 
     @classmethod
     def maintenance_status(cls, memory_dir: Path) -> dict[str, str]:

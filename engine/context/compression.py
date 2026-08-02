@@ -13,6 +13,7 @@ from .budget import (
     CONTEXT_SAFETY_MARGIN_RATIO,
     context_budget_for,
     estimate_compressible_tokens,
+    # estimate_tokens is re-exported here for engine.context's public surface.
     estimate_messages_tokens,
     estimate_tokens,
     model_limits_for,
@@ -196,6 +197,10 @@ def trim_conversation_for_context_limit(
     recovery_prefix = (
         "[Context deterministically shortened to fit the selected model]\n"
     )
+    recovery_ack = {
+        "role": "assistant",
+        "content": "Understood. I have the relevant earlier context.",
+    }
     history_text = "\n".join(history_lines)
 
     def historical_candidate(keep: int) -> list[dict]:
@@ -207,15 +212,30 @@ def trim_conversation_for_context_limit(
         return [
             *protected,
             {"role": "user", "content": recovered_history},
-            {
-                "role": "assistant",
-                "content": "Understood. I have the relevant earlier context.",
-            },
+            dict(recovery_ack),
             *active,
         ]
 
+    # The protected contract, the synthesized recovery annotation, and the
+    # active work are constant across every binary-search step; only the
+    # synthesized history message varies. Measuring that fixed prefix once and
+    # serializing a single message per step avoids re-serializing the whole
+    # conversation O(log N) times.
+    fixed_cost = estimate_messages_tokens([*protected, recovery_ack, *active])
+    protected_active_cost = estimate_messages_tokens([*protected, *active])
+
+    def candidate_cost(keep: int) -> int:
+        tail = history_text[-keep:] if keep else ""
+        marker = "[... earlier context truncated ...]\n" if keep < len(history_text) else ""
+        recovered_history = recovery_prefix + marker + tail
+        if not recovered_history.strip():
+            return protected_active_cost
+        return fixed_cost + estimate_messages_tokens(
+            [{"role": "user", "content": recovered_history}]
+        )
+
     minimum = historical_candidate(0)
-    if estimate_messages_tokens(minimum) > token_budget:
+    if candidate_cost(0) > token_budget:
         # Preserve the active request even if no space remains to annotate the
         # discarded history. The final fitter fails closed when that request
         # itself exceeds capacity.
@@ -225,49 +245,8 @@ def trim_conversation_for_context_limit(
     best = minimum
     while low <= high:
         keep = (low + high) // 2
-        current = historical_candidate(keep)
-        if estimate_messages_tokens(current) <= token_budget:
-            best = current
-            low = keep + 1
-        else:
-            high = keep - 1
-    return best
-
-
-def _trim_middle(text: str, token_budget: int) -> str:
-    if token_budget <= 0:
-        return ""
-    if estimate_tokens(text) <= token_budget:
-        return text
-    marker = "\n[... context truncated ...]\n"
-    low, high = 0, len(text)
-    best = ""
-    while low <= high:
-        keep = (low + high) // 2
-        head = keep // 2
-        tail = keep - head
-        candidate = text[:head] + marker + (text[-tail:] if tail else "")
-        if estimate_tokens(candidate) <= token_budget:
-            best = candidate
-            low = keep + 1
-        else:
-            high = keep - 1
-    return best or _trim_tail(marker, token_budget)
-
-
-def _trim_tail(text: str, token_budget: int) -> str:
-    if token_budget <= 0:
-        return ""
-    if estimate_tokens(text) <= token_budget:
-        return text
-    marker = "[... earlier context truncated ...]\n"
-    low, high = 0, len(text)
-    best = ""
-    while low <= high:
-        keep = (low + high) // 2
-        candidate = marker + (text[-keep:] if keep else "")
-        if estimate_tokens(candidate) <= token_budget:
-            best = candidate
+        if candidate_cost(keep) <= token_budget:
+            best = historical_candidate(keep)
             low = keep + 1
         else:
             high = keep - 1

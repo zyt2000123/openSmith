@@ -140,18 +140,39 @@ def contains_injection(text: str) -> bool:
     return any(p.search(normalized) for p in _INJECTION_PATTERNS)
 
 
+_PRIVATE_KEY_FENCE_BEGIN = re.compile(
+    r"-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----"
+)
+_PRIVATE_KEY_FENCE_END = re.compile(
+    r"-----END\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----"
+)
+
+
 def sanitize_memory_text(text: str) -> tuple[str, int, int]:
     """Remove unsafe lines before memory is persisted or injected into a prompt.
 
     Returns the cleaned text plus counts of removed secret and instruction-like
     lines.  Line-level removal preserves unrelated user-authored context while
     ensuring a known unsafe fragment cannot survive into the prompt layer.
+    Multi-line secrets (e.g. PEM private keys) are dropped as a block: only the
+    ``-----BEGIN ... KEY-----`` line matches the line-level secret scan, so the
+    base64 body would otherwise survive.
     """
     lines = text.splitlines()
     clean: list[str] = []
     secrets_removed = 0
     injections_removed = 0
+    in_private_key_block = False
     for line in lines:
+        if in_private_key_block:
+            secrets_removed += 1
+            if _PRIVATE_KEY_FENCE_END.search(line):
+                in_private_key_block = False
+            continue
+        if _PRIVATE_KEY_FENCE_BEGIN.search(line):
+            in_private_key_block = True
+            secrets_removed += 1
+            continue
         if contains_secret(line):
             secrets_removed += 1
         elif contains_injection(line):
@@ -159,6 +180,8 @@ def sanitize_memory_text(text: str) -> tuple[str, int, int]:
         else:
             clean.append(line)
     if contains_injection(text) and injections_removed == 0:
+        return "", secrets_removed, 1
+    if contains_secret(text) and secrets_removed == 0:
         return "", secrets_removed, 1
     return "\n".join(clean), secrets_removed, injections_removed
 

@@ -56,6 +56,9 @@ MAX_DURABLE_CHARS = _MEMORY_POLICY.view("durable").max_chars
 MAX_RECENT_SOURCE_CHARS = 24_000
 MAX_DURABLE_SOURCE_CHARS = 16_000
 MAX_EPISODE_SOURCE_CHARS = 16_000
+# Hard cap on an episode summary; oversized output is rejected rather than
+# silently truncated before it is written.
+_MAX_EPISODE_CHARS = 800
 MIN_WINDOW_DAYS, MAX_WINDOW_DAYS = _MEMORY_POLICY.view("recent").window_days
 # Compilation is deferred from the interactive turn and may require several
 # generator/reviewer calls. Keep a finite bound, but do not make a normal
@@ -138,12 +141,20 @@ def _load_recent(
 
 def _read_offset(memory_dir: Path) -> int:
     offset_file = memory_dir / ".compile_offset"
-    if offset_file.is_file():
-        try:
-            return max(0, int(offset_file.read_text().strip()))
-        except (ValueError, OSError):
-            pass
-    return 0
+    if not offset_file.exists() and not offset_file.is_symlink():
+        return 0
+    if offset_file.is_symlink():
+        raise OSError("compile offset is unavailable or unsafe")
+    safe_path = safe_file_in_dir(memory_dir, offset_file)
+    if safe_path is None:
+        raise OSError("compile offset is unavailable or unsafe")
+    try:
+        offset = int(safe_path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OSError("compile offset is unavailable or unsafe") from exc
+    if offset < 0:
+        raise OSError("compile offset is unavailable or unsafe")
+    return offset
 
 
 def _write_offset(memory_dir: Path, offset: int) -> None:
@@ -153,12 +164,17 @@ def _write_offset(memory_dir: Path, offset: int) -> None:
 def _read_durable_offset(memory_dir: Path) -> int:
     """Read the durable-specific checkpoint, falling back during migration."""
     offset_file = memory_dir / ".durable_offset"
-    if offset_file.is_file():
-        try:
-            return max(0, int(offset_file.read_text(encoding="utf-8").strip()))
-        except (ValueError, OSError):
-            pass
-    return _read_offset(memory_dir)
+    if not offset_file.exists() and not offset_file.is_symlink():
+        return _read_offset(memory_dir)
+    if offset_file.is_symlink():
+        raise OSError("durable offset is unavailable or unsafe")
+    safe_path = safe_file_in_dir(memory_dir, offset_file)
+    if safe_path is None:
+        raise OSError("durable offset is unavailable or unsafe")
+    try:
+        return max(0, int(safe_path.read_text(encoding="utf-8").strip()))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OSError("durable offset is unavailable or unsafe") from exc
 
 
 def _write_durable_offset(memory_dir: Path, offset: int) -> None:
@@ -679,10 +695,22 @@ async def compile_durable(
 ) -> bool:
     """Incrementally merge new events into durable.md."""
     policy = _MEMORY_POLICY
+    total = _total_lines(memory_dir)
     durable_offset = _read_durable_offset(memory_dir)
+    if durable_offset > total:
+        # recent.jsonl was truncated (e.g. by Dream cleanup) below the stored
+        # checkpoint.  Without this reset, _load_recent slices past the end of
+        # the log forever, durable compilation returns False every call and the
+        # durable view silently stops merging new facts.
+        logger.warning(
+            "durable offset %s exceeds %s recent.jsonl lines — resetting checkpoint",
+            durable_offset,
+            total,
+        )
+        _write_durable_offset(memory_dir, 0)
+        durable_offset = 0
     all_entries = _load_recent(memory_dir, offset=durable_offset)
     entries = _entries_for_view(all_entries, "durable")
-    total = _total_lines(memory_dir)
 
     out = resolve_view_path(policy, memory_dir.parent, "durable")
     fp_file = memory_dir / ".fp_durable"
@@ -804,7 +832,6 @@ async def compact_episode(
     else:
         summary = await _llm_summarize(llm, prompt)
 
-    _MAX_EPISODE_CHARS = 800
     if len(summary) > _MAX_EPISODE_CHARS:
         logger.warning(
             "episode summary exceeded %s characters — skipping write",
@@ -905,21 +932,25 @@ async def run_compilation(
     total = _total_lines(memory_dir)
     results = {"context": False, "recent": False, "durable": False}
     errors: dict[str, str] = {}
+    error_causes: dict[str, Exception] = {}
     try:
         results["context"] = await compile_context(memory_dir, llm, reviewer)
-    except Exception:
+    except Exception as exc:
         logger.warning("context-memory compilation failed", exc_info=True)
         errors["context"] = "context-memory compilation failed"
+        error_causes["context"] = exc
     try:
         results["recent"] = await compile_recent(memory_dir, llm, reviewer)
-    except Exception:
+    except Exception as exc:
         logger.warning("recent-memory compilation failed", exc_info=True)
         errors["recent"] = "recent-memory compilation failed"
+        error_causes["recent"] = exc
     try:
         results["durable"] = await compile_durable(memory_dir, llm, reviewer)
-    except Exception:
+    except Exception as exc:
         logger.warning("durable-memory compilation failed", exc_info=True)
         errors["durable"] = "durable-memory compilation failed"
+        error_causes["durable"] = exc
     if not errors and any(results.values()):
         _write_offset(memory_dir, total)
     # A successful layer is useful progress even when a later layer failed.
@@ -931,6 +962,11 @@ async def run_compilation(
         and results["recent"]
     )
     if errors and raise_on_error and not partial_progress_is_safe:
+        if len(error_causes) == 1:
+            # Preserve the underlying failure (review rejection, policy error,
+            # provider failure) so callers can distinguish retryable transport
+            # errors from review/content rejections that deserve a fresh attempt.
+            raise next(iter(error_causes.values()))
         raise RuntimeError("; ".join(errors.values()))
     if return_diagnostics:
         return {"results": results, "errors": errors}

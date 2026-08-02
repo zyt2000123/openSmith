@@ -7,9 +7,11 @@ Provides:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,7 +69,10 @@ async def retrieve_relevant_memory(
         return RelevantMemory()
 
     try:
-        durable = _select_relevant_durable(agent_dir / "memory", query)
+        # The durable scan is pure blocking file I/O; keep it off the event loop.
+        durable = await asyncio.to_thread(
+            _select_relevant_durable, agent_dir / "memory", query
+        )
     except Exception:
         logger.warning("durable-memory retrieval failed", exc_info=True)
         durable = ""
@@ -88,22 +93,10 @@ async def retrieve_relevant_memory(
             if not hits:
                 return RelevantMemory(durable=durable)
 
-            lines = ["## Relevant Episodes"]
-            total_chars = 0
-            for hit in hits:
-                ep_path = safe_file_in_dir(episodes_dir, episodes_dir / f"{hit['id']}.md")
-                if ep_path is None:
-                    continue
-                content, _, _ = sanitize_memory_text(ep_path.read_text(encoding="utf-8"))
-                content = content.strip()
-                if not content:
-                    continue
-                if total_chars + len(content) > _MAX_EPISODE_CONTEXT_CHARS:
-                    continue
-                lines.append(content)
-                total_chars += len(content)
-
-            if len(lines) > 1:
+            lines = await asyncio.to_thread(
+                _read_episode_hits, episodes_dir, hits, _MAX_EPISODE_CONTEXT_CHARS
+            )
+            if lines:
                 return RelevantMemory(durable=durable, episodes="\n\n".join(lines))
             return RelevantMemory(durable=durable)
         finally:
@@ -111,6 +104,29 @@ async def retrieve_relevant_memory(
     except Exception:
         logger.warning("episode-memory retrieval failed", exc_info=True)
         return RelevantMemory(durable=durable)
+
+
+def _read_episode_hits(
+    episodes_dir: Path,
+    hits: list[dict],
+    max_chars: int,
+) -> list[str]:
+    """Read and sanitize matched episode files without blocking the event loop."""
+    lines: list[str] = ["## Relevant Episodes"]
+    total_chars = 0
+    for hit in hits:
+        ep_path = safe_file_in_dir(episodes_dir, episodes_dir / f"{hit['id']}.md")
+        if ep_path is None:
+            continue
+        content, _, _ = sanitize_memory_text(ep_path.read_text(encoding="utf-8"))
+        content = content.strip()
+        if not content:
+            continue
+        if total_chars + len(content) > max_chars:
+            continue
+        lines.append(content)
+        total_chars += len(content)
+    return lines if len(lines) > 1 else []
 
 
 def _select_relevant_durable(memory_dir: Path, query: str) -> str:
@@ -175,18 +191,13 @@ def _load_episode_index_state(path: Path) -> dict[str, str]:
     return raw
 
 
-async def _sync_episode_index(idx, episodes_dir: Path) -> None:
-    """Synchronize the FTS index from current episode files.
-
-    State is keyed per episode rather than by a global timestamp, so copied or
-    restored files with an older mtime still enter the index. The state is
-    disposable and is only committed after index writes and stale-row removal
-    have succeeded.
-    """
-    state_path = episodes_dir / _EPISODE_INDEX_STATE
-    previous_state = _load_episode_index_state(state_path)
+def _scan_episode_changes(
+    episodes_dir: Path,
+    previous_state: dict[str, str],
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Scan episode files for signature changes; runs on a worker thread."""
     current_state: dict[str, str] = {}
-
+    changed: list[tuple[str, str]] = []
     for resolved in safe_markdown_files(episodes_dir):
         stat = resolved.stat()
         entry_id = resolved.stem
@@ -194,7 +205,29 @@ async def _sync_episode_index(idx, episodes_dir: Path) -> None:
         current_state[entry_id] = signature
         if previous_state.get(entry_id) != signature:
             content, _, _ = sanitize_memory_text(resolved.read_text(encoding="utf-8"))
-            await idx.index_entry(entry_id, content, "episode")
+            changed.append((entry_id, content))
+    return current_state, changed
+
+
+async def _sync_episode_index(idx, episodes_dir: Path) -> None:
+    """Synchronize the FTS index from current episode files.
+
+    State is keyed per episode rather than by a global timestamp, so copied or
+    restored files with an older mtime still enter the index. The state is
+    disposable and is only committed after index writes and stale-row removal
+    have succeeded.  File scanning runs on a worker thread (this is on the
+    per-query hot path) and index writes are batched into one transaction.
+    """
+    state_path = episodes_dir / _EPISODE_INDEX_STATE
+    previous_state = await asyncio.to_thread(_load_episode_index_state, state_path)
+    current_state, changed = await asyncio.to_thread(
+        _scan_episode_changes, episodes_dir, previous_state
+    )
+
+    if changed:
+        await idx.index_entries(
+            [(entry_id, content, "episode") for entry_id, content in changed]
+        )
 
     await idx.remove_missing_entries(set(current_state), "episode")
 
@@ -265,6 +298,41 @@ def _increment_counter(counter_file: Path, retry_threshold: int) -> int:
 def _reset_counter(counter_file: Path) -> None:
     with interprocess_file_lock(counter_file):
         atomic_write_text(counter_file, "0")
+
+
+# ---------------------------------------------------------------------------
+# Maintenance retry backoff
+# ---------------------------------------------------------------------------
+
+# A due-but-failing maintenance lane (transport/provider errors) stays due while
+# it fails because counters are clamped at their threshold.  Persist a
+# last-attempt timestamp per lane so inline turns and deferred background
+# scheduling skip retries inside this cooldown instead of hammering the LLM.
+_RETRY_COOLDOWN_SECONDS = 600.0
+
+
+def _retry_marker_path(memory_dir: Path, kind: str) -> Path:
+    return memory_dir / f".{kind}_retry_attempt"
+
+
+def _record_retry_attempt(memory_dir: Path, kind: str) -> None:
+    try:
+        atomic_write_text(_retry_marker_path(memory_dir, kind), str(time.time()))
+    except OSError:
+        logger.warning("could not record memory maintenance retry attempt", exc_info=True)
+
+
+def _clear_retry_attempt(memory_dir: Path, kind: str) -> None:
+    _retry_marker_path(memory_dir, kind).unlink(missing_ok=True)
+
+
+def _in_retry_cooldown(memory_dir: Path, kind: str) -> bool:
+    marker = _retry_marker_path(memory_dir, kind)
+    try:
+        attempted_at = float(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return time.time() - attempted_at < _RETRY_COOLDOWN_SECONDS
 
 
 async def save_conversation_memory(
@@ -341,7 +409,18 @@ async def save_conversation_memory(
     count = _increment_counter(counter_file, _COMPILE_INTERVAL)
 
     has_learning_signal = explicit_signal is not None or bool(stable_signals)
-    if (count >= _COMPILE_INTERVAL or has_learning_signal) and compile_maintenance is not None:
+    # An explicit learning signal is a fresh trigger and always deserves a
+    # compile.  The counter-driven lane skips retries while a transport/provider
+    # failure is inside its cooldown so a due-but-failing lane cannot call the
+    # LLM every turn.
+    if has_learning_signal and compile_maintenance is not None:
+        if await compile_maintenance(memory_dir):
+            _reset_counter(counter_file)
+    elif (
+        count >= _COMPILE_INTERVAL
+        and compile_maintenance is not None
+        and not _in_retry_cooldown(memory_dir, "compile")
+    ):
         if await compile_maintenance(memory_dir):
             _reset_counter(counter_file)
 
@@ -354,7 +433,11 @@ async def save_conversation_memory(
 
     nudge_counter = memory_dir / ".nudge_counter"
     nudge_count = _increment_counter(nudge_counter, NUDGE_INTERVAL)
-    if nudge_count >= NUDGE_INTERVAL and nudge_maintenance is not None:
+    if (
+        nudge_count >= NUDGE_INTERVAL
+        and nudge_maintenance is not None
+        and not _in_retry_cooldown(memory_dir, "nudge")
+    ):
         if await nudge_maintenance(memory_dir):
             _reset_counter(nudge_counter)
 
@@ -363,7 +446,11 @@ async def save_conversation_memory(
     dream_counter = memory_dir / ".dream_counter"
     d_count = _increment_counter(dream_counter, DREAM_INTERVAL)
 
-    if d_count >= DREAM_INTERVAL and dream_maintenance is not None:
+    if (
+        d_count >= DREAM_INTERVAL
+        and dream_maintenance is not None
+        and not _in_retry_cooldown(memory_dir, "dream")
+    ):
         if await dream_maintenance(memory_dir):
             _reset_counter(dream_counter)
 
