@@ -132,4 +132,9 @@ def _recommendation(incident: RunIncident) -> str:
         "run_cancelled": "Resume only when the user still expects the incomplete work to continue.",
         "run_incomplete": "Review the terminal reason and resume the run only if its prerequisites are still valid.",
     }
-    return recommendations[incident.category]
+    # A future terminal status (e.g. a new RUN_FINISHED reason) must not crash
+    # the read path with a KeyError; fall back to the generic failure advice.
+    return recommendations.get(
+        incident.category,
+        "Inspect the retained trace evidence and address the failing execution dependency before retrying.",
+    )

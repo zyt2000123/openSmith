@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from ._files import (
+    append_private_lines,
     atomic_write_text,
     contains_injection,
     contains_secret,
@@ -364,20 +365,22 @@ def _append_candidates(memory_dir: Path, candidates: list[NudgeCandidate]) -> No
         raise OSError("recent.jsonl is unavailable or unsafe")
     existing = _existing_candidate_keys(memory_dir)
     now = datetime.now(timezone.utc).isoformat()
-    with recent.open("a", encoding="utf-8") as output:
-        for candidate in candidates:
-            if _candidate_key(candidate) in existing:
-                continue
-            output.write(json.dumps({
-                "task": f"[nudge] {candidate.content}",
-                "summary": candidate.evidence,
-                "timestamp": now,
-                "kind": candidate.kind,
-                "scope": candidate.scope,
-                "evidence": candidate.evidence_type,
-                "evidence_type": candidate.evidence_type,
-                "origin": "periodic_nudge",
-            }, ensure_ascii=False) + "\n")
+    pending = [
+        json.dumps({
+            "task": f"[nudge] {candidate.content}",
+            "summary": candidate.evidence,
+            "timestamp": now,
+            "kind": candidate.kind,
+            "scope": candidate.scope,
+            "evidence": candidate.evidence_type,
+            "evidence_type": candidate.evidence_type,
+            "origin": "periodic_nudge",
+        }, ensure_ascii=False)
+        for candidate in candidates
+        if _candidate_key(candidate) not in existing
+    ]
+    if pending:
+        append_private_lines(recent, pending)
 
 
 async def run_nudge(

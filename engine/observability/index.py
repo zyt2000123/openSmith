@@ -115,6 +115,12 @@ class ObservabilityIndex:
         db = sqlite3.connect(self.path, timeout=5.0)
         try:
             db.execute("PRAGMA busy_timeout=5000")
+            # WAL allows concurrent reader/writer access across parallel agent
+            # runs sharing one index.sqlite3.  Without it a busy writer can
+            # raise SQLITE_BUSY inside a 5s window; save() treats that as a
+            # best-effort failure and the run silently stays out of list()
+            # forever (bootstrap only ever runs once).
+            db.execute("PRAGMA journal_mode=WAL")
             yield db
             db.commit()
         finally:

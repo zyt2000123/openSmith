@@ -236,3 +236,28 @@ def atomic_write_text(path: Path, content: str) -> None:
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
+
+
+def append_private_lines(path: Path, lines: list[str]) -> None:
+    """Append newline-terminated lines to *path* with a private file mode.
+
+    Unlike ``open(path, "a")`` — which applies the process umask and can leave
+    raw conversation content world-readable — ``os.open`` with ``O_APPEND``
+    creates a 0600 file and preserves it on every append.  Each line is written
+    with a single buffered call so a crash leaves at most one torn trailing
+    line, which readers already skip.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not lines:
+        return
+    payload = "".join(line if line.endswith("\n") else line + "\n" for line in lines)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        handle = os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        handle.write(payload)
+        handle.flush()
+    os.chmod(path, 0o600)

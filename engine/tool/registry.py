@@ -322,12 +322,25 @@ class ToolRegistry:
             allowed_filenames=_BUILTIN_PROVIDER_FILENAMES,
         )
 
-    def get_schemas(self, enabled: list[str] | None = None) -> list[dict]:
-        """Return OpenAI-compatible tool schemas."""
+    def get_schemas(
+        self,
+        enabled: list[str] | None = None,
+        *,
+        include_hidden: bool = False,
+    ) -> list[dict]:
+        """Return OpenAI-compatible tool schemas.
+
+        Hidden tools are metadata-only (registry helpers the model must not
+        call directly).  They are excluded here — not just by the callers — so
+        a scoped or explicitly-enabled view can never widen a model-facing
+        schema list into the hidden set.
+        """
         active = set(enabled) if enabled is not None else self._enabled
         result: list[dict] = []
         for name, (defn, _) in self._tools.items():
             if active is not None and name not in active:
+                continue
+            if defn.hidden and not include_hidden:
                 continue
             result.append({
                 "type": "function",
@@ -816,7 +829,12 @@ class ScopedToolRegistry:
     def working_directory(self) -> Path | None:
         return self._registry.working_directory
 
-    def get_schemas(self, enabled: list[str] | None = None) -> list[dict]:
+    def get_schemas(
+        self,
+        enabled: list[str] | None = None,
+        *,
+        include_hidden: bool = False,
+    ) -> list[dict]:
         active = self._active_names()
         if enabled is not None:
             active.intersection_update(
@@ -824,7 +842,10 @@ class ScopedToolRegistry:
                 for name in enabled
                 if isinstance(name, str) and name
             )
-        return self._registry.get_schemas(sorted(active))
+        return self._registry.get_schemas(
+            sorted(active),
+            include_hidden=include_hidden,
+        )
 
     def list_tools(self) -> list[ToolDefinition]:
         active = self._active_names()
