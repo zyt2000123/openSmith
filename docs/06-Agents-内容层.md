@@ -2,6 +2,8 @@
 
 > **当前实现说明**：`agents/` 是可版本化的内容与本地 provider 目录。它不保存运行时 profile 副本，也不实现插件系统；运行时状态位于 `~/.agent-smith/`。
 
+> **目录级地图**：逐目录职责、边界澄清（`smith/` vs `identities/`、`conditions/` vs `gates/` 等）与内容契约速查见 [`agents/README.md`](../agents/README.md)。
+
 ## 目录与职责
 
 | 路径 | 内容 | 被谁加载 |
@@ -49,26 +51,43 @@ routes:
 - route 的 `pipeline` 必须引用存在的 pipeline；`null` 表示用该 identity 的权限和提示直接运行 ReAct；
 - identity 只影响一次 Run 的能力配置和 Prompt，不能创建独立的 server profile、会话域或并行 worker。
 
-现有 `smith.yaml` 为默认身份；`coding.yaml` 绑定 coding skill chain。
+现有 `smith.yaml` 为默认身份（声明一条 `git` 路由，无 pipeline）；`coding.yaml` 是编码能力域身份，声明三条意图路由，各自绑定一条 pipeline（见下节）。
 
 ## Pipeline：可审查的技能编排
 
-`agents/pipelines/coding.yaml` 使用如下格式：
+当前有三条 shipped pipeline，位于 `agents/pipelines/`，由 `coding` 身份的三条路由绑定：
+
+| pipeline | 步骤（skill → gate） | 备注 |
+|---|---|---|
+| `requirements-research` | `grilling`→`grilling_complete`、`research`→`research_brief`、`ecc-plan`→`plan_confirmed` | 前两步含 `await_user_input_marker` |
+| `tdd-development` | `diagnosing-bugs`→`red_loop`、`tdd-workflow`→`tdd_evidence`、`verification-loop`→`tdd_verification` | `diagnosing-bugs` 节点带条件 `coding_bugfix_needs_diagnosis` |
+| `code-review` | `code-review`→`review_report`、`verification-loop`→`review_verification` | 首节点含 `await_user_input_marker` |
+
+`tdd-development.yaml` 是带条件节点的示例：
 
 ```yaml
-route: coding
+route: tdd-development
+
 steps:
-  - skill: coding-understanding
-    gate: understanding
-  - skill: coding-planning
-    gate: planning
-  - skill: coding-implementation
-    gate: contract_alignment
-backtrack:
-  coding-implementation: coding-planning
+  - skill: diagnosing-bugs
+    gate: red_loop
+    condition: coding_bugfix_needs_diagnosis
+    allowed_tools: [read_file, write_file, edit_file, list_dir, glob_files, grep, shell]
+    instructions: |
+      # 节点的执行指令；只有该节点内的 skill 可以看到
+      ...
 ```
 
-步骤按顺序执行。条件步骤由 `agents/conditions/` 中的函数决定是否运行；每一步的候选输出先经过 gate，成功才提交并进入下一步，失败可按 `backtrack` 返回前一阶段。不要把 side effect 或真实测试结果只写在 Markdown 说明中：它们必须由 skill 的工具调用和 gate 的事实检查产生。
+每个步骤的关键字段：
+
+- `skill`：`agents/skills/` 中可发现的技能名；
+- `gate`：`agents/gates/` 中已注册的 gate 名，输出先过 gate，通过才提交并进入下一步；
+- `condition`（可选）：`agents/conditions/` 中导出的条件函数，返回 false 时跳过该节点；
+- `await_user_input_marker`（可选）：skill 输出中出现该标记时，pipeline 保存 checkpoint 并暂停等待用户回复；
+- `allowed_tools`：该节点可用的工具子集，必须落在 identity 的 `tools.enabled` 内；
+- `instructions`：注入该节点 skill 的执行指令，只能描述流程，不能绕过安全策略。
+
+不要把 side effect 或真实测试结果只写在 Markdown 说明中：它们必须由 skill 的工具调用和 gate 的事实检查产生。`SkillChain` 引擎支持 gate 失败后按 `backtrack` 映射回退，但当前 shipped pipeline 均未声明 `backtrack`。
 
 ## Skill：任务 SOP
 

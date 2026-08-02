@@ -216,7 +216,7 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆�
 按需：FTS5 命中的 episodes
 ```
 
-`agent_loop.prepare_runtime()` 明确调用 `assemble_memory(include_durable=False)`，因此 durable 不会整份常驻。`search_relevant_memories()` 对 durable 条目做有界关键词召回，并继续对 episodes 使用 FTS5；任一检索失败都降级为空，不阻塞回答。
+`preparation.prepare_runtime()` 明确调用 `assemble_memory(include_durable=False)`（`engine/execution/orchestration/preparation.py:350`），因此 durable 不会整份常驻。`search_relevant_memories()` 对 durable 条目做有界关键词召回，并继续对 episodes 使用 FTS5；任一检索失败都降级为空，不阻塞回答。
 
 `PromptAssembler` 只负责组合调用方给出的记忆文本。学习得到的 context 与项目记忆都会先清洗并加安全围栏，明确历史内容只是参考，不能覆盖系统指令、`SMITH.md`、当前用户请求或工具权限。预算不足时可裁剪 recent/检索记忆，但常驻 `context.md` 不被裁剪；其自身由 4K Policy 上限约束。
 
@@ -233,7 +233,7 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆�
 | `memory/dream.py` | 低频清洗、durable 与事件增量对账、checkpoint 和受限日志回收 |
 | `memory/user_learner.py` | 只产出稳定偏好信号，不写 Markdown |
 | `memory/maintenance.py` | 生命周期锁、超时，以及由执行层注入的 LLM 依赖 |
-| `prompt/assembler.py` | 组合已接受的记忆，不理解编译规则 |
+| `engine/context/assembler.py` | 组合已接受的记忆，不理解编译规则 |
 
 新增规则或模板优先修改 `MEMORY_POLICY.md`；外部调用方不需要了解具体模型提示词和文件写入细节。三份正式 Markdown 始终只有一个写入入口。
 

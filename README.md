@@ -10,13 +10,13 @@
 ![Anthropic](https://img.shields.io/badge/Claude-191919?style=for-the-badge&logo=anthropic&logoColor=white)
 ![OpenAI](https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white)
 
-Smith is a single, always-on agent that runs locally. It keeps conversation context, accumulates memory across sessions, switches workflows via skills, and injects domain knowledge on demand. One agent, no orchestration overhead.
+Smith is a single, always-on agent that runs locally. It keeps conversation context, accumulates memory across sessions, and switches workflows via skills. One agent, no orchestration overhead.
 
 ## What It Does
 
-- **Interactive terminal** — rich Ink shell or plain CLI, your pick
-- **Skill-based workflows** — debug, plan, refactor, review, or direct reply, chosen per task
-- **Knowledge injection** — load domain context (frontend, backend, infra) without spawning new agents
+- **Interactive terminal** — a single rich Ink shell
+- **Skill-based workflows** — debug, plan, review, or direct reply, chosen per task
+- **Skill chains** — requirements research, TDD development, and code review are routed by intent and run as gated skill chains
 - **Real tools** — file I/O, shell, Git, web search, MCP, all sandboxed with permission levels
 - **Persistent memory** — sessions, agent memory, and project context survive restarts
 - **Multi-provider LLM** — OpenAI-compatible, Anthropic, Gemini; routed by use case (interactive / gate / background)
@@ -93,7 +93,7 @@ In the terminal, run `/reload` after editing context files to start a fresh sess
 shell (Ink / React)
       │ HTTP
       ▼
-server (FastAPI + CLI)
+server (FastAPI)
       │
       ▼
 engine (execution) ◄── agents (identity, skills, tools, safety)
@@ -107,7 +107,7 @@ common (paths, YAML, SQLite, filesystem)
 | `common/` | Paths, YAML configuration, SQLite connection, filesystem resources — zero business logic |
 | `engine/` | Task routing, skill chains, ReAct loop, LLM adapters, memory, tools, safety |
 | `agents/` | Smith identity, pipelines, built-in skills, tool providers, safety rules |
-| `server/` | FastAPI app, service orchestration, agent/session lifecycle, CLI |
+| `server/` | FastAPI app, service orchestration, agent/session lifecycle |
 | `shell/` | Ink/React terminal UI, auto-starts backend, SSE streaming |
 
 Dependencies flow one way: `server → engine → common`. The engine never imports FastAPI.
