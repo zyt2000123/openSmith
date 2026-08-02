@@ -12,7 +12,12 @@ def _get_paths() -> AppPaths:
 
 
 def reset_paths(paths: AppPaths | None = None) -> None:
-    """Reset the global paths instance (useful for testing or runtime reconfiguration)."""
+    """Replace the lazy path instance for tests or runtime reconfiguration.
+
+    Later ``config.PATHS`` lookups observe the replacement.  A value imported
+    with ``from common.config import PATHS`` is an ordinary Python snapshot and
+    intentionally keeps the instance that was bound at import time.
+    """
     global _paths_instance
     _paths_instance = paths
 
@@ -20,7 +25,7 @@ def reset_paths(paths: AppPaths | None = None) -> None:
 # Legacy module-level constants for backward compatibility
 # These resolve lazily through module attribute lookup.
 def __getattr__(name: str):
-    """Lazy module attribute resolution for backward compatibility."""
+    """Resolve legacy path exports lazily from the current ``AppPaths`` instance."""
     paths = _get_paths()
     mapping = {
         "DATA_DIR": paths.data_dir,

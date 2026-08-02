@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -53,12 +54,44 @@ def test_app_paths_reports_a_file_conflicting_with_the_runtime_data_directory(
         AppPaths(data_dir=data_path, project_root=tmp_path / "project").ensure_base_dirs()
 
 
+def test_app_paths_rejects_a_symlinked_runtime_data_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    paths = AppPaths(
+        data_dir=linked_parent / "data", project_root=tmp_path / "project"
+    )
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        paths.ensure_base_dirs()
+
+    assert not (outside / "data").exists()
+
+
 def test_app_paths_honors_explicit_project_root(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    (project_root / "agents" / "smith").mkdir(parents=True)
+    (project_root / "agents" / "smith" / "config.yaml").write_text("name: Smith\n")
+    (project_root / "agents" / "identities").mkdir()
+    (project_root / "agents" / "identities" / "smith.yaml").write_text("id: smith\n")
+    skill = project_root / "agents" / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: demo\n---\n")
+    monkeypatch.setenv("AGENT_SMITH_PROJECT_ROOT", str(project_root))
+
+    assert AppPaths.defaults().project_root == project_root.resolve()
+
+
+def test_app_paths_rejects_an_explicit_root_without_smith_runtime_assets(
+    monkeypatch, tmp_path: Path
+) -> None:
     project_root = tmp_path / "project"
     (project_root / "agents").mkdir(parents=True)
     monkeypatch.setenv("AGENT_SMITH_PROJECT_ROOT", str(project_root))
 
-    assert AppPaths.defaults().project_root == project_root.resolve()
+    with pytest.raises(RuntimeError, match="runtime assets"):
+        AppPaths.defaults()
 
 
 def test_app_paths_cwd_discovery_skips_unrelated_agents_directories(
@@ -84,9 +117,30 @@ def test_app_paths_cwd_discovery_skips_unrelated_agents_directories(
     assert AppPaths.defaults().project_root == smith_root
 
 
+def test_app_paths_requires_an_explicit_root_when_a_wheel_has_no_runtime_assets(
+    monkeypatch, tmp_path: Path
+) -> None:
+    package_path = tmp_path / "site-packages" / "common" / "paths.py"
+    package_path.parent.mkdir(parents=True)
+    empty_cwd = tmp_path / "empty-cwd"
+    empty_cwd.mkdir()
+    monkeypatch.setattr(paths_module, "__file__", str(package_path))
+    monkeypatch.chdir(empty_cwd)
+    monkeypatch.delenv("AGENT_SMITH_PROJECT_ROOT", raising=False)
+
+    with pytest.raises(RuntimeError, match="AGENT_SMITH_PROJECT_ROOT"):
+        AppPaths.defaults()
+
+
 def test_config_exposes_paths_as_a_lazy_app_paths_value(monkeypatch, tmp_path: Path) -> None:
     project_root = tmp_path / "project"
-    (project_root / "agents").mkdir(parents=True)
+    (project_root / "agents" / "smith").mkdir(parents=True)
+    (project_root / "agents" / "smith" / "config.yaml").write_text("name: Smith\n")
+    (project_root / "agents" / "identities").mkdir()
+    (project_root / "agents" / "identities" / "smith.yaml").write_text("id: smith\n")
+    skill = project_root / "agents" / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: demo\n---\n")
     monkeypatch.setenv("AGENT_SMITH_PROJECT_ROOT", str(project_root))
     config.reset_paths()
 
@@ -95,6 +149,24 @@ def test_config_exposes_paths_as_a_lazy_app_paths_value(monkeypatch, tmp_path: P
 
         assert PATHS == AppPaths.defaults()
         assert PATHS.project_root == project_root.resolve()
+    finally:
+        config.reset_paths()
+
+
+def test_config_module_access_observes_reset_paths_but_from_imports_are_snapshots(
+    tmp_path: Path,
+) -> None:
+    first_paths = AppPaths(data_dir=tmp_path / "first", project_root=tmp_path / "project")
+    second_paths = AppPaths(data_dir=tmp_path / "second", project_root=tmp_path / "project")
+    config.reset_paths(first_paths)
+
+    try:
+        from common.config import PATHS
+
+        config.reset_paths(second_paths)
+
+        assert PATHS is first_paths
+        assert config.PATHS is second_paths
     finally:
         config.reset_paths()
 
@@ -254,6 +326,60 @@ def test_app_paths_rejects_symlinked_builtin_skill_target(
     assert not (outside_target / "SKILL.md").exists()
 
 
+def test_app_paths_prunes_a_stale_builtin_skill_symlink_without_following_it(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project_root = tmp_path / "project"
+    source_skill = project_root / "agents" / "skills" / "demo"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "common.paths.sysconfig.get_path", lambda _name: str(tmp_path / "no-data")
+    )
+
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=project_root)
+    paths.ensure_base_dirs()
+    outside_target = tmp_path / "outside"
+    outside_target.mkdir()
+    sentinel = outside_target / "sentinel.txt"
+    sentinel.write_text("must remain", encoding="utf-8")
+    stale_link = paths.builtin_skills_dir / "demo" / "stale-link"
+    stale_link.symlink_to(outside_target, target_is_directory=True)
+
+    paths.ensure_base_dirs()
+
+    assert not stale_link.exists()
+    assert not stale_link.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "must remain"
+
+
+def test_app_paths_prunes_an_obsolete_builtin_skill_symlink_without_following_it(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project_root = tmp_path / "project"
+    source_skill = project_root / "agents" / "skills" / "demo"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "common.paths.sysconfig.get_path", lambda _name: str(tmp_path / "no-data")
+    )
+
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=project_root)
+    paths.ensure_base_dirs()
+    outside_target = tmp_path / "outside"
+    outside_target.mkdir()
+    sentinel = outside_target / "sentinel.txt"
+    sentinel.write_text("must remain", encoding="utf-8")
+    obsolete_link = paths.builtin_skills_dir / "obsolete"
+    obsolete_link.symlink_to(outside_target, target_is_directory=True)
+
+    paths.ensure_base_dirs()
+
+    assert not obsolete_link.exists()
+    assert not obsolete_link.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "must remain"
+
+
 def test_app_paths_rejects_a_symlinked_builtin_skill_manifest(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -364,6 +490,28 @@ def test_app_paths_restores_tampered_shipped_skill_files(
     assert installed_file.read_text(encoding="utf-8") == "trusted source"
 
 
+def test_app_paths_uses_the_manifest_to_skip_hashing_unchanged_skill_files(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project_root = tmp_path / "project"
+    source_skill = project_root / "agents" / "skills" / "demo"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    (source_skill / "instruction.md").write_text("trusted source", encoding="utf-8")
+    monkeypatch.setattr(
+        "common.paths.sysconfig.get_path", lambda _name: str(tmp_path / "no-data")
+    )
+
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=project_root)
+    paths.ensure_base_dirs()
+
+    def fail_if_hashed(path: Path) -> str:
+        pytest.fail(f"unchanged file was hashed: {path}")
+
+    monkeypatch.setattr(paths_module, "_file_digest", fail_if_hashed)
+    paths.ensure_base_dirs()
+
+
 def test_wheel_data_files_reproduce_every_bundled_skill_file() -> None:
     """A non-editable install reproduces every file from each shipped skill.
 
@@ -425,6 +573,30 @@ def test_yaml_save_preserves_existing_parent_permissions(monkeypatch, tmp_path: 
     save_yaml("relative.yaml", {"llm": {}})
 
     assert _mode(shared_dir) == 0o755
+
+
+def test_yaml_save_rejects_a_symlinked_parent_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        save_yaml(linked_parent / "config.yaml", {"llm": {}})
+
+    assert not (outside / "config.yaml").exists()
+
+
+def test_yaml_save_rejects_a_symlinked_destination(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("original: true\n", encoding="utf-8")
+    linked_destination = tmp_path / "config.yaml"
+    linked_destination.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        save_yaml(linked_destination, {"llm": {}})
+
+    assert outside.read_text(encoding="utf-8") == "original: true\n"
 
 
 def test_yaml_surfaces_invalid_documents_and_unsafe_values(tmp_path: Path) -> None:
@@ -514,7 +686,7 @@ def test_get_db_reconnects_when_runtime_paths_change(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_get_db_returns_cached_connections_without_an_sql_round_trip(
+def test_get_db_uses_a_lightweight_liveness_probe_for_cached_connections(
     monkeypatch, tmp_path: Path
 ) -> None:
     class Cursor:
@@ -543,4 +715,57 @@ def test_get_db_returns_cached_connections_without_an_sql_round_trip(
     finally:
         config.reset_paths()
 
-    assert cached.statements == []
+    assert cached.statements == ["SELECT 1"]
+
+
+def test_get_db_reconnects_a_closed_cached_connection(tmp_path: Path) -> None:
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=tmp_path / "project")
+    config.reset_paths(paths)
+
+    async def run() -> None:
+        try:
+            await database.close_db()
+            closed_connection = await database.get_db()
+            await closed_connection.close()
+
+            recovered_connection = await database.get_db()
+            cursor = await recovered_connection.execute("SELECT 1")
+            assert (await cursor.fetchone())[0] == 1
+            await cursor.close()
+            assert recovered_connection is not closed_connection
+        finally:
+            await database.close_db()
+            config.reset_paths()
+
+    asyncio.run(run())
+
+
+def test_get_db_runs_directory_setup_without_blocking_the_event_loop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=tmp_path / "project")
+    config.reset_paths(paths)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        heartbeat = asyncio.Event()
+        real_ensure_base_dirs = AppPaths.ensure_base_dirs
+
+        def slow_ensure_base_dirs(_paths: AppPaths) -> None:
+            loop.call_soon_threadsafe(heartbeat.set)
+            time.sleep(0.1)
+            real_ensure_base_dirs(_paths)
+
+        monkeypatch.setattr(AppPaths, "ensure_base_dirs", slow_ensure_base_dirs)
+        try:
+            await database.close_db()
+            started_at = loop.time()
+            task = asyncio.create_task(database.get_db())
+            await heartbeat.wait()
+            assert loop.time() - started_at < 0.05
+            await task
+        finally:
+            await database.close_db()
+            config.reset_paths()
+
+    asyncio.run(run())

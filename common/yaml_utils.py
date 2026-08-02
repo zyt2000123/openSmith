@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
+from .paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, _ensure_real_path
 
 
 class YamlConfigError(ValueError):
@@ -15,6 +15,7 @@ class YamlConfigError(ValueError):
 
 
 def _ensure_private_parent(path: Path) -> None:
+    _ensure_real_path(path, label="YAML path")
     missing: list[Path] = []
     current = path
     while not current.exists():
@@ -27,6 +28,8 @@ def _ensure_private_parent(path: Path) -> None:
         try:
             directory.mkdir(mode=PRIVATE_DIR_MODE)
         except FileExistsError:
+            if directory.is_symlink():
+                raise RuntimeError(f"Refusing to use symlinked YAML path: {directory}")
             if not directory.is_dir():
                 raise NotADirectoryError(f"YAML parent is not a directory: {directory}")
         else:
@@ -52,6 +55,7 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
 
 def save_yaml(path: Path | str, data: Any) -> None:
     p = Path(path)
+    _ensure_real_path(p, label="YAML path")
     if not isinstance(data, dict):
         raise YamlConfigError(f"YAML root for {p} must be a mapping")
     try:
