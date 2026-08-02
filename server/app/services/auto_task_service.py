@@ -28,6 +28,10 @@ log = logging.getLogger(__name__)
 _RETRY_BASE_DELAY_SECONDS = 60
 _MAX_RETRY_DELAY_SECONDS = 900
 _LEASE_RENEW_INTERVAL_SECONDS = 60
+# Transient renewal errors (SQLITE_BUSY, connection hiccups) are retried before
+# the lease is treated as lost; an immediately-cancelled healthy run would leave
+# the task to be re-executed after expiry (double cost).
+_LEASE_RENEW_RETRIES = 3
 # Safety net for a whole auto-task run.  Individual LLM requests and tool calls
 # have their own timeouts; this caps a pathological multi-turn loop so a hung
 # run cannot hold a _MAX_CONCURRENT_RUNS slot (and its lease) forever.
@@ -296,9 +300,14 @@ class AutoTaskService:
             )
             if finished is None:
                 # Lease was lost between renewal and finish (another worker
-                # reclaimed the task). The side effects already happened, so
-                # surface the run as completed without touching the
-                # lease-guarded run row.
+                # reclaimed the task).  The side effects already happened, so
+                # record this worker's own run as completed for an accurate
+                # history (the row is per-worker; the task itself belongs to
+                # the new owner).
+                finished = await self.repo.finish_run(
+                    run["id"], "completed", reply_text, force=True
+                )
+            if finished is None:
                 log.warning(
                     "Auto task %s run %s not recorded: lease no longer held",
                     task_id,
@@ -367,6 +376,22 @@ class AutoTaskService:
                     log.warning(
                         "failed to mark auto task run %s failed after lease loss",
                         run["id"],
+                        exc_info=True,
+                    )
+                # Release the task lease best-effort.  If we still own it (e.g.
+                # cancelled by a shutdown or an unrecoverable renewal error),
+                # the task must go back to idle instead of re-executing after
+                # the lease expires; if another worker reclaimed it, this is a
+                # no-op.
+                try:
+                    next_run = self._calc_next_run(trigger_type, trigger_config)
+                    await self.repo.finish_task(
+                        task_id, "idle", next_run, lease_token, retry_count=0
+                    )
+                except Exception:
+                    log.warning(
+                        "failed to release auto task %s lease on cancellation",
+                        task_id,
                         exc_info=True,
                     )
             raise
@@ -471,24 +496,44 @@ class AutoTaskService:
 
         Losing the lease mid-run means another worker owns the task now; call
         ``on_lost`` so the owner cancels the engine turn instead of continuing.
-        A renewal error is treated the same way: the lease will expire and a
-        second worker may reclaim the task, so the turn must stop.
+        A renewal error is retried before being treated as loss: a transient DB
+        hiccup must not cancel a healthy run whose lease still holds (the task
+        would later be re-executed, doubling cost).
         """
+        renewal_errors = 0
         try:
             while True:
                 await asyncio.sleep(_LEASE_RENEW_INTERVAL_SECONDS)
-                if not await self.repo.renew_lease(task_id, lease_token):
+                try:
+                    renewed = await self.repo.renew_lease(task_id, lease_token)
+                except Exception:
+                    # A transient DB error (SQLITE_BUSY, a lock, a closed
+                    # connection) is NOT proof the lease was lost; retry a few
+                    # times before treating it as loss.  Treating a hiccup as
+                    # loss would cancel a healthy run whose lease still holds,
+                    # and the task would later be re-executed (double cost).
+                    renewal_errors += 1
+                    if renewal_errors <= _LEASE_RENEW_RETRIES:
+                        log.warning(
+                            "Auto task %s lease renewal error (%d/%d); retrying",
+                            task_id,
+                            renewal_errors,
+                            _LEASE_RENEW_RETRIES,
+                        )
+                        continue
+                    log.exception(
+                        "Auto task %s lease renewal failed; treating the lease as lost",
+                        task_id,
+                    )
+                    on_lost()
+                    return
+                renewal_errors = 0
+                if not renewed:
                     log.warning("Auto task %s lease was lost while running", task_id)
                     on_lost()
                     return
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.exception(
-                "Auto task %s lease renewal failed; treating the lease as lost",
-                task_id,
-            )
-            on_lost()
 
     # ── helpers ──
 

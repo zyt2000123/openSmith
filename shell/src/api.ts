@@ -910,23 +910,30 @@ async function* readSseEvents(
       yield* consumed.events;
       if (sawDone) {
         // The server usually closes right after done, but a TCP packet split can
-        // put a trailing token_usage/context_usage frame in the NEXT read.  Give
-        // it a brief window, then stop — never hang the turn waiting for the
+        // put a trailing token_usage/context_usage frame in later reads.  Drain
+        // within a short budget, then stop — never hang the turn waiting for the
         // response to close.
-        const trailing = await Promise.race([
-          reader.read(),
-          new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), POST_DONE_DRAIN_MS)),
-        ]);
-        if (trailing === "timeout") return;
-        const { done: trailingDone, value: trailingValue } = trailing;
-        if (trailingDone) break;
-        if (!trailingValue || trailingValue.length === 0) return;
-        buffer += decoder.decode(trailingValue, { stream: true });
-        const trailingParsed = splitSseBuffer(buffer);
-        assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
-        const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
-        yield* trailingConsumed.events;
-        return;
+        const deadline = Date.now() + POST_DONE_DRAIN_MS;
+        for (;;) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return;
+          const trailing = await Promise.race([
+            reader.read(),
+            new Promise<"timeout">((resolve) => {
+              const timer = setTimeout(() => resolve("timeout"), remaining);
+              timer.unref?.();
+            }),
+          ]);
+          if (trailing === "timeout") return;
+          const { done: trailingDone, value: trailingValue } = trailing;
+          if (trailingDone) break;
+          if (!trailingValue || trailingValue.length === 0) return;
+          buffer += decoder.decode(trailingValue, { stream: true });
+          const trailingParsed = splitSseBuffer(buffer);
+          assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
+          const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
+          yield* trailingConsumed.events;
+        }
       }
     }
 

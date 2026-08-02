@@ -184,7 +184,10 @@ async function performStopOwnedServer(): Promise<void> {
     const finish = (): void => {
       clearTimeout(escalation);
       clearTimeout(hard);
-      if (ownedServer === child) ownedServer = null;
+      // Only forget the child once it has actually exited: an 'error' event can
+      // fire while the child still lives, and nulling early would leave the
+      // sync exit-handler fallback unable to reap a still-alive orphan.
+      if (child.exitCode !== null && ownedServer === child) ownedServer = null;
       resolve();
     };
     const escalation = setTimeout(() => {
