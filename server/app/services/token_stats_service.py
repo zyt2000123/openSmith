@@ -418,12 +418,21 @@ class TokenStatsService:
                     WHERE e.session_id=m.session_id
                       AND (e.source_key IS NULL OR e.source_key NOT LIKE 'message:%')
                 )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM token_usage_events e
+                    WHERE e.source_key = 'message:' || m.id
+                )
                 ORDER BY m.created_at ASC
                 """
             )
         except aiosqlite.OperationalError:
             # Keep the service usable with a minimal/custom database in tests or
             # during a partially completed schema migration.
+            return 0
+
+        if not rows:
+            await db.commit()
             return 0
 
         try:

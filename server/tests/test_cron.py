@@ -46,6 +46,20 @@ def test_weekday_zero_and_seven_both_mean_sunday() -> None:
     assert next_cron_time("0 12 * * 7", after=AFTER) == next_cron_time("0 12 * * 0", after=AFTER)
 
 
+def test_next_cron_time_matches_day_of_month_or_weekday_when_both_are_restricted() -> None:
+    """Standard cron fires when either restricted day field matches."""
+    assert next_cron_time("0 0 13 * 5", after=AFTER) == _utc(2026, 7, 31, 0, 0)
+
+
+def test_next_cron_time_accepts_a_leap_day_beyond_one_year() -> None:
+    """A valid yearly schedule may next fire in a later leap year."""
+    assert next_cron_time("0 0 29 2 *", after=_utc(2026, 8, 2, 0, 0)) == _utc(2028, 2, 29, 0, 0)
+
+
+def test_next_cron_time_handles_the_longest_gregorian_leap_day_gap() -> None:
+    assert next_cron_time("0 0 29 2 *", after=_utc(2096, 3, 1, 0, 0)) == _utc(2104, 2, 29, 0, 0)
+
+
 @pytest.mark.parametrize(
     ("expression", "reason"),
     [

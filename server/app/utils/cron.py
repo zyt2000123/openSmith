@@ -108,12 +108,16 @@ def next_cron_time(expression: str, after: datetime | None = None) -> datetime:
 
     # Convert cron weekday (0=Sun) to Python weekday (0=Mon)
     py_weekdays = [(d - 1) % 7 for d in weekdays] if parts[4] != "*" else None
+    day_of_month_restricted = parts[2] != "*"
+    day_of_week_restricted = py_weekdays is not None
 
     # Start searching from the next minute
     candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
-    # Search up to 366 days ahead to avoid infinite loops
-    limit = after + timedelta(days=366)
+    # A 5-field expression can legitimately wait across a skipped century leap
+    # year (for example, 29 February from 2096 to 2104), so cover the longest
+    # Gregorian leap-day gap while still bounding unsatisfiable expressions.
+    limit = after + timedelta(days=366 * 8)
 
     while candidate < limit:
         if candidate.month not in months:
@@ -122,11 +126,17 @@ def next_cron_time(expression: str, after: datetime | None = None) -> datetime:
             candidate = candidate.replace(day=1, hour=0, minute=0)
             continue
 
-        if candidate.day not in days:
-            candidate = candidate.replace(hour=0, minute=0) + timedelta(days=1)
-            continue
-
-        if py_weekdays is not None and candidate.weekday() not in py_weekdays:
+        day_of_month_matches = candidate.day in days
+        day_of_week_matches = (
+            candidate.weekday() in py_weekdays
+            if py_weekdays is not None
+            else True
+        )
+        if day_of_month_restricted and day_of_week_restricted:
+            day_matches = day_of_month_matches or day_of_week_matches
+        else:
+            day_matches = day_of_month_matches and day_of_week_matches
+        if not day_matches:
             candidate = candidate.replace(hour=0, minute=0) + timedelta(days=1)
             continue
 
@@ -140,7 +150,7 @@ def next_cron_time(expression: str, after: datetime | None = None) -> datetime:
 
         return candidate
 
-    raise ValueError(f"No valid next run time found within 366 days for: {expression!r}")
+    raise ValueError(f"No valid next run time found within eight years for: {expression!r}")
 
 
 def next_interval_time(seconds: int, after: datetime | None = None) -> datetime:

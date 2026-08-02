@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -9,6 +10,9 @@ from engine.mcp.client import MCPClient
 from engine.mcp.config import mcp_server_log_summary, mcp_transport_from_config
 
 from ..schemas.mcp import McpServerOut, McpToolSummaryOut
+
+_MAX_CONCURRENT_DISCOVERIES = 4
+_DISCOVERY_TIMEOUT_SECONDS = 35.0
 
 
 class McpService:
@@ -24,18 +28,31 @@ class McpService:
         if not isinstance(configured, list):
             return [McpServerOut(name="config", type="unknown", status="error", error="mcp_servers must be a list")]
 
-        result: list[McpServerOut] = []
+        result: list[McpServerOut | None] = [None] * len(configured)
+        inspections: list[tuple[int, dict[str, Any]]] = []
         for index, raw in enumerate(configured):
             if not isinstance(raw, dict):
-                result.append(McpServerOut(
+                result[index] = McpServerOut(
                     name=f"server-{index + 1}",
                     type="unknown",
                     status="error",
                     error="server entry must be a mapping",
-                ))
+                )
                 continue
-            result.append(await self._inspect_server(raw, index))
-        return result
+            inspections.append((index, raw))
+
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DISCOVERIES)
+
+        async def inspect_limited(config: dict[str, Any], index: int) -> McpServerOut:
+            async with semaphore:
+                return await self._inspect_server(config, index)
+
+        inspected = await asyncio.gather(
+            *(inspect_limited(raw, index) for index, raw in inspections)
+        )
+        for (index, _), server in zip(inspections, inspected):
+            result[index] = server
+        return [server for server in result if server is not None]
 
     async def _inspect_server(self, config: dict[str, Any], index: int) -> McpServerOut:
         summary = mcp_server_log_summary(config)
@@ -61,8 +78,16 @@ class McpService:
                 return McpServerOut(**common, status="error", error="invalid MCP transport configuration")
             client = MCPClient(transport=transport)
             try:
-                await client.connect()
-                tools = await client.list_tools()
+                try:
+                    async with asyncio.timeout(_DISCOVERY_TIMEOUT_SECONDS):
+                        await client.connect()
+                        tools = await client.list_tools()
+                except TimeoutError:
+                    return McpServerOut(
+                        **common,
+                        status="error",
+                        error=f"MCP discovery timed out after {_DISCOVERY_TIMEOUT_SECONDS:g} seconds",
+                    )
             finally:
                 await client.close()
             return McpServerOut(

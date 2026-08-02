@@ -154,27 +154,6 @@ class AgentService:
             offset=offset,
         )
 
-    async def stream_message(
-        self,
-        session_id: str,
-        content: str,
-        *,
-        context: str | None = None,
-        skill_name: str | None = None,
-        identity_id: str | None = None,
-        working_dir: str | None = None,
-    ) -> AsyncGenerator[dict, None]:
-        stream = await self.prepare_stream_message(
-            session_id,
-            content,
-            context=context,
-            skill_name=skill_name,
-            identity_id=identity_id,
-            working_dir=working_dir,
-        )
-        async for event in stream:
-            yield event
-
     async def prepare_stream_message(
         self,
         session_id: str,
@@ -194,11 +173,6 @@ class AgentService:
             identity_id=identity_id,
             working_dir=working_dir,
         )
-
-    async def resume_run(self, run_id: str) -> AsyncGenerator[dict, None]:
-        stream = await self.prepare_resume_run(run_id)
-        async for event in stream:
-            yield event
 
     async def prepare_resume_run(self, run_id: str) -> AsyncGenerator[dict, None]:
         return await self.session_service.prepare_resume_run(
@@ -221,7 +195,6 @@ class AgentService:
         return result.model_dump()
 
     async def get_token_stats(self, year: int | None = None) -> dict:
-        await self.token_stats_service.sync_from_traces()
         return await self.token_stats_service.get_stats(await self._profile_id(), year=year)
 
     async def get_run(self, run_id: str):
