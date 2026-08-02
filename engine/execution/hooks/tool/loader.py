@@ -1,6 +1,7 @@
-"""Hook 动态加载器
+"""Dynamic loader for tool-lifecycle hooks.
 
-从配置文件加载并实例化 Hook 类。
+Instantiates hook classes from a ``hooks.yaml`` config and registers them
+into a :class:`HookRegistry`.
 """
 
 from __future__ import annotations
@@ -12,17 +13,14 @@ from typing import Any
 
 import yaml
 
-from .hook_interface import PostToolHook, PreToolHook, StopHook
-from .hook_manager import HookRegistry
+from .interface import PostToolHook, PreToolHook, StopHook
+from .manager import HookRegistry
 
 logger = logging.getLogger(__name__)
 
 
 class HookLoader:
-    """Hook 动态加载器
-
-    从 YAML 配置文件加载 Hook 定义，动态导入并实例化 Hook 类。
-    """
+    """Load hook definitions from a YAML config and register them."""
 
     def load_hooks_from_config(
         self,
@@ -256,8 +254,9 @@ class HookLoader:
 
         # 如果是相对路径，尝试相对于配置文件目录解析
         if not module_file.is_absolute():
-            # 先尝试相对于项目根目录
-            project_root = Path(__file__).parent.parent.parent.parent
+            # 先尝试相对于项目根目录（本文件位于
+            # engine/execution/hooks/tool/loader.py，向上 5 级到达仓库根）
+            project_root = Path(__file__).parent.parent.parent.parent.parent
             resolved = project_root / module_path
             if not resolved.exists():
                 # 再尝试相对于配置文件目录

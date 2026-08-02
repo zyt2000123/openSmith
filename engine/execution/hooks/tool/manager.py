@@ -1,10 +1,10 @@
-"""Hook 注册中心和执行管理器
+"""Registry and executor for tool-lifecycle hooks.
 
-HookRegistry 负责：
-1. 注册 Hook 实例
-2. 按优先级执行 Pre Hook
-3. 执行 Post Hook（支持异步）
-4. 执行 Stop Hook（支持异步）
+``HookRegistry`` stores hook instances and runs them in priority order:
+1. register hook instances
+2. run Pre hooks (may block a tool call)
+3. run Post hooks (async)
+4. run Stop hooks (async)
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import asyncio
 import logging
 from typing import Any
 
-from .hook_interface import PostToolHook, PreToolHook, StopHook
+from .interface import PostToolHook, PreToolHook, StopHook
 
 logger = logging.getLogger(__name__)
 
