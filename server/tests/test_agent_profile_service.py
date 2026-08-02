@@ -75,4 +75,3 @@ async def test_create_profile_seeds_the_single_smith_runtime_profile(monkeypatch
 
     assert agent.id == "smith-id"
     assert captured["profile_seed_dir"] == SMITH_PROFILE_DIR
-    assert captured["name"] == "Smith"

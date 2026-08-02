@@ -8,6 +8,7 @@ The shell (or any local client) reads that file to authenticate.
 """
 from __future__ import annotations
 
+import errno
 import hmac
 import os
 import secrets
@@ -45,7 +46,21 @@ def _read_or_create_token() -> str:
 
     token = secrets.token_urlsafe(32)
     token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(str(token_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, PRIVATE_FILE_MODE)
+    # O_NOFOLLOW: a pre-planted symlink at the token path must not be truncated
+    # or overwritten through, which would let a local attacker clobber an
+    # arbitrary file. Refuse to start instead.
+    try:
+        fd = os.open(
+            str(token_path),
+            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RuntimeError(
+                f"refusing to write auth token through a symlink: {token_path}"
+            ) from exc
+        raise
     try:
         os.write(fd, token.encode())
     finally:

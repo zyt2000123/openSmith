@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import aiosqlite
 
-APP_SCHEMA = """
+# All rows are written with explicit ISO-8601 timestamps by the repositories;
+# these fallbacks use the same format so mixed sources never break TEXT ordering.
+_ISO_NOW = "strftime('%Y-%m-%dT%H:%M:%f+00:00','now')"
+
+APP_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS agent_profiles (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -14,7 +18,7 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     environment TEXT NOT NULL DEFAULT '',
     accent TEXT NOT NULL DEFAULT '',
     config_path TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT ({_ISO_NOW}),
     UNIQUE(name, role)
 );
 
@@ -24,7 +28,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     identity_id TEXT,
     model_profile TEXT,
     title TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT ({_ISO_NOW}),
     context_summary TEXT NOT NULL DEFAULT '',
     context_summary_cutoff INTEGER NOT NULL DEFAULT 0
 );
@@ -34,7 +38,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT ({_ISO_NOW})
 );
 
 CREATE TABLE IF NOT EXISTS auto_tasks (
@@ -55,7 +59,7 @@ CREATE TABLE IF NOT EXISTS auto_tasks (
     max_retries INTEGER NOT NULL DEFAULT 2,
     lease_until TEXT,
     lease_token TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT ({_ISO_NOW})
 );
 
 CREATE TABLE IF NOT EXISTS auto_task_runs (
@@ -63,7 +67,7 @@ CREATE TABLE IF NOT EXISTS auto_task_runs (
     auto_task_id TEXT NOT NULL REFERENCES auto_tasks(id) ON DELETE CASCADE,
     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
     output TEXT NOT NULL DEFAULT '',
-    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT NOT NULL DEFAULT ({_ISO_NOW}),
     finished_at TEXT,
     error TEXT
 );
@@ -79,7 +83,7 @@ CREATE TABLE IF NOT EXISTS token_usage_events (
     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
     output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
-    occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
+    occurred_at TEXT NOT NULL DEFAULT ({_ISO_NOW})
 );
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_session_time
@@ -90,7 +94,7 @@ CREATE TABLE IF NOT EXISTS observability_trace_cursors (
     byte_offset INTEGER NOT NULL DEFAULT 0,
     project_path TEXT NOT NULL DEFAULT '',
     model TEXT NOT NULL DEFAULT 'unknown',
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT ({_ISO_NOW})
 );
 
 CREATE TABLE IF NOT EXISTS llm_generations (
@@ -111,7 +115,7 @@ CREATE TABLE IF NOT EXISTS llm_generations (
     total_ms INTEGER NOT NULL DEFAULT 0,
     stream INTEGER NOT NULL DEFAULT 0,
     ok INTEGER NOT NULL DEFAULT 1,
-    occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
+    occurred_at TEXT NOT NULL DEFAULT ({_ISO_NOW})
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_generations_source_key
@@ -145,10 +149,17 @@ async def _ensure_session_context_columns(db: aiosqlite.Connection) -> None:
 
 async def _ensure_unique_profile_index(db: aiosqlite.Connection) -> None:
     """Add UNIQUE(name, role) to existing databases, deduplicating first."""
-    await db.execute(
-        "DELETE FROM agent_profiles WHERE rowid NOT IN "
-        "(SELECT MIN(rowid) FROM agent_profiles GROUP BY name, role)"
+    duplicates = await db.execute_fetchall(
+        "SELECT name, role FROM agent_profiles "
+        "GROUP BY name, role HAVING COUNT(*) > 1 LIMIT 1"
     )
+    if duplicates:
+        # Only run the non-idempotent cleanup when there is actually something
+        # to remove; on a healthy database this must not touch any rows.
+        await db.execute(
+            "DELETE FROM agent_profiles WHERE rowid NOT IN "
+            "(SELECT MIN(rowid) FROM agent_profiles GROUP BY name, role)"
+        )
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_profiles_name_role "
         "ON agent_profiles(name, role)"
@@ -193,7 +204,7 @@ async def _reset_stuck_auto_tasks(db: aiosqlite.Connection) -> None:
     )
     await db.execute(
         "UPDATE auto_task_runs SET status='failed', error='interrupted by restart', "
-        "finished_at=datetime('now') WHERE status='running'"
+        f"finished_at={_ISO_NOW} WHERE status='running'"
     )
 
 

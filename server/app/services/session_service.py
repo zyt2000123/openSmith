@@ -341,8 +341,10 @@ class SessionService:
             state.message_id,
         )
         # This completes ownership and identity validation synchronously, before
-        # recovery deletes any persisted partial assistant output.
-        stream = await self.prepare_stream_message(
+        # any state is mutated.  The stale partial assistant output is discarded
+        # only once the resumed stream actually produces a replacement reply
+        # (see _stream_message's finally), so a failed resume never loses it.
+        return await self.prepare_stream_message(
             agent_id,
             state.session_id,
             user_message["content"],
@@ -353,11 +355,6 @@ class SessionService:
             _message_id=state.message_id,
             _execution_identity_id=state.identity_id,
         )
-        await self.session_repo.discard_assistant_messages_after_user(
-            state.session_id,
-            state.message_id,
-        )
-        return stream
 
     async def prepare_stream_message(
         self,
@@ -444,15 +441,6 @@ class SessionService:
         execution_identity_id: str | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Yield SSE event dicts. Streams text chunks as they arrive from the engine."""
-        if _resume_run_id is None:
-            # Fetch recent history BEFORE saving the new message (avoids duplication)
-            history = await self._recent_history(session_id)
-            user_message = await self.session_repo.add_message(session_id, "user", content)
-            message_id = str(user_message["id"])
-        else:
-            history = list(_history_override or [])
-            message_id = _message_id
-
         # Stream structured events from engine
         def sse(event: str, data: dict) -> dict:
             return {"event": event, "data": json.dumps(data, ensure_ascii=False)}
@@ -467,6 +455,14 @@ class SessionService:
         terminal_reason: str | None = None
         terminal_notice: str | None = None
         try:
+            if _resume_run_id is None:
+                # Fetch recent history BEFORE saving the new message (avoids duplication)
+                history = await self._recent_history(session_id)
+                user_message = await self.session_repo.add_message(session_id, "user", content)
+                message_id = str(user_message["id"])
+            else:
+                history = list(_history_override or [])
+                message_id = _message_id
             runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
             model_name = str(getattr(getattr(services, "llm", None), "model", "") or "")
             request = EngineRequest(
@@ -688,6 +684,16 @@ class SessionService:
                 ) or "".join(visible_raw_reply)
             if reply_text:
                 try:
+                    if _resume_run_id is not None and _message_id is not None:
+                        # Only a resumed run that produced a replacement reply may
+                        # delete the interrupted run's stale partial output; a
+                        # resume that fails before producing text keeps it.
+                        await asyncio.shield(
+                            self.session_repo.discard_assistant_messages_after_user(
+                                session_id,
+                                _message_id,
+                            )
+                        )
                     msg = await asyncio.shield(
                         self.session_repo.add_message(session_id, "assistant", reply_text)
                     )

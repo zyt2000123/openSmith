@@ -11,6 +11,15 @@ router = APIRouter(prefix="/api/config", tags=["config"])
 LLMUsageName = Literal["interactive", "gate", "background"]
 
 
+def _validate_max_output_tokens(value: object) -> object:
+    """Reject bools and non-integers before Pydantic's int coercion kicks in."""
+    if value is None:
+        return value
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("max_output_tokens must be an integer")
+    return value
+
+
 class LLMRoutePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -26,11 +35,7 @@ class LLMRoutePatch(BaseModel):
     @field_validator("max_output_tokens", mode="before")
     @classmethod
     def validate_max_output_tokens(cls, value: object) -> object:
-        if value is None:
-            return value
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("max_output_tokens must be an integer")
-        return value
+        return _validate_max_output_tokens(value)
 
 
 class LLMTimeoutProfilePatch(BaseModel):
@@ -76,11 +81,7 @@ class LLMConfig(BaseModel):
     @field_validator("max_output_tokens", mode="before")
     @classmethod
     def validate_max_output_tokens(cls, value: object) -> object:
-        if value is None:
-            return value
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("max_output_tokens must be an integer")
-        return value
+        return _validate_max_output_tokens(value)
 
 
 def get_config_service() -> ConfigService:

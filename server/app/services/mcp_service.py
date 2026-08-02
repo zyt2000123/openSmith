@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -13,6 +14,11 @@ from ..schemas.mcp import McpServerOut, McpToolSummaryOut
 
 # Compatibility seam for tests embedding a temporary runtime profile.
 AGENT_DIR: Path | None = None
+
+# A single hanging MCP server (stdio process or HTTP endpoint) must not block
+# list_servers forever; each phase is capped and the error is surfaced per server.
+_MCP_CONNECT_TIMEOUT_SECONDS = 30.0
+_MCP_LIST_TOOLS_TIMEOUT_SECONDS = 30.0
 
 
 def _agent_dir() -> Path:
@@ -69,8 +75,12 @@ class McpService:
                 return McpServerOut(**common, status="error", error="invalid MCP transport configuration")
             client = MCPClient(transport=transport)
             try:
-                await client.connect()
-                tools = await client.list_tools()
+                await asyncio.wait_for(
+                    client.connect(), timeout=_MCP_CONNECT_TIMEOUT_SECONDS
+                )
+                tools = await asyncio.wait_for(
+                    client.list_tools(), timeout=_MCP_LIST_TOOLS_TIMEOUT_SECONDS
+                )
             finally:
                 await client.close()
             return McpServerOut(
@@ -84,6 +94,12 @@ class McpService:
                     )
                     for tool in tools
                 ],
+            )
+        except TimeoutError:
+            return McpServerOut(
+                **common,
+                status="error",
+                error=f"MCP server {name} connect/list_tools timed out",
             )
         except Exception as exc:
             return McpServerOut(**common, status="error", error=str(exc))

@@ -160,7 +160,7 @@ async def test_trigger_returns_while_the_engine_turn_is_still_running(
     service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
 
     # release is never set here: this only returns because execution is detached.
-    started = await asyncio.wait_for(service.trigger_auto_task("task-1"), timeout=1)
+    started = await asyncio.wait_for(service.trigger_auto_task("smith-id", "task-1"), timeout=1)
     await asyncio.wait_for(entered.wait(), timeout=1)
 
     assert started.status == "running"
@@ -224,7 +224,12 @@ async def test_auto_task_writes_reject_a_trigger_the_scheduler_can_never_fire() 
             self.wrote = False
 
         async def get(self, task_id: str) -> dict:
-            return {"id": task_id, "trigger_type": "cron", "trigger_config": "*/5 * * * *"}
+            return {
+                "id": task_id,
+                "agent_id": "smith-id",
+                "trigger_type": "cron",
+                "trigger_config": "*/5 * * * *",
+            }
 
         async def create(self, agent_id: str, data: dict) -> dict:
             self.wrote = True
@@ -251,13 +256,51 @@ async def test_auto_task_writes_reject_a_trigger_the_scheduler_can_never_fire() 
         # trigger_type omitted: the effective type comes from the stored row, so
         # only the service can decide whether this patch is schedulable.
         with pytest.raises(HTTPException) as updated:
-            await service.update_auto_task("task-1", AutoTaskUpdate(trigger_config=bad))
+            await service.update_auto_task(
+                "smith-id", "task-1", AutoTaskUpdate(trigger_config=bad)
+            )
         assert (created.value.status_code, updated.value.status_code) == (422, 422)
         assert repo.wrote is False
 
     assert AutoTaskService._require_next_run("cron", "*/5 * * * *") is not None
     assert AutoTaskService._require_next_run("cron", "0 9 * * 1-5") is not None
     assert AutoTaskService._require_next_run("manual", "") is None
+
+
+@pytest.mark.asyncio
+async def test_auto_task_mutations_reject_a_task_owned_by_another_agent() -> None:
+    """task_id-scoped mutations must not cross the owning-agent boundary."""
+    class ForeignRepo:
+        async def get(self, task_id: str) -> dict:
+            return {
+                "id": task_id,
+                "agent_id": "some-other-agent",
+                "trigger_type": "interval",
+                "trigger_config": "60",
+            }
+
+        async def delete(self, task_id: str) -> bool:
+            raise AssertionError("must not delete another agent's task")
+
+    service = AutoTaskService(ForeignRepo(), FakeProfileRepo(), FakeSessionRepo())
+
+    with pytest.raises(HTTPException) as exc:
+        await service.update_auto_task(
+            "smith-id", "task-1", AutoTaskUpdate(trigger_config="120")
+        )
+    assert exc.value.status_code == 404
+
+    with pytest.raises(HTTPException) as exc:
+        await service.trigger_auto_task("smith-id", "task-1")
+    assert exc.value.status_code == 404
+
+    with pytest.raises(HTTPException) as exc:
+        await service.delete_auto_task("smith-id", "task-1")
+    assert exc.value.status_code == 404
+
+    with pytest.raises(HTTPException) as exc:
+        await service.list_runs("smith-id", "task-1")
+    assert exc.value.status_code == 404
 
 
 def test_auto_task_create_requires_a_nonempty_working_directory() -> None:
@@ -420,3 +463,124 @@ async def test_auto_task_renews_its_lease_while_the_engine_is_running(
 
     assert finished["status"] == "completed"
     assert any(update.get("renewed_task_id") == "task-1" for update in task_repo.updates)
+
+
+@pytest.mark.asyncio
+async def test_completed_run_is_recorded_completed_when_the_lease_is_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If another worker reclaimed the task before completion, the run here still
+    completed: record it as completed and do not mark the task failed/rescheduled."""
+    class LostLeaseRepo(FakeAutoTaskRepo):
+        async def finish_task(
+            self,
+            task_id: str,
+            status: str,
+            next_run_at: str | None,
+            lease_token: str,
+            *,
+            retry_count: int | None = None,
+        ) -> bool:
+            return False
+
+    async def ok_reply(request, runtime, services):
+        return SimpleNamespace(text="done")
+
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "load_runtime_identity_catalog",
+        lambda: SimpleNamespace(resolve=lambda message: SimpleNamespace(identity_id="smith")),
+    )
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "build_engine_runtime",
+        lambda *args, **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(auto_task_service_module, "engine_reply_with_runtime", ok_reply)
+
+    task_repo = LostLeaseRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+    finished = await _run_to_completion(service, _task())
+
+    # The engine work happened and the assistant reply was persisted; the run
+    # record must say completed, never failed, and no failure reschedule may occur.
+    assert finished["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_success_schedules_next_run_from_completion_not_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """next_run must be derived from when the run finished. A task whose execution
+    outlives its interval would otherwise be immediately due again."""
+    engine_state = {"finished": False}
+
+    async def slow_reply(request, runtime, services):
+        await asyncio.sleep(0.005)
+        engine_state["finished"] = True
+        return SimpleNamespace(text="done")
+
+    def fake_calc_next_run(trigger_type: str, trigger_config: str) -> str:
+        assert engine_state["finished"], "_calc_next_run must run after the engine completes"
+        return "scheduled-after-completion"
+
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "load_runtime_identity_catalog",
+        lambda: SimpleNamespace(resolve=lambda message: SimpleNamespace(identity_id="smith")),
+    )
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "build_engine_runtime",
+        lambda *args, **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(auto_task_service_module, "engine_reply_with_runtime", slow_reply)
+    monkeypatch.setattr(
+        auto_task_service_module.AutoTaskService,
+        "_calc_next_run",
+        staticmethod(fake_calc_next_run),
+    )
+
+    task_repo = FakeAutoTaskRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+    finished = await _run_to_completion(
+        service,
+        _task(trigger_type="interval", trigger_config="3600"),
+    )
+
+    assert finished["status"] == "completed"
+    task_update = next(
+        update for update in task_repo.updates if update.get("task_id") == "task-1"
+    )
+    assert task_update["next_run_at"] == "scheduled-after-completion"
+
+
+@pytest.mark.asyncio
+async def test_hung_engine_run_times_out_and_releases_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pathological run must not renew its lease forever: an overall timeout
+    turns it into a failed run so the concurrency slot frees up."""
+    async def hung_reply(request, runtime, services):
+        await asyncio.sleep(60)
+        return SimpleNamespace(text="never")
+
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "load_runtime_identity_catalog",
+        lambda: SimpleNamespace(resolve=lambda message: SimpleNamespace(identity_id="smith")),
+    )
+    monkeypatch.setattr(
+        auto_task_service_module,
+        "build_engine_runtime",
+        lambda *args, **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(auto_task_service_module, "engine_reply_with_runtime", hung_reply)
+    monkeypatch.setattr(auto_task_service_module, "_TASK_EXECUTION_TIMEOUT_SECONDS", 0.01)
+
+    task_repo = FakeAutoTaskRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+    finished = await _run_to_completion(service, _task())
+
+    assert finished["status"] == "failed"
+    assert "timed out" in (finished["error"] or "").lower()

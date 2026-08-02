@@ -64,6 +64,8 @@ class ObservabilityService:
             agent_id=record.metadata.agent_id,
             session_id=record.metadata.session_id,
             identity_id=record.metadata.identity_id,
+            route_id=record.metadata.route_id,
+            pipeline_id=record.metadata.pipeline_id,
             working_dir=record.metadata.working_dir,
             forced_skill=record.metadata.forced_skill,
             created_at=record.metadata.created_at,

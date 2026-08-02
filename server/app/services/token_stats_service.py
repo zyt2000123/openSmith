@@ -86,6 +86,15 @@ class TokenStatsService:
                 (occurred_at or datetime.now(timezone.utc)).isoformat(),
             ),
         )
+        # An exact usage event supersedes the local text-token estimates for the
+        # same session (they carry source_key LIKE 'message:%'); clear them in the
+        # same transaction so get_stats never double-counts between this call and
+        # the next sync_from_traces.
+        await db.execute(
+            "DELETE FROM token_usage_events "
+            "WHERE source_key LIKE 'message:%' AND session_id=?",
+            (session_id,),
+        )
         await db.commit()
 
     async def record_generation(self, record: "GenerationRecord") -> None:

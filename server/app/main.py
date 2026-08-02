@@ -1,10 +1,8 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from fastapi import Depends
 
 from common import config as common_config
 from common.database import close_db

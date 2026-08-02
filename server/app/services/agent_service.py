@@ -158,27 +158,6 @@ class AgentService:
             offset=offset,
         )
 
-    async def stream_message(
-        self,
-        session_id: str,
-        content: str,
-        *,
-        context: str | None = None,
-        skill_name: str | None = None,
-        identity_id: str | None = None,
-        working_dir: str | None = None,
-    ) -> AsyncGenerator[dict, None]:
-        stream = await self.prepare_stream_message(
-            session_id,
-            content,
-            context=context,
-            skill_name=skill_name,
-            identity_id=identity_id,
-            working_dir=working_dir,
-        )
-        async for event in stream:
-            yield event
-
     async def prepare_stream_message(
         self,
         session_id: str,
@@ -198,11 +177,6 @@ class AgentService:
             identity_id=identity_id,
             working_dir=working_dir,
         )
-
-    async def resume_run(self, run_id: str) -> AsyncGenerator[dict, None]:
-        stream = await self.prepare_resume_run(run_id)
-        async for event in stream:
-            yield event
 
     async def prepare_resume_run(self, run_id: str) -> AsyncGenerator[dict, None]:
         return await self.session_service.prepare_resume_run(
@@ -270,13 +244,21 @@ class AgentService:
         )
 
     async def update_auto_task(self, task_id: str, body: AutoTaskUpdate):
-        return await self.auto_task_service.update_auto_task(task_id, body)
+        return await self.auto_task_service.update_auto_task(
+            await self._profile_id(), task_id, body
+        )
 
     async def trigger_auto_task(self, task_id: str) -> AutoTaskRunOut:
-        return await self.auto_task_service.trigger_auto_task(task_id)
+        return await self.auto_task_service.trigger_auto_task(
+            await self._profile_id(), task_id
+        )
 
     async def delete_auto_task(self, task_id: str) -> None:
-        await self.auto_task_service.delete_auto_task(task_id)
+        await self.auto_task_service.delete_auto_task(
+            await self._profile_id(), task_id
+        )
 
     async def list_runs(self, task_id: str):
-        return await self.auto_task_service.list_runs(task_id)
+        return await self.auto_task_service.list_runs(
+            await self._profile_id(), task_id
+        )

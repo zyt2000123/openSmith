@@ -58,7 +58,7 @@ def test_observability_service_derives_tool_timeout_incidents(tmp_path: Path) ->
         created_at="2026-07-19T00:00:00+00:00",
     ))
     observation.record(ExecutionEvent(EventType.TOOL_CALL_RESULT, {
-        "name": "shell", "status": "timeout", "reason": "command timed out",
+        "name": "shell", "error_kind": "timeout", "timed_out": True, "reason": "command timed out",
     }))
     observation.record(ExecutionEvent(EventType.RUN_FINISHED, {"status": "failed", "reason": "tool_failure_budget"}))
     service = ObservabilityService(ObservabilityReader(tmp_path))

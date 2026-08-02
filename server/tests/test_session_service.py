@@ -630,6 +630,128 @@ async def test_prepare_resume_rejects_a_retired_identity_without_discarding_part
 
 
 @pytest.mark.asyncio
+async def test_resume_that_fails_before_text_preserves_the_partial_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A resume that never produces a replacement reply must not discard the
+    interrupted run's persisted partial output."""
+    repo = FakeSessionRepo()
+    repo.identity_id = "smith"
+    identities_dir = tmp_path / "identities"
+    identities_dir.mkdir()
+    repo.messages = [
+        {"id": "u-current", "session_id": "sess-1", "role": "user", "content": "continue audit", "created_at": "1"},
+        {"id": "a-partial", "session_id": "sess-1", "role": "assistant", "content": "partial", "created_at": "2"},
+    ]
+    store = RunStateStore(tmp_path)
+    store.create(
+        "run-1",
+        agent_id="smith-id",
+        session_id="sess-1",
+        message_id="u-current",
+        identity_id="coding",
+        working_dir="/tmp/project",
+        forced_skill="review",
+    )
+    store.transition("run-1", "running")
+    store.transition("run-1", "incomplete")
+
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
+
+    async def fake_resume_events(request, runtime, services, run_id):
+        yield SimpleNamespace(type=SimpleNamespace(value="run_started"), data={"run_id": run_id})
+        raise RuntimeError("engine exploded before any text")
+
+    def fake_resume_stream(request, runtime, services, run_id):
+        return FakeRun(fake_resume_events(request, runtime, services, run_id))
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_resume_stream_with_runtime",
+        fake_resume_stream,
+    )
+
+    events = [
+        event
+        async for event in SessionService(
+            repo,
+            FakeAgentProfileRepo(),
+            identity_catalog=_identity_catalog(identities_dir),
+            run_state_store=store,
+        ).resume_run("smith-id", "run-1")
+    ]
+
+    assert [message["id"] for message in repo.messages] == ["u-current", "a-partial"]
+    assert repo.saved_messages == []
+    done = json.loads(events[-1]["data"])
+    assert done["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_resume_that_retracts_everything_preserves_the_partial_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Even a resumed run whose provisional drafts are all retracted (so nothing
+    survives to be persisted) must not delete the interrupted run's partials."""
+    repo = FakeSessionRepo()
+    repo.identity_id = "smith"
+    identities_dir = tmp_path / "identities"
+    identities_dir.mkdir()
+    repo.messages = [
+        {"id": "u-current", "session_id": "sess-1", "role": "user", "content": "continue audit", "created_at": "1"},
+        {"id": "a-partial", "session_id": "sess-1", "role": "assistant", "content": "partial", "created_at": "2"},
+    ]
+    store = RunStateStore(tmp_path)
+    store.create(
+        "run-1",
+        agent_id="smith-id",
+        session_id="sess-1",
+        message_id="u-current",
+        identity_id="smith",
+    )
+    store.transition("run-1", "running")
+    store.transition("run-1", "incomplete")
+
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
+
+    async def fake_resume_events(request, runtime, services, run_id):
+        yield SimpleNamespace(type=SimpleNamespace(value="run_started"), data={"run_id": run_id})
+        yield SimpleNamespace(type=SimpleNamespace(value="provisional_text_delta"), data={"provision_id": "draft-1", "text": "draft"})
+        yield SimpleNamespace(type=SimpleNamespace(value="provisional_retract"), data={"provision_id": "draft-1", "reason": "withdrawn"})
+        yield SimpleNamespace(type=SimpleNamespace(value="run_finished"), data={"status": "completed"})
+
+    def fake_resume_stream(request, runtime, services, run_id):
+        return FakeRun(fake_resume_events(request, runtime, services, run_id))
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_resume_stream_with_runtime",
+        fake_resume_stream,
+    )
+
+    events = [
+        event
+        async for event in SessionService(
+            repo,
+            FakeAgentProfileRepo(),
+            identity_catalog=_identity_catalog(identities_dir),
+            run_state_store=store,
+        ).resume_run("smith-id", "run-1")
+    ]
+
+    assert [message["id"] for message in repo.messages] == ["u-current", "a-partial"]
+    assert repo.saved_messages == []
+    done = json.loads(events[-1]["data"])
+    assert done["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_first_message_pins_default_react_identity_not_content_routed_identity(tmp_path: Path) -> None:
     repo = FakeSessionRepo()
     service = SessionService(
@@ -666,9 +788,19 @@ async def test_compress_session_persists_llm_summary(monkeypatch: pytest.MonkeyP
         {"id": "a2", "session_id": "sess-1", "role": "assistant", "content": "answer", "created_at": "4"},
     ]
 
+    summary = (
+        "<context_summary>"
+        "<conversation_overview>dense summary</conversation_overview>"
+        "<key_knowledge>none</key_knowledge>"
+        "<file_system_state>none</file_system_state>"
+        "<recent_actions>none</recent_actions>"
+        "<current_plan>none</current_plan>"
+        "</context_summary>"
+    )
+
     class FakeLlm:
         async def chat(self, messages):
-            return SimpleNamespace(text="<context_summary>dense summary</context_summary>", finish_reason="stop")
+            return SimpleNamespace(text=summary, finish_reason="stop")
 
     def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
         return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), SimpleNamespace(llm=FakeLlm())
@@ -677,7 +809,7 @@ async def test_compress_session_persists_llm_summary(monkeypatch: pytest.MonkeyP
 
     result = await SessionService(repo, FakeAgentProfileRepo()).compress_session("smith-id", "sess-1")
 
-    assert result.summary == "<context_summary>dense summary</context_summary>"
+    assert result.summary == summary
     assert result.message_count == 4
     assert repo.context_summary == result.summary
     assert repo.context_summary_cutoff == 4
