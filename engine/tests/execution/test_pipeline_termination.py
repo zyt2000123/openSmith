@@ -686,3 +686,47 @@ def test_resume_restores_provisional_ledger_for_already_streamed_final(
     # 会被重复渲染一遍。
     assert final[0].data.get("already_streamed") is True
     assert not (tmp_path / "sessions" / ".state" / "sess-prov.json").exists()
+
+
+# --- P9: checkpoint persistence is offloaded off the event loop -------------
+
+
+def test_checkpoint_save_offloads_sync_io_to_a_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """json.dump + fsync + os.replace must run in a thread, never the loop."""
+    import asyncio
+
+    from engine.execution.pipeline import pipeline as pipeline_module
+    from engine.execution.pipeline.pipeline_context import (
+        CTX_AGENT_ID,
+        CTX_IDENTITY_ID,
+        CTX_ROUTE_ID,
+        CTX_RUN_ID,
+        CTX_SESSION_ID,
+        CTX_STATE_DIR,
+        CTX_WORKING_DIR,
+    )
+
+    offloaded: list[object] = []
+
+    async def recording_to_thread(fn, *args, **kwargs):
+        offloaded.append(fn)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording_to_thread)
+
+    context = {
+        CTX_AGENT_ID: "a",
+        CTX_SESSION_ID: "sess-p9",
+        CTX_IDENTITY_ID: "smith",
+        CTX_ROUTE_ID: "feature",
+        CTX_STATE_DIR: str(tmp_path),
+        CTX_WORKING_DIR: str(tmp_path),
+        CTX_RUN_ID: "run-p9",
+    }
+
+    asyncio.run(pipeline_module._save_checkpoint(context, 0))
+
+    assert offloaded, "checkpoint persistence must be offloaded via asyncio.to_thread"
+    assert (tmp_path / "sessions" / ".state" / "sess-p9.json").is_file()
