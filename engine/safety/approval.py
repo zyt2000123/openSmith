@@ -341,9 +341,38 @@ _SECRET_VALUE_RE = re.compile(
     r")"
 )
 
+# Search-mode twin of ``_SECRET_VALUE_RE``: finds a credential embedded
+# *inside* a longer string (a shell command, a URL, a JSON blob).  Lengths are
+# tightened so ordinary content never matches — ``sk-development`` is a
+# directory name, not a key.
+_EMBEDDED_SECRET_RE = re.compile(
+    r"(?:"
+    r"sk-[A-Za-z0-9_\-]{20,}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{22,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{16,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{1,}\.[A-Za-z0-9_\-]{1,}"
+    r")"
+)
+
+# ``scheme://userinfo@`` in a URL — keep the scheme and host, drop the
+# userinfo (which may carry a password).
+_URL_CREDENTIALS_RE = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s]+)@"
+)
+
+# ``--token value`` / ``--token=value`` embedded in a command string.
+_EMBEDDED_FLAG_RE = re.compile(
+    r"(?<=\s)(-{1,2}(?:password|passwd|token|secret|api[-_]?key|apikey|"
+    r"access[-_]?key|client[-_]?secret|private[-_]?key|auth(?:orization)?|"
+    r"bearer|session[-_]?key|cookie))(?:\s*=\s*|\s+)(?:(?:'[^']*')|(?:\"[^\"]*\")|[^\s;|&]+)",
+    re.IGNORECASE,
+)
+
 
 def _is_secret_value(value: str) -> bool:
-    """Whether a string looks like a credential rather than ordinary content."""
+    """Whether a string is itself a credential rather than ordinary content."""
     text = value.strip()
     if not text:
         return False
@@ -352,12 +381,29 @@ def _is_secret_value(value: str) -> bool:
     return bool(_SECRET_VALUE_RE.fullmatch(text))
 
 
+def _redact_secret_text(text: str) -> str:
+    """Redact secret-shaped material embedded in a string summary.
+
+    A whole-string credential is hidden entirely; otherwise each embedded
+    high-confidence token, ``--flag value`` pair, and URL userinfo is replaced
+    in place so the surrounding context stays readable.
+    """
+    if _is_secret_value(text):
+        return "***"
+    redacted = _EMBEDDED_SECRET_RE.sub("***", text)
+    redacted = _EMBEDDED_FLAG_RE.sub(r"\1 ***", redacted)
+    redacted = _URL_CREDENTIALS_RE.sub(r"\1***@", redacted)
+    return redacted
+
+
 def _summarize_list(values: list | tuple, *, depth: int) -> list[object]:
     """Summarize a sequence, redacting flag-value pairs and secret-shaped values.
 
     Key-based redaction cannot see a credential that arrives as a positional
     list element (``["--token", "sk-..."]``); the only signal that the next
-    element is sensitive is the flag that precedes it.
+    element is sensitive is the flag that precedes it.  String elements that
+    are themselves secret-shaped (or carry an embedded secret) are handled by
+    ``_summarize_value`` -> ``_redact_secret_text``.
     """
     redacted: list[object] = []
     redact_next = False
@@ -376,9 +422,6 @@ def _summarize_list(values: list | tuple, *, depth: int) -> list[object]:
                 else:
                     redacted.append(item)
                     redact_next = True
-                continue
-            if _is_secret_value(item):
-                redacted.append("***")
                 continue
         redacted.append(_summarize_value(item, depth=depth + 1))
     return redacted
@@ -400,6 +443,7 @@ def _summarize_value(value: object, *, key: str | None = None, depth: int = 0) -
         return "***"
     if isinstance(value, str):
         safe = "".join(char if ord(char) >= 32 and char != "\x7f" else " " for char in value)
+        safe = _redact_secret_text(safe)
         return safe[:_MAX_SUMMARY_TEXT] + ("…" if len(safe) > _MAX_SUMMARY_TEXT else "")
     if isinstance(value, (int, float, bool)) or value is None:
         return value
@@ -414,12 +458,13 @@ def _summarize_value(value: object, *, key: str | None = None, depth: int = 0) -
 
 def _display_value(value: object, *, max_length: int = _MAX_SUMMARY_TEXT) -> str:
     if isinstance(value, str):
-        text = value
+        text = _redact_secret_text(value)
     else:
         try:
             text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
             text = str(value)
+        text = _redact_secret_text(text)
     compact = " ".join(text.replace("\r", " ").replace("\n", " ").split())
     return compact[:max_length] + ("…" if len(compact) > max_length else "")
 
