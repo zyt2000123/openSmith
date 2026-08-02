@@ -125,8 +125,80 @@ anchors its non-bypassable platform-write protection on it.
 | Pipeline + skill chain | `engine/execution/pipeline/pipeline.py`, `.../skill_chain.py` |
 | Prompt assembly | `engine/context/assembler.py` |
 | Tool policy | `engine/safety/tool_policy.py` (hard guard before soft challenge) |
+| **Hook system** | `engine/execution/hooks/` (framework), `agents/smith/hooks/` (built-in implementations) |
 | Data root | `common/paths.py` |
 | Smith profile seed | `agents/smith/` |
+
+## 6a. Hook System
+
+Smith has a **three-layer Hook system** for tool execution lifecycle management:
+
+### Architecture
+
+```
+PreToolUse (can block) → Tool Execution → PostToolUse (warnings only) → Stop (batch processing)
+```
+
+**Three Hook types**:
+
+1. **PreToolHook** - Executes before tool call, can block dangerous operations
+   - Priority-ordered (lower number = higher priority)
+   - Returns `(allowed: bool, denial_reason: str | None)`
+   - Use for: security enforcement, policy validation, configuration protection
+
+2. **PostToolHook** - Executes after tool call, observes results
+   - Cannot block (tool already executed)
+   - Returns `list[str]` of warnings (injected into conversation)
+   - Can be async (non-blocking)
+   - Use for: quality checks, logging, metrics
+
+3. **StopHook** - Executes at end of each Agent response
+   - Typically async (non-blocking)
+   - Use for: cost tracking, session persistence, batch processing
+
+### File Layout
+
+```
+engine/execution/hooks/
+├── hook_interface.py    # Abstract base classes
+├── hook_manager.py      # HookRegistry (registration + execution)
+├── hook_loader.py       # Dynamic loading from YAML config
+└── __init__.py
+
+agents/smith/hooks/
+├── config_protection.py # PreToolHook: Block config file modifications
+├── console_warn.py      # PostToolHook: Warn about debug statements
+├── cost_tracker.py      # StopHook: Track token usage and costs
+├── fact_gate.py         # PreToolHook: Require investigation before first edit
+├── quality_gate.py      # PostToolHook: Run format/lint checks
+└── __init__.py
+
+agents/smith/hooks.yaml  # Hook configuration (which hooks are enabled)
+```
+
+### Integration Points
+
+- `preparation.py`: Loads hooks from `agents/smith/hooks.yaml` into `services.hook_registry`
+- `react_loop.py`: Calls `hook_registry.run_pre_hooks()` before tool execution, `run_post_hooks()` after
+- `lifecycle.py`: Can call `hook_registry.run_stop_hooks()` at response end (not yet implemented)
+
+### Built-in Hooks
+
+| Hook | Type | Enabled | Purpose |
+|------|------|---------|---------|
+| `config-protection` | Pre | ✅ | Block edits to linter/formatter/type-checker configs |
+| `console-warn` | Post | ✅ | Warn about `console.log`, `print()`, etc. |
+| `quality-gate` | Post | ✅ | Run format/lint checks (async) |
+| `cost-tracker` | Stop | ✅ | Write token usage to `~/.agent-smith/metrics/costs.jsonl` |
+| `fact-gate` | Pre | ❌ | Require Read before first Edit (needs session state) |
+
+### Extension
+
+Users can add custom hooks:
+1. Write a Hook class implementing `PreToolHook`, `PostToolHook`, or `StopHook`
+2. Add entry to `~/.agent-smith/hooks.yaml` (loaded after built-in hooks)
+
+Hook system is **pluggable** — engine provides framework, agents provide implementations.
 
 ## 7. Smith Profile System
 
