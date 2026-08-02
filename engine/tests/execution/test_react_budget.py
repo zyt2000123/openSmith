@@ -673,6 +673,81 @@ def test_stream_context_rejection_recovers_without_replaying_as_non_stream():
     ]
 
 
+def test_context_limit_recovery_retracts_abandoned_provisional_draft():
+    """A stream that emits deltas and then hits a context-limit error must
+    retract the abandoned draft before the recovered stream runs; otherwise
+    both ids get committed at finish and the client keeps rendering text that
+    was discarded."""
+
+    class DraftThenContextLimitLLM(FakeLLM):
+        stream = True
+
+        def __init__(self) -> None:
+            super().__init__([])
+            self.stream_attempts = 0
+
+        async def chat_events(self, messages, tools=None):
+            self.stream_attempts += 1
+            if self.stream_attempts == 1:
+                yield ProviderEvent(
+                    ProviderEventType.OUTPUT_TEXT_DELTA,
+                    {"delta": "abandoned draft"},
+                )
+                raise LLMContextLengthError(
+                    "request exceeds context window",
+                    http_status=400,
+                    provider_code="context_length_exceeded",
+                )
+            yield ProviderEvent(
+                ProviderEventType.OUTPUT_TEXT_DELTA,
+                {"delta": "recovered"},
+            )
+            yield ProviderEvent(
+                ProviderEventType.RESPONSE_COMPLETED,
+                {"finish_reason": "stop", "raw_finish_reason": "stop"},
+            )
+
+    async def run():
+        llm = DraftThenContextLimitLLM()
+        events = [
+            event
+            async for event in _react_event_loop(
+                llm,
+                [{"role": "user", "content": "hello"}],
+                _registry(),
+            )
+        ]
+        return events, llm
+
+    events, llm = asyncio.run(run())
+
+    assert llm.stream_attempts == 2
+    provision_ids = [
+        event.data["provision_id"]
+        for event in events
+        if event.type == EventType.PROVISIONAL_TEXT_DELTA
+    ]
+    retracted_ids = [
+        event.data["provision_id"]
+        for event in events
+        if event.type == EventType.PROVISIONAL_RETRACT
+    ]
+    committed_ids = [
+        event.data["provision_id"]
+        for event in events
+        if event.type == EventType.PROVISIONAL_COMMIT
+    ]
+
+    assert len(provision_ids) == 2
+    # The abandoned draft is retracted; only the recovered stream's draft is
+    # committed — never both.
+    assert retracted_ids == provision_ids[:1]
+    assert committed_ids == provision_ids[1:]
+    assert [event.data["text"] for event in events if event.type == EventType.TEXT_DELTA] == [
+        "recovered"
+    ]
+
+
 def test_react_loop_collects_decision_response_from_canonical_events():
     async def run():
         llm = FakeLLM(

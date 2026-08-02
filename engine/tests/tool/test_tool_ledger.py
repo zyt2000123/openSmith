@@ -164,3 +164,33 @@ def test_stale_ledger_owner_cannot_finish_a_reclaimed_call(tmp_path):
     assert not replayed.claimed
     assert replayed.result is not None
     assert replayed.result.content == "retry success"
+
+
+def test_ledger_redacts_embedded_secrets_before_persisting(tmp_path):
+    """Tool output carrying credentials must not round-trip onto disk; the
+    replayed result served back must also be redacted."""
+    ledger = ToolExecutionLedger(tmp_path, "run-1")
+    ledger.begin(
+        call_id="call-1",
+        tool_name="writer",
+        idempotency_key="stable-key",
+    )
+    ledger.finish(
+        call_id="call-1",
+        idempotency_key="stable-key",
+        result=ToolResult(
+            call_id="call-1",
+            content="found token ghp_ABCDEFGHIJKLMNOPQRSTUV in file\nand url https://u:pw1234567890@example.com",
+        ),
+    )
+
+    replayed = ledger.begin(
+        call_id="call-2",
+        tool_name="writer",
+        idempotency_key="stable-key",
+        idempotent=True,
+    )
+    assert replayed.result is not None
+    assert "ghp_ABCDEFGHIJKLMNOPQRSTUV" not in replayed.result.content
+    assert "pw1234567890" not in replayed.result.content
+    assert "example.com" in replayed.result.content

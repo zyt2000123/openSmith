@@ -74,6 +74,24 @@ def test_approval_summary_redacts_secrets_embedded_in_string_arguments() -> None
     assert summary["command2"] == "aws configure --secret-access-key *** --region us"
 
 
+def test_approval_summary_redacts_short_bearer_and_gitlab_tokens() -> None:
+    """Short Bearer tokens and GitLab PATs embedded in commands must redact
+    even though they are not whole-string credentials or recognized key
+    families."""
+    summary = summarize_arguments({
+        "cmd1": "curl -H 'Authorization: Bearer abc123xyz' https://api.example.com",
+        "cmd2": "curl -H 'PRIVATE-TOKEN: glpat-abcdefghijklmnopqrstuv' https://gitlab.example.com",
+        "cmd3": "git push https://user:pw1234567890@example.com/repo.git",
+    })
+
+    assert "abc123xyz" not in summary["cmd1"]
+    assert "glpat-abcdefghijklmnopqrstuv" not in summary["cmd2"]
+    assert "pw1234567890" not in summary["cmd3"]
+    assert "https://api.example.com" in summary["cmd1"]
+    assert "https://gitlab.example.com" in summary["cmd2"]
+    assert "example.com/repo.git" in summary["cmd3"]
+
+
 def test_approval_summary_redacts_url_credentials() -> None:
     summary = summarize_arguments({
         "url": "https://user:supersecret@example.com/data",

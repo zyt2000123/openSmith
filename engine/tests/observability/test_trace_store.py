@@ -48,6 +48,33 @@ def test_trace_store_keeps_non_secret_token_metrics(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123",
+        "glpat-ABCDEFGHIJKLMNOPQRSTUV",
+        "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        "Authorization: Basic b3BlbnNlc2FtZToxMjM0NTY3ODkw",
+    ],
+)
+def test_trace_store_redacts_embedded_credentials_in_values(tmp_path, credential):
+    """Credentials embedded inside an innocuous field (a shell command) must
+    be redacted before persisting, for every common token family."""
+    store = TraceStore(tmp_path)
+    store.append(
+        "run-secret",
+        ExecutionEvent(
+            EventType.TOOL_CALL_START,
+            {"name": "shell", "command": f"curl -H 'Authorization: {credential}' example.com"},
+        ),
+    )
+
+    record = store.read("run-secret")[0]
+    assert "example.com" in record["data"]["command"]
+    assert credential not in record["data"]["command"]
+    assert "[REDACTED]" in record["data"]["command"]
+
+
 def test_trace_store_reads_only_the_requested_tail(tmp_path):
     store = TraceStore(tmp_path)
     for index in range(5):

@@ -40,6 +40,36 @@ def test_guard_check_can_skip_the_audit_record(tmp_path: Path) -> None:
     assert len(lines) == 1
 
 
+def test_audit_log_redacts_embedded_secrets_in_string_arguments(tmp_path: Path) -> None:
+    """A credential embedded in an ordinary string must not reach audit.jsonl.
+
+    The audit summarizer must apply the same embedded-secret redaction as the
+    approval card.  A shell command carrying a bearer token, a URL with
+    userinfo, and a whole-string token are all credential-bearing even though
+    their argument key ("command"/"url") is not a sensitive key name.
+    """
+    guard = _guard()
+    guard.audit._path = tmp_path / "audit.jsonl"
+    cases = [
+        # Whole-string credential under an innocuous key.
+        {"command": "curl -H 'Authorization: Bearer ghp_ABCDEFGHIJKLMNOPQRSTUV' example.com"},
+        # URL with embedded userinfo credentials.
+        {"url": "https://alice:hunter2secret@example.com/api"},
+        # Nested credential inside a list-valued argument.
+        {"args": ["--token", "sk-abcdefghijklmnopqrstuvwxyz"]},
+    ]
+    for arguments in cases:
+        call = ToolCall(id="t", name="shell", arguments=arguments)
+        guard.check(call)
+
+    audit_text = guard.audit._path.read_text(encoding="utf-8")
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in audit_text
+    assert "ghp_ABCDEFGHIJKLMNOPQRSTUV" not in audit_text
+    assert "hunter2secret" not in audit_text
+    # Keep the non-secret frame so the audit trail stays readable.
+    assert "example.com" in audit_text
+
+
 @pytest.mark.asyncio
 async def test_registry_execution_writes_exactly_one_audit_record(tmp_path: Path) -> None:
     """The full ReAct path (policy + backstop) logs one record per call."""

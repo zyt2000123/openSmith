@@ -227,6 +227,27 @@ def test_metadata_declared_path_args_are_guarded_without_hardcoded_entry():
     assert env_write.needs_confirmation
 
 
+def test_scalar_path_arg_rejects_a_non_string_value():
+    """A list/dict supplied for a scalar path argument must be rejected, not
+    str()-stringified into a bogus path: the guard would otherwise check a
+    different path than the provider interprets, creating a check/execute
+    divergence."""
+    defn = ToolDefinition(
+        name="custom_reader",
+        description="",
+        path_args=("path",),
+        is_write_tool=False,
+    )
+    guard = ToolGuard(_RULES, tool_registry={"custom_reader": defn})
+
+    result = guard.check(
+        ToolCall(id="t", name="custom_reader", arguments={"path": ["/etc/passwd", "/etc/shadow"]})
+    )
+
+    assert not result.allowed
+    assert "must be a string" in result.reason
+
+
 def test_metadata_permission_level_controls_registered_tool():
     defn = ToolDefinition(name="notes_read", description="", permission_level="read")
     guard = ToolGuard(_RULES, tool_registry={"notes_read": defn})

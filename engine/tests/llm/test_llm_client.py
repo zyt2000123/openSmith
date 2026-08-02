@@ -432,6 +432,52 @@ def test_streaming_client_forwards_prefix_cache_key_to_adapter_body() -> None:
     assert "extra_body" not in captured["body"]
 
 
+def test_streaming_request_requests_usage_inclusion() -> None:
+    """Streaming must set stream_options.include_usage so the provider emits
+    the terminal usage chunk; otherwise all streaming cost accounting is zero."""
+    captured: dict[str, object] = {}
+
+    async def fake_send(request, *, stream: bool):
+        captured["body"] = json_mod.loads(request.content)
+        return _successful_stream_response(request)
+
+    client = _client_with_send(fake_send)
+    try:
+        asyncio.run(_collect_events(client))
+    finally:
+        asyncio.run(client.close())
+
+    assert captured["body"]["stream"] is True
+    assert captured["body"]["stream_options"] == {"include_usage": True}
+
+
+def test_non_streaming_request_omits_include_usage() -> None:
+    """stream_options is a streaming-only field; non-streaming bodies keep the
+    pre-change shape so relays that reject unknown fields stay compatible."""
+    captured: dict[str, object] = {}
+
+    async def fake_send(request, *, stream: bool):
+        captured["body"] = json_mod.loads(request.content)
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_SseStream([
+                json_mod.dumps({
+                    "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                }).encode(),
+            ]),
+        )
+
+    client = _client_with_send(fake_send)
+    try:
+        asyncio.run(client.chat([{"role": "user", "content": "hello"}]))
+    finally:
+        asyncio.run(client.close())
+
+    assert captured["body"]["stream"] is False
+    assert "stream_options" not in captured["body"]
+
+
 def test_chat_events_retries_429_before_content(monkeypatch) -> None:
     retry_delays = _capture_retry_delays(monkeypatch)
     calls = {"n": 0}

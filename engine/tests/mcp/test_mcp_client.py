@@ -689,6 +689,31 @@ def test_stdio_transport_merges_env_with_parent_environment():
     assert "PATH" in transport._env
 
 
+def test_stdio_transport_does_not_inherit_parent_credentials(monkeypatch):
+    """A configured-but-untrusted MCP server must not read the engine's secrets
+    from its environment: only PATH, a small allowlist, and explicitly
+    configured variables are forwarded."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret_value")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value-12345")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    transport = StdioMCPTransport(["fake"])
+
+    assert transport._env["PATH"] == "/usr/bin:/bin"
+    assert "GITHUB_TOKEN" not in transport._env
+    assert "OPENAI_API_KEY" not in transport._env
+
+
+def test_stdio_transport_forwards_explicitly_configured_variables():
+    """An operator who explicitly grants a variable to an MCP server keeps it."""
+    transport = StdioMCPTransport(
+        ["fake"], env={"DATABASE_URL": "postgres://service:only-this@db"}
+    )
+
+    assert transport._env["DATABASE_URL"] == "postgres://service:only-this@db"
+    assert "GITHUB_TOKEN" not in transport._env
+
+
 def test_mcp_connect_rejects_unsupported_protocol_version():
     class BadVersionTransport:
         label = "bad-version"
@@ -1138,6 +1163,69 @@ def test_mcp_openai_schemas_match_registered_names_for_prefix():
     assert count == 1
     assert advertised == ["mcp_github_search"]
     assert advertised == registered
+
+
+def test_registered_mcp_tool_evicts_dead_connection_before_re_raise() -> None:
+    """A fatal connection error (expired HTTP session) must invoke the pool's
+    eviction hook so the next acquire reconnects; a plain tool-level failure
+    must not evict a healthy connection."""
+
+    class FailingClient:
+        def __init__(self) -> None:
+            self.tool = MCPTool("search", "", {})
+
+        async def list_tools(self):
+            return [self.tool]
+
+        async def call_tool(self, name, arguments):
+            mode = arguments.get("mode")
+            if mode == "boom":
+                raise MCPSessionExpiredError("MCP HTTP session expired")
+            if mode == "soft-fail":
+                raise RuntimeError("MCP tool returned an error result")
+            return "ok"
+
+    async def run():
+        registry = ToolRegistry()
+        evicted: list[str] = []
+
+        async def on_failure() -> None:
+            evicted.append("evicted")
+
+        client = FailingClient()
+        await register_mcp_tools_with_prefix(
+            registry,
+            client,
+            prefix="mcp_test",
+            on_connection_failure=on_failure,
+        )
+        expired = await registry.execute(
+            ToolCall(id="1", name="mcp_test_search", arguments={"mode": "boom"})
+        )
+        soft = await registry.execute(
+            ToolCall(id="2", name="mcp_test_search", arguments={"mode": "soft-fail"})
+        )
+        ok = await registry.execute(
+            ToolCall(id="3", name="mcp_test_search", arguments={"mode": "ok"})
+        )
+        return evicted, expired, soft, ok
+
+    evicted, expired, soft, ok = asyncio.run(run())
+
+    assert evicted == ["evicted"]
+    assert expired.is_error and "session expired" in expired.content
+    assert soft.is_error and "returned an error result" in soft.content
+    assert ok.content == "ok"
+
+
+def test_is_fatal_connection_error_classifies_transport_deaths() -> None:
+    from engine.mcp.client import is_fatal_connection_error
+
+    assert is_fatal_connection_error(MCPSessionExpiredError("expired"))
+    assert is_fatal_connection_error(RuntimeError("MCP server closed stdout unexpectedly"))
+    assert is_fatal_connection_error(RuntimeError("MCP stdio transport not connected"))
+    assert not is_fatal_connection_error(RuntimeError("MCP tool returned an error result"))
+    assert not is_fatal_connection_error(TimeoutError("slow"))
 
 
 def test_mcp_openai_schemas_deduplicate_colliding_names():

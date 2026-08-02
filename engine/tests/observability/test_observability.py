@@ -181,6 +181,29 @@ def test_summary_list_reads_only_the_index_selected_records(
     assert summary_reads == ["run-3.summary.json"]
 
 
+def test_summary_index_reconciles_after_a_failed_upsert(tmp_path, monkeypatch) -> None:
+    """A run whose index upsert failed (e.g. SQLITE_BUSY) must not stay hidden
+    from list() forever: the next access re-bootstraps the idempotent index."""
+    store = RunSummaryStore(tmp_path)
+    _save_completed_summary(store, "run-1")
+
+    # Simulate the concurrent-writer failure on the next upsert.
+    import sqlite3
+
+    def failing_bootstrap_entry(entry):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store._index, "bootstrap_entry", failing_bootstrap_entry)
+    _save_completed_summary(store, "run-2")
+    assert store._index_stale is True
+
+    # The next access re-bootstraps the idempotent index from the summary
+    # files on disk, so run-2 is no longer hidden.
+    records = store.list("smith", limit=10)
+    assert store._index_stale is False
+    assert {record.metadata.run_id for record in records} == {"run-1", "run-2"}
+
+
 def test_observability_retention_removes_oldest_completed_run_files(
     tmp_path,
 ) -> None:
