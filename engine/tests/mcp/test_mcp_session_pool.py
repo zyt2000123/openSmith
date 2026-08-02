@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from engine.mcp.client import MCPTool
+from engine.mcp.client import MCPConnectError, MCPTool
 from engine.mcp.session_pool import MCPClientSessionPool
 
 
@@ -146,6 +146,85 @@ def test_session_pool_replaces_connections_when_server_config_changes() -> None:
         return created, first, second
 
     created, first, second = asyncio.run(run())
+
+    assert len(created) == 2
+    assert first[0].client is not second[0].client
+    assert created[0].closed is True
+    assert created[1].closed is True
+
+
+def test_session_pool_connect_all_fail_surfaces_typed_error_and_does_not_cache() -> None:
+    """All-fail connect must raise a typed error and cache nothing: caching []
+    under the fingerprint silently removes every MCP tool for the session and
+    short-circuits the retry on the next acquire."""
+    async def run():
+        async def connect(config: dict):
+            raise ConnectionError("server down")
+
+        pool = MCPClientSessionPool(connect_server=connect)
+        config = [{"type": "stdio", "name": "docs", "command": ["docs-server"]}]
+        try:
+            await pool.acquire("session-1", config)
+        except MCPConnectError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("all-fail connect must raise a typed error")
+        cached = pool._entries.get("session-1")
+        await pool.close()
+        return message, cached
+
+    message, cached = asyncio.run(run())
+
+    assert "all 1 MCP servers failed to connect" in message
+    assert cached is None
+
+
+def test_session_pool_keeps_healthy_servers_when_other_connects_fail() -> None:
+    """One broken server must not prevent the rest from registering."""
+    async def run():
+        created: list[FakeClient] = []
+
+        async def connect(config: dict):
+            if config["name"] == "broken":
+                raise ConnectionError("down")
+            client = FakeClient(str(config["name"]))
+            created.append(client)
+            return client, [MCPTool("search", "", {})]
+
+        pool = MCPClientSessionPool(connect_server=connect)
+        servers = await pool.acquire("session-1", [
+            {"type": "stdio", "name": "broken", "command": ["broken"]},
+            {"type": "stdio", "name": "docs", "command": ["docs"]},
+        ])
+        await pool.close()
+        return servers, created
+
+    servers, created = asyncio.run(run())
+
+    assert [server.client.name for server in servers] == ["docs"]
+    assert [client.name for client in created] == ["docs"]
+
+
+def test_session_pool_evict_drops_cached_connections_and_next_acquire_reconnects() -> None:
+    """After a transport/tool-call failure a caller evicts the session entry so
+    the next acquire reconnects instead of reusing a dead connection."""
+    async def run():
+        created: list[FakeClient] = []
+
+        async def connect(config: dict):
+            client = FakeClient(str(config["name"]))
+            created.append(client)
+            return client, [MCPTool("search", "", {})]
+
+        pool = MCPClientSessionPool(connect_server=connect)
+        config = [{"type": "stdio", "name": "docs", "command": ["docs"]}]
+        first = await pool.acquire("session-1", config)
+        await pool.evict("session-1")
+        second = await pool.acquire("session-1", config)
+        await pool.close()
+        return first, second, created
+
+    first, second, created = asyncio.run(run())
 
     assert len(created) == 2
     assert first[0].client is not second[0].client

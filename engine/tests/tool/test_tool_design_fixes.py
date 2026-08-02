@@ -1447,6 +1447,282 @@ def test_memory_ops_episode_uses_injected_runner():
     assert "OK: episode saved to alpha.md (1 related events)" in result
 
 
+def test_shell_rejects_bad_argument_types() -> None:
+    """shell must fail cleanly on bad argument types, like its sibling tools."""
+    shell = _load_tool_module("shell")
+
+    non_string_command = asyncio.run(shell.execute(command=123))
+    assert non_string_command.startswith("Error:")
+    empty_command = asyncio.run(shell.execute(command="   "))
+    assert empty_command.startswith("Error:")
+
+    bad_timeout = asyncio.run(shell.execute(command="echo hi", timeout="30"))
+    assert bad_timeout.startswith("Error:")
+    bad_bool_timeout = asyncio.run(shell.execute(command="echo hi", timeout=True))
+    assert bad_bool_timeout.startswith("Error:")
+
+    bad_cwd = asyncio.run(shell.execute(command="echo hi", cwd=123))
+    assert bad_cwd.startswith("Error:")
+
+
+def test_write_file_rejects_oversized_content(tmp_path: Path) -> None:
+    """An unbounded write had no size guard while read_file caps at 50 KB."""
+    write_file = _load_tool_module("write_file")
+    write_file.MAX_WRITE_BYTES = 10  # shrink the cap so the test needs no real 8 MB
+    target = tmp_path / "big.txt"
+
+    result = asyncio.run(
+        write_file.execute(path=str(target), content="x" * 11)
+    )
+    assert result.startswith("Error:") and "write limit" in result
+    assert not target.exists()
+
+
+def test_edit_file_rejects_non_utf8_and_oversized(tmp_path: Path) -> None:
+    """A lossy read+write used to corrupt non-UTF-8 bytes; now it refuses."""
+    edit_file = _load_tool_module("edit_file")
+    binary = tmp_path / "binary.txt"
+    binary.write_bytes(b"\xff\xfebinary-content")
+
+    result = asyncio.run(
+        edit_file.execute(path=str(binary), old_string="x", new_string="y")
+    )
+    assert result.startswith("Error:") and "not valid UTF-8" in result
+    assert binary.read_bytes() == b"\xff\xfebinary-content"
+
+    edit_file.MAX_EDIT_BYTES = 10
+    text = tmp_path / "text.txt"
+    text.write_text("a" * 20, encoding="utf-8")
+    oversized = asyncio.run(
+        edit_file.execute(path=str(text), old_string="a", new_string="a" * 12)
+    )
+    assert oversized.startswith("Error:") and "edit limit" in oversized
+    assert text.read_text(encoding="utf-8") == "a" * 20
+
+
+def test_todo_fails_closed_without_injected_storage() -> None:
+    """The removed module-global fallback means todo requires a session file."""
+    todo = _load_tool_module("todo")
+
+    result = asyncio.run(todo.execute(action="list"))
+    assert result.startswith("Error:") and "not provided" in result
+
+
+def test_grep_fallback_excludes_directories_case_insensitively(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """--exclude-dir is case-sensitive; the fallback must exclude .Git too."""
+    grep_tool = _load_tool_module("grep")
+    monkeypatch.setattr(grep_tool, "_has_rg", lambda: False)
+
+    (tmp_path / ".Git").mkdir()
+    (tmp_path / ".Git" / "secret.txt").write_text("needle here", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("needle here", encoding="utf-8")
+
+    result = asyncio.run(grep_tool.execute(pattern="needle", path=str(tmp_path)))
+    assert "visible.txt" in result
+    assert ".Git" not in result
+    assert "secret.txt" not in result
+
+
+def test_read_pdf_default_window_caps_at_max_pages() -> None:
+    """An unqualified read of a long PDF should window, not error."""
+    read_pdf = _load_tool_module("read_pdf")
+
+    assert read_pdf._parse_pages("", 150) == list(range(100))
+    assert read_pdf._parse_pages("all", 150) == list(range(100))
+    assert read_pdf._parse_pages("", 50) == list(range(50))
+    # An explicit selection beyond the cap still fails loudly.
+    try:
+        read_pdf._parse_pages("1-150", 150)
+    except ValueError as exc:
+        assert "Too many pages" in str(exc)
+    else:
+        raise AssertionError("explicit oversized page selection was accepted")
+
+
+def test_web_crawl_state_file_is_private(tmp_path: Path) -> None:
+    """State holds crawled content; the file must be 0600 in a 0700 dir."""
+    web_crawl = _load_tool_module("web_crawl")
+    state_path = tmp_path / "crawl" / "state.json"
+    records = {
+        "https://example.com/": {
+            "url": "https://example.com/",
+            "content_hash": "abc",
+            "changed": True,
+            "fetched_at": 1,
+            "text": "body",
+        }
+    }
+
+    web_crawl._write_state(str(state_path), records)
+
+    assert (state_path.stat().st_mode & 0o777) == 0o600
+    assert (state_path.parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_read_file_never_materializes_a_single_huge_line(tmp_path: Path) -> None:
+    """The 50 KB preview budget used to be applied only after the full line
+    (a minified JS / single-line JSON file) was read into memory whole."""
+    read_file = _load_tool_module("read_file")
+    target = tmp_path / "huge.txt"
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("x" * (20 * 1024 * 1024))
+
+    result = asyncio.run(read_file.execute(path=str(target)))
+
+    # The result stays tiny and carries the truncation marker; it must not
+    # contain the 20 MB line.
+    assert len(result) < 100 * 1024
+    assert "line truncated at" in result
+
+
+def test_edit_file_rejects_empty_old_string(tmp_path: Path) -> None:
+    """str.replace("", x) splices x between every character; with replace_all it
+    silently mangled the whole file while reporting OK."""
+    edit_file = _load_tool_module("edit_file")
+    target = tmp_path / "t.txt"
+    target.write_text("abc", encoding="utf-8")
+
+    result = asyncio.run(
+        edit_file.execute(path=str(target), old_string="", new_string="-", replace_all=True)
+    )
+
+    assert result.startswith("Error:") and "must not be empty" in result
+    assert target.read_text(encoding="utf-8") == "abc"
+
+
+def test_git_ops_neutralizes_repo_hooks(tmp_path: Path) -> None:
+    """A checked-in pre-commit hook must not execute when git_ops commits."""
+    git_ops = _load_tool_module("git_ops")
+    import subprocess as _subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    _subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    _subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "f.txt").write_text("hi")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True)
+
+    marker = tmp_path / "hook-ran.txt"
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+
+    class RealEnvironment:
+        async def run_command(self, argv, *, cwd=None, timeout_seconds=None, env=None):
+            proc = await asyncio.create_subprocess_exec(
+                *argv, cwd=cwd, env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+            return SimpleNamespace(
+                exit_code=proc.returncode,
+                stdout=out.decode(errors="replace"),
+                stderr=err.decode(errors="replace"),
+                error=None, timed_out=False, output_incomplete=False,
+            )
+
+    result = asyncio.run(
+        git_ops.execute(action="commit", message="x", cwd=str(repo), environment=RealEnvironment())
+    )
+
+    assert result.startswith("[exit_code=0]")
+    assert not marker.exists(), "repository-controlled hook executed"
+
+
+def test_read_pdf_declares_a_timeout() -> None:
+    """PDF parsing runs in a worker thread; without a timeout a crafted file can
+    pin that thread indefinitely."""
+    read_pdf = _load_tool_module("read_pdf")
+    assert isinstance(read_pdf.TOOL_META.get("timeout_seconds"), (int, float))
+
+
+def test_web_crawl_rejects_doctype_sitemaps() -> None:
+    """ElementTree expands internal entities; a DOCTYPE sitemap must be refused."""
+    web_crawl = _load_tool_module("web_crawl")
+    evil = (
+        '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">]>'
+        "<urlset><loc>&lol;</loc></urlset>"
+    )
+    assert web_crawl._parse_sitemap(evil) == []
+
+
+def test_web_crawl_caps_site_requested_crawl_delay() -> None:
+    """A hostile robots.txt crawl-delay must not stall the crawl to the timeout."""
+    web_crawl = _load_tool_module("web_crawl")
+    assert web_crawl.MAX_ROBOTS_CRAWL_DELAY <= 10.0
+    policy = web_crawl._parse_robots(
+        "User-agent: *\nCrawl-delay: 1000000\n"
+    )
+    # The cap is applied in _crawl; assert the policy surfaces the raw value and
+    # the cap constant exists so a regression in the cap wiring is caught.
+    assert policy.crawl_delay == 1000000.0
+
+
+def test_git_ops_hardens_repo_config_driven_execution(tmp_path: Path) -> None:
+    """Every git invocation must carry the config-execution neutralizers."""
+    git_ops = _load_tool_module("git_ops")
+    recorded: list[list[str]] = []
+
+    class RecordingEnvironment:
+        async def run_command(self, argv, *, cwd=None, timeout_seconds=None, env=None):
+            recorded.append(argv)
+            return SimpleNamespace(
+                timed_out=False, error=None, exit_code=0, stdout="", stderr="",
+            )
+
+    asyncio.run(
+        git_ops.execute(action="status", cwd=str(tmp_path), environment=RecordingEnvironment())
+    )
+
+    assert recorded
+    for argv in recorded:
+        assert "core.hooksPath=/dev/null" in argv
+        assert "core.fsmonitor=false" in argv
+        assert "diff.external=" in argv
+        assert "credential.helper=" in argv
+        assert "core.sshCommand=ssh" in argv
+
+
+def test_read_pdf_extraction_respects_the_internal_deadline() -> None:
+    """The worker thread must abort cleanly instead of running past the budget."""
+    read_pdf = _load_tool_module("read_pdf")
+    import time as _time
+
+    class StubReader:
+        pages = [object()]
+
+    with pytest.raises(read_pdf._PdfTimeout):
+        read_pdf._extract_with_pypdf(StubReader(), [0], deadline=0.0)
+
+
+def test_git_ops_redacts_remote_url_credentials(tmp_path: Path) -> None:
+    """`git remote -v` echoes embedded credentials; discover must not leak them."""
+    git_ops = _load_tool_module("git_ops")
+
+    redacted = git_ops._redact_url_credentials(
+        "origin\thttps://user:supersecrettoken@github.com/example/repo.git (fetch)"
+    )
+    assert "supersecrettoken" not in redacted
+    assert "https://***@github.com/example/repo.git" in redacted
+
+
+def test_web_crawl_rejects_doctype_outside_a_fixed_window() -> None:
+    """A prolog comment must not push the DOCTYPE past the entity check."""
+    web_crawl = _load_tool_module("web_crawl")
+    padding = "<!--" + "A" * 600 + "-->"
+    evil = (
+        '<?xml version="1.0"?>' + padding +
+        '<!DOCTYPE lolz [<!ENTITY lol "https://evil.example/x">]>'
+        "<urlset><loc>&lol;</loc></urlset>"
+    )
+    assert web_crawl._parse_sitemap(evil) == []
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

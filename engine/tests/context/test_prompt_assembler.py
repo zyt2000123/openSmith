@@ -568,3 +568,61 @@ def test_prompt_manifest_marks_trimmable_layers_without_leaking_content(tmp_path
     assert assembly.plan.within_budget is False
     assert assembly.plan.required_tokens > assembly.plan.token_budget
     assert manifest["budget"]["within_budget"] is False
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks not available")
+@pytest.mark.usefixtures("_isolate_apppaths")
+def test_assembler_rejects_symlinked_profile_file(tmp_path: Path) -> None:
+    agent_dir = _make_agent_dir(tmp_path)
+    (agent_dir / "role.md").unlink()
+    secret = tmp_path / "secret.md"
+    secret.write_text("SECRET_PROFILE_CONTENT", encoding="utf-8")
+    os.symlink(secret, agent_dir / "role.md")
+
+    prompt = PromptAssembler().assemble(
+        agent_dir,
+        FakeToolRegistry(),
+        FakeSkillRegistry(),
+        {},
+    )
+
+    assert "SECRET_PROFILE_CONTENT" not in prompt
+    assert "## Context: Agent Role" not in prompt
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks not available")
+@pytest.mark.usefixtures("_isolate_apppaths")
+def test_assembler_rejects_profile_memory_escaping_via_symlinked_dir(
+    tmp_path: Path,
+) -> None:
+    """A symlinked memory/ directory pointing outside the profile is refused."""
+    agent_dir = _make_agent_dir(tmp_path)
+    external = tmp_path / "external-memory"
+    external.mkdir()
+    (external / "recent.md").write_text("EXTERNAL_MEMORY_CONTENT", encoding="utf-8")
+    os.symlink(external, agent_dir / "memory")
+
+    prompt = PromptAssembler().assemble(
+        agent_dir,
+        FakeToolRegistry(),
+        FakeSkillRegistry(),
+        {},
+    )
+
+    assert "EXTERNAL_MEMORY_CONTENT" not in prompt
+    assert "## Memory Reference" not in prompt
+
+
+@pytest.mark.usefixtures("_isolate_apppaths")
+def test_prefix_cache_key_invalidates_when_profile_file_changes(tmp_path: Path) -> None:
+    agent_dir = _make_agent_dir(tmp_path)
+    assembler = PromptAssembler()
+    assembler.assemble(agent_dir, FakeToolRegistry(), FakeSkillRegistry(), {})
+    first = PromptAssembler.get_prefix_cache_key(agent_dir)
+    assert first
+
+    (agent_dir / "role.md").write_text("ROLE CHANGED", encoding="utf-8")
+    assembler.assemble(agent_dir, FakeToolRegistry(), FakeSkillRegistry(), {})
+    second = PromptAssembler.get_prefix_cache_key(agent_dir)
+
+    assert second != first

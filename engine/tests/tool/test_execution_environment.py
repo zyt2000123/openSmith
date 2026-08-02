@@ -88,7 +88,9 @@ def test_local_environment_times_out_and_reports_it() -> None:
     )
 
     assert result.timed_out
-    assert result.exit_code is None
+    # The process group was reaped by _stop_process_group, so the real exit
+    # status (the signal that killed it) must be surfaced, not dropped.
+    assert result.exit_code is not None
     assert time.monotonic() - started < 10
 
 

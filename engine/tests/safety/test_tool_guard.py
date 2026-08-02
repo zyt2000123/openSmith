@@ -688,6 +688,172 @@ def test_dollar_anchored_rule_patterns_match_raw_argument_values():
     assert _check_tool("read_file", {"path": str(home / "proj" / ".env.example")}).allowed
 
 
+# ── S1: case-variant / unlisted sensitive-file reads must require approval ──
+
+
+def test_case_variant_sensitive_file_reads_require_high_risk_approval(tmp_path: Path):
+    """`.ENV` and `key.PEM` bypass the case-sensitive regex rules on APFS."""
+    guard = _builtin_guard(tmp_path / "missing-rules.json", allowed_dirs=[tmp_path])
+    for name in (".ENV", "key.PEM"):
+        path = tmp_path / name
+        path.write_text("SECRET=1\n", encoding="utf-8")
+        result = guard.check(
+            ToolCall(id="t", name="read_file", arguments={"path": str(path)})
+        )
+        assert not result.allowed, name
+        assert result.approval_required, name
+        assert result.needs_confirmation, name
+        assert result.approval_scope is not None and result.approval_scope.high_risk, name
+
+
+def test_env_variant_and_stray_private_key_reads_require_high_risk_approval(
+    tmp_path: Path,
+):
+    """`.env.staging`, `.env.dev`, `id_rsa` match no regex rule but hold secrets."""
+    guard = _builtin_guard(tmp_path / "missing-rules.json", allowed_dirs=[tmp_path])
+    for name in (".env.staging", ".env.dev", "id_rsa", "id_ed25519", "id_rsa_old"):
+        path = tmp_path / name
+        path.write_text("x\n", encoding="utf-8")
+        result = guard.check(
+            ToolCall(id="t", name="read_file", arguments={"path": str(path)})
+        )
+        assert not result.allowed, name
+        assert result.approval_scope is not None and result.approval_scope.high_risk, name
+
+
+def test_documented_env_templates_remain_readable(tmp_path: Path):
+    guard = _builtin_guard(tmp_path / "missing-rules.json", allowed_dirs=[tmp_path])
+    for name in (".env.example", ".env.template", ".env.sample"):
+        path = tmp_path / name
+        path.write_text("KEY=value\n", encoding="utf-8")
+        result = guard.check(
+            ToolCall(id="t", name="read_file", arguments={"path": str(path)})
+        )
+        assert result.allowed, name
+
+
+# ── S2a: .git credential-bearing reads must require approval ──
+
+
+def test_read_git_config_and_credentials_require_high_risk_approval(tmp_path: Path):
+    git_dir = tmp_path / "proj" / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "config").write_text(
+        '[remote "origin"]\n\turl = https://user:token@example.com/repo\n',
+        encoding="utf-8",
+    )
+    (git_dir / "credentials").write_text(
+        "https://user:token@example.com\n", encoding="utf-8"
+    )
+    guard = _builtin_guard(tmp_path / "missing-rules.json", allowed_dirs=[git_dir.parent])
+
+    for name in ("config", "credentials"):
+        result = guard.check(
+            ToolCall(id="t", name="read_file", arguments={"path": str(git_dir / name)})
+        )
+        assert not result.allowed, name
+        assert result.approval_required, name
+        assert result.approval_scope is not None and result.approval_scope.high_risk, name
+
+
+def test_other_git_metadata_reads_stay_ordinary(tmp_path: Path):
+    git_dir = tmp_path / "proj" / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    guard = _builtin_guard(tmp_path / "missing-rules.json", allowed_dirs=[git_dir.parent])
+
+    result = guard.check(
+        ToolCall(id="t", name="read_file", arguments={"path": str(git_dir / "HEAD")})
+    )
+    assert result.allowed
+
+
+# ── S3: cp/install/dd into platform data must escalate to high-risk ──
+
+
+def test_cp_install_dd_into_platform_data_require_high_risk_approval():
+    for command in (
+        "cp notes.txt ~/.agent-smith/agent/notes",
+        "install notes.txt ~/.agent-smith/agent/notes",
+        "dd if=notes.txt of=~/.agent-smith/agent/notes",
+        "cp notes.txt ~/.AGENT-SMITH/agent/notes",
+    ):
+        result = _check(command)
+        assert not result.allowed, command
+        assert result.approval_required, command
+        assert result.approval_scope is not None and result.approval_scope.high_risk, command
+
+
+def test_cp_into_user_project_stays_allowed():
+    assert _check("cp notes.txt ~/Downloads/project/notes").allowed
+
+
+# ── S4: the audit log keeps a single append handle ──
+
+
+def test_audit_log_reuses_one_handle_and_reopens_on_path_change(tmp_path: Path):
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    audit = AuditLog(first)
+
+    audit.record("shell", {"command": "pwd"}, GuardResult(allowed=True), call_id="c1")
+    handle = audit._handle
+    assert handle is not None
+
+    audit.record("shell", {"command": "ls"}, GuardResult(allowed=True), call_id="c2")
+    assert audit._handle is handle
+
+    audit._path = second
+    audit.record("shell", {"command": "cat"}, GuardResult(allowed=True), call_id="c3")
+
+    assert len(first.read_text(encoding="utf-8").strip().splitlines()) == 2
+    assert len(second.read_text(encoding="utf-8").strip().splitlines()) == 1
+    audit.close()
+
+
+def test_audit_log_redacts_secret_flag_pairs_in_list_arguments(tmp_path: Path):
+    log_path = tmp_path / "audit.jsonl"
+    audit = AuditLog(log_path)
+    audit.record(
+        "shell",
+        {"command": "run", "args": ["--token", "sk-secret-123456", "--model", "gpt-4o"]},
+        GuardResult(allowed=True),
+        call_id="c1",
+    )
+    audit.close()
+
+    entry = json.loads(log_path.read_text(encoding="utf-8"))
+    assert entry["args_summary"]["args"] == ["--token", "***", "--model", "gpt-4o"]
+
+
+# ── S6: sensitive-key redaction comes from a single shared source ──
+
+
+def test_sensitive_key_redaction_comes_from_the_shared_approval_source():
+    import engine.safety.approval as approval_module
+    import engine.safety.tool_guard as tool_guard_module
+
+    # tool_guard must import the helper rather than carry a duplicate tuple.
+    assert not hasattr(tool_guard_module, "_SENSITIVE_ARG_KEY_PARTS")
+    assert (
+        tool_guard_module._is_sensitive_argument_name
+        is approval_module._is_sensitive_argument_name
+    )
+
+
+def test_guard_and_approval_redact_the_same_argument_keys():
+    from engine.safety.approval import summarize_arguments
+    from engine.safety.tool_guard import _summarize_args
+
+    arguments = {"dbPassword": "secret", "auth_token": "t", "normal": "plain"}
+    assert _summarize_args(arguments)["dbPassword"] == "***"
+    assert _summarize_args(arguments)["auth_token"] == "***"
+    assert summarize_arguments(arguments)["dbPassword"] == "***"
+    assert summarize_arguments(arguments)["auth_token"] == "***"
+    assert _summarize_args(arguments)["normal"] == "plain"
+    assert summarize_arguments(arguments)["normal"] == "plain"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

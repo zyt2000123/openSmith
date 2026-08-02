@@ -161,3 +161,25 @@ def test_run_state_store_rejects_path_traversal(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         store.get("../outside")
+
+
+def test_run_state_fsyncs_the_parent_directory_after_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rename must be made durable, not just the file contents."""
+    fsync_fds: list[int] = []
+    original_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        fsync_fds.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith-id")
+
+    # One fsync for the file before os.replace, plus one for the runs dir after.
+    assert len(fsync_fds) >= 2
+    restored = store.get("run-1")
+    assert restored is not None and restored.status is RunStatus.QUEUED
+    assert not list((tmp_path / "runs").glob("*.tmp"))

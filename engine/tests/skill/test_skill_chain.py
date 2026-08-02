@@ -121,6 +121,54 @@ def test_shipped_coding_skillchains_load_gates_conditions_and_pause_contracts() 
     assert set(coding.enabled_tools or ()) == node_tools
 
 
+@pytest.mark.asyncio
+async def test_requirements_gates_accept_real_handoffs_without_magic_markers(
+    tmp_path: Path,
+) -> None:
+    content = load_gate_content(ROOT / "agents")
+    grilling_gate = content.gates["grilling_complete"]()
+    research_gate = content.gates["research_brief"]()
+    plan_gate = content.gates["plan_confirmed"]()
+
+    grilling = await grilling_gate.check(
+        "Scope: compare supported providers.\n"
+        "Non-goals: implementation.\n"
+        "Constraints: use primary sources.\n"
+        "Acceptance signal: a cited recommendation.",
+        {},
+    )
+    incomplete_grilling = await grilling_gate.check(
+        "Scope: compare supported providers.\n"
+        "Non-goals: implementation.\n"
+        "Acceptance signal: a cited recommendation.",
+        {},
+    )
+    research_path = tmp_path / "docs" / "research" / "providers.md"
+    research_path.parent.mkdir(parents=True)
+    research_path.write_text(
+        "# ResearchBrief\n\n"
+        "## Problem\nCompare providers.\n\n"
+        "## Evidence\nhttps://example.com/official\n\n"
+        "## Assumptions\nNone.\n\n"
+        "## Open Questions\nNone.\n\n"
+        "## Recommendation\nChoose the documented option.\n",
+        encoding="utf-8",
+    )
+    research = await research_gate.check(
+        "ResearchBrief: docs/research/providers.md",
+        {"_working_dir": str(tmp_path)},
+    )
+    plan = await plan_gate.check(
+        "The plan is ready for implementation.",
+        {"user_response": "确认，按此方案继续。"},
+    )
+
+    assert grilling.verdict == "pass"
+    assert incomplete_grilling.verdict == "retry"
+    assert research.verdict == "pass"
+    assert plan.verdict == "pass"
+
+
 def test_shipped_gate_and_condition_content_do_not_import_engine_or_common() -> None:
     content_files = [
         *(ROOT / "agents" / "gates").rglob("*.py"),

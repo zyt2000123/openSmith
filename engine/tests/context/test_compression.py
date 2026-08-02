@@ -4,12 +4,14 @@ import asyncio
 import math
 from types import SimpleNamespace
 
+from engine.context.budget import estimate_messages_tokens
 from engine.context.compression import (
     DEFAULT_CONTEXT_LIMIT,
     compact_history,
     compaction_policy_for_llm,
     compress,
     needs_compaction,
+    trim_conversation_for_context_limit,
 )
 from engine.context import SessionSummaryStatus, summarize_session
 from engine.llm.contracts import ModelLimits
@@ -266,3 +268,61 @@ def test_session_summary_fails_closed_when_its_own_prompt_cannot_fit() -> None:
     assert result.status is SessionSummaryStatus.UNFIT
     assert not result.usable
     assert llm.calls == 0
+
+
+def test_trim_conversation_for_context_limit_returns_untouched_copy_when_fit() -> None:
+    conversation = [
+        {"role": "system", "content": "contract"},
+        {"role": "user", "content": "short history"},
+        {"role": "user", "content": "active"},
+    ]
+
+    result = trim_conversation_for_context_limit(conversation, token_budget=10_000)
+
+    assert result == conversation
+    assert result is not conversation
+
+
+def test_trim_conversation_for_context_limit_fits_recovered_history_in_budget() -> None:
+    conversation = [
+        {"role": "system", "content": "contract"},
+        {"role": "user", "content": "x" * 20_000},
+        {"role": "assistant", "content": "y" * 20_000},
+        {"role": "user", "content": "ACTIVE_GOAL"},
+    ]
+
+    result = trim_conversation_for_context_limit(conversation, token_budget=3000)
+
+    assert estimate_messages_tokens(result) <= 3000
+    assert result[0] == {"role": "system", "content": "contract"}
+    assert result[-1] == {"role": "user", "content": "ACTIVE_GOAL"}
+
+
+def test_trim_conversation_for_context_limit_annotates_trimmed_history() -> None:
+    conversation = [
+        {"role": "system", "content": "contract"},
+        {"role": "user", "content": "a" * 50_000},
+        {"role": "assistant", "content": "b" * 50_000},
+        {"role": "user", "content": "ACTIVE_GOAL"},
+    ]
+
+    result = trim_conversation_for_context_limit(conversation, token_budget=3000)
+
+    texts = " ".join(str(message.get("content", "")) for message in result)
+    assert "Context deterministically shortened" in texts
+    assert "ACTIVE_GOAL" in texts
+    assert result[-1] == {"role": "user", "content": "ACTIVE_GOAL"}
+
+
+def test_trim_conversation_for_context_limit_preserves_active_turn_when_protected_exceeds() -> None:
+    conversation = [
+        {"role": "system", "content": "s" * 20_000},
+        {"role": "user", "content": "ACTIVE_GOAL"},
+    ]
+
+    result = trim_conversation_for_context_limit(conversation, token_budget=100)
+
+    assert result == [
+        {"role": "system", "content": "s" * 20_000},
+        {"role": "user", "content": "ACTIVE_GOAL"},
+    ]

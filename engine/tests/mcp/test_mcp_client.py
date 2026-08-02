@@ -22,6 +22,7 @@ from engine.mcp.client import (
     MAX_TOOL_NAME_LENGTH,
     MCPClient,
     MCPTool,
+    MCPSessionExpiredError,
     StdioMCPTransport,
     StreamableHTTPMCPTransport,
     register_mcp_tools,
@@ -981,6 +982,174 @@ def test_stdio_transport_cancellation_kills_and_reaps_process():
         return process.killed, transport._process
 
     assert asyncio.run(run()) == (True, None)
+
+
+def test_stdio_transport_label_logs_executable_only():
+    """The transport label feeds connect/registration log lines, so command
+    arguments -- which routinely embed tokens -- must never appear in it."""
+    transport = StdioMCPTransport(["npx", "-y", "mcp-server", "--token", "SECRET"])
+
+    assert transport.label == "npx"
+    assert "SECRET" not in transport.label
+
+
+def test_http_transport_label_redacts_query_and_credentials():
+    transport = StreamableHTTPMCPTransport(
+        "https://user:pass@mcp.example.test/mcp?token=SECRET&scope=x#fragment"
+    )
+
+    assert transport.label == "https://mcp.example.test/mcp"
+    assert "SECRET" not in transport.label
+    assert "pass" not in transport.label
+
+
+def test_mcp_server_log_summary_redacts_command_args_and_url_query():
+    summary = _mcp_server_log_summary({
+        "type": "stdio",
+        "name": "docs",
+        "command": ["npx", "-y", "mcp-server", "--token", "SECRET"],
+        "url": "https://mcp.example.test/mcp?token=SECRET",
+        "timeout": 30,
+    })
+
+    assert summary["command"] == "npx"
+    assert summary["url"] == "https://mcp.example.test/mcp"
+    assert "SECRET" not in repr(summary)
+
+
+def test_stdio_transport_raises_when_response_stream_exceeds_budget(monkeypatch):
+    """A server that keeps sending notifications must not hold a request open
+    forever: the per-line timeout resets on every read, so a whole-request byte
+    budget is the only bound on the wait."""
+    import engine.mcp.client as mcp_client
+
+    notification = b'{"jsonrpc":"2.0","method":"notifications/message","params":{"x":1}}\n'
+    monkeypatch.setattr(mcp_client, "MAX_MCP_SSE_STREAM_BYTES", len(notification) * 3 + 1)
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.data = b""
+
+        def write(self, data: bytes) -> None:
+            self.data += data
+
+        async def drain(self) -> None:
+            return None
+
+    class FakeStdout:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def readline(self) -> bytes:
+            self.calls += 1
+            return notification
+
+    async def run():
+        transport = StdioMCPTransport(["fake"])
+        transport._process = SimpleNamespace(stdin=FakeStdin(), stdout=FakeStdout())
+        try:
+            await transport.send_request("tools/list", {})
+        except RuntimeError as exc:
+            return str(exc), transport._framing_broken, transport._process.stdout.calls
+        raise AssertionError("whole-request byte budget was not enforced")
+
+    message, framing_broken, reads = asyncio.run(run())
+
+    assert "exceeds maximum total size" in message
+    assert framing_broken is True
+    assert reads == 4
+
+
+def test_streamable_http_transport_clears_session_on_expiry():
+    """A 404 for an established session must drop the stale MCP-Session-Id so
+    the next request can re-initialize instead of replaying it into 404s."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        payload = json.loads(request.content.decode())
+        method = payload.get("method")
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                headers={"MCP-Session-Id": "session-1"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"protocolVersion": "2025-11-25"},
+                },
+            )
+        if method == "tools/list":
+            if "mcp-session-id" in request.headers:
+                return httpx.Response(
+                    404, headers={"MCP-Session-Id": "session-1"}, text="expired"
+                )
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": {"tools": []}},
+            )
+        raise AssertionError(method)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            transport = StreamableHTTPMCPTransport(
+                "https://mcp.example.test/mcp", http_client=http_client,
+            )
+            transport._session_id = "session-1"
+            try:
+                await transport.send_request("tools/list", {})
+            except MCPSessionExpiredError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("session expiry did not raise typed error")
+            # The stale id is cleared, so a follow-up request can succeed.
+            result = await transport.send_request("tools/list", {})
+            return message, transport._session_id, result
+
+    message, session_id, result = asyncio.run(run())
+
+    assert "session expired" in message
+    assert session_id is None
+    assert result == {"tools": []}
+
+
+def test_mcp_openai_schemas_match_registered_names_for_prefix():
+    """Schema advertisement must use the same per-prefix, de-duplicated names
+    as registration so advertised names always equal registered names."""
+    class FakeClient:
+        async def list_tools(self):
+            return [MCPTool("search", "", {})]
+
+        async def call_tool(self, name, arguments):
+            return name
+
+    async def run():
+        registry = ToolRegistry()
+        prefix = "mcp_github"
+        count = await register_mcp_tools_with_prefix(registry, FakeClient(), prefix=prefix)
+        schemas = MCPClient([sys.executable, "-V"]).to_openai_schemas(
+            [MCPTool("search", "", {})], prefix=prefix,
+        )
+        return count, [tool.name for tool in registry.list_tools()], [
+            schema["function"]["name"] for schema in schemas
+        ]
+
+    count, registered, advertised = asyncio.run(run())
+
+    assert count == 1
+    assert advertised == ["mcp_github_search"]
+    assert advertised == registered
+
+
+def test_mcp_openai_schemas_deduplicate_colliding_names():
+    schemas = MCPClient([sys.executable, "-V"]).to_openai_schemas([
+        MCPTool("search-docs", "", {}),
+        MCPTool("search_docs", "", {}),
+    ])
+    names = [schema["function"]["name"] for schema in schemas]
+
+    assert names[0] == "mcp_search_docs"
+    assert len(names) == 2
+    assert len(set(names)) == 2
 
 
 if __name__ == "__main__":

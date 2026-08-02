@@ -248,7 +248,8 @@ class RequirementsPipelineLLM(FakeLLM):
         super().__init__()
         self.tool_sets: list[set[str]] = []
         self.responses = [
-            "Agreed scope: export a CSV report; non-goal: scheduling. "
+            "Scope: export a CSV report; non-goal: scheduling. "
+            "Constraints: preserve the existing export API. "
             "Acceptance signal: an exported file has the selected columns.\n"
             "<!-- agent-smith:grilling-complete -->",
             "ResearchBrief: docs/research/csv-export.md\n"
@@ -1905,6 +1906,37 @@ GATES = {"runtime_contract_planning": AlwaysPassGate}
     assert [node.skill_name for node in setup.chain.nodes] == ["planning"]
 
 
+def test_prepare_runtime_keeps_a_keyword_miss_on_direct_react_without_llm_routing(
+    tmp_path: Path,
+) -> None:
+    class CountingRouterLLM(FakeLLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls += 1
+            return ChatResponse(text="coding:code-review")
+
+    async def run():
+        runtime, services, _ = _runtime(tmp_path)
+        llm = CountingRouterLLM()
+        services.llm = llm  # type: ignore[assignment]
+        setup = await prepare_runtime(
+            EngineRequest(message="帮我看看这个改动值不值得做"),
+            runtime,
+            services,
+        )
+        return setup, llm
+
+    setup, llm = asyncio.run(run())
+
+    assert setup.route.identity_id == "smith"
+    assert setup.route.route_id == "direct"
+    assert setup.chain is None
+    assert llm.calls == 0
+
+
 def test_pending_user_input_restores_only_the_paused_chain_route(tmp_path: Path) -> None:
     """A grilling answer continues its chain; an explicit cancel returns to ReAct."""
     from engine.execution.orchestration.preparation import _route_pending_user_input
@@ -2421,3 +2453,30 @@ def test_run_stream_persists_redacted_provider_failure_details(tmp_path: Path) -
     assert state is not None
     assert state.error_details == expected
     assert "must-not-be-persisted" not in str(trace)
+
+
+def test_enabled_tools_from_config_logs_unknown_tool_names(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo in tools.enabled must be audible, not silently disable the tool."""
+    import logging
+
+    from engine.execution.orchestration.preparation import enabled_tools_from_config
+    from engine.identity import IdentitySpec
+
+    registry = ToolRegistry()
+    registry.register("read_file", "", {}, lambda: "OK")
+    registry.register("write_file", "", {}, lambda: "OK")
+
+    with caplog.at_level(logging.WARNING, logger="engine.execution.orchestration.preparation"):
+        enabled = enabled_tools_from_config(
+            {"tools": {"enabled": ["read_file", "typo_tool", "write_file"]}},
+            registry,
+            IdentitySpec(
+                id="smith", name="Smith", description="", prompt="",
+                enabled_tools=None, enabled_skills=None, routes=(), is_default=True,
+            ),
+        )
+
+    assert enabled == ["read_file", "write_file"]
+    assert any("typo_tool" in record.message for record in caplog.records)

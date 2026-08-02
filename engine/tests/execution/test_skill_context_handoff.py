@@ -12,6 +12,7 @@ from engine.execution.pipeline.gate import GateResult
 from engine.execution.pipeline.skill_chain import SkillChain, SkillNode
 from engine.identity import IdentitySpec, RouteDecision
 from engine.llm.client import ChatResponse, ToolCallData
+from engine.llm.events import ProviderEvent, ProviderEventType
 from engine.safety.tool_guard import ToolGuard
 from engine.skill.loader import SkillBody, SkillMeta
 from engine.tool.registry import ToolRegistry
@@ -27,6 +28,7 @@ _IDENTITY = IdentitySpec(
     is_default=True,
 )
 _FEATURE_ROUTE = RouteDecision(_IDENTITY, "feature", "feature", score=1)
+_DIRECT_ROUTE = RouteDecision(_IDENTITY, "direct", None, score=1)
 
 
 class RecordingLLM:
@@ -211,3 +213,57 @@ def test_pipeline_skills_keep_assembled_context_and_bound_prior_output() -> None
     assert "END-PLAN" in handoff
     assert "[... truncated ...]" in handoff
     assert len(handoff) < len(predecessor_output)
+
+
+def test_forced_skill_emits_accumulated_text_before_the_terminal_event() -> None:
+    """A consumer that stops at FAILED/INCOMPLETE must still see the output."""
+
+    class LengthStreamingLLM:
+        stream = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat_events(self, messages, tools=None):
+            self.calls += 1
+            yield ProviderEvent(ProviderEventType.RESPONSE_CREATED)
+            yield ProviderEvent(
+                ProviderEventType.OUTPUT_TEXT_DELTA, {"delta": f"draft-{self.calls}"}
+            )
+            yield ProviderEvent(
+                ProviderEventType.RESPONSE_COMPLETED,
+                {"finish_reason": "length", "raw_finish_reason": "length"},
+            )
+
+    async def run():
+        return [
+            event
+            async for event in run_agent_stream(
+                LengthStreamingLLM(),
+                "IDENTITY=smith",
+                "plan the work",
+                FakeToolRegistry(),
+                TwoSkillRegistry(),
+                _DIRECT_ROUTE,
+                None,
+                FailureLoopGuard(),
+                forced_skill="plan",
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    terminal_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type in {EventType.INCOMPLETE, EventType.FAILED}
+    )
+    delta_indices = [
+        index
+        for index, event in enumerate(events)
+        if event.type is EventType.TEXT_DELTA
+    ]
+    assert delta_indices, "accumulated forced-skill text must be emitted"
+    assert all(index < terminal_index for index in delta_indices)
+    assert "draft-1draft-2draft-3" in events[delta_indices[0]].data["text"]
+    assert events[-1].type is EventType.DONE

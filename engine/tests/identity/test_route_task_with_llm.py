@@ -69,11 +69,34 @@ def test_keyword_hit_never_consults_the_llm(tmp_path: Path) -> None:
     assert llm.calls == 0
 
 
+def test_keyword_miss_stays_direct_unless_llm_routing_is_explicitly_enabled(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    llm = _FixedLLM(token="coding:code-review")
+
+    decision = asyncio.run(route_task_with_llm(
+        "帮忙看看这段代码有没有问题",
+        catalog,
+        llm=llm,
+    ))
+
+    assert decision.identity_id == "smith"
+    assert decision.route_id == "direct"
+    assert decision.pipeline_id is None
+    assert llm.calls == 0
+
+
 def test_llm_selects_a_declared_route_when_keywords_miss(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path)
     llm = _FixedLLM(token="coding:code-review")
 
-    decision = asyncio.run(route_task_with_llm("帮忙看看这段代码有没有问题", catalog, llm=llm))
+    decision = asyncio.run(route_task_with_llm(
+        "帮忙看看这段代码有没有问题",
+        catalog,
+        llm=llm,
+        allow_llm_fallback=True,
+    ))
 
     assert decision.identity_id == "coding"
     assert decision.route_id == "code-review"
@@ -85,7 +108,12 @@ def test_llm_direct_answer_keeps_the_deterministic_fallback(tmp_path: Path) -> N
     catalog = _catalog(tmp_path)
     llm = _FixedLLM(token="DIRECT")
 
-    decision = asyncio.run(route_task_with_llm("帮忙看看这段代码有没有问题", catalog, llm=llm))
+    decision = asyncio.run(route_task_with_llm(
+        "帮忙看看这段代码有没有问题",
+        catalog,
+        llm=llm,
+        allow_llm_fallback=True,
+    ))
 
     assert decision.identity_id == "smith"
     assert decision.route_id == "direct"
@@ -96,7 +124,12 @@ def test_llm_failure_falls_back_to_deterministic_routing(tmp_path: Path) -> None
     catalog = _catalog(tmp_path)
     llm = _RaisingLLM()
 
-    decision = asyncio.run(route_task_with_llm("帮忙看看这段代码有没有问题", catalog, llm=llm))
+    decision = asyncio.run(route_task_with_llm(
+        "帮忙看看这段代码有没有问题",
+        catalog,
+        llm=llm,
+        allow_llm_fallback=True,
+    ))
 
     assert decision.identity_id == "smith"
     assert decision.route_id == "direct"
@@ -107,7 +140,12 @@ def test_llm_inventing_an_undeclared_route_falls_back(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path)
     llm = _FixedLLM(token="coding:does-not-exist")
 
-    decision = asyncio.run(route_task_with_llm("帮忙看看这段代码有没有问题", catalog, llm=llm))
+    decision = asyncio.run(route_task_with_llm(
+        "帮忙看看这段代码有没有问题",
+        catalog,
+        llm=llm,
+        allow_llm_fallback=True,
+    ))
 
     assert decision.identity_id == "smith"
     assert decision.route_id == "direct"

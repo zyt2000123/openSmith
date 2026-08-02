@@ -171,6 +171,25 @@ def test_compact_episode_rejects_unsafe_topic_and_oversize_output(tmp_path: Path
         ))
 
 
+def test_compact_episode_respects_module_level_char_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The episode budget must be a module constant, not a per-call local."""
+    import engine.memory.compile as memory_compile
+
+    memory_dir = tmp_path / "memory"
+    monkeypatch.setattr(memory_compile, "_MAX_EPISODE_CHARS", 50)
+
+    with pytest.raises(MemoryCompilationError, match="exceeded"):
+        asyncio.run(compact_episode(
+            memory_dir,
+            StaticLLM("x" * 51),
+            "safe topic",
+            [{"task": "safe task", "summary": "safe summary"}],
+        ))
+
+
 # ---------------------------------------------------------------------------
 # Episode search index
 # ---------------------------------------------------------------------------
@@ -189,6 +208,9 @@ def test_episode_index_skips_unchanged_files(tmp_path: Path) -> None:
         async def index_entry(self, entry_id: str, content: str, scope: str) -> None:
             self.indexed.append(entry_id)
 
+        async def index_entries(self, entries: list[tuple[str, str, str]]) -> None:
+            self.indexed.extend(entry_id for entry_id, _, _ in entries)
+
         async def remove_missing_entries(self, entry_ids: set[str], scope: str) -> None:
             self.active_ids.append(entry_ids)
 
@@ -202,6 +224,35 @@ def test_episode_index_skips_unchanged_files(tmp_path: Path) -> None:
 
     assert idx.indexed == ["topic"]
     assert idx.active_ids == [{"topic"}, {"topic"}]
+
+
+def test_episode_index_batches_changed_entries_into_one_write(tmp_path: Path) -> None:
+    """Index sync must batch writes into a single transaction on the hot path."""
+    episodes_dir = tmp_path / "memory" / "episodes"
+    episodes_dir.mkdir(parents=True)
+    (episodes_dir / "one.md").write_text("content one", encoding="utf-8")
+    (episodes_dir / "two.md").write_text("content two", encoding="utf-8")
+
+    class RecordingIndex:
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+            self.active_ids: list[set[str]] = []
+
+        async def index_entries(self, entries: list[tuple[str, str, str]]) -> None:
+            self.batches.append([entry_id for entry_id, _, _ in entries])
+
+        async def remove_missing_entries(self, entry_ids: set[str], scope: str) -> None:
+            self.active_ids.append(entry_ids)
+
+    async def run() -> RecordingIndex:
+        idx = RecordingIndex()
+        await _sync_episode_index(idx, episodes_dir)
+        return idx
+
+    idx = asyncio.run(run())
+
+    assert idx.batches == [["one", "two"]]
+    assert idx.active_ids == [{"one", "two"}]
 
 
 def test_episode_index_removes_rows_for_manually_deleted_files(tmp_path: Path) -> None:
@@ -241,6 +292,9 @@ def test_episode_index_adds_a_restored_file_with_an_older_mtime(tmp_path: Path) 
 
         async def index_entry(self, entry_id: str, content: str, scope: str) -> None:
             self.indexed.append(entry_id)
+
+        async def index_entries(self, entries: list[tuple[str, str, str]]) -> None:
+            self.indexed.extend(entry_id for entry_id, _, _ in entries)
 
         async def remove_missing_entries(self, entry_ids: set[str], scope: str) -> None:
             return None
@@ -439,6 +493,29 @@ def test_user_preference_learner_emits_technical_level_after_three_signals(tmp_p
 
     assert "tech_level=expert" in observations
     assert (tmp_path / "context.md").read_text(encoding="utf-8") == original
+
+
+def test_user_preference_learner_does_not_reemit_after_failed_ack(tmp_path: Path) -> None:
+    """Emitted signals must reset their counter so a skipped acknowledge cannot
+    re-emit the same signal every matching turn, and the counter stays bounded."""
+    learner = UserPreferenceLearner(tmp_path)
+
+    async def run() -> tuple[list[str], list[str], int]:
+        all_observations: list[str] = []
+        first_three: list[str] = []
+        for index in range(4):
+            batch = await learner.observe("async coroutine design", "reply")
+            all_observations.extend(batch)
+            if index < 3:
+                first_three.extend(batch)
+        state = learner._load_state()
+        return first_three, all_observations, state["counters"]["tech_level"]["expert"]
+
+    first_three, all_observations, counter = asyncio.run(run())
+
+    assert first_three.count("tech_level=expert") == 1
+    assert all_observations.count("tech_level=expert") == 1
+    assert counter == 1  # reset after emission, then one more observation
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +791,30 @@ def test_compile_durable_keeps_backup_before_replacing_existing_memory(tmp_path:
     assert (memory_dir / "durable.md.bak").read_text(encoding="utf-8") == original
 
 
+def test_compile_durable_resets_a_stale_offset_that_exceeds_line_count(tmp_path: Path) -> None:
+    """A truncated recent.jsonl below a stored offset must not wedge durable merging."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    event = {
+        "task": "durable task",
+        "summary": "durable result",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "decision",
+        "scope": "project",
+        "evidence": "user_explicit",
+    }
+    (memory_dir / "recent.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    (memory_dir / ".durable_offset").write_text("50", encoding="utf-8")
+
+    replacement = DURABLE_DOC.format(evidence="- **Task**: durable result.")
+    assert asyncio.run(
+        compile_durable(memory_dir, StaticLLM(replacement), PassReviewer())
+    ) is True
+
+    assert (memory_dir / ".durable_offset").read_text(encoding="utf-8") == "1"
+    assert "durable result" in (memory_dir / "durable.md").read_text(encoding="utf-8")
+
+
 def test_compile_durable_sanitizes_existing_memory_before_prompting(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
@@ -796,7 +897,7 @@ def test_run_compilation_surfaces_failure_when_requested(tmp_path: Path) -> None
         ):
             await run_compilation(tmp_path / "memory", StaticLLM(), raise_on_error=True)
 
-    with pytest.raises(RuntimeError, match="recent-memory compilation failed"):
+    with pytest.raises(RuntimeError, match="recent failed"):
         asyncio.run(run())
 
 
@@ -832,6 +933,55 @@ def test_run_compilation_does_not_update_offset_on_failure(tmp_path: Path) -> No
         return _read_offset(memory_dir)
 
     assert asyncio.run(run()) == 0
+
+
+def test_compile_offset_read_fails_closed_on_symlink(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    outside = tmp_path / "outside-offset"
+    outside.write_text("1", encoding="utf-8")
+    (memory_dir / ".compile_offset").symlink_to(outside)
+
+    with pytest.raises(OSError, match="unsafe"):
+        _read_offset(memory_dir)
+    assert outside.read_text(encoding="utf-8") == "1"
+
+
+def test_durable_offset_read_fails_closed_on_symlink(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    outside = tmp_path / "outside-offset"
+    outside.write_text("1", encoding="utf-8")
+    (memory_dir / ".durable_offset").symlink_to(outside)
+
+    with pytest.raises(OSError, match="unsafe"):
+        _read_durable_offset(memory_dir)
+    assert outside.read_text(encoding="utf-8") == "1"
+
+
+def test_compile_durable_rejects_a_symlinked_durable_offset(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    durable = DURABLE_DOC.format(evidence="- **Old**: keep this durable fact.")
+    (memory_dir / "durable.md").write_text(durable, encoding="utf-8")
+    event = {
+        "task": "durable task",
+        "summary": "durable result",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "decision",
+        "scope": "project",
+        "evidence": "user_explicit",
+    }
+    (memory_dir / "recent.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    outside = tmp_path / "outside-offset"
+    outside.write_text("0", encoding="utf-8")
+    (memory_dir / ".durable_offset").symlink_to(outside)
+
+    with pytest.raises(OSError, match="unsafe"):
+        asyncio.run(compile_durable(memory_dir, StaticLLM(durable), PassReviewer()))
+
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == durable
+    assert outside.read_text(encoding="utf-8") == "0"
 
 
 def test_durable_checkpoint_prevents_remerge_after_recent_failure(tmp_path: Path) -> None:
@@ -1990,6 +2140,42 @@ def test_episode_search_matches_non_adjacent_query_terms(tmp_path: Path) -> None
             await idx.close()
 
     assert [hit["id"] for hit in asyncio.run(run())] == ["preference"]
+
+
+def test_episode_search_keeps_short_cjk_terms_in_mixed_queries(tmp_path: Path) -> None:
+    """A 2-char CJK term in a mixed-length query must not be silently dropped."""
+    episodes_dir = tmp_path / "memory" / "episodes"
+    episodes_dir.mkdir(parents=True)
+    (episodes_dir / "topic.md").write_text("# 部署\n\n我们讨论部署了新的系统", encoding="utf-8")
+
+    async def run() -> list[dict]:
+        idx = SearchIndex(episodes_dir)
+        await idx.open()
+        try:
+            await _sync_episode_index(idx, episodes_dir)
+            return await idx.search("python 部署")
+        finally:
+            await idx.close()
+
+    assert [hit["id"] for hit in asyncio.run(run())] == ["topic"]
+
+
+def test_episode_search_short_terms_are_ored_not_anded(tmp_path: Path) -> None:
+    """The short-term LIKE scan must use OR like the MATCH path, not AND."""
+    episodes_dir = tmp_path / "memory" / "episodes"
+    episodes_dir.mkdir(parents=True)
+    (episodes_dir / "topic.md").write_text("# 记忆\n\n我们讨论了记忆系统的部署", encoding="utf-8")
+
+    async def run() -> list[dict]:
+        idx = SearchIndex(episodes_dir)
+        await idx.open()
+        try:
+            await _sync_episode_index(idx, episodes_dir)
+            return await idx.search("记忆 甲")
+        finally:
+            await idx.close()
+
+    assert [hit["id"] for hit in asyncio.run(run())] == ["topic"]
 
 
 def test_generate_and_review_tolerates_malformed_reviewer_shapes() -> None:
