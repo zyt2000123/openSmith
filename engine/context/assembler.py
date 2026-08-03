@@ -648,7 +648,20 @@ class PromptAssembler:
 
     @staticmethod
     def get_prefix_cache_key(agent_dir: Path) -> str | None:
-        """Return the hash of stable prompt layers for LLM prefix caching."""
+        """Return the hash of stable prompt layers for LLM prefix caching.
+
+        Look-aside only — the execution path does **not** read this.  It carries
+        the key it just computed on ``AssembledPrompt.prefix_cache_key``, through
+        ``AgentSetup`` into the ReAct loop, so a request always sends its own key.
+
+        Do not adopt this as that path's source.  The cache is keyed on
+        ``(agent_dir, profile-file signature)`` while the hash it stores also
+        covers the tool and skill layers, which no signature here can see: two
+        concurrent assemblies for the same profile with different identity tool
+        allowlists write the same key, so a lookup can return the other one's
+        hash.  Sending a prefix-cache hint that does not describe the prompt you
+        actually sent defeats the provider-side cache it exists to hit.
+        """
         cache_key = (
             str(agent_dir),
             PromptAssembler._profile_static_signature(agent_dir),

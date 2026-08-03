@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import os
 import re
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -510,6 +511,7 @@ class ToolRegistry:
                 name=tool_name,
                 arguments=dict(call.arguments),
                 idempotency_key=call.idempotency_key,
+                declared_paths=dict(call.declared_paths),
             )
 
         entry = self._tools.get(tool_name)
@@ -518,6 +520,11 @@ class ToolRegistry:
 
         definition, _ = entry
         arguments = dict(call.arguments)
+        # ``setdefault`` below keeps this idempotent: ``execute`` re-normalizes as
+        # a backstop, and re-deriving the declared view from an already-resolved
+        # argument would collapse it back onto the resolved path — silently making
+        # the second (execution-time) guard check weaker than the first.
+        declared_paths = dict(call.declared_paths)
         properties = (
             definition.parameters.get("properties")
             if isinstance(definition.parameters, dict)
@@ -537,6 +544,9 @@ class ToolRegistry:
             candidate = Path(value).expanduser()
             if not candidate.is_absolute():
                 candidate = self._working_dir / candidate
+            # Absolutize without following symlinks, so the guard still sees the
+            # component names the caller actually wrote.
+            declared_paths.setdefault(argument_name, os.path.abspath(str(candidate)))
             arguments[argument_name] = str(candidate.resolve())
 
         return ToolCall(
@@ -544,6 +554,7 @@ class ToolRegistry:
             name=tool_name,
             arguments=arguments,
             idempotency_key=call.idempotency_key,
+            declared_paths=declared_paths,
         )
 
     async def _invoke(

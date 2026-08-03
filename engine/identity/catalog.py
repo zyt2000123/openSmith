@@ -238,8 +238,12 @@ class IdentityCatalog:
         Pipeline-internal skills are validated by
         ``validate_execution_assets()``, which has the parsed chain available.
         This catalog-level check still verifies identity-owned skill allowlists
-        and route-to-pipeline references. A pipeline node never falls back to
-        generic ReAct when its declared Skill is unavailable.
+        and route-to-pipeline references. A pipeline node whose declared Skill is
+        missing at run time does *not* fail the run: it falls back to node-local
+        ReAct and still runs its gate (see
+        ``engine.execution.pipeline.pipeline.run_pipeline``), which is why this
+        startup check exists — to surface the misconfiguration before a run
+        silently degrades.
         """
         pipelines = set(pipeline_ids)
         skills = set(skill_names)

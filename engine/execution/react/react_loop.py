@@ -1117,13 +1117,26 @@ async def react_event_loop(
                     call.arguments
                 )
                 if not allowed:
-                    # Pre Hook 阻止了工具执行
+                    # Pre Hook 阻止了工具执行。
+                    # 每个 assistant.tool_calls 条目都必须有配对的 tool 结果消息，
+                    # 否则**下一次**请求整个被 provider 拒收（OpenAI 400；Anthropic
+                    # "tool_use ids were found without tool_result blocks"）。这条
+                    # 分支曾是本循环里唯一漏掉配对的阻断路径，而 config-protection
+                    # 是默认开启的 PreToolHook —— 编辑 pyproject.toml / tsconfig.json
+                    # 就会走到这里。
+                    denial = denial_reason or "Blocked by pre-tool hook"
+                    conversation.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": f"[BLOCKED] {denial}",
+                    })
+                    conversation.append({"role": "system", "content": tool_blocked_prompt()})
                     blocked_event: dict[str, object] = {
                         "id": tc.id,
                         "error": True,
                         "blocked": True,
                         "preflight": False,
-                        "reason": denial_reason or "Blocked by pre-tool hook",
+                        "reason": denial,
                     }
                     if granted_approval_id is not None:
                         # The call already passed the approval gate; carry the
@@ -1134,6 +1147,25 @@ async def react_event_loop(
                     yield ExecutionEvent(EventType.TOOL_CALL_RESULT, blocked_event)
                     round_had_failure = True
                     consecutive_errors += 1
+                    # A hook that denies the same call every round is a loop the
+                    # other error paths already bound; without this the model can
+                    # retry a permanently-blocked edit until the whole iteration
+                    # budget is gone.
+                    error_key = f"{tc.name}:{denial[:120]}"
+                    if error_key == last_error_key:
+                        identical_error_count += 1
+                    else:
+                        last_error_key = error_key
+                        identical_error_count = 1
+                    if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                        yield ExecutionEvent(
+                            EventType.TEXT_DELTA,
+                            {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
+                        )
+                        yield ExecutionEvent(EventType.INCOMPLETE, {
+                            "reason": "identical_tool_error_loop",
+                        })
+                        return
                     if consecutive_errors >= 3:
                         conversation.append({"role": "system", "content": TOOL_FAILURE_HINT})
                         consecutive_errors = 0

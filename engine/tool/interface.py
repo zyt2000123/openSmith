@@ -49,6 +49,16 @@ class ToolCall:
     name: str
     arguments: dict = field(default_factory=dict)
     idempotency_key: str | None = None
+    # Path arguments as the caller spelled them, absolutized but NOT resolved
+    # (keyed by argument name).  ``ToolRegistry.normalize_call`` must hand the
+    # provider a fully resolved path so the guard and the provider touch the
+    # same file, but resolving also erases the symlink *names* that the safety
+    # guard's directory-component rules match on — a ``.git`` that is a symlink
+    # resolves to a path with no ``.git`` component.  Carrying the declared
+    # spelling alongside lets ``FileGuard`` keep checking both views, which is
+    # what its rules were written for.  Not part of the call fingerprint: it is
+    # derived from ``arguments``, never independent input.
+    declared_paths: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

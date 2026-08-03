@@ -177,3 +177,174 @@ def test_loader_injects_configured_priority_over_class_default(tmp_path):
 
     assert hook is not None
     assert hook.priority == 1
+
+
+# ── Integration: the react_loop <-> hook_registry seam ──
+#
+# The tests above exercise HookRegistry in isolation.  Nothing covered the loop
+# that calls it, which is how a denied Pre hook came to leave an assistant
+# tool_calls entry with no paired tool result — malformed history that every
+# provider rejects on the *next* request.  config-protection ships enabled, so
+# any edit to pyproject.toml / tsconfig.json reached it.
+
+
+class _DenyingPreHook(PreToolHook):
+    @property
+    def id(self) -> str:
+        return "deny-everything"
+
+    @property
+    def priority(self) -> int:
+        return 1
+
+    async def check(self, tool_name, tool_input):
+        return False, "config file modification blocked"
+
+
+class _RecordingLLM:
+    """Captures the conversation handed to each provider call."""
+
+    stream = False
+
+    def __init__(self) -> None:
+        self.calls: list[list[dict]] = []
+        self._turn = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        from engine.llm.client import ChatResponse
+        from engine.llm.contracts import ToolCallData
+
+        self.calls.append([dict(message) for message in messages])
+        self._turn += 1
+        if self._turn == 1:
+            return ChatResponse(
+                text="",
+                tool_calls=[
+                    ToolCallData(
+                        id="call-1",
+                        name="write_file",
+                        arguments={"path": "pyproject.toml", "content": "x"},
+                    )
+                ],
+            )
+        return ChatResponse(text="done")
+
+
+def _unanswered_tool_calls(conversation: list[dict]) -> list[str]:
+    """Tool-call ids in the history with no matching tool result message."""
+    answered = {
+        message.get("tool_call_id")
+        for message in conversation
+        if message.get("role") == "tool"
+    }
+    requested: list[str] = []
+    for message in conversation:
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            requested.extend(call["id"] for call in message["tool_calls"])
+    return [call_id for call_id in requested if call_id not in answered]
+
+
+@pytest.mark.asyncio
+async def test_pre_hook_denial_leaves_no_unanswered_tool_call() -> None:
+    from engine.execution.events import EventType
+    from engine.execution.react.react_loop import react_event_loop
+    from engine.tool.registry import ToolRegistry
+
+    registry = ToolRegistry()
+
+    async def write_file(path: str, content: str) -> str:  # pragma: no cover
+        raise AssertionError("the hook must block execution")
+
+    registry.register(
+        "write_file", "Write", {}, write_file,
+        permission_level="write", side_effect="write",
+    )
+    hooks = HookRegistry()
+    hooks.register_pre_hook(_DenyingPreHook())
+
+    llm = _RecordingLLM()
+    events = []
+    async for event in react_event_loop(
+        llm,
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": "edit config"}],
+        registry,
+        None,
+        max_iters=3,
+        hook_registry=hooks,
+    ):
+        events.append(event)
+
+    assert len(llm.calls) == 2, "the loop must continue after a hook denial"
+    for conversation in llm.calls:
+        assert _unanswered_tool_calls(conversation) == []
+
+    blocked = [
+        event for event in events
+        if event.type is EventType.TOOL_CALL_RESULT and event.data.get("blocked")
+    ]
+    assert len(blocked) == 1
+    assert "config file modification blocked" in blocked[0].data["reason"]
+    # The denial reaches the model as an observation it can act on.
+    denial = [
+        message for message in llm.calls[1]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call-1"
+    ]
+    assert denial and denial[0]["content"].startswith("[BLOCKED]")
+
+
+@pytest.mark.asyncio
+async def test_repeated_pre_hook_denial_stops_instead_of_burning_the_budget() -> None:
+    """A hook denies deterministically, so retrying it cannot ever succeed."""
+    from engine.execution.events import EventType
+    from engine.execution.react.react_loop import react_event_loop
+    from engine.llm.client import ChatResponse
+    from engine.llm.contracts import ToolCallData
+    from engine.tool.registry import ToolRegistry
+
+    class _AlwaysRetriesLLM:
+        stream = False
+
+        def __init__(self) -> None:
+            self.turns = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.turns += 1
+            return ChatResponse(
+                text="",
+                tool_calls=[
+                    ToolCallData(
+                        id=f"call-{self.turns}",
+                        name="write_file",
+                        arguments={"path": "pyproject.toml", "content": "x"},
+                    )
+                ],
+            )
+
+    registry = ToolRegistry()
+
+    async def write_file(path: str, content: str) -> str:  # pragma: no cover
+        raise AssertionError("the hook must block execution")
+
+    registry.register(
+        "write_file", "Write", {}, write_file,
+        permission_level="write", side_effect="write",
+    )
+    hooks = HookRegistry()
+    hooks.register_pre_hook(_DenyingPreHook())
+
+    llm = _AlwaysRetriesLLM()
+    reasons = [
+        event.data.get("reason")
+        async for event in react_event_loop(
+            llm,
+            [{"role": "user", "content": "edit config"}],
+            registry,
+            None,
+            max_iters=60,
+            hook_registry=hooks,
+        )
+        if event.type is EventType.INCOMPLETE
+    ]
+
+    assert reasons == ["identical_tool_error_loop"]
+    assert llm.turns < 60, "the identical-error guard must stop the loop early"

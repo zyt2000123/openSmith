@@ -179,10 +179,16 @@ def sanitize_memory_text(text: str) -> tuple[str, int, int]:
             injections_removed += 1
         else:
             clean.append(line)
+    # A pattern can match across a line break (``password:\n  <value>``) while no
+    # single line matches on its own.  Drop the whole text, and count it under the
+    # category that actually fired — reporting a leaked credential as an
+    # "instruction-injection" made ``store.sanitize_event_value`` write the wrong
+    # redaction notice into memory, sending a reviewer looking for an attack when
+    # the event was a secret.
     if contains_injection(text) and injections_removed == 0:
-        return "", secrets_removed, 1
+        return "", secrets_removed, injections_removed + 1
     if contains_secret(text) and secrets_removed == 0:
-        return "", secrets_removed, 1
+        return "", secrets_removed + 1, injections_removed
     return "\n".join(clean), secrets_removed, injections_removed
 
 

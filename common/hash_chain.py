@@ -104,6 +104,13 @@ class HashChainLog:
         self._legacy_linked = False
         self._handle = None
         self._handle_path: Path | None = None
+        # Size of the log as of our own last write.  A different size means some
+        # other writer appended, so our cached seq/prev_hash are stale.
+        self._observed_size: int | None = None
+        # An anchor names an exact head, so it must be cleared before the chain
+        # legitimately grows past it.  Set on construction (a previous process
+        # may have sealed on shutdown) and again after every seal.
+        self._anchor_pending_clear = True
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -132,6 +139,8 @@ class HashChainLog:
     def append(self, record: dict, *, sync: bool = False) -> dict:
         """Chain and persist one record; returns the record as written."""
         with self._lock:
+            self._drop_stale_anchor()
+            self._reload_if_externally_appended()
             self._ensure_loaded()
             chained = dict(record)
             chained["seq"] = self._next_seq
@@ -165,6 +174,7 @@ class HashChainLog:
 
             self._prev_hash = chained["hash"]
             self._next_seq += 1
+            self._remember_size()
             return chained
 
     def seal(self) -> dict:
@@ -174,6 +184,7 @@ class HashChainLog:
         deferred-sync ones) is durable before the anchor names the head.
         """
         with self._lock:
+            self._reload_if_externally_appended()
             self._ensure_loaded()
             if self._handle is not None:
                 self._handle.flush()
@@ -213,6 +224,7 @@ class HashChainLog:
                 os.replace(temp, self.anchor_path)
                 self.anchor_path.chmod(CHAIN_FILE_MODE)
                 _fsync_directory(self.anchor_path.parent)
+                self._anchor_pending_clear = True
             except OSError:
                 temp.unlink(missing_ok=True)
                 logger.warning("failed to write chain anchor: %s", self.anchor_path, exc_info=True)
@@ -264,6 +276,61 @@ class HashChainLog:
             return value if isinstance(value, dict) else None
         except (OSError, json.JSONDecodeError):
             return None
+
+    def _drop_stale_anchor(self) -> None:
+        """Clear a sealed anchor before extending the chain past it.
+
+        ``verify_chain`` requires the anchor to name the *current* head, so any
+        log that legitimately grows after a seal would report ``anchor
+        mismatch``.  The install-wide audit trail is sealed at shutdown and
+        extended again on the next start, which would otherwise make every
+        post-restart verification look like tampering.  Runs at most once per
+        seal, so the ordinary append path costs nothing.  The next :meth:`seal`
+        re-anchors the new head.
+        """
+        if not self._anchor_pending_clear:
+            return
+        self._anchor_pending_clear = False
+        try:
+            self.anchor_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "failed to clear chain anchor before append: %s",
+                self.anchor_path,
+                exc_info=True,
+            )
+
+    def _remember_size(self) -> None:
+        try:
+            self._observed_size = self.path.stat().st_size
+        except OSError:
+            self._observed_size = None
+
+    def _reload_if_externally_appended(self) -> None:
+        """Re-read the tail when another writer appended since our last write.
+
+        ``seq``/``prev_hash`` are cached in memory and ``_ensure_loaded`` only
+        ever runs once per instance, so a second writer on the same file forks
+        the chain: both assign the same ``seq`` from the same ``prev_hash``, and
+        :func:`verify_chain` then reports a sequence gap on a log nobody
+        tampered with — a false tamper alarm produced by ordinary concurrent
+        use.  Comparing the file size against our own last write costs one
+        ``stat`` and, in the overwhelmingly common single-writer case, skips the
+        rescan entirely.
+        """
+        if not self._loaded:
+            return
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        if self._observed_size is not None and size == self._observed_size:
+            return
+        self._loaded = False
+        self._next_seq = 1
+        self._prev_hash = genesis_hash(self.namespace)
+        self._legacy_linked = False
+        self._ensure_loaded()
 
     def _ensure_loaded(self) -> None:
         if self._loaded:

@@ -886,3 +886,139 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {e}")
     sys.exit(1 if failures else 0)
+
+
+# ── Review: the guard must still see the path the caller actually wrote ──
+
+
+def _workspace_guard(workspace: Path) -> tuple[ToolGuard, ToolRegistry]:
+    """Build the guard exactly as ``prepare_runtime`` does for one request."""
+    provider_dir = Path(__file__).resolve().parents[3] / "agents" / "tools"
+    registry = ToolRegistry()
+    registry.load_builtin_providers(provider_dir)
+    registry.bind_working_directory(workspace)
+    guard = ToolGuard(_RULES)
+    guard.set_working_directory(workspace)
+    guard.set_non_delegable_write_roots([provider_dir])
+    guard.bind_definitions(registry.definitions())
+    return guard, registry
+
+
+def _check_declared(guard: ToolGuard, registry: ToolRegistry, tool: str, path: str):
+    call = registry.normalize_call(
+        ToolCall(id="t", name=tool, arguments={"path": path, "content": "x"})
+    )
+    return guard.check(call, audit=False)
+
+
+def test_symlinked_git_dir_still_requires_high_risk_write_approval(tmp_path: Path):
+    """normalize_call resolves paths before the guard runs, which erased the
+    ``.git`` component a symlinked .git resolves away from — demoting a git-hook
+    write (code that runs on the next git operation) to a routine write."""
+    workspace = (tmp_path / "ws").resolve()
+    store = workspace / "gitstore"
+    (store / "hooks").mkdir(parents=True)
+    (store / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    os.symlink(store, workspace / ".git")
+
+    guard, registry = _workspace_guard(workspace)
+    result = _check_declared(guard, registry, "write_file", ".git/hooks/pre-commit")
+
+    assert not result.allowed
+    assert result.approval_required
+    assert result.risk.value == "high"
+    assert ".git" in result.reason
+
+
+def test_symlinked_git_dir_still_gates_credential_bearing_config_read(tmp_path: Path):
+    """.git/config embeds ``https://user:token@host`` remote URLs, and read_file
+    is approval_policy="never" — so losing the .git classification made this a
+    free credential read with no user interaction at all."""
+    workspace = (tmp_path / "ws").resolve()
+    store = workspace / "gitstore"
+    store.mkdir(parents=True)
+    (store / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (store / "config").write_text("[remote]\n\turl = https://u:tok@h/x\n", encoding="utf-8")
+    os.symlink(store, workspace / ".git")
+
+    guard, registry = _workspace_guard(workspace)
+    call = registry.normalize_call(
+        ToolCall(id="t", name="read_file", arguments={"path": ".git/config"})
+    )
+    result = guard.check(call, audit=False)
+
+    assert not result.allowed
+    assert result.approval_required
+    assert result.risk.value == "high"
+
+
+def test_symlinked_credential_dir_still_requires_high_risk_approval(tmp_path: Path):
+    workspace = (tmp_path / "ws").resolve()
+    store = workspace / "keystore"
+    store.mkdir(parents=True)
+    os.symlink(store, workspace / ".ssh")
+
+    guard, registry = _workspace_guard(workspace)
+    result = _check_declared(guard, registry, "write_file", ".ssh/authorized_keys")
+
+    assert not result.allowed
+    assert result.risk.value == "high"
+    assert ".ssh" in result.reason
+
+
+def test_declared_path_survives_the_registry_execution_recheck(tmp_path: Path):
+    """``ToolRegistry.execute`` re-normalizes as a backstop; re-deriving the
+    declared view there would collapse it onto the resolved path and make the
+    second guard check weaker than the first."""
+    workspace = (tmp_path / "ws").resolve()
+    store = workspace / "gitstore"
+    (store / "hooks").mkdir(parents=True)
+    (store / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    os.symlink(store, workspace / ".git")
+
+    _guard, registry = _workspace_guard(workspace)
+    once = registry.normalize_call(
+        ToolCall(id="t", name="write_file", arguments={"path": ".git/hooks/pre-commit"})
+    )
+    twice = registry.normalize_call(once)
+
+    assert once.declared_paths == twice.declared_paths
+    assert once.declared_paths["path"].endswith("/.git/hooks/pre-commit")
+    assert once.arguments["path"] == twice.arguments["path"]
+
+
+def test_empty_allowed_dirs_is_deny_all_not_the_permissive_default(tmp_path: Path):
+    """``if allowed_dirs:`` conflated None (unconfigured) with [] (deny-all), so
+    a caller asking for a deny-all baseline silently got [home, /tmp, cwd] and
+    its one-file whitelist became a no-op."""
+    empty = ToolGuard(_RULES, allowed_dirs=[])
+    default = ToolGuard(_RULES, allowed_dirs=None)
+
+    assert empty.file_guard._allowed == []
+    assert default.file_guard._allowed != []
+    outside = tmp_path / "anywhere" / "victim.txt"
+    assert not empty.file_guard.check_path(str(outside), writing=True).allowed
+
+
+def test_concurrent_audit_logs_keep_one_verifiable_chain(tmp_path: Path):
+    """AuditLog is built per request but appends to one install-wide log.  With
+    per-instance chain state, two concurrent runs assigned the same seq from the
+    same prev_hash and verify() reported tampering on an untampered log."""
+    log_path = tmp_path / "audit.jsonl"
+    run_a = AuditLog(log_path)
+    run_b = AuditLog(log_path)
+
+    run_a.record("read_file", {"path": "/a/1"}, GuardResult(allowed=True), run_id="run-A")
+    run_b.record("read_file", {"path": "/b/1"}, GuardResult(allowed=True), run_id="run-B")
+    run_a.record("read_file", {"path": "/a/2"}, GuardResult(allowed=True), run_id="run-A")
+    run_b.record("read_file", {"path": "/b/2"}, GuardResult(allowed=True), run_id="run-B")
+
+    verification = run_a.verify()
+    assert verification.ok, verification.failure
+    assert verification.records == 4
+    sequences = [
+        json.loads(line)["seq"]
+        for line in log_path.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert sequences == [1, 2, 3, 4]
+    run_a.close()
