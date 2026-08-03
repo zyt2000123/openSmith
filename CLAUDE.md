@@ -254,7 +254,17 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 810 passed, server 189 passed (5 skipped), shell 236 passed.
+Current baseline: engine 980 passed (59 skipped), server 222 passed (5 skipped),
+shell 275 passed.
+
+The engine's 59 skips are almost all macOS-only Seatbelt tests; every one carries
+`@pytest.mark.skipif(sys.platform != "darwin")`. A Seatbelt test *failing* rather
+than skipping on Linux means that marker is missing — add it.
+
+`shell` has 11 pre-existing failures on a container with no
+`~/.agent-smith/auth_token`: they call the real `localAuthHeaders`, which reads
+that file. They fail identically on `main`, so treat them as environment noise,
+not as a regression from your change.
 
 ## 10. Not Implemented Yet
 

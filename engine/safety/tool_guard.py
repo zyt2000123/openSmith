@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -58,6 +59,18 @@ class GuardResult:
 
 
 # ── Path guard (req #3: symlink, traversal, sensitive files) ──
+
+def _ordered_unique(*values: str) -> tuple[str, ...]:
+    """Deduplicate while preserving order, for stable user-facing reasons.
+
+    A ``set`` here would make the refusal message name whichever spelling the
+    hash order happened to yield.
+    """
+    seen: dict[str, None] = {}
+    for value in values:
+        seen.setdefault(value, None)
+    return tuple(seen)
+
 
 def _casefolded(path: Path) -> Path:
     """Lowercase a path, for security comparisons only — never for I/O.
@@ -239,10 +252,18 @@ class FileGuard:
         self.set_allowed_dirs(allowed_dirs)
 
     def set_allowed_dirs(self, allowed_dirs: list[Path] | None) -> None:
-        if allowed_dirs:
-            self._allowed = [p.resolve() for p in allowed_dirs]
-        else:
+        """Replace the ordinary directory boundary.
+
+        ``None`` means "not configured" and keeps the permissive default.  An
+        empty list is a deliberate deny-all baseline for a caller that intends to
+        reach exactly one path through :meth:`SessionWhitelist.allow_file` —
+        conflating it with ``None`` handed that caller ``[home, /tmp, cwd]``
+        instead, silently turning its whitelist into a no-op.
+        """
+        if allowed_dirs is None:
             self._allowed = [Path.home().resolve(), Path("/tmp").resolve(), Path.cwd().resolve()]
+        else:
+            self._allowed = [p.resolve() for p in allowed_dirs]
 
     def set_working_directory(self, working_dir: Path) -> None:
         root = Path(working_dir).expanduser().resolve()
@@ -317,14 +338,39 @@ class FileGuard:
             ),
         )
 
-    def check_path(self, path_str: str, writing: bool = False) -> GuardResult:
+    def check_path(
+        self,
+        path_str: str,
+        writing: bool = False,
+        *,
+        declared_path: str | None = None,
+    ) -> GuardResult:
+        """Evaluate one path against the guard's rules.
+
+        ``declared_path`` is the same target as the caller spelled it, absolutized
+        but not resolved.  It matters because ``ToolRegistry.normalize_call``
+        hands this method an already-resolved ``path_str`` (so the guard and the
+        provider agree on which file is touched), and resolving erases the very
+        component names the rules below match on: with a symlinked ``.git``,
+        ``lexical`` and ``target`` would otherwise both read
+        ``<workspace>/gitstore/...`` and no ``.git`` rule could fire.  Passing the
+        declared spelling restores the second view.  It is only ever used to
+        *add* blocks, never to authorize: containment in ``_allowed`` is still
+        decided on the resolved ``target`` alone.
+        """
         try:
             # Shell expands a leading tilde before execution; mirror that here
             # so the guard evaluates the same target the command will touch.
             candidate = Path(path_str).expanduser()
             if not candidate.is_absolute() and self._working_dir is not None:
                 candidate = self._working_dir / candidate
-            lexical = Path(os.path.abspath(str(candidate)))
+            if declared_path:
+                declared = Path(declared_path).expanduser()
+                if not declared.is_absolute() and self._working_dir is not None:
+                    declared = self._working_dir / declared
+                lexical = Path(os.path.abspath(str(declared)))
+            else:
+                lexical = Path(os.path.abspath(str(candidate)))
             target = candidate.resolve()
         except (ValueError, OSError):
             return GuardResult(allowed=False, reason=f"Invalid path: {path_str}")
@@ -360,8 +406,10 @@ class FileGuard:
 
         # Check the literal path as well as the resolved one: a credential
         # directory that is itself a symlink resolves to a name carrying no
-        # ``.ssh``/``.aws`` component and would otherwise slip through.  The
-        # sensitive-write branch below already pairs lexical with resolved.
+        # ``.ssh``/``.aws`` component and would otherwise slip through.  Every
+        # name/component rule below pairs the two views for the same reason; see
+        # ``declared_path`` in this method's docstring for why ``lexical`` has to
+        # be supplied by the caller rather than re-derived here.
         for part in (*target.parts, *lexical.parts):
             if part.lower() in self._ALWAYS_BLOCKED:
                 return self._path_approval(
@@ -380,16 +428,25 @@ class FileGuard:
             # case-sensitive, so .ENV / .env.staging / key.PEM / id_rsa would
             # otherwise bypass approval entirely on case-insensitive filesystems.
             name = target.name.lower()
-            if _is_sensitive_read_name(name):
-                return self._path_approval(
-                    target,
-                    writing=False,
-                    high_risk=True,
-                    reason=f"Read of sensitive file {target.name} requires high-risk approval",
-                )
+            # Resolved name first, then the declared one, so the reason text is
+            # deterministic and names the file actually being opened when both
+            # spellings are sensitive.
+            for candidate_name in _ordered_unique(name, lexical.name.lower()):
+                if _is_sensitive_read_name(candidate_name):
+                    return self._path_approval(
+                        target,
+                        writing=False,
+                        high_risk=True,
+                        reason=(
+                            f"Read of sensitive file {candidate_name} requires "
+                            "high-risk approval"
+                        ),
+                    )
             # .git/config embeds remote URLs (which often carry credentials) and
             # .git/credentials stores them verbatim; both are free reads today.
-            if name in _GIT_CREDENTIAL_FILES and any(
+            if (
+                name in _GIT_CREDENTIAL_FILES or lexical.name.lower() in _GIT_CREDENTIAL_FILES
+            ) and any(
                 part.lower() == ".git" for part in (*target.parts, *lexical.parts)
             ):
                 return self._path_approval(
@@ -400,15 +457,20 @@ class FileGuard:
                 )
 
         if writing:
-            name = target.name.lower()
-            if name in self._SENSITIVE_WRITE or name.startswith(".env"):
-                return self._path_approval(
-                    target,
-                    writing=True,
-                    high_risk=True,
-                    reason=f"Write to sensitive file {name} requires high-risk approval",
-                )
-            for part in target.parts:
+            # Pair the resolved and declared names/components, exactly as the
+            # credential-directory branch above does.  Resolved-only was the gap:
+            # a symlinked ``.git`` (or a symlinked ``.env``) resolves to an
+            # innocuous name, and the write it authorizes is a git hook — code
+            # that runs on the next git operation.
+            for name in _ordered_unique(target.name.lower(), lexical.name.lower()):
+                if name in self._SENSITIVE_WRITE or name.startswith(".env"):
+                    return self._path_approval(
+                        target,
+                        writing=True,
+                        high_risk=True,
+                        reason=f"Write to sensitive file {name} requires high-risk approval",
+                    )
+            for part in (*target.parts, *lexical.parts):
                 if part.lower() in self._SENSITIVE_DIRS:
                     return self._path_approval(
                         target,
@@ -499,16 +561,68 @@ class FileGuard:
 
 # ── Audit log (req #6: every tool call logged) ──────────────
 
+# One chain object per audit file for the whole process.  ``AuditLog`` is built
+# per ``ToolGuard`` — i.e. per engine request (``build_engine_runtime``) — while
+# every instance appends to the same install-wide ``audit.jsonl``.  Each
+# ``HashChainLog`` caches seq/prev_hash in memory behind a *per-instance* lock,
+# so two concurrent runs each assigned the same seq from the same prev_hash and
+# forked the chain: ``verify()`` then reported a sequence gap on a log nobody
+# tampered with.  Sharing the object makes that lock serialize every writer in
+# this process; ``HashChainLog`` separately detects another process's appends.
+_AUDIT_CHAINS: dict[Path, HashChainLog] = {}
+_AUDIT_CHAINS_GUARD = threading.Lock()
+
+
+def _shared_audit_chain(path: Path, namespace: str) -> HashChainLog:
+    try:
+        key = path.resolve()
+    except OSError:
+        key = Path(os.path.abspath(str(path)))
+    with _AUDIT_CHAINS_GUARD:
+        chain = _AUDIT_CHAINS.get(key)
+        if chain is None:
+            chain = HashChainLog(path, namespace=namespace, keep_handle=True)
+            _AUDIT_CHAINS[key] = chain
+        return chain
+
+
+def close_audit_chains() -> None:
+    """Seal and close every shared audit chain (server shutdown).
+
+    Sealing here rather than per run is deliberate: the log is install-wide and
+    concurrent runs interleave in it, so there is no per-run "head" to anchor —
+    an anchor written mid-run would be stale the moment another run appended and
+    would itself become a false ``anchor mismatch``.  A clean shutdown *is* a
+    real boundary, and :meth:`HashChainLog.unseal` clears the anchor when
+    appending resumes.
+    """
+    with _AUDIT_CHAINS_GUARD:
+        chains = list(_AUDIT_CHAINS.values())
+        _AUDIT_CHAINS.clear()
+    for chain in chains:
+        try:
+            if chain.path.is_file():
+                chain.seal()
+        except Exception:
+            logger.warning("failed to seal audit chain: %s", chain.path, exc_info=True)
+        finally:
+            chain.close()
+
+
 class AuditLog:
     """Append-only, tamper-evident JSONL audit sink.
 
     Every entry is hash-chained (``seq``/``prev_hash``/``hash``) so editing,
     reordering, or deleting a prior entry is detectable via :meth:`verify`.
-    The chain head is anchored (``<log>.head``) at each run boundary and on
-    :meth:`close`, so a rollback to a shorter-but-consistent chain is also
-    detected.  ``record`` runs synchronously from the guard on the event loop;
-    chaining adds only SHA-256 hashing, not extra fsync, on top of the existing
-    per-append flush.
+    The chain head is anchored (``<log>.head``) on :meth:`close` and at server
+    shutdown (:func:`close_audit_chains`), so a rollback to a
+    shorter-but-consistent chain is also detected.  ``record`` runs synchronously
+    from the guard on the event loop; chaining adds only SHA-256 hashing, not
+    extra fsync, on top of the existing per-append flush.
+
+    The chain itself is shared per log path across every instance in the process
+    (see :data:`_AUDIT_CHAINS`) — one guard per request must not mean one
+    independent view of a shared append-only file.
     """
 
     _CHAIN_NAMESPACE = "agent-smith-audit"
@@ -522,18 +636,13 @@ class AuditLog:
                 log_path = Path.home() / ".agent-smith" / "audit.jsonl"
         self._path = log_path
         self._chain: HashChainLog | None = None
-        self._sealed_run: str | None = None
 
     def _ensure_chain(self) -> HashChainLog:
-        """Return the chain for the current path, reopening on a path change."""
+        """Return the shared chain for the current path."""
         if self._chain is None or self._chain.path != self._path:
-            if self._chain is not None:
-                self._chain.close()
-            self._chain = HashChainLog(
-                self._path,
-                namespace=self._CHAIN_NAMESPACE,
-                keep_handle=True,
-            )
+            # The previous chain is process-shared and may still be in use by a
+            # concurrent request, so it is never closed here.
+            self._chain = _shared_audit_chain(self._path, self._CHAIN_NAMESPACE)
         return self._chain
 
     @property
@@ -555,18 +664,13 @@ class AuditLog:
             **_summarize_args(extra),
         }
         try:
-            chain = self._ensure_chain()
-            run_id = extra.get("run_id")
-            if (
-                isinstance(run_id, str)
-                and self._sealed_run is not None
-                and run_id != self._sealed_run
-            ):
-                # Anchor the previous run's chain at the boundary so a later
-                # rollback of that run is detectable.
-                chain.seal()
-            self._sealed_run = run_id if isinstance(run_id, str) else self._sealed_run
-            chain.append(entry)
+            # No per-run sealing: the log is install-wide and concurrent runs
+            # interleave in it, so a run boundary is not a chain head.  An anchor
+            # written there is stale as soon as another run appends, and would
+            # itself read as an ``anchor mismatch``.  Sealing happens on
+            # :meth:`close` and at shutdown (``close_audit_chains``), which are
+            # the only boundaries where the head is well defined.
+            self._ensure_chain().append(entry)
         except Exception:
             logger.warning("failed to append tool safety audit", exc_info=True)
 
@@ -874,7 +978,10 @@ class ToolGuard:
         if not path_args and not list_path_args and not opaque_command:
             return None
 
-        paths_to_check: list[tuple[str, bool]] = []
+        # (path, writing, declared_path) — declared_path is the caller's own
+        # spelling for scalar path args (see FileGuard.check_path); list args and
+        # shell redirect targets are never pre-resolved, so they have none.
+        paths_to_check: list[tuple[str, bool, str | None]] = []
 
         for arg_name in path_args:
             path_val = tool_call.arguments.get(arg_name)
@@ -909,7 +1016,9 @@ class ToolGuard:
                         f"got {type(path_val).__name__}"
                     ),
                 )
-            paths_to_check.append((path_val, is_write))
+            paths_to_check.append(
+                (path_val, is_write, tool_call.declared_paths.get(arg_name))
+            )
 
         cwd_val = tool_call.arguments.get("cwd")
         cwd = str(cwd_val) if cwd_val else ""
@@ -922,7 +1031,7 @@ class ToolGuard:
                 p = Path(str(raw))
                 if cwd and not p.is_absolute():
                     p = Path(cwd) / p
-                paths_to_check.append((str(p), is_write))
+                paths_to_check.append((str(p), is_write, None))
 
         if opaque_command:
             cmd = tool_call.arguments.get("command", "")
@@ -952,10 +1061,12 @@ class ToolGuard:
                 except (ValueError, OSError):
                     continue
                 if candidate.is_relative_to(_PLATFORM_DATA_ROOT):
-                    paths_to_check.append((wp, True))
+                    paths_to_check.append((wp, True, None))
 
-        for p, writing in paths_to_check:
-            result = self.file_guard.check_path(p, writing=writing)
+        for p, writing, declared in paths_to_check:
+            result = self.file_guard.check_path(
+                p, writing=writing, declared_path=declared
+            )
             if not result.allowed:
                 # The session whitelist may extend only the ordinary directory
                 # boundary; high-risk paths do not set ``boundary_block``.

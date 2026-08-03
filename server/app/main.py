@@ -8,6 +8,7 @@ from common import config as common_config
 from common.database import close_db
 from engine.execution import RunStateError, RunStateStore
 from engine.llm.observability import set_default_generation_sink
+from engine.safety.tool_guard import close_audit_chains
 
 from .infrastructure.auth import get_local_token, require_auth
 from .infrastructure.database import get_app_db
@@ -16,10 +17,9 @@ from .routers import (
     config,
 )
 from .services.auto_task_service import cancel_background_runs
+from .services.engine_runtime import close_shared_llm_clients, load_runtime_identity_catalog
 from .services.scheduler import run_scheduler
 from .services.token_stats_service import TokenStatsService
-
-from .services.engine_runtime import close_shared_llm_clients, load_runtime_identity_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,10 @@ async def lifespan(app: FastAPI):
     # so drain them before the LLM clients they are still using go away.
     await cancel_background_runs()
     await close_shared_llm_clients()
+    # Anchor the audit chain head at the only boundary where it is well
+    # defined: no run is still appending to the install-wide log.  A rollback
+    # of the sealed log is then detectable on the next verification.
+    close_audit_chains()
     await close_db()
 
 

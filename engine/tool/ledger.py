@@ -21,10 +21,20 @@ def _ledger_redacted_content(content: str, *, limit: int = 4096) -> str:
     trail.  ``_redact_secret_text`` hides whole-string credentials entirely and
     replaces embedded high-confidence tokens in place, keeping the rest of the
     output readable.
+
+    The stored copy is capped well below the ~50 KB a tool result may carry, and
+    a replay hands that copy back as the tool's result.  Silently returning a cut
+    string would make a resumed run reason over output that *looks* complete, so
+    the truncation is marked the same way ``engine.tool.truncation`` marks its
+    own — a resumed model can then tell that the tail is missing.
     """
     from engine.safety.approval import _redact_secret_text
 
-    return _redact_secret_text(content)[:limit]
+    redacted = _redact_secret_text(content)
+    if len(redacted) <= limit:
+        return redacted
+    marker = f"\n\n...({len(redacted) - limit} chars truncated in the tool ledger)"
+    return redacted[:limit] + marker
 
 
 @dataclass(frozen=True)

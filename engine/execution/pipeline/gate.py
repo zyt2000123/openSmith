@@ -12,6 +12,7 @@ under ``agents/gates/<domain>/`` and are registered at startup by
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal, Mapping, Protocol
 
@@ -64,6 +65,18 @@ def _normalized_llm_verdict(text: str) -> str:
     return text.strip().rstrip(".!?。！？:：;；\t\r\n").upper()
 
 
+def _mentions_fail(verdict: str) -> bool:
+    """Whether a normalized verdict rejects the output anywhere in its text.
+
+    ``startswith("PASS")`` was evaluated after ``startswith("FAIL")``, so a
+    reply that restates the choice before deciding — ``"PASS/FAIL
+    determination: FAIL - no tests"`` — matched PASS and let a rejected output
+    through the gate.  A gate must fail closed: any FAIL token anywhere means
+    fail, and only a reply that leads with PASS and never says FAIL passes.
+    """
+    return re.search(r"\bFAIL\b", verdict) is not None
+
+
 class LLMGate:
     """LLM-based semantic verification layer on top of a heuristic pre-filter."""
 
@@ -102,8 +115,18 @@ class LLMGate:
                 ])
             text = resp.text.strip()
             verdict = _normalized_llm_verdict(text)
-            if verdict.startswith("FAIL"):
-                reason = text[len("FAIL"):].strip(":： \t\r\n")
+            if _mentions_fail(verdict):
+                # Extract the reason from the original casing, not the
+                # upper-cased verdict, so the hint handed back to the node reads
+                # the way the gate wrote it.  Anchor on the *last* FAIL: a reply
+                # that restates the choice first ("PASS/FAIL determination: FAIL
+                # - no tests") puts the deciding token last, and anchoring on the
+                # first one would hand back the preamble as the reason.
+                matches = list(re.finditer(r"\bFAIL\b", text, re.IGNORECASE))
+                tail = text[matches[-1].end():] if matches else ""
+                # Models separate the verdict from the reason with a colon or a
+                # dash about equally often; keep neither in the hint.
+                reason = tail.strip(":：-—– \t\r\n") or "gate rejected the output"
                 return GateResult("fail", f"LLM verification: {reason}", retry_hint=reason)
             if verdict.startswith("PASS"):
                 # The heuristic pre-filter passed or was uncertain (retry);

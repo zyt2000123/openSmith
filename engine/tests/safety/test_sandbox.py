@@ -81,6 +81,7 @@ def test_macos_seatbelt_handles_workspace_paths_with_profile_metacharacters(
     assert result.stdout == "safe\n"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
 def test_macos_seatbelt_rejects_a_working_directory_outside_the_workspace(
     tmp_path: Path,
 ) -> None:

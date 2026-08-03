@@ -736,12 +736,12 @@ def project_execution_event(
                     reason="approval_granted",
                 )
                 # resolve_approval_if_waiting records the event and clears the
-                # pending approval atomically; request_approval already cleared
-                # the tool.  One source TOOL_CALL_RESULT must produce exactly
-                # one event_seq increment, and a run that already left
-                # WAITING_APPROVAL falls through to clear_tool below.
+                # pending approval atomically, so returning here keeps one source
+                # TOOL_CALL_RESULT at exactly one event_seq increment.  No
+                # clear_tool is needed on this path: request_approval already
+                # cleared current_tool when the approval was raised, and no
+                # TOOL_CALL_START is re-emitted for the resumed call.
                 return
-                # Fall through to clear_tool: the tool has executed and completed.
             elif approval_outcome in {"denied", "timed_out"}:
                 store.resolve_approval_if_waiting(
                     run_id,

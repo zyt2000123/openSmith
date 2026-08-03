@@ -172,3 +172,60 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {e}")
     sys.exit(1 if failures else 0)
+
+
+# ── Review: a gate must fail closed on an ambiguous verdict ──
+
+
+def test_llm_gate_fails_when_the_verdict_mentions_fail_after_pass() -> None:
+    """``startswith("PASS")`` was checked after ``startswith("FAIL")``, so a reply
+    that restates the choice before deciding ("PASS/FAIL determination: FAIL")
+    matched PASS and let a rejected output through."""
+
+    class _PreFilter:
+        async def check(self, output, context):
+            return GateResult("pass", "heuristic ok")
+
+    class _LLM:
+        async def chat(self, messages, **kwargs):
+            return ChatResponse(text="PASS/FAIL determination: FAIL - no tests were run")
+
+    gate = LLMGate(_PreFilter(), "check {output}")
+    gate.set_llm(_LLM())
+    result = asyncio.run(gate.check("some output", {}))
+
+    assert result.verdict == "fail"
+    assert "no tests were run" in result.reason
+    assert result.retry_hint == "no tests were run"
+
+
+def test_llm_gate_still_passes_a_plain_pass_verdict() -> None:
+    class _PreFilter:
+        async def check(self, output, context):
+            return GateResult("pass", "heuristic ok")
+
+    class _LLM:
+        async def chat(self, messages, **kwargs):
+            return ChatResponse(text="PASS.")
+
+    gate = LLMGate(_PreFilter(), "check {output}")
+    gate.set_llm(_LLM())
+
+    assert asyncio.run(gate.check("some output", {})).verdict == "pass"
+
+
+def test_llm_gate_reports_a_reason_for_a_lowercase_fail() -> None:
+    class _PreFilter:
+        async def check(self, output, context):
+            return GateResult("pass", "heuristic ok")
+
+    class _LLM:
+        async def chat(self, messages, **kwargs):
+            return ChatResponse(text="fail: missing migration")
+
+    gate = LLMGate(_PreFilter(), "check {output}")
+    gate.set_llm(_LLM())
+    result = asyncio.run(gate.check("some output", {}))
+
+    assert result.verdict == "fail"
+    assert result.retry_hint == "missing migration"
