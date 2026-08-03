@@ -6,6 +6,12 @@ from datetime import datetime, timedelta, timezone
 from ..database import get_app_db
 
 
+# Scheduling columns that are meaningfully empty; everything else keeps its
+# value when a caller passes None, so a partial update cannot null a NOT NULL
+# column such as title or instruction.
+_NULLABLE_FIELDS = frozenset({"last_run_at", "next_run_at", "lease_until", "lease_token"})
+
+
 class AutoTaskRepo:
 
     # ── auto_tasks CRUD ──
@@ -78,9 +84,17 @@ class AutoTaskRepo:
             "instruction", "working_dir", "status", "last_run_at", "next_run_at",
             "retry_count", "max_retries", "lease_until", "lease_token",
         ):
-            if field in updates and updates[field] is not None:
-                set_parts.append(f"{field}=?")
-                params.append(updates[field])
+            if field not in updates:
+                continue
+            # A caller that omits a key means "leave it"; one that passes None
+            # for a nullable scheduling column means "clear it".  Collapsing
+            # those two left a task switched to `manual` still carrying its old
+            # next_run_at, and list_due_tasks does not filter on trigger_type —
+            # so the scheduler ran it once more after the user disabled it.
+            if updates[field] is None and field not in _NULLABLE_FIELDS:
+                continue
+            set_parts.append(f"{field}=?")
+            params.append(updates[field])
 
         if "enabled" in updates and updates["enabled"] is not None:
             set_parts.append("enabled=?")

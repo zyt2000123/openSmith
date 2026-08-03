@@ -194,8 +194,17 @@ class SessionService:
         if summary:
             history = [{"role": "user", "content": f"[Session context summary]\n{summary}"}]
             if isinstance(cutoff, int) and cutoff > 0:
-                rows = await self.session_repo.get_messages(session_id, offset=cutoff)
-                rows = rows[-_HISTORY_LIMIT:]
+                # cutoff counts from the start of the session, so it cannot be
+                # paged from directly: get_messages caps a page at 200, and
+                # taking the last rows of that page yields cutoff+190..cutoff+199
+                # rather than the newest messages.  Offset from the end instead,
+                # never reaching back into the summarized prefix.
+                counter = getattr(self.session_repo, "count_messages", None)
+                total = await counter(session_id) if counter is not None else 0
+                start = max(cutoff, total - _HISTORY_LIMIT)
+                rows = await self.session_repo.get_messages(
+                    session_id, limit=_HISTORY_LIMIT, offset=start
+                )
             else:
                 rows = await self.session_repo.get_recent_messages(session_id, _HISTORY_LIMIT)
         else:
@@ -222,8 +231,20 @@ class SessionService:
         history: list[dict] = []
         if isinstance(summary, str) and summary:
             history.append({"role": "user", "content": f"[Session context summary]\n{summary}"})
-            if isinstance(cutoff, int) and cutoff > 0:
-                prior_rows = prior_rows[cutoff:]
+            if isinstance(cutoff, int) and cutoff > 0 and prior_rows:
+                # cutoff is absolute; prior_rows is a window of at most
+                # _HISTORY_LIMIT rows ending at message_id.  Slicing by the raw
+                # cutoff emptied the window for any cutoff >= its length.
+                # Translate to a window-relative index via the window's own
+                # absolute start.
+                counter = getattr(self.session_repo, "count_messages", None)
+                window_start = (
+                    await counter(session_id, prior_rows[0].get("id"))
+                    if counter is not None
+                    else cutoff
+                )
+                drop = max(0, cutoff - window_start)
+                prior_rows = prior_rows[drop:]
         return history + [
             {"role": str(row["role"]), "content": str(row["content"])}
             for row in prior_rows[-_HISTORY_LIMIT:]

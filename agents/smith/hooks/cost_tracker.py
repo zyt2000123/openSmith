@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from common.paths import get_data_root
+from common.config import DATA_DIR
 from engine.execution.hooks import StopHook
 
 # 成本记录含会话 ID 与 token 统计，必须私有（0600）且不被 umask 影响。
@@ -77,7 +77,7 @@ class CostTrackerHook(StopHook):
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
             "model": model_used,
-            "estimated_cost_usd": round(cost_usd, 6),
+            "estimated_cost_usd": round(cost_usd, 6) if cost_usd is not None else None,
         }
 
         # 保存到 ~/.agent-smith/metrics/costs.jsonl
@@ -95,8 +95,8 @@ class CostTrackerHook(StopHook):
         model: str,
         input_tokens: int,
         output_tokens: int
-    ) -> float:
-        """计算成本（美元）"""
+    ) -> float | None:
+        """计算成本（美元）；模型未知时返回 None 而不是猜测。"""
         # 标准化模型名（移除版本号等后缀）
         model_base = model.lower()
         for key in self.MODEL_PRICING:
@@ -106,16 +106,14 @@ class CostTrackerHook(StopHook):
                 output_cost = (output_tokens / 1_000_000) * pricing["output"]
                 return input_cost + output_cost
 
-        # 未知模型，使用 Sonnet 定价作为默认
-        default_pricing = self.MODEL_PRICING["claude-sonnet-4"]
-        input_cost = (input_tokens / 1_000_000) * default_pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * default_pricing["output"]
-        return input_cost + output_cost
+        # 未知模型不猜价。这个 workbench 会路由到非 Anthropic 供应商，按 Sonnet
+        # 记账会给 gpt/gemini/本地模型编出一个看似可信的金额；记 None 表示
+        # "无定价数据"，读取方能区分"免费"与"不知道"。
+        return None
 
     async def _save_cost_record(self, record: dict[str, Any]) -> None:
         """保存成本记录到 JSONL 文件"""
-        data_root = get_data_root()
-        metrics_dir = data_root / "metrics"
+        metrics_dir = DATA_DIR / "metrics"
         metrics_dir.mkdir(parents=True, exist_ok=True)
 
         cost_file = metrics_dir / "costs.jsonl"

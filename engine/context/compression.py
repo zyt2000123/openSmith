@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PRUNED_MARKER = "[pruned]"
-PRUNE_PROTECT_TURNS = 2
 PRUNE_PROTECT_THRESHOLD_CHARS = 8000
 PRUNE_MIN_CHARS = 2000
 CONTEXT_TRIGGER_RATIO = 0.7
@@ -77,26 +76,27 @@ def _preserved_active_context(conversation: list[dict]) -> list[dict]:
 def prune_tool_outputs(
     conversation: list[dict],
     *,
-    protect_turns: int = PRUNE_PROTECT_TURNS,
     protect_threshold: int = PRUNE_PROTECT_THRESHOLD_CHARS,
     min_prune: int = PRUNE_MIN_CHARS,
 ) -> int:
-    """Remove old tool outputs in-place, protecting recent turns.
+    """Remove old tool outputs in-place, protecting the most recent ones.
+
+    Recency is measured in characters walked backwards, not in user turns.
+    Tool results only ever exist *after* the last user message — react_loop
+    appends ``role:"tool"`` but never ``role:"user"``, and session history
+    cannot supply them because ``messages.role`` is constrained to
+    user/assistant/system — so a user-turn counter protected every tool result
+    in existence and this function could never prune anything.
 
     Returns number of chars pruned.
     """
-    turns = 0
     total_chars = 0
     pruned_chars = 0
     to_prune: list[dict] = []
 
     for i in range(len(conversation) - 1, -1, -1):
         msg = conversation[i]
-        if msg.get("role") == "user":
-            turns += 1
         if msg.get("role") == "tool":
-            if turns < protect_turns:
-                continue
             content = msg.get("content", "")
             # Exact match, not substring: a real tool output that merely
             # mentions the marker (grepping this repo does) would otherwise
@@ -104,10 +104,14 @@ def prune_tool_outputs(
             if content == _PRUNED_MARKER:
                 break
             char_count = len(content) if isinstance(content, str) else 0
-            total_chars += char_count
+            # Compare before accumulating: the threshold is how much recent
+            # output to keep, so a message is prunable only once *earlier*
+            # messages already filled that budget.  Accumulating first would
+            # prune the newest result whenever it alone exceeds the threshold.
             if total_chars > protect_threshold:
                 to_prune.append(msg)
                 pruned_chars += char_count
+            total_chars += char_count
 
     if pruned_chars < min_prune:
         return 0
