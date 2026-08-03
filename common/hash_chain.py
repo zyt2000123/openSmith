@@ -408,8 +408,35 @@ def verify_chain(
                     failure=f"hash mismatch at record {index}",
                 )
             if prev_chained_hash is None:
+                # The first chained record must *declare* a preceding legacy
+                # tail before one is admitted.  Inferring it from the absence
+                # of a ``hash`` key is forgeable: ``record_hash`` excludes that
+                # key, so deleting it from record k turns k into a "legacy"
+                # record whose record_hash() is, by construction, exactly the
+                # prev_hash record k+1 already stores — letting any prefix be
+                # dropped and refilled.  The declaration itself is covered by
+                # the record's hash, so it cannot be added after the fact.
+                declared_legacy = value.get("legacy_linked") is True
+                if declared_legacy and last_legacy is None:
+                    return ChainVerification(
+                        ok=False,
+                        records=index - 1,
+                        failure=(
+                            f"chained record {index} declares a legacy tail "
+                            "but none precedes it"
+                        ),
+                    )
+                if not declared_legacy and last_legacy is not None:
+                    return ChainVerification(
+                        ok=False,
+                        records=index - 1,
+                        failure=(
+                            f"unchained records precede chained record {index}, "
+                            "which does not declare a legacy tail"
+                        ),
+                    )
                 expected_prev = (
-                    record_hash(last_legacy) if last_legacy is not None else genesis_hash(namespace)
+                    record_hash(last_legacy) if declared_legacy else genesis_hash(namespace)
                 )
             else:
                 expected_prev = prev_chained_hash
