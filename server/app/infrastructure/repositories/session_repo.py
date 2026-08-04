@@ -177,6 +177,30 @@ class SessionRepo:
         await cursor.close()
         return rows
 
+    async def count_messages(
+        self, session_id: str, before_message_id: str | None = None
+    ) -> int:
+        """Total messages, or how many precede ``before_message_id``.
+
+        ``context_summary_cutoff`` is an absolute count from the start of the
+        session, so turning it into an offset into a bounded window needs the
+        window's absolute position.  Counting DB-side keeps that O(1) in memory
+        no matter how long the session is.
+        """
+        db = await get_app_db()
+        if before_message_id is None:
+            rows = await db.execute_fetchall(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id=?",
+                (session_id,),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id=? AND rowid < "
+                "(SELECT rowid FROM messages WHERE session_id=? AND id=?)",
+                (session_id, session_id, before_message_id),
+            )
+        return int(rows[0]["n"]) if rows else 0
+
     async def get_message(self, session_id: str, message_id: str) -> dict | None:
         db = await get_app_db()
         rows = await db.execute_fetchall(

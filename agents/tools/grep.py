@@ -34,6 +34,18 @@ TOOL_META = {
 MAX_RESULTS = 200
 MAX_LINE_LEN = 500
 EXCLUDED = [".git", "node_modules", "__pycache__", ".venv", "dist", ".build", "*.egg-info"]
+# Credential-bearing paths a *directory* walk must never return.  ToolGuard
+# reasons about the path the model names; this tool names a directory and
+# returns the contents of everything beneath it, so read_file's sensitive-file
+# gate does not cover the subtree and the provider has to exclude these itself.
+# Naming such a file directly stays possible — the guard sees that basename and
+# gates it — so this list only narrows the recursive case.
+SECRET_EXCLUDED = [
+    ".ssh", ".gnupg", ".aws", ".kube",              # credential directories
+    ".env*", ".npmrc", ".pypirc", ".netrc",         # credential files
+    "*.pem", "*.key", "*.p12", "*.pfx",             # private keys and certs
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",   # ssh keys outside ~/.ssh
+]
 _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 
 
@@ -94,10 +106,15 @@ def _execute_sync(
     if not os.path.exists(resolved):
         return f"Error: path not found: {resolved}"
 
+    # Secrets are excluded only when walking a directory.  A file the model
+    # names is a different case: ToolGuard sees that basename and gates it, so
+    # excluding it here would block a search the user already approved.
+    secret_globs = SECRET_EXCLUDED if os.path.isdir(resolved) else []
+
     use_rg = _has_rg()
     if use_rg:
         args = ["rg", "--hidden", "--max-columns", str(MAX_LINE_LEN), "--max-count", "50"]
-        for e in EXCLUDED:
+        for e in EXCLUDED + secret_globs:
             # --iglob, not --glob: on a case-insensitive filesystem the exclusion
             # list should suppress the directory however it happens to be typed.
             args.extend(["--iglob", f"!{e}"])
@@ -118,6 +135,11 @@ def _execute_sync(
         args = ["grep", "-r", "-E", "--binary-files=without-match"]
         for e in EXCLUDED:
             args.extend(["--exclude-dir", _casefold_glob(e)])
+        for e in secret_globs:
+            # --exclude-dir skips a matching directory, --exclude a matching
+            # file; the secret list holds both kinds, so every entry gets both.
+            folded = _casefold_glob(e)
+            args.extend(["--exclude-dir", folded, "--exclude", folded])
         if ignore_case: args.append("-i")
         if files_only: args.append("-l")
         else:

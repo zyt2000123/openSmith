@@ -300,13 +300,20 @@ async def execute(
         )
         if rc_dry != 0:
             return _format_result(rc_dry, dry_out, dry_err)
-        _, staged_out, _ = await run(
-            ["diff", "--name-only", "--diff-filter=ACMR", "--cached"]
+        # -z, not core.quotePath=false: git C-quotes a path containing a `"` or
+        # a `\` no matter how quotePath is set, and every _SENSITIVE_PATTERNS
+        # branch anchors on `$` or `($|\.)`, so a trailing quote made them all
+        # miss.  NUL-separated output is the only form that is never rewritten.
+        rc_staged, staged_out, staged_err = await run(
+            ["diff", "--name-only", "-z", "--diff-filter=ACMR", "--cached"]
         )
+        # Fail closed: a scan that errored tells us nothing about the index, and
+        # `git commit -m` would commit all of it.
+        if rc_staged != 0:
+            return _format_result(rc_staged, staged_out, staged_err)
 
         candidates = _parse_add_dry_run(dry_out)
-        if staged_out.strip():
-            candidates.extend(staged_out.strip().splitlines())
+        candidates.extend(path for path in staged_out.split("\0") if path)
 
         sensitive = _check_sensitive_files(candidates)
         if sensitive:

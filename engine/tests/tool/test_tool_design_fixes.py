@@ -357,8 +357,11 @@ def _fake_git_for_commit(git_ops, monkeypatch, *, would_add: str, staged: str):
         recorded.append(args)
         if "--dry-run" in args:
             return 0, would_add, ""
-        if args[:4] == ["diff", "--name-only", "--diff-filter=ACMR", "--cached"]:
-            return 0, staged, ""
+        if args[:2] == ["diff", "--name-only"] and "--cached" in args:
+            # The index scan runs with -z, whose output is NUL-separated and
+            # never C-quoted; feeding newline-separated text here would test a
+            # shape real git does not produce.
+            return 0, staged.replace("\n", "\0"), ""
         return 0, "", ""
 
     monkeypatch.setattr(git_ops, "_run_git", fake_run)
