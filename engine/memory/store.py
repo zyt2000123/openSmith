@@ -59,6 +59,8 @@ async def retrieve_relevant_memory(
     agent_dir: Path,
     query: str,
     top_k: int = 3,
+    *,
+    embedding_provider: object | None = None,
 ) -> RelevantMemory:
     """Search durable and episode memory while retaining their source boundary.
 
@@ -82,6 +84,28 @@ async def retrieve_relevant_memory(
     if not episodes_dir.is_dir():
         return RelevantMemory(durable=durable)
 
+    # Durable memory is the routing layer.  Topic pages are only eligible when
+    # a durable bullet selected for this question explicitly covers them.
+    try:
+        from .knowledge import TopicAssociationStore
+
+        associations = TopicAssociationStore(agent_dir / "memory")
+        routed_topics = associations.topics_for_entries(
+            [line for line in durable.splitlines() if line.lstrip().startswith("-")]
+        )
+        has_associations = associations.has_associations()
+        has_topic_state = associations.has_state()
+    except Exception:
+        logger.warning("durable topic routing failed", exc_info=True)
+        routed_topics = ()
+        has_associations = False
+        has_topic_state = False
+    # Existing profiles without a generated-topic state retain legacy episode
+    # recall. Once a snapshot exists, its association map is authoritative.
+    if has_topic_state and (not has_associations or not routed_topics):
+        return RelevantMemory(durable=durable)
+    routed_entry_ids = associations.file_ids_for_topics(routed_topics) if has_topic_state else None
+
     try:
         from .search import SearchIndex
 
@@ -89,16 +113,41 @@ async def retrieve_relevant_memory(
         await idx.open()
         try:
             await _sync_episode_index(idx, episodes_dir)
+            semantic_hits: list[dict[str, object]] = []
 
-            hits = await idx.search(query, top_k)
-            if not hits:
-                return RelevantMemory(durable=durable)
+            if embedding_provider is not None and has_associations:
+                try:
+                    from .vector import TopicVectorIndex
 
-            lines = await asyncio.to_thread(
-                _read_episode_hits, episodes_dir, hits, _MAX_EPISODE_CONTEXT_CHARS
+                    vector_index = TopicVectorIndex(episodes_dir)
+                    await vector_index.sync(
+                        _topic_documents(episodes_dir, routed_topics, routed_entry_ids or ()), embedding_provider
+                    )
+                    semantic_hits = await vector_index.search(
+                        query, routed_topics, embedding_provider, top_k
+                    )
+                except Exception:
+                    logger.warning("topic vector retrieval failed; falling back to FTS", exc_info=True)
+
+            hits = await idx.search(
+                query,
+                top_k,
+                entry_ids=routed_entry_ids,
             )
+            lines = await asyncio.to_thread(
+                _read_episode_hits,
+                episodes_dir,
+                hits,
+                _MAX_EPISODE_CONTEXT_CHARS,
+                [line for line in durable.splitlines() if line.lstrip().startswith("-")],
+            )
+            if semantic_hits:
+                lines = _merge_knowledge_fragments(
+                    [_without_durable_repetition(str(hit["text"]), [line for line in durable.splitlines() if line.lstrip().startswith("-")]) for hit in semantic_hits], lines
+                )
             if lines:
-                return RelevantMemory(durable=durable, episodes="\n\n".join(lines))
+                episode_text = "\n\n".join(lines)
+                return RelevantMemory(durable=durable, episodes=episode_text)
             return RelevantMemory(durable=durable)
         finally:
             await idx.close()
@@ -111,8 +160,10 @@ def _read_episode_hits(
     episodes_dir: Path,
     hits: list[dict],
     max_chars: int,
+    durable_entries: list[str] | None = None,
 ) -> list[str]:
     """Read and sanitize matched episode files without blocking the event loop."""
+    durable_entries = durable_entries or []
     lines: list[str] = ["## Relevant Episodes"]
     total_chars = 0
     for hit in hits:
@@ -120,6 +171,7 @@ def _read_episode_hits(
         if ep_path is None:
             continue
         content, _, _ = sanitize_memory_text(ep_path.read_text(encoding="utf-8"))
+        content = _without_durable_repetition(content, durable_entries)
         content = content.strip()
         if not content:
             continue
@@ -128,6 +180,36 @@ def _read_episode_hits(
         lines.append(content)
         total_chars += len(content)
     return lines if len(lines) > 1 else []
+
+
+def _without_durable_repetition(content: str, durable_entries: list[str]) -> str:
+    for entry in durable_entries:
+        content = content.replace(entry, "")
+    return content
+
+
+def _merge_knowledge_fragments(semantic: list[str], lexical: list[str]) -> list[str]:
+    """Keep semantic and lexical evidence while dropping exact duplicate fragments."""
+    result = ["## Relevant Topic Knowledge"]
+    seen: set[str] = set()
+    for fragment in [*semantic, *lexical[1:]]:
+        normalized = " ".join(fragment.split())
+        if normalized and normalized not in seen:
+            result.append(fragment)
+            seen.add(normalized)
+    return result if len(result) > 1 else []
+
+
+def _topic_documents(episodes_dir: Path, topics: tuple[str, ...], file_ids: tuple[str, ...]) -> dict[str, str]:
+    documents: dict[str, str] = {}
+    for topic, file_id in zip(topics, file_ids, strict=False):
+        path = safe_file_in_dir(episodes_dir, episodes_dir / f"{file_id}.md")
+        if path is None:
+            continue
+        content, _, _ = sanitize_memory_text(path.read_text(encoding="utf-8"))
+        if content.strip():
+            documents[topic] = content
+    return documents
 
 
 def _select_relevant_durable(memory_dir: Path, query: str) -> str:

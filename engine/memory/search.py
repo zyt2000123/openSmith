@@ -206,13 +206,28 @@ class SearchIndex:
         )
         await self._db.commit()
 
-    async def search(self, query: str, top_k: int = 10) -> list[dict]:
+    async def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        entry_ids: tuple[str, ...] | None = None,
+    ) -> list[dict]:
         stripped = query.strip()
         if not self._db or not stripped:
             return []
         terms = _search_terms(stripped)
         if not terms:
             return []
+        allowed = tuple(dict.fromkeys(entry_ids or ()))
+        if entry_ids is not None and not allowed:
+            return []
+        scope_sql = ""
+        scope_params: tuple[str, ...] = ()
+        if allowed:
+            placeholders = ", ".join("?" for _ in allowed)
+            scope_sql = f" AND entry_id IN ({placeholders})"
+            scope_params = allowed
         matchable = [term for term in terms if len(term) >= _TRIGRAM_MIN]
         # The trigram tokenizer cannot match terms shorter than three characters
         # (common for CJK words), so those terms are served by a LIKE scan.  The
@@ -229,9 +244,9 @@ class SearchIndex:
                 )
                 rows = await self._db.execute_fetchall(
                     "SELECT entry_id, bm25(memory_fts) AS score "
-                    "FROM memory_fts WHERE memory_fts MATCH ? "
+                    "FROM memory_fts WHERE memory_fts MATCH ?" + scope_sql + " "
                     "ORDER BY score LIMIT ?",
-                    (safe_query, top_k),
+                    (safe_query, *scope_params, top_k),
                 )
             if short_terms:
                 escaped_terms = [
@@ -245,8 +260,8 @@ class SearchIndex:
                 )
                 like_rows = await self._db.execute_fetchall(
                     f"SELECT entry_id, 0.0 AS score FROM memory_fts "
-                    f"WHERE {predicates} LIMIT ?",
-                    (*[f"%{term}%" for term in escaped_terms], top_k),
+                    f"WHERE ({predicates})" + scope_sql + " LIMIT ?",
+                    (*[f"%{term}%" for term in escaped_terms], *scope_params, top_k),
                 )
                 if like_rows:
                     seen = {row["entry_id"] for row in rows}

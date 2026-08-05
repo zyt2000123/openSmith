@@ -155,7 +155,13 @@ class MemoryMaintenanceService:
                 nudged = await self._run_nudge_and_compile_unlocked(memory_dir)
                 if nudged:
                     self._mark_completed("nudge", memory_dir)
-            if self._is_pending("compile", memory_dir):
+            topic_sync_pending = False
+            try:
+                from engine.memory.knowledge import TopicAssociationStore
+                topic_sync_pending = TopicAssociationStore(memory_dir).is_sync_pending()
+            except Exception:
+                logger.warning("topic sync retry state unavailable", exc_info=True)
+            if self._is_pending("compile", memory_dir) or topic_sync_pending:
                 compiled = await self._run_compilation_unlocked(memory_dir)
                 if compiled:
                     self._mark_completed("compile", memory_dir)
@@ -181,6 +187,7 @@ class MemoryMaintenanceService:
                     raise_on_error=True,
                     allow_partial_progress=True,
                     return_diagnostics=True,
+                    sync_topics=True,
                 ),
                 timeout=_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
             )
