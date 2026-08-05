@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -61,6 +62,49 @@ def _digest(text: str) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_FAILURE_TAIL_BYTES = 65536
+_FAILURE_ERROR_CHARS = 160
+
+
+def recent_failure_streak(memory_dir: Path) -> tuple[int, str | None]:
+    """Return the trailing run of failed automatic memory operations.
+
+    A pipeline that keeps failing — an expired provider key answering 401 on
+    every compile, an unreachable relay — otherwise starves silently behind
+    per-attempt warnings.  The status probe surfaces the streak and the newest
+    error (already sanitized by the writer) so a client can show that memory
+    has stopped accumulating.  Reads only the tail of the audit log.
+    """
+    path = memory_dir / "memory_history.jsonl"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _FAILURE_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return 0, None
+    streak = 0
+    last_error: str | None = None
+    for line in reversed(tail.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            # A torn trailing write, or the oldest record cut by the tail
+            # window; neither decides anything, so skip rather than stop.
+            continue
+        if not isinstance(record, dict) or record.get("status") != "failed":
+            break
+        streak += 1
+        if last_error is None:
+            error = record.get("error")
+            if isinstance(error, str) and error.strip():
+                last_error = error.strip()[:_FAILURE_ERROR_CHARS]
+    return streak, last_error
 
 
 def trim_memory_history(

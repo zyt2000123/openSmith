@@ -59,6 +59,8 @@ async def retrieve_relevant_memory(
     agent_dir: Path,
     query: str,
     top_k: int = 3,
+    *,
+    embedding_provider: object | None = None,
 ) -> RelevantMemory:
     """Search durable and episode memory while retaining their source boundary.
 
@@ -82,23 +84,88 @@ async def retrieve_relevant_memory(
     if not episodes_dir.is_dir():
         return RelevantMemory(durable=durable)
 
+    durable_bullets = [
+        line for line in durable.splitlines() if line.lstrip().startswith("-")
+    ]
+    # Durable memory routes the *generated* topic pages: a topic is eligible only
+    # when a durable bullet selected for this question covers it.  A
+    # ``generated_ids`` of ``None`` means no snapshot exists yet, so nothing is
+    # scoped and every episode keeps its original recall.
+    routed_topics: tuple[str, ...] = ()
+    topic_entry_ids: tuple[str, ...] = ()
+    generated_ids: set[str] | None = None
+    try:
+        from .knowledge import TopicAssociationStore
+
+        associations = TopicAssociationStore(agent_dir / "memory")
+        routed_topics = associations.topics_for_entries(durable_bullets)
+        if associations.has_state():
+            topic_entry_ids = associations.file_ids_for_topics(routed_topics)
+            generated_ids = set(associations.snapshot()[1].values())
+    except Exception:
+        logger.warning("durable topic routing failed", exc_info=True)
+        routed_topics = ()
+        topic_entry_ids = ()
+        generated_ids = None
+
     try:
         from .search import SearchIndex
 
         idx = SearchIndex(episodes_dir)
         await idx.open()
         try:
-            await _sync_episode_index(idx, episodes_dir)
-
-            hits = await idx.search(query, top_k)
-            if not hits:
-                return RelevantMemory(durable=durable)
-
-            lines = await asyncio.to_thread(
-                _read_episode_hits, episodes_dir, hits, _MAX_EPISODE_CONTEXT_CHARS
+            indexed_ids = await _sync_episode_index(idx, episodes_dir)
+            # A generated topic page answers only to durable routing, while an
+            # episode written before the snapshot existed keeps its original
+            # unscoped recall — adopting the knowledge layer must not strand the
+            # memory a profile already accumulated.
+            routed_entry_ids = (
+                None
+                if generated_ids is None
+                else topic_entry_ids + tuple(sorted(indexed_ids - generated_ids))
             )
+            semantic_hits: list[dict[str, object]] = []
+
+            # Vector search covers generated pages only, so it is keyed on the
+            # routed topics and must never see the legacy ids added above.
+            if embedding_provider is not None and routed_topics:
+                try:
+                    from .vector import TopicVectorIndex
+
+                    vector_index = TopicVectorIndex(episodes_dir)
+                    await vector_index.sync(
+                        _topic_documents(episodes_dir, routed_topics, topic_entry_ids),
+                        embedding_provider,
+                    )
+                    semantic_hits = await vector_index.search(
+                        query, routed_topics, embedding_provider, top_k
+                    )
+                except Exception:
+                    logger.warning("topic vector retrieval failed; falling back to FTS", exc_info=True)
+
+            hits = await idx.search(
+                query,
+                top_k,
+                entry_ids=routed_entry_ids,
+            )
+            lines = await asyncio.to_thread(
+                _read_episode_hits,
+                episodes_dir,
+                hits,
+                _MAX_EPISODE_CONTEXT_CHARS,
+                durable_bullets,
+            )
+            if semantic_hits:
+                lines = _merge_knowledge_fragments(
+                    [
+                        _without_durable_repetition(str(hit["text"]), durable_bullets)
+                        for hit in semantic_hits
+                    ],
+                    lines,
+                )
             if lines:
-                return RelevantMemory(durable=durable, episodes="\n\n".join(lines))
+                episode_text = "\n\n".join(lines)
+                return RelevantMemory(durable=durable, episodes=episode_text)
             return RelevantMemory(durable=durable)
         finally:
             await idx.close()
@@ -111,8 +178,10 @@ def _read_episode_hits(
     episodes_dir: Path,
     hits: list[dict],
     max_chars: int,
+    durable_entries: list[str] | None = None,
 ) -> list[str]:
     """Read and sanitize matched episode files without blocking the event loop."""
+    durable_entries = durable_entries or []
     lines: list[str] = ["## Relevant Episodes"]
     total_chars = 0
     for hit in hits:
@@ -120,6 +189,7 @@ def _read_episode_hits(
         if ep_path is None:
             continue
         content, _, _ = sanitize_memory_text(ep_path.read_text(encoding="utf-8"))
+        content = _without_durable_repetition(content, durable_entries)
         content = content.strip()
         if not content:
             continue
@@ -128,6 +198,48 @@ def _read_episode_hits(
         lines.append(content)
         total_chars += len(content)
     return lines if len(lines) > 1 else []
+
+
+def _without_durable_repetition(content: str, durable_entries: list[str]) -> str:
+    """Drop episode lines that only restate a durable bullet already in context.
+
+    Substring removal cut a durable phrase out of the middle of an episode
+    sentence — "我们决定<X>，而不是 Y" lost its subject and inverted the meaning —
+    and a durable ``---`` separator erased every ``---`` in the page.  Compare
+    whole lines on collapsed whitespace instead.
+    """
+    duplicates = {" ".join(entry.split()) for entry in durable_entries if entry.strip()}
+    if not duplicates:
+        return content
+    return "\n".join(
+        line
+        for line in content.splitlines()
+        if " ".join(line.split()) not in duplicates
+    )
+
+
+def _merge_knowledge_fragments(semantic: list[str], lexical: list[str]) -> list[str]:
+    """Keep semantic and lexical evidence while dropping exact duplicate fragments."""
+    result = ["## Relevant Topic Knowledge"]
+    seen: set[str] = set()
+    for fragment in [*semantic, *lexical[1:]]:
+        normalized = " ".join(fragment.split())
+        if normalized and normalized not in seen:
+            result.append(fragment)
+            seen.add(normalized)
+    return result if len(result) > 1 else []
+
+
+def _topic_documents(episodes_dir: Path, topics: tuple[str, ...], file_ids: tuple[str, ...]) -> dict[str, str]:
+    documents: dict[str, str] = {}
+    for topic, file_id in zip(topics, file_ids, strict=False):
+        path = safe_file_in_dir(episodes_dir, episodes_dir / f"{file_id}.md")
+        if path is None:
+            continue
+        content, _, _ = sanitize_memory_text(path.read_text(encoding="utf-8"))
+        if content.strip():
+            documents[topic] = content
+    return documents
 
 
 def _select_relevant_durable(memory_dir: Path, query: str) -> str:
@@ -210,8 +322,12 @@ def _scan_episode_changes(
     return current_state, changed
 
 
-async def _sync_episode_index(idx, episodes_dir: Path) -> None:
-    """Synchronize the FTS index from current episode files.
+async def _sync_episode_index(idx, episodes_dir: Path) -> set[str]:
+    """Synchronize the FTS index from current episode files, returning their ids.
+
+    The returned set is the episode ids currently backed by a file, which lets a
+    caller separate generated topic pages from pre-existing episodes without a
+    second directory scan on the per-query hot path.
 
     State is keyed per episode rather than by a global timestamp, so copied or
     restored files with an older mtime still enter the index. The state is
@@ -238,6 +354,7 @@ async def _sync_episode_index(idx, episodes_dir: Path) -> None:
             json.dumps(current_state, ensure_ascii=False, sort_keys=True),
         )
     (episodes_dir / ".index_mtime").unlink(missing_ok=True)
+    return set(current_state)
 
 
 # ---------------------------------------------------------------------------

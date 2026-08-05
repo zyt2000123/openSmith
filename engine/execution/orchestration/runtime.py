@@ -71,6 +71,7 @@ class RuntimeServices:
     skill_registry: SkillRegistry
     gate_llm: LLMPort | None = None
     background_llm: LLMPort | None = None
+    embedding_provider: Any | None = None
     tool_guard: ToolGuard | None = None
     mcp_clients: list[Any] = field(default_factory=list)
     mcp_session_pool: Any | None = None

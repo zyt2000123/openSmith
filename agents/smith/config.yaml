@@ -12,6 +12,14 @@ description: 面向个人工作流的常驻本地 Agent，负责理解目标、�
 llm:
   model: null
 
+# 可选的领域知识语义检索。默认关闭；启用后仅在 durable 已命中领域时使用。
+# knowledge:
+#   embeddings:
+#     enabled: true
+#     base_url: https://api.openai.com/v1
+#     model: text-embedding-3-small
+#     api_key_env: OPENAI_API_KEY
+
 # 严格白名单，fail-closed；再与 identity 的 tools 取交集。未列入即调不到（如 memory_ops）
 tools:
   enabled:

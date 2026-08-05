@@ -824,7 +824,9 @@ async def compact_episode(
     )
     prompt = (
         f"Write a concise episode summary for the topic: {topic}\n\n"
-        f"Include: background, process, key decisions, and outcome.\n"
+        f"Include: background, process, applicability boundaries, and exceptions.\n"
+        f"Do not restate the source facts verbatim; the durable memory already supplies "
+        f"those core conclusions, so add only the detail needed to understand or apply them.\n"
         f"Max 800 chars.\n\n{source}"
     )
     if reviewer:
@@ -921,6 +923,7 @@ async def run_compilation(
     raise_on_error: bool = False,
     allow_partial_progress: bool = False,
     return_diagnostics: bool = False,
+    sync_topics: bool = False,
 ) -> dict:
     """Run compilation, optionally surfacing failures for retry control.
 
@@ -951,6 +954,35 @@ async def run_compilation(
         logger.warning("durable-memory compilation failed", exc_info=True)
         errors["durable"] = "durable-memory compilation failed"
         error_causes["durable"] = exc
+    topic_sync_pending = False
+    if sync_topics:
+        try:
+            from .knowledge import TopicAssociationStore
+            topic_sync_pending = TopicAssociationStore(memory_dir).is_sync_pending()
+        except Exception:
+            logger.warning("durable topic synchronization state unavailable", exc_info=True)
+    if sync_topics and (results["durable"] or topic_sync_pending):
+        from .store import _clear_retry_attempt, _record_retry_attempt
+
+        try:
+            from .knowledge import sync_durable_topics
+
+            await sync_durable_topics(memory_dir, llm, reviewer)
+            _clear_retry_attempt(memory_dir, "topic_sync")
+        except Exception:
+            # Topic pages are a derived knowledge view.  They must never make
+            # an already-reviewed durable memory update fail or retry forever.
+            logger.warning("durable topic synchronization failed", exc_info=True)
+            try:
+                from .knowledge import TopicAssociationStore
+
+                TopicAssociationStore(memory_dir).mark_sync_pending()
+                # This exception never reaches the maintenance service's own
+                # backoff, so the cooldown has to be recorded here; otherwise a
+                # classifier that keeps failing burns one LLM call per tick.
+                _record_retry_attempt(memory_dir, "topic_sync")
+            except Exception:
+                logger.warning("could not persist durable topic sync retry state", exc_info=True)
     if not errors and any(results.values()):
         _write_offset(memory_dir, total)
     # A successful layer is useful progress even when a later layer failed.

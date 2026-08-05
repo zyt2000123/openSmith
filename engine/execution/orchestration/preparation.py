@@ -377,13 +377,17 @@ async def prepare_runtime(
     services.hook_registry = hook_registry
 
     from engine.memory.compile import assemble_memory, ensure_durable_template
+    from engine.memory.embeddings import embedding_provider_from_config
     from engine.memory.store import retrieve_relevant_memory
 
     try:
         ensure_durable_template(state_dir / "memory")
     except Exception:
         logger.warning("failed to initialize durable memory template", exc_info=True)
-    retrieved = await retrieve_relevant_memory(state_dir, request.message)
+    embedding_provider = services.embedding_provider or embedding_provider_from_config(profile_config)
+    retrieved = await retrieve_relevant_memory(
+        state_dir, request.message, embedding_provider=embedding_provider
+    )
     memory_text = assemble_memory(state_dir / "memory", include_durable=False)
     eval_guidance = (
         EVAL_SENSITIVE_GUIDANCE if detect_eval_sensitive(request.message) else ""
