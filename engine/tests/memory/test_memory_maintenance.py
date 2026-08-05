@@ -882,6 +882,8 @@ def test_maintenance_status_reports_idle_for_a_fresh_memory_dir(tmp_path):
         "compile": "idle",
         "nudge": "idle",
         "dream": "idle",
+        "consecutive_failures": 0,
+        "last_error": None,
     }
 
 
@@ -923,6 +925,46 @@ async def test_maintenance_status_reports_running_while_a_task_is_in_flight(tmp_
         MemoryMaintenanceService._background_tasks.pop(key, None)
 
     assert memory_maintenance_status(memory_dir)["compile"] == "idle"
+
+
+def test_maintenance_status_surfaces_a_trailing_failure_streak(tmp_path):
+    """A pipeline stalled on provider errors must be visible, not just logged."""
+    from engine.memory import memory_maintenance_status
+    from engine.memory.history import append_memory_history
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    append_memory_history(memory_dir, target="recent", policy_version=1, status="written")
+    for _ in range(3):
+        append_memory_history(
+            memory_dir,
+            target="recent",
+            policy_version=1,
+            status="failed",
+            error="LLMResponseError: LLM request failed (HTTP 401) after 1 attempt(s).",
+        )
+
+    status = memory_maintenance_status(memory_dir)
+
+    assert status["consecutive_failures"] == 3
+    assert "401" in status["last_error"]
+
+
+def test_failure_streak_ends_at_the_newest_successful_operation(tmp_path):
+    from engine.memory import memory_maintenance_status
+    from engine.memory.history import append_memory_history
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    append_memory_history(
+        memory_dir, target="recent", policy_version=1, status="failed", error="boom"
+    )
+    append_memory_history(memory_dir, target="recent", policy_version=1, status="written")
+
+    status = memory_maintenance_status(memory_dir)
+
+    assert status["consecutive_failures"] == 0
+    assert status["last_error"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -168,12 +168,14 @@ def test_empty_durable_snapshot_removes_stale_topic_files(tmp_path) -> None:
     episodes_dir.mkdir(parents=True)
     (memory_dir / "durable.md").write_text("# Durable\n", encoding="utf-8")
     (episodes_dir / "deployment.md").write_text("old topic", encoding="utf-8")
+    (episodes_dir / "deployment.md.bak").write_text("old topic backup", encoding="utf-8")
     TopicAssociationStore(memory_dir).replace_topic(
         "deployment", ["- deploy with Kubernetes"]
     )
 
     assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ()
     assert not (episodes_dir / "deployment.md").exists()
+    assert not (episodes_dir / "deployment.md.bak").exists()
     assert not TopicAssociationStore(memory_dir).has_associations()
 
 
@@ -279,6 +281,36 @@ def test_unchanged_topic_reuses_its_page_instead_of_regenerating(tmp_path) -> No
     second = TopicLLM()
     assert asyncio.run(sync_durable_topics(memory_dir, second)) == ("部署",)
     assert second.calls == 1, "an unchanged topic must not cost a generation call"
+
+
+def test_duplicate_classifier_topics_merge_into_one_page(tmp_path) -> None:
+    """A repeated topic name must not cost a second generation or drop coverage."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text(
+        "# Durable\n\n- 生产环境使用 Kubernetes 部署。\n- 回滚依赖 Helm 历史版本。\n",
+        encoding="utf-8",
+    )
+
+    class DuplicateTopicLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, _messages, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResponse(
+                    text='{"topics":[{"topic":"部署","entries":[0]},{"topic":"部署","entries":[1]}]}'
+                )
+            return ChatResponse(text="部署与回滚流程说明。")
+
+    llm = DuplicateTopicLLM()
+
+    assert asyncio.run(sync_durable_topics(memory_dir, llm)) == ("部署",)
+    assert llm.calls == 2, "one classification plus one generation, not two"
+    store = TopicAssociationStore(memory_dir)
+    assert store.topics_for_entries(["- 生产环境使用 Kubernetes 部署。"]) == ("部署",)
+    assert store.topics_for_entries(["- 回滚依赖 Helm 历史版本。"]) == ("部署",)
 
 
 def test_snapshot_keeps_topics_and_files_consistent(tmp_path) -> None:

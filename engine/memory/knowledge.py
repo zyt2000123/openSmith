@@ -261,7 +261,7 @@ def _parse_groups(text: str, entry_count: int) -> list[tuple[str, tuple[int, ...
     topics = raw.get("topics") if isinstance(raw, dict) else None
     if not isinstance(topics, list):
         return None
-    groups: list[tuple[str, tuple[int, ...]]] = []
+    groups: dict[str, set[int]] = {}
     for item in topics[:8]:
         if not isinstance(item, dict):
             continue
@@ -270,10 +270,14 @@ def _parse_groups(text: str, entry_count: int) -> list[tuple[str, tuple[int, ...
         if not isinstance(topic, str) or not isinstance(indexes, list):
             continue
         safe_topic, _, _ = sanitize_memory_text(topic)
-        selected = tuple(sorted({index for index in indexes if isinstance(index, int) and 0 <= index < entry_count}))
-        if safe_topic.strip() and selected:
-            groups.append((safe_topic.strip()[:80], selected))
-    return groups
+        cleaned = safe_topic.strip()[:80]
+        selected = {index for index in indexes if isinstance(index, int) and 0 <= index < entry_count}
+        if cleaned and selected:
+            # Classifiers occasionally repeat a topic name; merging keeps one
+            # page per topic instead of paying a second generation (and review)
+            # round with only the last duplicate's coverage surviving.
+            groups.setdefault(cleaned, set()).update(selected)
+    return [(topic, tuple(sorted(selected))) for topic, selected in groups.items()]
 
 
 def _remove_topic_file(episodes_dir: Path, file_id: str) -> None:
@@ -281,6 +285,9 @@ def _remove_topic_file(episodes_dir: Path, file_id: str) -> None:
     filename = f"{file_id.removesuffix('.md')}.md"
     if not file_id or "/" in file_id or "\\" in file_id:
         return
-    target = episodes_dir / filename
-    if target.is_file() and target.resolve().is_relative_to(episodes_dir.resolve()):
-        target.unlink()
+    # compact_episode keeps a .bak beside the page it overwrites; removing the
+    # page must not strand that backup as an orphan.
+    for name in (filename, f"{filename}.bak"):
+        target = episodes_dir / name
+        if target.is_file() and target.resolve().is_relative_to(episodes_dir.resolve()):
+            target.unlink()

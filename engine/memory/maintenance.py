@@ -427,7 +427,7 @@ class MemoryMaintenanceService:
         _clear_retry_attempt(memory_dir, kind)
 
     @classmethod
-    def maintenance_status(cls, memory_dir: Path) -> dict[str, str]:
+    def maintenance_status(cls, memory_dir: Path) -> dict[str, object]:
         """Report, per maintenance kind, whether work is running or still owed.
 
         ``running`` means a background task for it is in flight in this process.
@@ -435,9 +435,14 @@ class MemoryMaintenanceService:
         threshold — but nothing is executing it yet; the scheduler's idle tick
         picks those up. Deferred maintenance is otherwise invisible: it spans
         turns, so it cannot be reported over a per-run event stream.
+
+        ``consecutive_failures``/``last_error`` expose the trailing failure run
+        from the memory history, so a provider outage (an expired key answering
+        401 on every compile) is visible instead of starving memory silently
+        behind per-attempt warnings.
         """
         resolved = memory_dir.resolve()
-        status: dict[str, str] = {}
+        status: dict[str, object] = {}
         for kind in MAINTENANCE_KINDS:
             task = cls._background_tasks.get((resolved, kind))
             if task is not None and not task.done():
@@ -446,6 +451,11 @@ class MemoryMaintenanceService:
                 status[kind] = "pending"
             else:
                 status[kind] = "idle"
+        from engine.memory.history import recent_failure_streak
+
+        streak, last_error = recent_failure_streak(memory_dir)
+        status["consecutive_failures"] = streak
+        status["last_error"] = last_error
         return status
 
     @classmethod
@@ -546,7 +556,7 @@ class MemoryLifecycleHooks:
         return await self.maintenance.run_idle_maintenance(memory_dir)
 
 
-def memory_maintenance_status(memory_dir: Path) -> dict[str, str]:
+def memory_maintenance_status(memory_dir: Path) -> dict[str, object]:
     """Read-only view of deferred memory maintenance, for status endpoints.
 
     Deliberately free of LLM dependencies: a status probe must not have to build
