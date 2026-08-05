@@ -353,7 +353,7 @@ def _fake_git_for_commit(git_ops, monkeypatch, *, would_add: str, staged: str):
     """
     recorded: list[list[str]] = []
 
-    async def fake_run(args, cwd=None, timeout=30, environment=None):
+    async def fake_run(args, cwd=None, timeout=30, environment=None, env=None):
         recorded.append(args)
         if "--dry-run" in args:
             return 0, would_add, ""
@@ -398,7 +398,7 @@ def test_commit_expands_the_pathspec_before_scanning_it(tmp_path, monkeypatch):
 
     assert "refusing to stage sensitive files: src/deep/.env" in result
     # Refused before staging, so the index is left exactly as it was.
-    assert not any(args[:1] == ["commit"] for args in recorded)
+    assert not any("commit" in args for args in recorded)
     assert not any(args == ["add", "--"] + ["*"] for args in recorded)
 
 
@@ -412,7 +412,7 @@ def test_commit_refuses_a_secret_already_in_the_index(tmp_path, monkeypatch):
     result = _run_commit(git_ops, tmp_path, files=["ok.txt"])
 
     assert "refusing to stage sensitive files: .env" in result
-    assert not any(args[:1] == ["commit"] for args in recorded)
+    assert not any("commit" in args for args in recorded)
 
 
 def test_commit_ignores_untracked_files_it_will_never_stage(tmp_path, monkeypatch):
@@ -425,7 +425,8 @@ def test_commit_ignores_untracked_files_it_will_never_stage(tmp_path, monkeypatc
     result = _run_commit(git_ops, tmp_path)
 
     assert "refusing to stage sensitive" not in result
-    assert ["commit", "-m", "work"] in recorded
+    # Identity pinning prepends -c flags, so match the subcommand, not args[0].
+    assert any("commit" in args and args[-2:] == ["-m", "work"] for args in recorded)
     assert not any(args[:1] == ["ls-files"] for args in recorded)
 
 

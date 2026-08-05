@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from pathlib import Path
 
 TOOL_META = {
@@ -27,6 +28,35 @@ TOOL_META = {
 
 MAX_ENTRIES = 300
 EXCLUDED = {".git", "node_modules", "__pycache__", ".venv", "dist", ".build", ".DS_Store", ".egg-info"}
+
+# Credential-bearing names a *directory* walk must never surface — not their
+# contents, not even their existence and size.  ToolGuard gates a directly-named
+# sensitive file (engine/safety/tool_guard.py `_is_sensitive_read_name`), but a
+# recursive listing names a directory and reaches everything beneath it, so this
+# tool has to exclude them itself.  Kept in sync with that guard predicate by
+# engine/tests/tool/test_read_tool_secret_parity.py; `agents/` cannot import the
+# engine, so the logic is mirrored, not shared.
+_SECRET_DIRS = {".ssh", ".gnupg", ".aws", ".kube"}
+_SECRET_FILES = {".npmrc", ".pypirc", ".netrc"}
+_SECRET_EXTENSIONS = (".pem", ".key", ".p12", ".pfx")
+_ENV_TEMPLATE_SUFFIXES = (".env.example", ".env.template", ".env.sample")
+_SSH_KEY_RE = re.compile(r"(?:^|[-_.])(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:[-_.]|$)")
+
+
+def _is_secret_name(name: str) -> bool:
+    """Whether a basename is credential-bearing and must be hidden from a walk."""
+    lower = name.lower()
+    # A public key is safe and stays listable — mirrors the guard, and keeps the
+    # SSH-key regex below from catching ``id_rsa.pub``.
+    if lower.endswith(".pub"):
+        return False
+    if lower in _SECRET_DIRS or lower in _SECRET_FILES:
+        return True
+    if lower.startswith(".env"):
+        return not lower.endswith(_ENV_TEMPLATE_SUFFIXES)
+    if lower.endswith(_SECRET_EXTENSIONS):
+        return True
+    return _SSH_KEY_RE.search(lower) is not None
 
 
 def _execute_sync(*, path: str = ".", max_depth: int = 2) -> str:
@@ -71,12 +101,14 @@ def _execute_sync(*, path: str = ".", max_depth: int = 2) -> str:
         dirs = [
             entry for entry in entries
             if entry not in EXCLUDED
+            and not _is_secret_name(entry)
             and is_safe_entry(os.path.join(dir_path, entry))
             and os.path.isdir(os.path.join(dir_path, entry))
         ]
         files = [
             entry for entry in entries
             if entry not in EXCLUDED
+            and not _is_secret_name(entry)
             and is_safe_entry(os.path.join(dir_path, entry))
             and os.path.isfile(os.path.join(dir_path, entry))
         ]

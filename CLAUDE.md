@@ -217,6 +217,12 @@ A wheel install ships them through `[tool.setuptools.data-files]` in
 `common/pyproject.toml`, which needs one entry per skill — a test asserts that
 declaration stays in sync.
 
+Profile seeding is copy-once: `init_smith_profile_files` skips any file that
+already exists in `~/.agent-smith/`, so additions to the repo seed (e.g. the
+commented `knowledge:` example in `agents/smith/config.yaml`) reach fresh
+installs only. Existing installs configure features by editing
+`~/.agent-smith/config.yaml` directly.
+
 ## 8. Implementation Guidance
 
 - Inspect current code first; prefer existing patterns
@@ -254,17 +260,19 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 980 passed (59 skipped), server 222 passed (5 skipped),
-shell 275 passed.
+Current baseline: engine 1046 passed (59 skipped), server 237 passed (5 skipped),
+shell 301 passed (with `~/.agent-smith/auth_token` present).
 
 The engine's 59 skips are almost all macOS-only Seatbelt tests; every one carries
 `@pytest.mark.skipif(sys.platform != "darwin")`. A Seatbelt test *failing* rather
 than skipping on Linux means that marker is missing — add it.
 
-`shell` has 11 pre-existing failures on a container with no
+`shell` has 12 auth-dependent tests that fail on a container with no
 `~/.agent-smith/auth_token`: they call the real `localAuthHeaders`, which reads
-that file. They fail identically on `main`, so treat them as environment noise,
-not as a regression from your change.
+that file. Create it (`mkdir -p ~/.agent-smith && printf token > ~/.agent-smith/auth_token
+&& chmod 600 ~/.agent-smith/auth_token`) to run the whole suite green, or treat
+them as environment noise — they fail identically on `main`, not as a regression
+from your change.
 
 ## 10. Not Implemented Yet
 

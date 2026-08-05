@@ -4,7 +4,7 @@ import path from "node:path";
 
 const AUTH_TOKEN_PATH = path.join(os.homedir(), ".agent-smith", "auth_token");
 
-let permissionWarningIssued = false;
+let permissionChecked = false;
 
 export function buildAuthHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
@@ -26,18 +26,22 @@ export async function localAuthHeaders(): Promise<Record<string, string>> {
   // The token authenticates this machine's API.  If it is group/world readable,
   // warn once (per process) so a loose umask does not silently leak it to other
   // local users without spamming stderr on every request.
-  if (!permissionWarningIssued) {
+  if (!permissionChecked) {
     try {
       const info = await stat(AUTH_TOKEN_PATH);
+      // The check is done for this process — mark it before warning so a
+      // correctly-permissioned (mode 600) token is not re-stat'd on every
+      // request, which the old warn-only flag left happening forever.
+      permissionChecked = true;
       if (info.mode & 0o077) {
-        permissionWarningIssued = true;
         console.warn(
           `Warning: ${AUTH_TOKEN_PATH} is readable by other users (mode 0${(info.mode & 0o777).toString(8)}); ` +
             "chmod 600 it to keep the local API token private.",
         );
       }
     } catch {
-      // Permission problems surface at the read above; do not fail auth over a stat.
+      // Permission problems surface at the read above; do not fail auth over a
+      // stat, and leave the flag unset so a transient stat error retries.
     }
   }
 

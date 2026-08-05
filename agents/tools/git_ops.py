@@ -130,8 +130,57 @@ def _safe_environment(cwd: str | None) -> dict[str, str]:
     return environment
 
 
+def _host_config_environment(cwd: str | None) -> dict[str, str]:
+    """The safe environment, but with the host's real git config stack visible.
+
+    Reserved for read-only ``git config`` queries: config lookup executes no
+    repository-controlled hooks, filters, or helpers, so it alone may see the
+    user's real HOME (and any explicit GIT_CONFIG_* / XDG_CONFIG_HOME
+    redirection) without exposing runtime secrets to repository code.
+    """
+    environment = _safe_environment(cwd)
+    home = os.environ.get("HOME")
+    if home:
+        environment["HOME"] = home
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "XDG_CONFIG_HOME"):
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+        else:
+            environment.pop(key, None)
+    return environment
+
+
+async def _resolve_git_identity(
+    repo_dir: str, environment
+) -> tuple[str | None, str | None]:
+    """Resolve the identity git itself would pick, honoring the host config stack.
+
+    ``_safe_environment`` hides the user's global/system config from every git
+    subprocess so repository-controlled code cannot read runtime secrets — but
+    that also hid ``user.name``/``user.email``, so committing in a repo without
+    a local identity either failed outright or let git fabricate ``user@fqdn``
+    from the hostname.  Query the values read-only with the real stack visible
+    (repo config still wins, matching git's own precedence, because the lookup
+    runs inside the repository) and pin them onto ``commit`` explicitly.
+    """
+    values: list[str | None] = []
+    env = _host_config_environment(repo_dir)
+    for key in ("user.name", "user.email"):
+        rc, out, _ = await _run_git(
+            ["config", "--get", key], cwd=repo_dir, environment=environment, env=env
+        )
+        value = out.strip() if rc == 0 else ""
+        values.append(value or None)
+    return values[0], values[1]
+
+
 async def _run_git(
-    args: list[str], cwd: str | None = None, timeout: int = 30, environment=None
+    args: list[str],
+    cwd: str | None = None,
+    timeout: int = 30,
+    environment=None,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Run a git command via the execution environment; return (returncode, stdout, stderr)."""
     if environment is None:
@@ -154,7 +203,7 @@ async def _run_git(
         argv=["git", *harden, *args],
         cwd=cwd,
         timeout_seconds=timeout,
-        env=_safe_environment(cwd),
+        env=env if env is not None else _safe_environment(cwd),
     )
     if result.timed_out:
         return -1, "", f"git command timed out after {timeout}s"
@@ -326,8 +375,18 @@ async def execute(
         if rc != 0:
             return _format_result(rc, out, err_msg)
 
-        # Commit
-        rc, out, err_msg = await run(["commit", "-m", message])
+        # Commit with the identity the user actually configured.  The isolated
+        # environment hides the global config, so resolve it via a read-only
+        # lookup and pin it explicitly; ``user.useConfigOnly`` keeps git from
+        # fabricating a ``user@fqdn`` identity when nothing is configured —
+        # failing with git's own actionable message instead.
+        name, email = await _resolve_git_identity(repo_dir, environment)
+        identity_args = ["-c", "user.useConfigOnly=true"]
+        if name:
+            identity_args.extend(["-c", f"user.name={name}"])
+        if email:
+            identity_args.extend(["-c", f"user.email={email}"])
+        rc, out, err_msg = await run([*identity_args, "commit", "-m", message])
         return _format_result(rc, out, err_msg)
 
     elif action == "push":

@@ -94,6 +94,7 @@ async def retrieve_relevant_memory(
     routed_topics: tuple[str, ...] = ()
     topic_entry_ids: tuple[str, ...] = ()
     generated_ids: set[str] | None = None
+    snapshot_topics: frozenset[str] | None = None
     try:
         from .knowledge import TopicAssociationStore
 
@@ -101,12 +102,15 @@ async def retrieve_relevant_memory(
         routed_topics = associations.topics_for_entries(durable_bullets)
         if associations.has_state():
             topic_entry_ids = associations.file_ids_for_topics(routed_topics)
-            generated_ids = set(associations.snapshot()[1].values())
+            topics_map, files_map = associations.snapshot()
+            generated_ids = set(files_map.values())
+            snapshot_topics = frozenset(topics_map)
     except Exception:
         logger.warning("durable topic routing failed", exc_info=True)
         routed_topics = ()
         topic_entry_ids = ()
         generated_ids = None
+        snapshot_topics = None
 
     try:
         from .search import SearchIndex
@@ -136,6 +140,7 @@ async def retrieve_relevant_memory(
                     await vector_index.sync(
                         _topic_documents(episodes_dir, routed_topics, topic_entry_ids),
                         embedding_provider,
+                        valid_topics=snapshot_topics,
                     )
                     semantic_hits = await vector_index.search(
                         query, routed_topics, embedding_provider, top_k

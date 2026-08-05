@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,6 +18,8 @@ from ._files import atomic_write_text, safe_file_in_dir, sanitize_memory_text
 
 if TYPE_CHECKING:
     from engine.llm.port import LLMPort
+
+logger = logging.getLogger(__name__)
 
 
 def topic_filename(topic: str) -> str | None:
@@ -88,7 +91,14 @@ class TopicAssociationStore:
         self._root.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self._path, json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
 
-    def replace_topic(self, topic: str, durable_entries: list[str], *, file_id: str | None = None) -> None:
+    def replace_topic(
+        self,
+        topic: str,
+        durable_entries: list[str],
+        *,
+        file_id: str | None = None,
+        page_hash: str | None = None,
+    ) -> None:
         cleaned_topic = topic.strip()
         if not cleaned_topic:
             raise ValueError("topic must not be empty")
@@ -102,24 +112,50 @@ class TopicAssociationStore:
         if covered and filename:
             state["topics"][cleaned_topic] = covered
             state["files"][cleaned_topic] = filename.removesuffix(".md")
+            if page_hash:
+                state["hashes"][cleaned_topic] = page_hash
+            else:
+                state["hashes"].pop(cleaned_topic, None)
         else:
             state["topics"].pop(cleaned_topic, None)
             state["files"].pop(cleaned_topic, None)
+            state["hashes"].pop(cleaned_topic, None)
         self._root.mkdir(parents=True, exist_ok=True)
         atomic_write_text(
             self._path,
             json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         )
 
+    def page_hashes(self) -> dict[str, str]:
+        """Return topic → sha256 of the page content this store last generated.
+
+        Used as a deletion guard: a page whose current content no longer matches
+        the recorded hash was overwritten by something other than the topic sync
+        (``memory_ops`` writes user episodes into the same namespace), so it is
+        no longer ours to delete.
+        """
+        return dict(self._load()["hashes"])
+
     def replace_all_topics(
-        self, topics: dict[str, list[str]], *, file_ids: dict[str, str] | None = None
-    ) -> dict[str, str]:
-        """Replace the full generated-topic snapshot and report removed topics."""
+        self,
+        topics: dict[str, list[str]],
+        *,
+        file_ids: dict[str, str] | None = None,
+        file_hashes: dict[str, str] | None = None,
+    ) -> dict[str, tuple[str, str | None]]:
+        """Replace the full generated-topic snapshot and report removed topics.
+
+        Returns removed topic → ``(episode_id, recorded_page_hash)``; a ``None``
+        hash means the snapshot predates hash recording and the caller cannot
+        verify provenance before deleting.
+        """
         state = self._load()
         old_files = state["files"]
+        old_hashes = state["hashes"]
         current = set(state["topics"])
         normalized: dict[str, list[str]] = {}
         resolved_files: dict[str, str] = {}
+        resolved_hashes: dict[str, str] = {}
         for topic, entries in topics.items():
             cleaned = topic.strip()
             covered = sorted({self.entry_id(entry) for entry in entries if entry.strip()})
@@ -132,8 +168,12 @@ class TopicAssociationStore:
                 continue
             normalized[cleaned] = covered
             resolved_files[cleaned] = file_id.removesuffix(".md")
+            page_hash = (file_hashes or {}).get(cleaned) or old_hashes.get(cleaned)
+            if page_hash:
+                resolved_hashes[cleaned] = page_hash
         state["topics"] = normalized
         state["files"] = resolved_files
+        state["hashes"] = resolved_hashes
         state["sync_pending"] = False
         self._root.mkdir(parents=True, exist_ok=True)
         atomic_write_text(
@@ -142,24 +182,31 @@ class TopicAssociationStore:
         )
         # Built after the write so a topic whose slug no longer resolves cannot
         # raise here and strand its generated page as an unreachable orphan.
-        removed: dict[str, str] = {}
+        removed: dict[str, tuple[str, str | None]] = {}
         for topic in current.difference(normalized):
             stale_id = old_files.get(topic) or topic_filename(topic)
             if stale_id:
-                removed[topic] = stale_id.removesuffix(".md")
+                removed[topic] = (stale_id.removesuffix(".md"), old_hashes.get(topic))
         return removed
 
     def _load(self) -> dict[str, object]:
+        empty = {
+            "version": self._VERSION,
+            "topics": {},
+            "files": {},
+            "hashes": {},
+            "sync_pending": False,
+        }
         safe_path = safe_file_in_dir(self._root, self._path)
         if safe_path is None:
-            return {"version": self._VERSION, "topics": {}, "files": {}, "sync_pending": False}
+            return dict(empty)
         try:
             raw = json.loads(safe_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {"version": self._VERSION, "topics": {}, "files": {}, "sync_pending": False}
+            return dict(empty)
         topics = raw.get("topics") if isinstance(raw, dict) else None
         if not isinstance(topics, dict):
-            return {"version": self._VERSION, "topics": {}, "files": {}, "sync_pending": False}
+            return dict(empty)
         normalized = {
             topic: sorted({entry for entry in entries if isinstance(entry, str)})
             for topic, entries in topics.items()
@@ -170,7 +217,18 @@ class TopicAssociationStore:
             topic: file_id for topic, file_id in raw_files.items()
             if topic in normalized and isinstance(file_id, str)
         } if isinstance(raw_files, dict) else {}
-        return {"version": self._VERSION, "topics": normalized, "files": files, "sync_pending": bool(raw.get("sync_pending", False))}
+        raw_hashes = raw.get("hashes") if isinstance(raw, dict) else {}
+        hashes = {
+            topic: page_hash for topic, page_hash in raw_hashes.items()
+            if topic in normalized and isinstance(page_hash, str)
+        } if isinstance(raw_hashes, dict) else {}
+        return {
+            "version": self._VERSION,
+            "topics": normalized,
+            "files": files,
+            "hashes": hashes,
+            "sync_pending": bool(raw.get("sync_pending", False)),
+        }
 
 
 async def sync_durable_topics(
@@ -189,8 +247,8 @@ async def sync_durable_topics(
     entries = _durable_entries(durable_path.read_text(encoding="utf-8"))
     if not entries:
         store = TopicAssociationStore(memory_dir)
-        for file_id in store.replace_all_topics({}).values():
-            _remove_topic_file(memory_dir / "episodes", file_id)
+        for file_id, page_hash in store.replace_all_topics({}).values():
+            _remove_topic_file(memory_dir / "episodes", file_id, page_hash)
         return ()
     prompt = (
         "Group the following durable memory bullets into at most 8 concise domain "
@@ -216,10 +274,12 @@ async def sync_durable_topics(
 
     store = TopicAssociationStore(memory_dir)
     prior_topics, prior_files = store.snapshot()
+    prior_hashes = store.page_hashes()
     episodes_dir = memory_dir / "episodes"
     updated: list[str] = []
     topic_entries: dict[str, list[str]] = {}
     file_ids: dict[str, str] = {}
+    file_hashes: dict[str, str] = {}
     for topic, indexes in groups:
         selected = [entries[index] for index in indexes]
         covered = tuple(sorted({store.entry_id(entry) for entry in selected}))
@@ -233,6 +293,15 @@ async def sync_durable_topics(
         ):
             topic_entries[topic] = selected
             file_ids[topic] = prior_file
+            # Carry the recorded hash forward, NOT a hash of the current file: a
+            # page the user overwrote since generation must keep mismatching so
+            # the deletion guard still protects it.  A pre-hash snapshot has no
+            # provenance to preserve, so adopt the current content once.
+            prior_hash = prior_hashes.get(topic) or _page_content_hash(
+                episodes_dir / f"{prior_file}.md"
+            )
+            if prior_hash:
+                file_hashes[topic] = prior_hash
             updated.append(topic)
             continue
         related = [{"task": entry, "summary": entry} for entry in selected]
@@ -241,10 +310,15 @@ async def sync_durable_topics(
             raise RuntimeError(f"topic episode generation failed: {topic}")
         topic_entries[topic] = selected
         file_ids[topic] = path.stem
+        written_hash = _page_content_hash(path)
+        if written_hash:
+            file_hashes[topic] = written_hash
         updated.append(topic)
-    removed = store.replace_all_topics(topic_entries, file_ids=file_ids)
-    for file_id in removed.values():
-        _remove_topic_file(episodes_dir, file_id)
+    removed = store.replace_all_topics(
+        topic_entries, file_ids=file_ids, file_hashes=file_hashes
+    )
+    for file_id, page_hash in removed.values():
+        _remove_topic_file(episodes_dir, file_id, page_hash)
     return tuple(updated)
 
 
@@ -280,11 +354,39 @@ def _parse_groups(text: str, entry_count: int) -> list[tuple[str, tuple[int, ...
     return [(topic, tuple(sorted(selected))) for topic, selected in groups.items()]
 
 
-def _remove_topic_file(episodes_dir: Path, file_id: str) -> None:
-    """Remove only the predictable generated topic file, never arbitrary paths."""
+def _page_content_hash(path: Path) -> str | None:
+    """Hash a topic page's exact bytes, or None when it cannot be read."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _remove_topic_file(
+    episodes_dir: Path, file_id: str, expected_hash: str | None = None
+) -> None:
+    """Remove only the predictable generated topic file, never arbitrary paths.
+
+    Generated pages share the episodes namespace with user episodes written by
+    ``memory_ops``, and ``compact_episode`` overwrites a same-topic page in
+    place.  When the snapshot recorded a content hash, delete only if the page
+    still matches it: a mismatch means someone else's content now lives at this
+    id, and removing it (plus its ``.bak``, the last copy) would destroy memory
+    the user wrote.  Hash-less snapshots predate the guard and keep the old
+    unconditional cleanup.
+    """
     filename = f"{file_id.removesuffix('.md')}.md"
     if not file_id or "/" in file_id or "\\" in file_id:
         return
+    page = episodes_dir / filename
+    if expected_hash is not None and page.is_file():
+        current = _page_content_hash(page)
+        if current is not None and current != expected_hash:
+            logger.info(
+                "keeping topic page %s: content diverged from the generated snapshot",
+                filename,
+            )
+            return
     # compact_episode keeps a .bak beside the page it overwrites; removing the
     # page must not strand that backup as an orphan.
     for name in (filename, f"{filename}.bak"):

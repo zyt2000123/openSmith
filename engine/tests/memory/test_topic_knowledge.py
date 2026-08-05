@@ -121,7 +121,7 @@ def test_topic_snapshot_reconciles_removed_topics(tmp_path) -> None:
 
     removed = store.replace_all_topics({"数据库": ["- use PostgreSQL"]})
 
-    assert removed == {"部署": "部署"}
+    assert removed == {"部署": ("部署", None)}
     assert store.topics_for_entries(["- deploy with Kubernetes"]) == ()
 
 
@@ -224,6 +224,67 @@ def test_vector_sync_reuses_stored_vectors_on_a_second_run(tmp_path) -> None:
 
     assert after_second == after_first, "unchanged chunks must not be re-embedded"
     assert [hit["topic"] for hit in hits] == ["deployment"]
+
+
+def test_vector_sync_keeps_vectors_for_topics_not_routed_this_query(tmp_path) -> None:
+    """Alternating routed topics must not re-embed on every switch."""
+    index = TopicVectorIndex(tmp_path / "episodes")
+    provider = FakeEmbedder()
+    every_topic = frozenset({"deployment", "database"})
+
+    async def run():
+        await index.sync({"deployment": "deploy rollout"}, provider, valid_topics=every_topic)
+        await index.sync({"database": "database tuning"}, provider, valid_topics=every_topic)
+        calls_after_both = provider.calls
+        await index.sync({"deployment": "deploy rollout"}, provider, valid_topics=every_topic)
+        return calls_after_both, provider.calls
+
+    calls_after_both, calls_after_return = asyncio.run(run())
+
+    assert calls_after_return == calls_after_both, (
+        "returning to an already-embedded topic must reuse its stored vectors"
+    )
+
+
+def test_vector_sync_prunes_topics_that_left_the_snapshot(tmp_path) -> None:
+    episodes_dir = tmp_path / "episodes"
+    index = TopicVectorIndex(episodes_dir)
+    provider = FakeEmbedder()
+
+    async def run():
+        await index.sync(
+            {"deployment": "deploy rollout", "database": "database tuning"},
+            provider,
+            valid_topics=frozenset({"deployment", "database"}),
+        )
+        await index.sync(
+            {"deployment": "deploy rollout"},
+            provider,
+            valid_topics=frozenset({"deployment"}),
+        )
+
+    asyncio.run(run())
+
+    state = json.loads((episodes_dir / "vectors.json").read_text(encoding="utf-8"))
+    assert {item["topic"] for item in state["items"].values()} == {"deployment"}
+
+
+def test_vector_sync_skips_the_write_when_nothing_changed(tmp_path) -> None:
+    """This runs on the per-query hot path; an unchanged result must not rewrite."""
+    episodes_dir = tmp_path / "episodes"
+    index = TopicVectorIndex(episodes_dir)
+    provider = FakeEmbedder()
+    documents = {"deployment": "deploy rollout details"}
+
+    async def run():
+        await index.sync(documents, provider)
+        before = (episodes_dir / "vectors.json").stat().st_mtime_ns
+        await index.sync(documents, provider)
+        return before, (episodes_dir / "vectors.json").stat().st_mtime_ns
+
+    before, after = asyncio.run(run())
+
+    assert after == before, "an unchanged sync must not rewrite vectors.json"
 
 
 def test_vector_sync_re_embeds_a_corrupted_stored_vector(tmp_path) -> None:
@@ -377,6 +438,101 @@ def test_routed_query_cannot_reach_an_unrouted_topic_page(tmp_path) -> None:
 
     assert "关键词优先" in result.episodes
     assert "关键词也出现在这里" not in result.episodes
+
+
+def test_user_overwritten_topic_page_survives_topic_removal(tmp_path) -> None:
+    """A page the user's own episode content took over is no longer ours to delete.
+
+    memory_ops writes user episodes into the same namespace and header format,
+    so a same-topic summary lands on the generated page's path.  Removing the
+    topic used to delete the page *and* its ``.bak`` — the last copy of what
+    the user wrote.
+    """
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text(
+        "# Durable\n\n- 生产环境使用 Kubernetes 部署。\n", encoding="utf-8"
+    )
+    assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ("部署",)
+    page = memory_dir / "episodes" / "部署.md"
+    page.write_text("# 部署\n\n用户手写的部署经验，必须保留。\n", encoding="utf-8")
+
+    (memory_dir / "durable.md").write_text("# Durable\n", encoding="utf-8")
+    assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ()
+
+    assert page.is_file(), "a user-overwritten page must survive topic removal"
+    assert "用户手写" in page.read_text(encoding="utf-8")
+
+
+def test_removed_generated_page_is_still_deleted_when_content_matches(tmp_path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text(
+        "# Durable\n\n- 生产环境使用 Kubernetes 部署。\n", encoding="utf-8"
+    )
+    assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ("部署",)
+    page = memory_dir / "episodes" / "部署.md"
+    assert page.is_file()
+
+    (memory_dir / "durable.md").write_text("# Durable\n", encoding="utf-8")
+    assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ()
+
+    assert not page.exists(), "an untouched generated page is reconciled away"
+
+
+def test_reuse_carries_the_recorded_hash_so_the_guard_outlives_a_no_op_sync(tmp_path) -> None:
+    """An unchanged-topic sync between the overwrite and the removal must not
+    re-bless the user's content as generated."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text(
+        "# Durable\n\n- 生产环境使用 Kubernetes 部署。\n", encoding="utf-8"
+    )
+    assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ("部署",)
+    page = memory_dir / "episodes" / "部署.md"
+    page.write_text("# 部署\n\n用户手写的部署经验。\n", encoding="utf-8")
+
+    # Unchanged coverage → the reuse branch runs and must carry the old hash.
+    assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ("部署",)
+    (memory_dir / "durable.md").write_text("# Durable\n", encoding="utf-8")
+    assert asyncio.run(sync_durable_topics(memory_dir, TopicLLM())) == ()
+
+    assert page.is_file(), "the guard must survive an intervening reuse sync"
+
+
+def test_topic_sync_failures_reach_the_status_probe_and_recovery_clears_them(tmp_path) -> None:
+    """The lane must be visible: a failed sync lands in the history (feeding the
+    failure streak) and flips ``topic_sync`` to pending; a recovered sync writes
+    the success record that ends the streak."""
+    from engine.memory import memory_maintenance_status
+    from engine.memory.compile import run_compilation
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text(
+        "# Durable\n\n- 生产环境使用 Kubernetes 部署。\n", encoding="utf-8"
+    )
+    TopicAssociationStore(memory_dir).mark_sync_pending()
+
+    class FailingLLM:
+        async def chat(self, _messages, **_kwargs):
+            raise RuntimeError("classifier unavailable")
+
+    asyncio.run(run_compilation(memory_dir, FailingLLM(), sync_topics=True))
+
+    status = memory_maintenance_status(memory_dir)
+    assert status["topic_sync"] == "pending"
+    assert status["consecutive_failures"] == 1
+    assert "classifier unavailable" in str(status["last_error"])
+
+    from engine.memory.store import _clear_retry_attempt
+
+    _clear_retry_attempt(memory_dir, "topic_sync")
+    asyncio.run(run_compilation(memory_dir, TopicLLM(), sync_topics=True))
+
+    status = memory_maintenance_status(memory_dir)
+    assert status["topic_sync"] == "idle"
+    assert status["consecutive_failures"] == 0
 
 
 def test_durable_dedup_drops_whole_lines_without_cutting_sentences() -> None:

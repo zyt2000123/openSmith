@@ -44,7 +44,13 @@ SECRET_EXCLUDED = [
     ".ssh", ".gnupg", ".aws", ".kube",              # credential directories
     ".env*", ".npmrc", ".pypirc", ".netrc",         # credential files
     "*.pem", "*.key", "*.p12", "*.pfx",             # private keys and certs
-    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",   # ssh keys outside ~/.ssh
+    # SSH keys, including copies affixed away from ~/.ssh (id_rsa_old,
+    # backup-id_ed25519).  ToolGuard._is_sensitive_read_name gates these with a
+    # word-boundary regex, so a bare-basename exclusion here let a directory
+    # walk dump exactly the affixed keys the guard blocks on a direct read.
+    # The globs over-match slightly (grid_rsa) — harmless: an over-excluded file
+    # is still searchable when named directly, where the guard then governs it.
+    "*id_rsa*", "*id_dsa*", "*id_ecdsa*", "*id_ed25519*",
 ]
 _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 

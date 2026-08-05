@@ -729,7 +729,15 @@ async def _run_events_with_runtime(
                 "reason": "consumer_disconnected",
             })
             try:
-                await boundary.record(cancelled_event)
+                # Shield the terminal record: this runs *because* the consumer
+                # disconnected, so the enclosing task is already being cancelled.
+                # boundary.record hops through asyncio.to_thread, whose executor
+                # future is cancelled if the work item has not dequeued yet —
+                # dropping the CANCELLED transition and stranding the run state at
+                # 'running', which makes every later resume 409 until restart.
+                # The shielded write is bounded (one fsync), so it completes even
+                # as the cancellation propagates below.
+                await asyncio.shield(boundary.record(cancelled_event))
             except asyncio.CancelledError as exc:
                 cancellation = cancellation or exc
             except Exception:
