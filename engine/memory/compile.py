@@ -962,16 +962,25 @@ async def run_compilation(
         except Exception:
             logger.warning("durable topic synchronization state unavailable", exc_info=True)
     if sync_topics and (results["durable"] or topic_sync_pending):
+        from .store import _clear_retry_attempt, _record_retry_attempt
+
         try:
             from .knowledge import sync_durable_topics
 
             await sync_durable_topics(memory_dir, llm, reviewer)
+            _clear_retry_attempt(memory_dir, "topic_sync")
         except Exception:
             # Topic pages are a derived knowledge view.  They must never make
             # an already-reviewed durable memory update fail or retry forever.
             logger.warning("durable topic synchronization failed", exc_info=True)
             try:
+                from .knowledge import TopicAssociationStore
+
                 TopicAssociationStore(memory_dir).mark_sync_pending()
+                # This exception never reaches the maintenance service's own
+                # backoff, so the cooldown has to be recorded here; otherwise a
+                # classifier that keeps failing burns one LLM call per tick.
+                _record_retry_attempt(memory_dir, "topic_sync")
             except Exception:
                 logger.warning("could not persist durable topic sync retry state", exc_info=True)
     if not errors and any(results.values()):

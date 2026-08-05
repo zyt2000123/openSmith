@@ -84,27 +84,29 @@ async def retrieve_relevant_memory(
     if not episodes_dir.is_dir():
         return RelevantMemory(durable=durable)
 
-    # Durable memory is the routing layer.  Topic pages are only eligible when
-    # a durable bullet selected for this question explicitly covers them.
+    durable_bullets = [
+        line for line in durable.splitlines() if line.lstrip().startswith("-")
+    ]
+    # Durable memory routes the *generated* topic pages: a topic is eligible only
+    # when a durable bullet selected for this question covers it.  A
+    # ``generated_ids`` of ``None`` means no snapshot exists yet, so nothing is
+    # scoped and every episode keeps its original recall.
+    routed_topics: tuple[str, ...] = ()
+    topic_entry_ids: tuple[str, ...] = ()
+    generated_ids: set[str] | None = None
     try:
         from .knowledge import TopicAssociationStore
 
         associations = TopicAssociationStore(agent_dir / "memory")
-        routed_topics = associations.topics_for_entries(
-            [line for line in durable.splitlines() if line.lstrip().startswith("-")]
-        )
-        has_associations = associations.has_associations()
-        has_topic_state = associations.has_state()
+        routed_topics = associations.topics_for_entries(durable_bullets)
+        if associations.has_state():
+            topic_entry_ids = associations.file_ids_for_topics(routed_topics)
+            generated_ids = set(associations.snapshot()[1].values())
     except Exception:
         logger.warning("durable topic routing failed", exc_info=True)
         routed_topics = ()
-        has_associations = False
-        has_topic_state = False
-    # Existing profiles without a generated-topic state retain legacy episode
-    # recall. Once a snapshot exists, its association map is authoritative.
-    if has_topic_state and (not has_associations or not routed_topics):
-        return RelevantMemory(durable=durable)
-    routed_entry_ids = associations.file_ids_for_topics(routed_topics) if has_topic_state else None
+        topic_entry_ids = ()
+        generated_ids = None
 
     try:
         from .search import SearchIndex
@@ -112,16 +114,28 @@ async def retrieve_relevant_memory(
         idx = SearchIndex(episodes_dir)
         await idx.open()
         try:
-            await _sync_episode_index(idx, episodes_dir)
+            indexed_ids = await _sync_episode_index(idx, episodes_dir)
+            # A generated topic page answers only to durable routing, while an
+            # episode written before the snapshot existed keeps its original
+            # unscoped recall — adopting the knowledge layer must not strand the
+            # memory a profile already accumulated.
+            routed_entry_ids = (
+                None
+                if generated_ids is None
+                else topic_entry_ids + tuple(sorted(indexed_ids - generated_ids))
+            )
             semantic_hits: list[dict[str, object]] = []
 
-            if embedding_provider is not None and has_associations:
+            # Vector search covers generated pages only, so it is keyed on the
+            # routed topics and must never see the legacy ids added above.
+            if embedding_provider is not None and routed_topics:
                 try:
                     from .vector import TopicVectorIndex
 
                     vector_index = TopicVectorIndex(episodes_dir)
                     await vector_index.sync(
-                        _topic_documents(episodes_dir, routed_topics, routed_entry_ids or ()), embedding_provider
+                        _topic_documents(episodes_dir, routed_topics, topic_entry_ids),
+                        embedding_provider,
                     )
                     semantic_hits = await vector_index.search(
                         query, routed_topics, embedding_provider, top_k
@@ -139,11 +153,15 @@ async def retrieve_relevant_memory(
                 episodes_dir,
                 hits,
                 _MAX_EPISODE_CONTEXT_CHARS,
-                [line for line in durable.splitlines() if line.lstrip().startswith("-")],
+                durable_bullets,
             )
             if semantic_hits:
                 lines = _merge_knowledge_fragments(
-                    [_without_durable_repetition(str(hit["text"]), [line for line in durable.splitlines() if line.lstrip().startswith("-")]) for hit in semantic_hits], lines
+                    [
+                        _without_durable_repetition(str(hit["text"]), durable_bullets)
+                        for hit in semantic_hits
+                    ],
+                    lines,
                 )
             if lines:
                 episode_text = "\n\n".join(lines)
@@ -183,9 +201,21 @@ def _read_episode_hits(
 
 
 def _without_durable_repetition(content: str, durable_entries: list[str]) -> str:
-    for entry in durable_entries:
-        content = content.replace(entry, "")
-    return content
+    """Drop episode lines that only restate a durable bullet already in context.
+
+    Substring removal cut a durable phrase out of the middle of an episode
+    sentence — "我们决定<X>，而不是 Y" lost its subject and inverted the meaning —
+    and a durable ``---`` separator erased every ``---`` in the page.  Compare
+    whole lines on collapsed whitespace instead.
+    """
+    duplicates = {" ".join(entry.split()) for entry in durable_entries if entry.strip()}
+    if not duplicates:
+        return content
+    return "\n".join(
+        line
+        for line in content.splitlines()
+        if " ".join(line.split()) not in duplicates
+    )
 
 
 def _merge_knowledge_fragments(semantic: list[str], lexical: list[str]) -> list[str]:
@@ -292,8 +322,12 @@ def _scan_episode_changes(
     return current_state, changed
 
 
-async def _sync_episode_index(idx, episodes_dir: Path) -> None:
-    """Synchronize the FTS index from current episode files.
+async def _sync_episode_index(idx, episodes_dir: Path) -> set[str]:
+    """Synchronize the FTS index from current episode files, returning their ids.
+
+    The returned set is the episode ids currently backed by a file, which lets a
+    caller separate generated topic pages from pre-existing episodes without a
+    second directory scan on the per-query hot path.
 
     State is keyed per episode rather than by a global timestamp, so copied or
     restored files with an older mtime still enter the index. The state is
@@ -320,6 +354,7 @@ async def _sync_episode_index(idx, episodes_dir: Path) -> None:
             json.dumps(current_state, ensure_ascii=False, sort_keys=True),
         )
     (episodes_dir / ".index_mtime").unlink(missing_ok=True)
+    return set(current_state)
 
 
 # ---------------------------------------------------------------------------

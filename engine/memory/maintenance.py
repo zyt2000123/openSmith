@@ -158,7 +158,11 @@ class MemoryMaintenanceService:
             topic_sync_pending = False
             try:
                 from engine.memory.knowledge import TopicAssociationStore
-                topic_sync_pending = TopicAssociationStore(memory_dir).is_sync_pending()
+                from engine.memory.store import _in_retry_cooldown
+
+                topic_sync_pending = TopicAssociationStore(
+                    memory_dir
+                ).is_sync_pending() and not _in_retry_cooldown(memory_dir, "topic_sync")
             except Exception:
                 logger.warning("topic sync retry state unavailable", exc_info=True)
             if self._is_pending("compile", memory_dir) or topic_sync_pending:

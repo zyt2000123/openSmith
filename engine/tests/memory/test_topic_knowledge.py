@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+
+import pytest
 
 from engine.memory.knowledge import TopicAssociationStore
 from engine.memory.knowledge import sync_durable_topics
 from engine.memory.knowledge import topic_filename
 from engine.llm.client import ChatResponse
+from engine.memory.store import _without_durable_repetition
 from engine.memory.store import retrieve_relevant_memory
 from engine.memory.vector import TopicVectorIndex
 from engine.memory.embeddings import embedding_provider_from_config
@@ -26,7 +30,11 @@ class TopicLLM:
 class FakeEmbedder:
     model = "test-embedder"
 
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def embed(self, texts):
+        self.calls += 1
         return [[1.0, 0.0] if "deploy" in text.lower() else [0.0, 1.0] for text in texts]
 
 
@@ -194,3 +202,157 @@ def test_scoped_short_term_search_cannot_escape_topic_filter(tmp_path) -> None:
             await index.close()
 
     assert [hit["id"] for hit in asyncio.run(run())] == ["deployment"]
+
+
+def test_vector_sync_reuses_stored_vectors_on_a_second_run(tmp_path) -> None:
+    """The reuse branch is unreachable on a first sync, so it must be run twice."""
+    index = TopicVectorIndex(tmp_path / "episodes")
+    provider = FakeEmbedder()
+    documents = {"deployment": "deploy rollout details"}
+
+    async def run():
+        await index.sync(documents, provider)
+        after_first = provider.calls
+        await index.sync(documents, provider)
+        after_second = provider.calls
+        hits = await index.search("deploy safely", ("deployment",), provider, 3)
+        return after_first, after_second, hits
+
+    after_first, after_second, hits = asyncio.run(run())
+
+    assert after_second == after_first, "unchanged chunks must not be re-embedded"
+    assert [hit["topic"] for hit in hits] == ["deployment"]
+
+
+def test_vector_sync_re_embeds_a_corrupted_stored_vector(tmp_path) -> None:
+    episodes_dir = tmp_path / "episodes"
+    index = TopicVectorIndex(episodes_dir)
+    provider = FakeEmbedder()
+    documents = {"deployment": "deploy rollout details"}
+
+    async def run():
+        await index.sync(documents, provider)
+        state_path = episodes_dir / "vectors.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for item in state["items"].values():
+            item["vector"] = None
+        state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+        await index.sync(documents, provider)
+        return await index.search("deploy safely", ("deployment",), provider, 3)
+
+    assert [hit["topic"] for hit in asyncio.run(run())] == ["deployment"]
+
+
+def test_empty_classifier_groups_do_not_wipe_the_snapshot(tmp_path) -> None:
+    memory_dir = tmp_path / "memory"
+    episodes_dir = memory_dir / "episodes"
+    episodes_dir.mkdir(parents=True)
+    (memory_dir / "durable.md").write_text(
+        "# Durable\n\n- 生产环境使用 Kubernetes 部署。\n", encoding="utf-8"
+    )
+    (episodes_dir / "部署.md").write_text("既有主题页面", encoding="utf-8")
+    store = TopicAssociationStore(memory_dir)
+    store.replace_topic("部署", ["- 生产环境使用 Kubernetes 部署。"])
+
+    class EmptyGroupLLM:
+        async def chat(self, _messages, **_kwargs):
+            return ChatResponse(text='{"topics": []}')
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(sync_durable_topics(memory_dir, EmptyGroupLLM()))
+
+    assert (episodes_dir / "部署.md").is_file()
+    assert store.topics_for_entries(["- 生产环境使用 Kubernetes 部署。"]) == ("部署",)
+
+
+def test_unchanged_topic_reuses_its_page_instead_of_regenerating(tmp_path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text(
+        "# Durable\n\n- 生产环境使用 Kubernetes 部署。\n", encoding="utf-8"
+    )
+    first = TopicLLM()
+    assert asyncio.run(sync_durable_topics(memory_dir, first)) == ("部署",)
+    assert first.calls == 2  # classify, then generate the page
+
+    second = TopicLLM()
+    assert asyncio.run(sync_durable_topics(memory_dir, second)) == ("部署",)
+    assert second.calls == 1, "an unchanged topic must not cost a generation call"
+
+
+def test_snapshot_keeps_topics_and_files_consistent(tmp_path) -> None:
+    """A topic whose slug resolves to nothing has no page, so it is not recorded."""
+    store = TopicAssociationStore(tmp_path / "memory")
+    store.replace_topic("!!!", ["- alpha fact"])
+    store.replace_topic("deployment", ["- beta fact"])
+
+    assert store.topics_for_entries(["- alpha fact"]) == ()
+
+    removed = store.replace_all_topics({"deployment": ["- beta fact"]})
+
+    assert removed == {}
+    topics, files = store.snapshot()
+    assert set(topics) == set(files) == {"deployment"}
+
+
+def test_snapshot_does_not_strand_episodes_that_predate_it(tmp_path) -> None:
+    """A topic snapshot scopes only its own pages; older episodes stay reachable."""
+    memory_dir = tmp_path / "memory"
+    episodes_dir = memory_dir / "episodes"
+    episodes_dir.mkdir(parents=True)
+    (memory_dir / "durable.md").write_text(
+        "- 路由使用关键词匹配\n- 部署使用 docker compose\n", encoding="utf-8"
+    )
+    (episodes_dir / "legacy-deploy.md").write_text(
+        "# 部署\n\n上线前先跑 docker compose config 校验。", encoding="utf-8"
+    )
+    (episodes_dir / "routing-topic.md").write_text(
+        "# 路由\n\n路由优先关键词，其次 LLM 兜底。", encoding="utf-8"
+    )
+    TopicAssociationStore(memory_dir).replace_all_topics(
+        {"路由": ["- 路由使用关键词匹配"]}, file_ids={"路由": "routing-topic"}
+    )
+
+    routed = asyncio.run(retrieve_relevant_memory(tmp_path, "路由 关键词"))
+    unrouted = asyncio.run(retrieve_relevant_memory(tmp_path, "部署 docker compose"))
+
+    assert "LLM 兜底" in routed.episodes
+    assert "docker compose config" in unrouted.episodes, (
+        "an episode predating the snapshot must not become unreachable"
+    )
+
+
+def test_routed_query_cannot_reach_an_unrouted_topic_page(tmp_path) -> None:
+    """The scope still holds for generated pages: only routed topics are eligible."""
+    memory_dir = tmp_path / "memory"
+    episodes_dir = memory_dir / "episodes"
+    episodes_dir.mkdir(parents=True)
+    (memory_dir / "durable.md").write_text(
+        "- 路由使用关键词匹配\n- 部署使用 docker compose\n", encoding="utf-8"
+    )
+    (episodes_dir / "routing-topic.md").write_text("# 路由\n\n关键词优先。", encoding="utf-8")
+    (episodes_dir / "deploy-topic.md").write_text("# 部署\n\n关键词也出现在这里。", encoding="utf-8")
+    TopicAssociationStore(memory_dir).replace_all_topics(
+        {
+            "路由": ["- 路由使用关键词匹配"],
+            "部署": ["- 部署使用 docker compose"],
+        },
+        file_ids={"路由": "routing-topic", "部署": "deploy-topic"},
+    )
+
+    result = asyncio.run(retrieve_relevant_memory(tmp_path, "路由 关键词"))
+
+    assert "关键词优先" in result.episodes
+    assert "关键词也出现在这里" not in result.episodes
+
+
+def test_durable_dedup_drops_whole_lines_without_cutting_sentences() -> None:
+    # The second line *contains* the durable bullet as a substring, which is what
+    # made the previous str.replace approach cut the subject out of the sentence.
+    episode = "- 使用 pytest\n  - 使用 pytest 时要加 -p no:cacheprovider\n"
+
+    cleaned = _without_durable_repetition(episode, ["- 使用 pytest"])
+
+    assert cleaned.splitlines() == ["  - 使用 pytest 时要加 -p no:cacheprovider"]
+    assert "使用 pytest 时要加" in cleaned

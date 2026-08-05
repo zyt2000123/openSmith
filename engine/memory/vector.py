@@ -38,18 +38,27 @@ class TopicVectorIndex:
             for chunk in _chunks(text)
         }
         existing = state.get("items", {})
-        changed = [item for item_id, item in current.items() if item_id not in existing]
-        vectors = await provider.embed([item["text"] for item in changed]) if changed else []
-        if len(vectors) != len(changed):
+        # Reuse a stored vector only when the chunk text is unchanged *and* the
+        # stored vector survived.  A corrupted entry has to be re-embedded; the
+        # earlier split dropped it from both branches and lost it permanently.
+        items: dict[str, dict] = {}
+        stale: list[tuple[str, dict]] = []
+        for item_id, item in current.items():
+            prior = existing.get(item_id)
+            if (
+                isinstance(prior, dict)
+                and prior.get("text") == item["text"]
+                and isinstance(prior.get("vector"), list)
+            ):
+                items[item_id] = {**item, "vector": prior["vector"]}
+            else:
+                stale.append((item_id, item))
+        vectors = await provider.embed([item["text"] for _, item in stale]) if stale else []
+        if len(vectors) != len(stale):
             raise ValueError("embedding provider returned an unexpected vector count")
-        items = {
-            item_id: {**item, "vector": vector}
-            for item_id, item in current.items()
-            if item_id in existing and existing[item_id].get("text") == item["text"]
-        }
         items.update({
-            self._chunk_id(item["topic"], item["text"]): {**item, "vector": vector}
-            for item, vector in zip(changed, vectors)
+            item_id: {**item, "vector": vector}
+            for (item_id, item), vector in zip(stale, vectors, strict=True)
         })
         self._root.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self._path, json.dumps({"model": provider.model, "items": items}, ensure_ascii=False))
