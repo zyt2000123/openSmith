@@ -289,6 +289,49 @@ test("trailing token_usage after done is not dropped", async () => {
   }
 });
 
+test("a token_usage frame split into a later read is yielded exactly once", async () => {
+  // The frame arrives in a SEPARATE read after done — the TCP split the drain
+  // loop exists for.  Without advancing the drain buffer past consumed chunks,
+  // the next drain read and the final flush re-yield it, and applyStreamState
+  // *adds* usage deltas, inflating the trailing frame 2-3x.
+  const originalFetch = globalThis.fetch;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      controller.enqueue(new TextEncoder().encode('event: done\ndata: {"id":"message-1"}\n\n'));
+    },
+  });
+
+  globalThis.fetch = async () =>
+    new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+
+  try {
+    const events: Array<Record<string, unknown>> = [];
+    const consume = (async () => {
+      for await (const event of streamMessage("http://127.0.0.1:8140", "session-1", "hello", { timeoutMs: 1_000 })) {
+        events.push(event as Record<string, unknown>);
+      }
+    })();
+
+    // Deliver the trailing usage frame in its own read, then close the stream.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    streamController?.enqueue(
+      new TextEncoder().encode(
+        'event: token_usage\ndata: {"input_tokens":1,"output_tokens":2,"total_tokens":3}\n\n',
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    streamController?.close();
+    await consume;
+
+    const usageFrames = events.filter((event) => event.type === "token_usage");
+    assert.equal(usageFrames.length, 1, "the split-out token_usage frame must be yielded exactly once");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("SSE decoder retains a tool preflight result", () => {
   const event = decodeSseEvent('event: tool_result\ndata: {"id":"tool-1","preflight":true,"summary":"facts first"}');
 

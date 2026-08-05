@@ -289,8 +289,11 @@ class AutoTaskService:
 
             # Compute the next slot from completion time, not start time: an
             # interval/cron task whose execution outlives its schedule must not
-            # be immediately due again.
-            next_run = self._calc_next_run(trigger_type, trigger_config)
+            # be immediately due again.  Read the current schedule so an edit made
+            # mid-run takes effect now instead of one stale cycle later.
+            next_run = await self._next_run_from_current_config(
+                task_id, trigger_type, trigger_config
+            )
             finished = await self.repo.finish_run(
                 run["id"],
                 "completed",
@@ -384,7 +387,9 @@ class AutoTaskService:
                 # the lease expires; if another worker reclaimed it, this is a
                 # no-op.
                 try:
-                    next_run = self._calc_next_run(trigger_type, trigger_config)
+                    next_run = await self._next_run_from_current_config(
+                        task_id, trigger_type, trigger_config
+                    )
                     await self.repo.finish_task(
                         task_id, "idle", next_run, lease_token, retry_count=0
                     )
@@ -413,8 +418,48 @@ class AutoTaskService:
             else:
                 # Non-retryable failure: schedule the next slot from now so a
                 # task whose execution outlived its interval does not immediately
-                # loop through failure again.
-                retry_at = self._calc_next_run(trigger_type, trigger_config)
+                # loop through failure again.  Honor a schedule edited mid-run.
+                retry_at = await self._next_run_from_current_config(
+                    task_id, trigger_type, trigger_config
+                )
+            # Record the run failure BEFORE releasing the task lease.  finish_run's
+            # lease gate requires status=='running' with this token; finishing the
+            # task first nulls the token, so the gated write would return None and
+            # leave the run row a phantom 'running' with error=NULL forever — the
+            # exact defect the success and cancellation paths already avoid.
+            error_text = _redact_error_text(exc)
+            finished = await self.repo.finish_run(
+                run["id"],
+                "failed",
+                "",
+                error=error_text,
+                auto_task_id=task_id,
+                lease_token=lease_token,
+            )
+            if finished is None:
+                # The lease was genuinely lost mid-run (another worker reclaimed
+                # the task).  This run row is still this worker's own to finalize,
+                # so force past the gate — force only touches our run row, never
+                # the task the new owner now holds.  Mirrors the success and
+                # cancellation paths.
+                finished = await self.repo.finish_run(
+                    run["id"], "failed", "", error=error_text, force=True
+                )
+            if finished is None:
+                # Even the forced write found the row already non-'running' (a late
+                # cancellation finalized it).  Do not blow up the detached task over
+                # bookkeeping; report the outcome from what we know.
+                log.warning(
+                    "Auto task %s run %s failure not recorded: run already finalized",
+                    task_id,
+                    run["id"],
+                )
+                finished = {
+                    **run,
+                    "status": "failed",
+                    "error": error_text,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }
             finished_task = await self.repo.finish_task(
                 task_id,
                 retry_status,
@@ -424,28 +469,6 @@ class AutoTaskService:
             )
             if not finished_task:
                 log.warning("Auto task %s lease was lost before failure handling", task_id)
-            finished = await self.repo.finish_run(
-                run["id"],
-                "failed",
-                "",
-                error=_redact_error_text(exc),
-                auto_task_id=task_id,
-                lease_token=lease_token,
-            )
-            if finished is None:
-                # Lease lost before failure handling: do not blow up the detached
-                # task over bookkeeping, and never retry a superseded run.
-                log.warning(
-                    "Auto task %s run %s failure not recorded: lease no longer held",
-                    task_id,
-                    run["id"],
-                )
-                finished = {
-                    **run,
-                    "status": "failed",
-                    "error": _redact_error_text(exc),
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                }
             return AutoTaskRunOut(**finished)
         finally:
             lease_renewal.cancel()
@@ -561,6 +584,27 @@ class AutoTaskService:
             return cls._next_run(trigger_type, trigger_config)
         except (ValueError, TypeError, OverflowError):
             return None
+
+    async def _next_run_from_current_config(
+        self, task_id: str, fallback_type: str, fallback_config: str
+    ) -> str | None:
+        """Compute the next slot from the task's CURRENT schedule, not the snapshot.
+
+        trigger_type/trigger_config are captured at claim time, so a schedule the
+        user edits while the run is in flight would be silently overwritten on
+        completion by a value derived from the stale snapshot — the new schedule
+        would not take effect for one more old cycle (up to the old cron period).
+        Re-read the row and honor its current schedule (including a switch to
+        'manual', which stops the task); fall back to the snapshot only if the
+        task was deleted mid-run.
+        """
+        try:
+            current = await self.repo.get(task_id)
+        except Exception:
+            current = None
+        if not current:
+            return self._calc_next_run(fallback_type, fallback_config)
+        return self._calc_next_run(current["trigger_type"], current["trigger_config"])
 
     @classmethod
     def _require_next_run(cls, trigger_type: str, trigger_config: str) -> str | None:

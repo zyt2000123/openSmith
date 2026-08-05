@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,4 +75,12 @@ app.include_router(config.router, dependencies=[Depends(require_auth)])
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0"}
+    # Echo the launcher-supplied nonce so a shell that spawned this process can
+    # tell its own server apart from a foreign one that happened to win the same
+    # port in a startup race.  Absent (a manually started server) → null, which
+    # the launcher treats as "not mine, do not adopt as just-spawned".
+    return {
+        "status": "ok",
+        "version": "0.2.0",
+        "nonce": os.environ.get("SMITH_SERVER_NONCE") or None,
+    }

@@ -5,8 +5,9 @@ import inspect
 import json
 import logging
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, AsyncIterator
 
 from fastapi import HTTPException
 
@@ -40,24 +41,59 @@ from .token_stats_service import TokenStatsService
 # The map is guarded by a threading lock so it stays safe even if the server
 # ever runs the handlers from more than one thread/loop, and it is bounded: an
 # abandoned (never-deleted) session must not leak a lock per session forever.
-# Only unlocked locks are evicted — a lock that is held (or has waiters queued)
-# can never be removed while a stream is mid-turn.
+# Eviction is refcounted, NOT keyed on asyncio.Lock.locked(): locked() reports
+# False in the window between release() and a queued waiter's wake-up, so
+# evicting on it could drop a lock that a waiter is about to acquire and let two
+# turns interleave the exact history-read/insert window this serializes.  A
+# caller (holder or queued waiter) is counted in-use from before acquire() until
+# after release(), and only zero-user entries are evicted.
 _SESSION_STREAM_LOCKS: dict[str, asyncio.Lock] = {}
+_SESSION_STREAM_LOCK_USERS: dict[str, int] = {}
 _SESSION_STREAM_LOCKS_GUARD = threading.Lock()
 _SESSION_STREAM_LOCKS_MAX = 64
 
 
-def _session_stream_lock(session_id: str) -> asyncio.Lock:
+def _acquire_session_lock_slot(session_id: str) -> asyncio.Lock:
+    """Reserve this session's lock and mark the caller in-use before acquiring."""
     with _SESSION_STREAM_LOCKS_GUARD:
         lock = _SESSION_STREAM_LOCKS.get(session_id)
         if lock is None:
             if len(_SESSION_STREAM_LOCKS) >= _SESSION_STREAM_LOCKS_MAX:
-                for key, candidate in list(_SESSION_STREAM_LOCKS.items()):
-                    if not candidate.locked():
+                for key in list(_SESSION_STREAM_LOCKS):
+                    if _SESSION_STREAM_LOCK_USERS.get(key, 0) == 0:
                         del _SESSION_STREAM_LOCKS[key]
+                        _SESSION_STREAM_LOCK_USERS.pop(key, None)
             lock = asyncio.Lock()
             _SESSION_STREAM_LOCKS[session_id] = lock
+        _SESSION_STREAM_LOCK_USERS[session_id] = _SESSION_STREAM_LOCK_USERS.get(session_id, 0) + 1
         return lock
+
+
+def _release_session_lock_slot(session_id: str) -> None:
+    with _SESSION_STREAM_LOCKS_GUARD:
+        remaining = _SESSION_STREAM_LOCK_USERS.get(session_id, 0) - 1
+        if remaining > 0:
+            _SESSION_STREAM_LOCK_USERS[session_id] = remaining
+        else:
+            _SESSION_STREAM_LOCK_USERS.pop(session_id, None)
+
+
+@asynccontextmanager
+async def _session_turn_lock(session_id: str) -> AsyncIterator[None]:
+    """Serialize the per-session turn-mutation window, refcounting the slot.
+
+    Held only for the history-read + user-insert window, never across the
+    streaming generator, so an abandoned stream cannot deadlock a session.
+    """
+    lock = _acquire_session_lock_slot(session_id)
+    try:
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+    finally:
+        _release_session_lock_slot(session_id)
 
 # Recent messages passed to the engine as short-term conversational context
 _HISTORY_LIMIT = 10
@@ -275,9 +311,15 @@ class SessionService:
         if not deleted:
             raise HTTPException(404, "Session not found")
         await close_session_mcp_clients(session_id)
-        # Drop the per-session stream lock so deleted sessions do not leak a
-        # lock per session for the server's lifetime.
-        _SESSION_STREAM_LOCKS.pop(session_id, None)
+        # Drop the per-session stream lock so deleted sessions do not leak a lock
+        # for the server's lifetime.  Under the guard, and only when idle: an
+        # unguarded pop racing an in-flight turn (or one popping a lock a waiter
+        # still holds a slot on) breaks the same serialization the map provides.
+        # A busy slot is left for refcount eviction once its turn drains.
+        with _SESSION_STREAM_LOCKS_GUARD:
+            if _SESSION_STREAM_LOCK_USERS.get(session_id, 0) == 0:
+                _SESSION_STREAM_LOCKS.pop(session_id, None)
+                _SESSION_STREAM_LOCK_USERS.pop(session_id, None)
 
     async def compress_session(self, agent_id: str, session_id: str) -> ContextCompressionOut:
         session = await self.session_repo.get_owned(session_id, agent_id)
@@ -487,16 +529,10 @@ class SessionService:
         terminal_reason: str | None = None
         terminal_notice: str | None = None
         try:
-            session_lock = _session_stream_lock(session_id)
-            lock_held = False
-            try:
-                # Serialize history-read + user-message insert: two concurrent
-                # turns both read before either inserts, so each run's context
-                # would omit the other's just-inserted user turn.  The lock is
-                # held only for this mutation window (not across the streaming
-                # generator) so an abandoned stream can never deadlock a session.
-                await session_lock.acquire()
-                lock_held = True
+            # Serialize history-read + user-message insert: two concurrent turns
+            # both read before either inserts, so each run's context would omit
+            # the other's just-inserted user turn.
+            async with _session_turn_lock(session_id):
                 if _resume_run_id is None:
                     # Fetch recent history BEFORE saving the new message (avoids duplication)
                     history = await self._recent_history(session_id)
@@ -505,9 +541,6 @@ class SessionService:
                 else:
                     history = list(_history_override or [])
                     message_id = _message_id
-            finally:
-                if lock_held:
-                    session_lock.release()
             runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
             model_name = str(getattr(getattr(services, "llm", None), "model", "") or "")
             request = EngineRequest(
@@ -757,19 +790,31 @@ class SessionService:
                         # Only a resumed run that produced a replacement reply may
                         # delete the interrupted run's stale partial output; a
                         # resume that fails before producing text keeps it.
-                        # Ordering is deliberate: discard MUST run before
-                        # add_message.  The discard deletes every assistant row
-                        # with rowid between the user message and the next user
-                        # turn, so inserting the new reply first would delete it.
-                        await asyncio.shield(
-                            self.session_repo.discard_assistant_messages_after_user(
+                        #
+                        # discard MUST run before add_message: the discard deletes
+                        # every assistant row between the user message and the next
+                        # user turn, so inserting first would delete the new reply.
+                        # Both steps run inside ONE shielded coroutine: two separate
+                        # shields let a client disconnect (anyio re-delivers the
+                        # cancellation on every loop tick) raise CancelledError —
+                        # a BaseException the except-clause below cannot catch —
+                        # at the await between them, deleting the old reply and
+                        # never inserting the replacement.  As one unit the pair is
+                        # atomic against that cancellation.
+                        async def _persist_replacement() -> dict:
+                            await self.session_repo.discard_assistant_messages_after_user(
                                 session_id,
                                 _message_id,
                             )
+                            return await self.session_repo.add_message(
+                                session_id, "assistant", reply_text
+                            )
+
+                        msg = await asyncio.shield(_persist_replacement())
+                    else:
+                        msg = await asyncio.shield(
+                            self.session_repo.add_message(session_id, "assistant", reply_text)
                         )
-                    msg = await asyncio.shield(
-                        self.session_repo.add_message(session_id, "assistant", reply_text)
-                    )
                 except Exception:
                     logger.exception("failed to persist streamed reply (session=%s)", session_id)
                     terminal_status = "failed"

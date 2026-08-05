@@ -945,6 +945,11 @@ async function* readSseEvents(
           buffer += decoder.decode(trailingValue, { stream: true });
           const trailingParsed = splitSseBuffer(buffer);
           assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
+          // Advance past the frames just consumed, exactly as the main loop does
+          // at :921.  Without this the buffer keeps every parsed chunk, so the
+          // next drain read and the final flush re-yield them — and applyStreamState
+          // *adds* usage deltas, inflating a split-out trailing token_usage 2-3x.
+          buffer = trailingParsed.remainder;
           const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
           yield* trailingConsumed.events;
         }
