@@ -217,6 +217,12 @@ A wheel install ships them through `[tool.setuptools.data-files]` in
 `common/pyproject.toml`, which needs one entry per skill — a test asserts that
 declaration stays in sync.
 
+Profile seeding is copy-once: `init_smith_profile_files` skips any file that
+already exists in `~/.agent-smith/`, so additions to the repo seed (e.g. the
+commented `knowledge:` example in `agents/smith/config.yaml`) reach fresh
+installs only. Existing installs configure features by editing
+`~/.agent-smith/config.yaml` directly.
+
 ## 8. Implementation Guidance
 
 - Inspect current code first; prefer existing patterns
@@ -254,8 +260,8 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 980 passed (59 skipped), server 222 passed (5 skipped),
-shell 275 passed.
+Current baseline: engine 1040 passed (59 skipped), server 231 passed (5 skipped),
+shell 278 passed.
 
 The engine's 59 skips are almost all macOS-only Seatbelt tests; every one carries
 `@pytest.mark.skipif(sys.platform != "darwin")`. A Seatbelt test *failing* rather

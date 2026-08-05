@@ -962,6 +962,7 @@ async def run_compilation(
         except Exception:
             logger.warning("durable topic synchronization state unavailable", exc_info=True)
     if sync_topics and (results["durable"] or topic_sync_pending):
+        from .history import append_memory_history
         from .store import _clear_retry_attempt, _record_retry_attempt
 
         try:
@@ -969,7 +970,15 @@ async def run_compilation(
 
             await sync_durable_topics(memory_dir, llm, reviewer)
             _clear_retry_attempt(memory_dir, "topic_sync")
-        except Exception:
+            # The status probe's failure streak reads the history; a success
+            # record is what ends a topic-sync streak once the lane recovers.
+            append_memory_history(
+                memory_dir,
+                target="topic_sync",
+                policy_version=_MEMORY_POLICY.version,
+                status="written",
+            )
+        except Exception as exc:
             # Topic pages are a derived knowledge view.  They must never make
             # an already-reviewed durable memory update fail or retry forever.
             logger.warning("durable topic synchronization failed", exc_info=True)
@@ -981,6 +990,16 @@ async def run_compilation(
                 # backoff, so the cooldown has to be recorded here; otherwise a
                 # classifier that keeps failing burns one LLM call per tick.
                 _record_retry_attempt(memory_dir, "topic_sync")
+                # Without a history record this lane was invisible to the
+                # failure-streak probe: it could starve forever while the
+                # status endpoint reported a healthy pipeline.
+                append_memory_history(
+                    memory_dir,
+                    target="topic_sync",
+                    policy_version=_MEMORY_POLICY.version,
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             except Exception:
                 logger.warning("could not persist durable topic sync retry state", exc_info=True)
     if not errors and any(results.values()):

@@ -233,14 +233,30 @@ function useMemoryMaintenance(baseUrl: string): MemoryMaintenance | null {
 }
 
 /**
+ * A memory pipeline is considered stalled after this many consecutive failed
+ * automatic operations. One or two failures are routine transients (a slow
+ * provider, a review rejection retried next tick); a trailing streak means
+ * memory has stopped accumulating and the user should know.
+ */
+export const MEMORY_FAILURE_STREAK_THRESHOLD = 3;
+
+export function memoryMaintenanceStalled(maintenance: MemoryMaintenance | null): boolean {
+  return (maintenance?.consecutive_failures ?? 0) >= MEMORY_FAILURE_STREAK_THRESHOLD;
+}
+
+/**
  * The label for ambient memory work, or null when there is nothing to show.
  *
- * Running work outranks owed work. Dreaming is the rarest, then periodic
- * curation, then ordinary compilation, so the most meaningful active pass is
- * the one named.
+ * A stalled pipeline outranks everything: "memory queued" would be actively
+ * misleading while every attempt fails. Otherwise running work outranks owed
+ * work. Dreaming is the rarest, then periodic curation, then ordinary
+ * compilation, so the most meaningful active pass is the one named.
  */
 export function memoryMaintenanceLabel(maintenance: MemoryMaintenance | null): string | null {
   if (!maintenance) return null;
+  if (memoryMaintenanceStalled(maintenance)) {
+    return `memory stalled ×${maintenance.consecutive_failures}`;
+  }
   if (maintenance.dream === "running") return "dreaming";
   if (maintenance.nudge === "running") return "curating memory";
   if (maintenance.compile === "running") return "compiling memory";
@@ -289,9 +305,25 @@ function countedToolParts(counts: Record<string, number>, marker: string, color:
     ]);
 }
 
+const MEMORY_ERROR_DISPLAY_CHARS = 60;
+
 function memoryParts(maintenance: MemoryMaintenance | null): HudPart[] {
   const label = memoryMaintenanceLabel(maintenance);
   if (!label) return [];
+  // A stalled pipeline is a problem, not ambience: it gets the error color and
+  // carries the newest failure so the user can tell a dead key from a dead
+  // relay without tailing logs.
+  if (memoryMaintenanceStalled(maintenance)) {
+    const part: HudPart = [{ text: `☾ ${label}`, color: ERROR }];
+    const error = maintenance?.last_error?.trim();
+    if (error) {
+      const shown = error.length > MEMORY_ERROR_DISPLAY_CHARS
+        ? `${error.slice(0, MEMORY_ERROR_DISPLAY_CHARS)}…`
+        : error;
+      part.push({ text: ` ${shown}`, color: MUTED });
+    }
+    return [part];
+  }
   // Ambient, not an activity: memory work belongs to the agent, not to this
   // turn, so it reads as a dim aside rather than a tool result.
   return [[{ text: `☾ ${label}`, color: MUTED }]];

@@ -28,7 +28,23 @@ class TopicVectorIndex:
         self._root = episodes_dir
         self._path = episodes_dir / self._NAME
 
-    async def sync(self, documents: dict[str, str], provider: EmbeddingProvider) -> None:
+    async def sync(
+        self,
+        documents: dict[str, str],
+        provider: EmbeddingProvider,
+        *,
+        valid_topics: frozenset[str] | None = None,
+    ) -> None:
+        """Refresh the chunks for *documents*, merging with what is stored.
+
+        Routing is per-query, so a call carries only the topics routed right
+        now.  Rebuilding the whole file from them threw away every other
+        topic's vectors — alternating queries between two topics re-embedded
+        (a paid API call) on every switch.  Topics absent from *documents*
+        keep their stored vectors; *valid_topics*, when given, prunes topics
+        that left the association snapshot entirely.  An unchanged result
+        skips the write — this runs on the per-query hot path.
+        """
         state = self._load()
         if state.get("model") != provider.model:
             state = {}
@@ -38,10 +54,22 @@ class TopicVectorIndex:
             for chunk in _chunks(text)
         }
         existing = state.get("items", {})
+        items: dict[str, dict] = {}
+        for item_id, item in existing.items():
+            if not isinstance(item, dict):
+                continue
+            topic = item.get("topic")
+            if topic in documents:
+                # This topic is being re-synced below; stale chunk ids of its
+                # earlier content must not linger.
+                continue
+            if valid_topics is not None and topic not in valid_topics:
+                continue
+            if isinstance(item.get("text"), str) and isinstance(item.get("vector"), list):
+                items[item_id] = item
         # Reuse a stored vector only when the chunk text is unchanged *and* the
         # stored vector survived.  A corrupted entry has to be re-embedded; the
         # earlier split dropped it from both branches and lost it permanently.
-        items: dict[str, dict] = {}
         stale: list[tuple[str, dict]] = []
         for item_id, item in current.items():
             prior = existing.get(item_id)
@@ -60,6 +88,8 @@ class TopicVectorIndex:
             item_id: {**item, "vector": vector}
             for (item_id, item), vector in zip(stale, vectors, strict=True)
         })
+        if state.get("model") == provider.model and items == existing:
+            return
         self._root.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self._path, json.dumps({"model": provider.model, "items": items}, ensure_ascii=False))
 

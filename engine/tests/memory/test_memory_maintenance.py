@@ -882,6 +882,7 @@ def test_maintenance_status_reports_idle_for_a_fresh_memory_dir(tmp_path):
         "compile": "idle",
         "nudge": "idle",
         "dream": "idle",
+        "topic_sync": "idle",
         "consecutive_failures": 0,
         "last_error": None,
     }

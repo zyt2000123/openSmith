@@ -219,6 +219,7 @@ def test_memory_status_route_reports_deferred_maintenance() -> None:
                 "compile": "idle",
                 "nudge": "running",
                 "dream": "running",
+                "topic_sync": "pending",
                 "consecutive_failures": 213,
                 "last_error": "LLMResponseError: LLM request failed (HTTP 401)",
             }
@@ -235,6 +236,7 @@ def test_memory_status_route_reports_deferred_maintenance() -> None:
         "compile": "idle",
         "nudge": "running",
         "dream": "running",
+        "topic_sync": "pending",
         "consecutive_failures": 213,
         "last_error": "LLMResponseError: LLM request failed (HTTP 401)",
     }
