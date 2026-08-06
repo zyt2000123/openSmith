@@ -131,6 +131,16 @@ export type MemoryMaintenance = {
   compile: MaintenanceState;
   nudge: MaintenanceState;
   dream: MaintenanceState;
+  /** Derived topic-knowledge lane; runs inside compile, so never "running". */
+  topic_sync?: MaintenanceState;
+  /**
+   * Trailing run of failed automatic memory operations, with the newest
+   * sanitized failure. A stalled pipeline (an expired provider key answering
+   * 401 on every compile) must be visible in the HUD, not just in the API.
+   * Optional so the shell keeps working against servers predating the field.
+   */
+  consecutive_failures?: number;
+  last_error?: string | null;
 };
 
 export type RunState = {
@@ -508,7 +518,11 @@ export async function listSkills(baseUrl: string): Promise<SkillSummary[]> {
  * can carry their state — it is polled.
  */
 export async function fetchMemoryMaintenance(baseUrl: string): Promise<MemoryMaintenance> {
-  return request<MemoryMaintenance>(baseUrl, "/api/agent/memory/status");
+  const maintenance = await request<MemoryMaintenance>(baseUrl, "/api/agent/memory/status");
+  return {
+    ...maintenance,
+    last_error: maintenance.last_error ? sanitizeTerminalText(maintenance.last_error) : maintenance.last_error,
+  };
 }
 
 export async function setSkillEnabled(baseUrl: string, skillName: string, enabled: boolean): Promise<SkillSummary> {
@@ -931,6 +945,11 @@ async function* readSseEvents(
           buffer += decoder.decode(trailingValue, { stream: true });
           const trailingParsed = splitSseBuffer(buffer);
           assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
+          // Advance past the frames just consumed, exactly as the main loop does
+          // at :921.  Without this the buffer keeps every parsed chunk, so the
+          // next drain read and the final flush re-yield them — and applyStreamState
+          // *adds* usage deltas, inflating a split-out trailing token_usage 2-3x.
+          buffer = trailingParsed.remainder;
           const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
           yield* trailingConsumed.events;
         }

@@ -18,7 +18,11 @@ class OpenAICompatibleEmbeddingProvider:
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # This runs on the per-query hot path (sync + query embed, so twice per
+        # turn worst case). Semantic recall is an enhancement over FTS, not a
+        # dependency: a hung provider should cost seconds before the fallback,
+        # not half a minute.
+        async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
                 self.base_url.rstrip("/") + "/embeddings",
                 headers={"Authorization": f"Bearer {self.api_key}"},

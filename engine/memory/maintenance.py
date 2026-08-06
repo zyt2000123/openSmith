@@ -440,6 +440,10 @@ class MemoryMaintenanceService:
         from the memory history, so a provider outage (an expired key answering
         401 on every compile) is visible instead of starving memory silently
         behind per-attempt warnings.
+
+        ``topic_sync`` reports the derived knowledge lane.  It executes inside
+        the compile lane so it is never ``running`` on its own; ``pending``
+        means the last synchronization failed and the idle tick owes a retry.
         """
         resolved = memory_dir.resolve()
         status: dict[str, object] = {}
@@ -451,6 +455,17 @@ class MemoryMaintenanceService:
                 status[kind] = "pending"
             else:
                 status[kind] = "idle"
+        try:
+            from engine.memory.knowledge import TopicAssociationStore
+
+            status["topic_sync"] = (
+                "pending"
+                if TopicAssociationStore(memory_dir).is_sync_pending()
+                else "idle"
+            )
+        except Exception:
+            logger.warning("topic sync status unavailable", exc_info=True)
+            status["topic_sync"] = "idle"
         from engine.memory.history import recent_failure_streak
 
         streak, last_error = recent_failure_streak(memory_dir)

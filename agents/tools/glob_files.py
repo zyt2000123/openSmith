@@ -3,6 +3,7 @@
 import asyncio
 import fnmatch
 import os
+import re
 from pathlib import Path
 
 TOOL_META = {
@@ -32,6 +33,33 @@ MAX_RESULTS = 200
 # no timeout of the kind grep gets from its subprocess.
 MAX_SCAN_ENTRIES = 20_000
 EXCLUDED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "dist", ".build"}
+
+# Credential-bearing names an enumeration must never surface, even by path.
+# ToolGuard gates a directly-named sensitive file, but a pattern walk reaches a
+# whole subtree, so this tool excludes them itself.  Kept in sync with the guard
+# by engine/tests/tool/test_read_tool_secret_parity.py; `agents/` cannot import
+# the engine, so the logic is mirrored rather than shared.
+_SECRET_DIRS = {".ssh", ".gnupg", ".aws", ".kube"}
+_SECRET_FILES = {".npmrc", ".pypirc", ".netrc"}
+_SECRET_EXTENSIONS = (".pem", ".key", ".p12", ".pfx")
+_ENV_TEMPLATE_SUFFIXES = (".env.example", ".env.template", ".env.sample")
+_SSH_KEY_RE = re.compile(r"(?:^|[-_.])(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:[-_.]|$)")
+
+
+def _is_secret_name(name: str) -> bool:
+    """Whether a basename is credential-bearing and must be hidden from a walk."""
+    lower = name.lower()
+    # A public key is safe and stays discoverable — mirrors the guard, and keeps
+    # the SSH-key regex below from catching ``id_rsa.pub``.
+    if lower.endswith(".pub"):
+        return False
+    if lower in _SECRET_DIRS or lower in _SECRET_FILES:
+        return True
+    if lower.startswith(".env"):
+        return not lower.endswith(_ENV_TEMPLATE_SUFFIXES)
+    if lower.endswith(_SECRET_EXTENSIONS):
+        return True
+    return _SSH_KEY_RE.search(lower) is not None
 
 
 def _is_relative_pattern(pattern: str) -> bool:
@@ -92,6 +120,7 @@ def _safe_glob(base: Path, pattern: str) -> tuple[list[Path], bool]:
         try:
             if (
                 not candidate.is_symlink()
+                and not _is_secret_name(candidate.name)
                 and candidate.is_file()
                 and _is_within_base(candidate, base)
             ):
@@ -118,7 +147,12 @@ def _safe_glob(base: Path, pattern: str) -> tuple[list[Path], bool]:
         if component == "**":
             stack.append((directory, index + 1))
             for entry in entries(directory):
-                if entry.name in EXCLUDED_DIRS or entry.name.startswith(".") or entry.is_symlink():
+                if (
+                    entry.name in EXCLUDED_DIRS
+                    or entry.name.startswith(".")
+                    or _is_secret_name(entry.name)
+                    or entry.is_symlink()
+                ):
                     continue
                 candidate = Path(entry.path)
                 try:
@@ -133,6 +167,7 @@ def _safe_glob(base: Path, pattern: str) -> tuple[list[Path], bool]:
         for entry in entries(directory):
             if (
                 entry.name in EXCLUDED_DIRS
+                or _is_secret_name(entry.name)
                 or entry.is_symlink()
                 or not _matches_component(entry.name, component)
             ):

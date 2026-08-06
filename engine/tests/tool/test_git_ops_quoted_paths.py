@@ -94,8 +94,17 @@ def test_staged_secret_is_refused_whatever_the_path_encoding(
     assert _git(repo, "rev-parse", "HEAD").returncode != 0, "a commit was created anyway"
 
 
-def test_ordinary_commit_still_works(tmp_path: Path) -> None:
-    """The guard must not block a commit that carries no secrets."""
+def test_ordinary_commit_still_works(tmp_path: Path, monkeypatch) -> None:
+    """The guard must not block a commit that carries no secrets.
+
+    The host's global identity is pinned to a file this test controls: the
+    tool resolves ``user.name``/``user.email`` from the host config stack, and
+    leaving that to the machine made this test pass or fail with the runner's
+    FQDN.
+    """
+    config = tmp_path / "gitconfig"
+    config.write_text("[user]\n\tname = Probe User\n\temail = probe@example.invalid\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
     provider = _load_git_ops()
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -1393,6 +1393,89 @@ async def test_stream_message_persists_visible_reply_when_the_consumer_is_cancel
 
 
 @pytest.mark.asyncio
+async def test_resume_disconnect_keeps_discard_and_insert_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A resumed run deletes the interrupted partial reply and inserts the
+    replacement.  Those two writes must be one shielded unit: with two separate
+    shields, a cancellation re-delivered (as anyio does on every loop tick)
+    between them deletes the old reply and never inserts the new one, so the turn
+    ends with a user message and no assistant reply at all.
+    """
+    repo = FakeSessionRepo()
+    repo.identity_id = "smith"
+    identities_dir = tmp_path / "identities"
+    identities_dir.mkdir()
+    repo.messages = [
+        {"id": "u-current", "session_id": "sess-1", "role": "user", "content": "continue", "created_at": "1"},
+        {"id": "a-partial", "session_id": "sess-1", "role": "assistant", "content": "partial", "created_at": "2"},
+    ]
+    store = RunStateStore(tmp_path)
+    store.create(
+        "run-1", agent_id="smith-id", session_id="sess-1", message_id="u-current",
+        identity_id="smith", working_dir="/tmp/project",
+    )
+    store.transition("run-1", "running")
+    store.transition("run-1", "incomplete")
+
+    streaming = asyncio.Event()
+    discarding = asyncio.Event()
+
+    class SuspendingResumeRepo(FakeSessionRepo):
+        async def discard_assistant_messages_after_user(self, session_id: str, user_message_id: str) -> int:
+            discarding.set()
+            await asyncio.sleep(0.05)  # a yield point for a second cancellation to land
+            return await super().discard_assistant_messages_after_user(session_id, user_message_id)
+
+    resume_repo = SuspendingResumeRepo()
+    resume_repo.identity_id = "smith"
+    resume_repo.messages = list(repo.messages)
+
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
+
+    async def fake_resume_events(request, runtime, services, run_id):
+        yield SimpleNamespace(type=SimpleNamespace(value="run_started"), data={"run_id": run_id})
+        yield SimpleNamespace(type=SimpleNamespace(value="text_delta"), data={"text": "resumed reply"})
+        streaming.set()
+        await asyncio.sleep(3600)  # park in the engine until the disconnect arrives
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_resume_stream_with_runtime",
+        lambda request, runtime, services, run_id: FakeRun(
+            fake_resume_events(request, runtime, services, run_id)
+        ),
+    )
+
+    service = SessionService(
+        resume_repo, FakeAgentProfileRepo(),
+        identity_catalog=_identity_catalog(identities_dir),
+        run_state_store=store,
+    )
+
+    async def consume() -> None:
+        async for _ in resume_prepared_run(service, "smith-id", "run-1"):
+            pass
+
+    task = asyncio.create_task(consume())
+    await streaming.wait()
+    task.cancel()  # disconnect: interrupt the stream, enter the persistence finally
+    await discarding.wait()
+    task.cancel()  # re-deliver the cancellation while discard is in flight
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The shielded discard+insert runs to completion after the task raised.
+    await asyncio.sleep(0.15)
+    assert ("sess-1", "assistant", "resumed reply") in resume_repo.saved_messages, (
+        "the replacement reply must be inserted even though the old one was discarded"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stream_message_reports_failed_status_when_persisting_the_reply_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1436,29 +1519,43 @@ async def test_stream_message_reports_failed_status_when_persisting_the_reply_fa
 
 
 @pytest.mark.asyncio
-async def test_session_stream_lock_map_is_bounded_and_keeps_held_locks() -> None:
-    """The per-session lock map must not leak a lock per session forever.
+async def test_session_stream_lock_map_is_bounded_and_keeps_in_use_locks() -> None:
+    """The per-session lock map must not leak a lock per session forever, and
+    eviction must be refcounted rather than keyed on asyncio.Lock.locked().
 
-    Only unlocked locks are evicted once the map grows past the bound; a lock a
-    stream currently holds (or is queued on) must never be dropped, or a new
-    stream for that session could bypass the serialization.
+    locked() reads False in the window between release() and a queued waiter's
+    wake-up, so evicting on it could drop a lock a waiter is about to acquire.
+    A reserved-but-not-yet-held slot models exactly that window; it must survive
+    the bound, then become evictable once released.
     """
     module = session_service_module
     module._SESSION_STREAM_LOCKS.clear()
-
-    held = module._session_stream_lock("held-session")
-    await held.acquire()
+    module._SESSION_STREAM_LOCK_USERS.clear()
     try:
-        assert held.locked()
+        lock = module._acquire_session_lock_slot("in-use")
+        # Reserved, not acquired: the exact release→waiter-wakeup window where the
+        # old locked()-based eviction would have dropped this lock.
+        assert not lock.locked()
+        assert module._SESSION_STREAM_LOCK_USERS["in-use"] == 1
+
         for index in range(100):
-            module._session_stream_lock(f"session-{index}")
-        # The map never grows unboundedly after the bound is crossed.
+            module._acquire_session_lock_slot(f"session-{index}")
+            module._release_session_lock_slot(f"session-{index}")
+
         assert len(module._SESSION_STREAM_LOCKS) <= module._SESSION_STREAM_LOCKS_MAX
-        # A held lock is never evicted (eviction only removes unlocked entries).
-        assert module._SESSION_STREAM_LOCKS.get("held-session") is held
+        assert "in-use" in module._SESSION_STREAM_LOCKS, (
+            "an in-use lock must survive eviction even while it is not locked()"
+        )
+
+        # Once released it is idle and may be evicted to make room.
+        module._release_session_lock_slot("in-use")
+        for index in range(100, 200):
+            module._acquire_session_lock_slot(f"session-{index}")
+            module._release_session_lock_slot(f"session-{index}")
+        assert "in-use" not in module._SESSION_STREAM_LOCKS
     finally:
-        held.release()
         module._SESSION_STREAM_LOCKS.clear()
+        module._SESSION_STREAM_LOCK_USERS.clear()
 
 
 @pytest.mark.asyncio
@@ -1498,23 +1595,22 @@ async def test_get_messages_byte_budget_stops_fetching_at_the_cap(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_session_stream_lock_serializes_concurrent_turns() -> None:
+async def test_session_turn_lock_serializes_concurrent_turns() -> None:
     """Many turns on the SAME session must serialize (one holder at a time),
-    while turns on DIFFERENT sessions proceed concurrently."""
+    while turns on DIFFERENT sessions proceed concurrently — and every slot is
+    released back to a refcount of zero afterward."""
     module = session_service_module
     module._SESSION_STREAM_LOCKS.clear()
-
-    same_session = module._session_stream_lock("session-1")
-    other_session = module._session_stream_lock("session-2")
+    module._SESSION_STREAM_LOCK_USERS.clear()
 
     peak_same = 0
     active_same = 0
     peak_total = 0
     active_total = 0
 
-    async def turn(lock: asyncio.Lock, *, cross: bool) -> None:
+    async def turn(session_id: str, *, cross: bool) -> None:
         nonlocal active_same, peak_same, active_total, peak_total
-        async with lock:
+        async with module._session_turn_lock(session_id):
             active_total += 1
             peak_total = max(peak_total, active_total)
             if not cross:
@@ -1526,16 +1622,20 @@ async def test_session_stream_lock_serializes_concurrent_turns() -> None:
             active_total -= 1
 
     # 10 turns on the same session: strict mutual exclusion.
-    await asyncio.gather(*[turn(same_session, cross=False) for _ in range(10)])
+    await asyncio.gather(*[turn("session-1", cross=False) for _ in range(10)])
     assert peak_same == 1
 
     # Turns on another session overlap with a turn on session-1: the per-session
     # lock must never serialize across sessions.
     await asyncio.gather(
-        turn(same_session, cross=False),
-        turn(other_session, cross=True),
-        turn(other_session, cross=True),
+        turn("session-1", cross=False),
+        turn("session-2", cross=True),
+        turn("session-2", cross=True),
     )
     assert peak_total >= 2
 
+    # No slot leaks: every reservation was released.
+    assert module._SESSION_STREAM_LOCK_USERS == {}
+
     module._SESSION_STREAM_LOCKS.clear()
+    module._SESSION_STREAM_LOCK_USERS.clear()
