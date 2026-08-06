@@ -99,13 +99,13 @@ server (FastAPI)
 engine (execution) ◄── agents (identity, skills, tools, safety)
       │
       ▼
-common (paths, YAML, SQLite, filesystem)
+common (paths, YAML, SQLite, filesystem, audit hash chain)
 ```
 
 | Layer | What It Does |
 |---|---|
-| `common/` | Paths, YAML configuration, SQLite connection, filesystem resources — zero business logic |
-| `engine/` | Task routing, skill chains, ReAct loop, LLM adapters, memory, tools, safety |
+| `common/` | Paths, YAML configuration, SQLite connection, filesystem resources, tamper-evident audit log hash chain (`common/hash_chain.py`, consumed by the engine's trace store and tool guard) — no orchestration logic |
+| `engine/` | Task routing, skill chains, ReAct loop, LLM adapters, memory, tools, safety, sandbox (`engine/sandbox/`), observability (`engine/observability/`) |
 | `agents/` | Smith identity, pipelines, built-in skills, tool providers, safety rules |
 | `server/` | FastAPI app, service orchestration, agent/session lifecycle |
 | `shell/` | Ink/React terminal UI, auto-starts backend, SSE streaming |

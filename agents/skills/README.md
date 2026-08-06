@@ -25,14 +25,14 @@ agents/skills/
 └── <skill-name>/
     ├── SKILL.md
     └── references/
-        ├── evals.md         # 内置 Skill 必需；人类可读的最小回归
+        ├── evals.md         # 内部新建 Skill 必需；vendored 上游技能豁免（见 SOURCES.md）
         └── *.md             # 可选参考，运行时不会自动加载
 ```
 
 - Skill 名称直接使用简单的 kebab-case，例如 `planning`、`code-review`。
 - 目录名必须与 `SKILL.md` frontmatter 中的 `name` 完全一致。
 - 注册表和 SkillChain 都通过完整名称精确匹配 Skill。
-- 添加 Skill 不会自动把它加入 SkillChain；链路变更必须显式修改并测试 `engine/execution/skill_chain.py`。
+- 添加 Skill 不会自动把它加入 SkillChain；链路变更必须显式修改并测试 `engine/execution/pipeline/skill_chain.py`。
 - 主 Prompt 只注入 Skill 的名称和描述；Skill 被选中后，`SKILL.md` 正文才作为独立执行上下文加载。
 - `README.md` 和 `references/` 不会自动进入执行上下文。
 - Pipeline 节点会先按 `skill:` 名称解析并执行该 `SKILL.md` 的工作流上下文。若该 Skill
@@ -90,7 +90,9 @@ argument_hint: commit, branch, diff, or path
 
 ## 最小评估与资产边界
 
-每个拟内置 Skill 必须在 `references/evals.md` 中提供四类最小用例：
+每个**内部新建**的内置 Skill 必须在 `references/evals.md` 中提供四类最小用例；
+vendored 上游技能（来源与锁定见 [`SOURCES.md`](SOURCES.md)）豁免此要求，保持
+与上游一致。四类用例：
 
 - **trigger**：应命中该 Skill 的输入，以及预期步骤和检查点。
 - **route**：相似但应分流的输入，以及明确的替代路径。
