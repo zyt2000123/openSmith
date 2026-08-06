@@ -50,9 +50,12 @@ flowchart LR
 | `LLMRequest` / `ChatResponse` | `engine/llm/contracts.py` | 供应商无关的请求与完整响应数据 |
 | `ProviderEvent` | `engine/llm/events.py` | 统一的流式事件：文本、思考、工具参数、用量、完成 |
 | `ProviderAdapter` | `engine/llm/adapters/base.py` | 具体协议 adapter 的私有接口 |
-| `ProviderClient` | `engine/llm/client.py` | adapter 外的统一门面、能力校验与非流式事件归一化 |
+| `ProviderClient` | `engine/llm/client.py` | adapter 外的统一门面、能力校验与非流式事件归一化；每次调用发射一条 `GenerationRecord` |
 | `ProviderRegistry` | `engine/llm/factory.py` | provider 名称规范化、别名和 adapter 构造 |
 | `model_config` | `engine/llm/model_config.py` | 多层配置合并、用途路由、超时和端点校验 |
+| `RecordingLLM` | `engine/llm/replay.py` | 录制/回放 LLM turn（流式录 `ProviderEvent` 序列，非流式录 `ChatResponse`），设 `AGENT_SMITH_RECORD_LLM` 启用，用于把 harness 回归变成确定性等值断言 |
+| `GenerationRecord` | `engine/llm/observability.py` | 每次模型调用的观测记录（含 `ttft_ms`）；`llm_purpose` / `generation_context` 标注用途与 run 作用域 |
+| `normalize_usage` | `engine/llm/usage.py` | 归一化各 provider 的 usage 计量字段 |
 
 ## 4. Provider 与兼容协议
 
@@ -116,7 +119,7 @@ llm:
 
 这意味着本地明文 HTTP relay 不在默认支持范围内。若未来确有开发需求，应新增显式、受限的开发开关，而不是放宽默认安全策略。
 
-当前校验不是企业级出网策略：域名的 DNS 解析结果没有在此处做 allowlist / 私网地址复核。因此它适合当前“本机连接自己信任的中转站”的定位；一旦演变为多用户部署，应在网络出口层再加域名 allowlist、DNS 重绑定防护和审计。
+除了字面量 IP 与 `localhost`（含 `*.localhost`）的显式拒绝，`validate_llm_base_url` 还会对域名的 DNS 解析结果做私网/回环复核：解析出的全部地址中只要有任意一个不是全局可路由地址（`not is_global`）即拒绝；解析失败时放行，把可诊断的传输错误留给请求路径。当前仍然缺少的是域名 allowlist 与 DNS 重绑定（TOCTOU：校验时解析为公网、请求时重绑定到内网）防护。因此它适合当前“本机连接自己信任的中转站”的定位；一旦演变为多用户部署，应在网络出口层再加域名 allowlist、DNS 重绑定防护和审计。
 
 ### 从代码直接调用
 
@@ -275,7 +278,7 @@ uv run pytest tests/test_config_service.py tests/test_config_loader.py tests/tes
 - 端点、超时、响应体和 SSE 限制；
 - provider 错误不泄露敏感正文。
 
-## 11. 收敛状态与验收口径（2026-07-26）
+## 11. 收敛状态与验收口径
 
 ### 11.1 当前结论
 
@@ -307,16 +310,7 @@ uv run pytest tests/test_config_service.py tests/test_config_loader.py tests/tes
 
 ### 11.2 当前验证快照
 
-2026-07-26 在当前工作树完成了以下验证：
-
-| 范围 | 结果 |
-|---|---|
-| `engine/tests/llm` | `70 passed` |
-| Engine 架构约束 | `11 passed` |
-| Engine 全量回归 | `557 passed, 5 deselected` |
-| Server LLM 配置、运行时装配、client 缓存与关闭 | `9 passed` |
-
-5 个未执行用例均为当前 Codex 沙箱中无法嵌套启动的 macOS Seatbelt 实执行测试；实际环境错误为 `sandbox-exec: sandbox_apply: Operation not permitted`，不属于 LLM 调用链失败。以上数字是一次验收快照，不替代后续改动后的重新运行。
+验收数字以最近一次全量测试运行为准（当前基线：engine `1046 passed / 59 skipped`，跳过项几乎全部是 macOS-only 的 Seatbelt 实执行测试）。任何快照都只是一次验收记录，不替代后续改动后的重新运行。
 
 ### 11.3 真实模型 E2E 门禁
 

@@ -86,13 +86,13 @@ server/ → engine/ → common/
 
 Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 
-| Layer | Directory | Source lines | Responsibility |
+| Layer | Directory | Source lines (non-test) | Responsibility |
 |---|---|---|---|
-| Infrastructure | `common/` | 578 | Paths, SQLite connection, YAML read/write. Zero business logic. |
-| Execution | `engine/` | 23.1k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
-| Content | `agents/` | 4.8k | Smith identity seed, pipelines, gates, tools, skills, safety rules. Pure content. |
-| Platform | `server/` | 5.2k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints. |
-| Terminal UI | `shell/` | 10.1k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
+| Infrastructure | `common/` | 1.1k | Paths, SQLite connection, YAML read/write, hash chain. Zero business logic. |
+| Execution | `engine/` | 27.4k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
+| Content | `agents/` | 9.7k | Smith identity seed, pipelines, gates, conditions, tools, skills, hooks. Pure content. |
+| Platform | `server/` | 6.0k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints (34 router + `/api/health`). |
+| Terminal UI | `shell/` | 10.7k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
 
 Rules:
 
@@ -160,17 +160,18 @@ PreToolUse (can block) → Tool Execution → PostToolUse (warnings only) → St
 
 ```
 engine/execution/hooks/
-├── hook_interface.py    # Abstract base classes
-├── hook_manager.py      # HookRegistry (registration + execution)
-├── hook_loader.py       # Dynamic loading from YAML config
-├── engine_hooks.py      # HookManager/HookType — engine-internal extension hooks
-└── __init__.py
+├── tool/                # Tool lifecycle hooks
+│   ├── interface.py     # PreToolHook / PostToolHook / StopHook ABCs
+│   ├── manager.py       # HookRegistry (registration + execution)
+│   └── loader.py        # HookLoader — dynamic loading from YAML config
+├── extension/
+│   └── manager.py       # HookManager/HookType — engine-internal extension hooks
+└── __init__.py          # re-exports both systems under one import path
 
 agents/smith/hooks/
 ├── config_protection.py # PreToolHook: Block config file modifications
 ├── console_warn.py      # PostToolHook: Warn about debug statements
 ├── cost_tracker.py      # StopHook: Track token usage and costs
-├── fact_gate.py         # PreToolHook: Require investigation before first edit
 ├── quality_gate.py      # PostToolHook: Run format/lint checks
 └── __init__.py
 
@@ -179,9 +180,10 @@ agents/smith/hooks.yaml  # Hook configuration (which hooks are enabled)
 
 ### Integration Points
 
-- `preparation.py`: Loads hooks from `agents/smith/hooks.yaml` into `services.hook_registry`
+- `preparation.py`: Loads hooks from `agents/smith/hooks.yaml`, then user hooks from
+  `~/.agent-smith/hooks.yaml`, into `services.hook_registry`
 - `react_loop.py`: Calls `hook_registry.run_pre_hooks()` before tool execution, `run_post_hooks()` after
-- `lifecycle.py`: Can call `hook_registry.run_stop_hooks()` at response end (not yet implemented)
+- `lifecycle.py`: Calls `hook_registry.run_stop_hooks()` at response end
 
 ### Built-in Hooks
 
@@ -191,7 +193,10 @@ agents/smith/hooks.yaml  # Hook configuration (which hooks are enabled)
 | `console-warn` | Post | ✅ | Warn about `console.log`, `print()`, etc. |
 | `quality-gate` | Post | ✅ | Run format/lint checks (async) |
 | `cost-tracker` | Stop | ✅ | Write token usage to `~/.agent-smith/metrics/costs.jsonl` |
-| `fact-gate` | Pre | ❌ | Require Read before first Edit (needs session state) |
+
+The fact gate (require investigation before the first edit) is **not** a
+pluggable hook anymore: it lives at `engine/safety/fact_gate.py` and is wired
+per request in `lifecycle.py` (`use_fact_gate`), always active, challenge-only.
 
 ### Extension
 

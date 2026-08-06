@@ -36,8 +36,10 @@ coding identity
 锁定来源见 [`agents/skills/SOURCES.md`](../skills/SOURCES.md)。服务启动时会校验：
 路由引用的 pipeline 存在、每个节点的 Skill 已注册、且节点属于该身份的
 `skills.enabled` allowlist。节点的 `allowed_tools` 同时必须属于身份的
-`tools.enabled` allowlist，且必须由内置 provider 实际注册；任一项缺失都拒绝
-启动，不会静默回退到通用 ReAct。
+`tools.enabled` allowlist，且必须由内置 provider 实际注册；启动期资产校验发现
+任一项缺失即拒绝启动，缺失配置不会被静默吞掉。运行期则不同：若某节点的
+Skill 不可用（缺失或被禁用），不是阻断，而是该节点退回节点内 ReAct 执行，
+gate 照跑，不通过就不进下一节点。
 
 ## 最小格式
 
@@ -75,7 +77,8 @@ routes:
 - 未指定时，首条消息会在整个目录中按 `examples`、`keywords` 和 `priority`
   选中一个身份，并固定到该会话；
 - 后续消息继续使用已固定的身份。若要切换身份，请创建新会话；
-- `GET /api/agent/identities` 可列出启动时加载的身份。
+- 身份列表当前没有 HTTP 端点；identity 在会话创建或首条消息时选定并固定到
+  该会话。
 
 要新增财务、法务等领域，只需新增对应 YAML、所引用的 pipeline YAML，以及
 需要时的 SKILL.md；无需修改 `task_router.py` 或新增 Agent 实例。
