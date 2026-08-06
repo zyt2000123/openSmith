@@ -32,7 +32,9 @@ Smith 是唯一运行中的 Agent。记忆模块的目标不是保存更多聊�
   → 用户纠正、忘记请求和新任务结果再次进入证据流
 ```
 
-Compiler 和 Reviewer 是两个模型角色。生产运行时分别使用 `RuntimeServices.llm` 与 `RuntimeServices.gate_llm`；正式 Markdown 没有 Reviewer 明确通过时不得写入。
+Compiler 和 Reviewer 是两个模型角色。生产运行时 Compiler 使用 `RuntimeServices.background_llm`（未配置时回退 `services.llm`），Reviewer 使用 `RuntimeServices.gate_llm`。
+
+正式 Markdown 的写入有三条路径：Reviewer 明确通过的正常路径；`recent.md`/`durable.md` 在 Compiler 超时或多轮审核仍未通过时的**抽取式 fallback** 路径（`_fallback_recent_document` / `_fallback_durable_document`，不含模型新增内容、只做确定性证据抽取，仍过全部结构/密钥/注入校验，审计 status 为 `fallback`，并推进指纹与 offset）；以及 `durable.md` 首次初始化时写空模板（status 为 `initialized`）。`context.md` 没有 fallback 路径。
 
 写文件的代码只做确定性技术校验，不做第三次语义裁决。
 
@@ -43,15 +45,21 @@ Compiler 和 Reviewer 是两个模型角色。生产运行时分别使用 `Runti
 | 文件 | 职责 | 正常回答是否读取 |
 |---|---|---|
 | `SMITH.md` | 用户手写规则与项目指令 | 固定加载，自动记忆永不写入 |
-| `engine/memory/MEMORY_POLICY.md` | 三个正式视图唯一的生成、审核和格式规则 | 仅 Compiler、Reviewer、Dream 读取 |
+| `engine/memory/MEMORY_POLICY.md` | 三个正式视图唯一的生成、审核和格式规则 | 仅 Compiler、Reviewer、Dream、Nudge、topic sync 读取（Nudge 的候选审核规则目前硬编码在 `nudge.py`，仅从 Policy 读版本号） |
 | `context.md` | 已确认的用户偏好、协作模式和稳定用户背景 | 每轮固定加载 |
 | `memory/recent.jsonl` | 追加式、已清洗的证据日志 | 不直接进入回答 Prompt |
 | `memory/recent.md` | 最近 3–7 天仍需延续的工作 | 非空时加载 |
 | `memory/durable.md` | 稳定项目事实、决定、流程和陷阱 | 仅查询命中时加载 |
-| `memory/episodes/*.md` | 可检索的任务经历 | 仅查询命中时加载 |
-| `memory/memory_history.jsonl` | 编译、审核和写入审计 | 不进入回答 Prompt |
+| `memory/episodes/*.md` | 可检索的任务经历（含用户 episode、Nudge episode、topic sync 生成页与 `.bak`） | 仅查询命中时加载 |
+| `memory/episodes/topic-associations.json` | durable 条目 → topic 页面的路由关联（entry-id、文件名、页面哈希快照） | 不进入回答 Prompt |
+| `memory/episodes/vectors.json` | 可选的 topic 页面向量索引（启用 embeddings 时） | 不进入回答 Prompt |
+| `memory/episodes/search.sqlite` / `.fts_version` | FTS5 检索索引与 schema 版本 | 不进入回答 Prompt |
+| `memory/episodes/.index_state.json` | 逐文件 mtime/size 签名，驱动索引增量重建 | 不进入回答 Prompt |
+| `memory/memory_history.jsonl` | 编译、审核和写入审计（Dream 定期裁剪到 500 条 / 90 天） | 不进入回答 Prompt |
 | `memory/.nudge_counter` / `.nudge_offset` | 20 回合质量检查的待触发计数与已审阅证据 checkpoint | 不进入回答 Prompt |
-| `memory/.nudge_pending` | 延迟运行时尚未完成的 Nudge 标记 | 不进入回答 Prompt |
+| `memory/.{compile,nudge,dream}_pending` | 延迟运行时尚未完成的对应 lane 标记 | 不进入回答 Prompt |
+| `memory/.{compile,nudge,dream,topic_sync}_retry_attempt` | 传输/provider 失败后的 600 秒重试冷却标记 | 不进入回答 Prompt |
+| `memory/.maintenance` | 维护任务的进程间锁文件 | 不进入回答 Prompt |
 
 `context.md` 位于 profile 根目录，是因为它属于 Smith 与用户之间的常驻协作上下文；项目记忆位于 `memory/`，便于独立维护、清理和检索。Policy 位于 Python 包内并作为 package data 发布，确保源码运行和 wheel 安装使用同一份规则。
 
@@ -80,12 +88,16 @@ Compiler 和 Reviewer 是两个模型角色。生产运行时分别使用 `Runti
   "task": "用户消息的已清洗文本",
   "summary": "Smith 回答的已清洗文本",
   "timestamp": "ISO-8601 UTC",
-  "kind": "work|preference|correction|decision|remember|forget|pattern",
+  "kind": "work|partial_work|preference|correction|decision|remember|forget|pattern|verified_fact|procedure|pitfall",
   "scope": "user|project",
-  "evidence": "tool_result|user_explicit|repeated_observation",
-  "signals": ["tech_level=expert"]
+  "evidence": "tool_result|partial_tool_result|user_explicit|repeated_observation",
+  "signals": ["tech_level=expert"],
+  "status": "（可选）turn 未完成时的状态说明",
+  "reason": "（可选）未完成原因"
 }
 ```
+
+`kind` 的权威枚举以 `engine/memory/policy.py` 的三个 frozenset（`MANUAL_MEMORY_KINDS` / `DURABLE_MEMORY_KINDS` / compile 的 `_RECENT_KINDS`）为准。`partial_work` 记录未完成 turn 的工具进展（`evidence: partial_tool_result`，附 `status`/`reason`），不得晋升为完成事实。Nudge 候选事件另带 `content`/`evidence_type`/`origin` 字段。
 
 事件字段超过 16K 字符时保留首尾并显式标记截断。密钥和已知提示词注入行在写入前删除。`recent.jsonl` 是编译证据源，不是直接给回答模型读取的记忆。
 
@@ -140,17 +152,17 @@ Reviewer 通过后，代码继续检查：
 - 没有代码围栏且未超过字符预算；
 - 没有密钥或提示词注入内容。
 
-检查通过后先保留旧文件 `.bak`，再使用临时文件和 `os.replace()` 原子替换。成功、未变化、拒绝和异常都会追加到 `memory_history.jsonl`，日志只保存哈希、轮次和脱敏错误，不复制记忆正文。
+检查通过后，若旧文件非空且内容有变化，先保留旧文件 `.bak`（首次写入与内容未变时不产生备份），再使用临时文件和 `os.replace()` 原子替换。所有写入路径（通过、fallback、初始化、清除）都收敛到同一个确定性校验函数 `_commit_view()`。成功、未变化、fallback、拒绝和异常都会追加到 `memory_history.jsonl`，日志只保存哈希、轮次和脱敏错误，不复制记忆正文。
 
 ## 6. Compile 调度与 offset
 
 `run_compilation()` 的顺序是：
 
 ```text
-compile_context → compile_recent → compile_durable
+compile_context → compile_recent → compile_durable → sync_durable_topics（可选第四阶段）
 ```
 
-三个视图各自失败、各自记录审计，不会让未审核内容进入其他视图。
+前三个视图各自失败、各自记录审计，不会让未审核内容进入其他视图。第四阶段 topic sync 在 `sync_topics=True` 且 durable 编译成功（或存在 `sync_pending` 待办）时执行；生产维护路径固定开启。它消费**已审核**的 durable bullets，由 classifier 分组为至多 8 个 topic，逐 topic 复用 `compact_episode` 的 Generator/Reviewer 链路生成 `memory/episodes/` 下的 topic 页面，并把条目→页面的路由写入 `topic-associations.json`。topic sync 失败时写 `sync_pending`、记 `.topic_sync_retry_attempt` 冷却，并追加 `target="topic_sync"` 的审计记录。
 
 - `.fp_context`、`.fp_recent`、`.fp_durable`：输入指纹；
 - `.compile_offset`：本轮完整编译进度；
@@ -159,11 +171,16 @@ compile_context → compile_recent → compile_durable
 - `.dream_commit.json`：durable 已审核替换、但对应 `.dream_offset` 尚未确认时的恢复日志；只保存旧/新哈希和行 offset，不保存记忆正文；
 - `.dream_cleanup.json`：`recent.jsonl` 已审计前缀的回收日志，保存旧/新日志哈希和 compile、durable、Dream 的目标 offset；启动时优先完成它，避免日志已截断而 offset 尚未同步时重放证据；
 - `.compile_counter`：普通事件编译计数器。
+- `.dream_counter`：Dream 的有效回合计数器。
 - `.nudge_counter`：有效记忆回合的质量检查计数器，达到 20 时触发；成功得到空候选或已记录候选才归零。
 - `.nudge_offset`：已经由 Nudge 审阅过的 `recent.jsonl` 行；拒绝、超时或异常时不前进。
-- `.nudge_pending`：共享 LLM 客户端下延迟执行的待处理标记；维护状态将其作为 `nudge=pending` 报告。
+- `.compile_pending` / `.nudge_pending` / `.dream_pending`：共享 LLM 客户端下延迟执行的待处理标记；维护状态将其作为对应 lane 的 `pending` 报告。
+- `.{compile,nudge,dream,topic_sync}_retry_attempt`：重试冷却标记（见下）。
+- `.maintenance`：维护任务的进程间锁文件。
 
 `recent.md` 始终基于完整滚动窗口重建，不从 compile offset 截断；`durable.md` 始终从 durable offset 增量读取。只有成功消费的层才更新自己的指纹或 offset，失败后下次继续重试。
+
+**重试与退避**：失败按类型区分处理——审核拒绝、内容不合规等"内容性失败"立即可重试；传输或 provider 失败（如 401、超时）则写入对应 lane 的 `.{lane}_retry_attempt` 标记，600 秒内跳过该 lane 的计数器触发，避免持续故障时每轮都烧一次 LLM 调用。显式学习信号触发的编译不受冷却约束；计数器触发受冷却约束。
 
 ### 6.1 周期 Nudge：20 回合的候选质量门
 
@@ -212,45 +229,56 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆�
 ```text
 常驻：context.md
 被动工作记忆：recent.md
-按需：durable.md 中与当前问题匹配的条目
-按需：FTS5 命中的 episodes
+按需第一层：durable.md 中与当前问题关键词匹配的条目
+按需第二层：被命中 durable 条目路由到的 topic 页面（FTS + 可选向量混合召回）
 ```
 
-`preparation.prepare_runtime()` 明确调用 `assemble_memory(include_durable=False)`（`engine/execution/orchestration/preparation.py:350`），因此 durable 不会整份常驻。`search_relevant_memories()` 对 durable 条目做有界关键词召回，并继续对 episodes 使用 FTS5；任一检索失败都降级为空，不阻塞回答。
+`preparation.prepare_runtime()` 明确调用 `assemble_memory(include_durable=False)`，因此生产路径下 durable 不会整份常驻。主检索入口是 `retrieve_relevant_memory()`，返回保留来源边界的 `RelevantMemory(durable=..., episodes=...)`——durable 与 episodes 在 prompt 中是两个独立层（Durable Memory Retrieval / Relevant Episodes），不是一段文本（`search_relevant_memories()` 只是把两段拍平的向后兼容包装）。召回链路是：durable 关键词召回 → 用 `topics_for_entries()` 反查命中条目被路由的 topic → 只有这些 topic 的页面进入 FTS 作用域；若配置了 embedding provider，还会额外做 `TopicVectorIndex` 余弦检索并与词法证据合并去重。存在语义命中时，注入段标题由 `## Relevant Episodes` 变为 `## Relevant Topic Knowledge`。任一检索失败都降级为空，不阻塞回答。
 
-`PromptAssembler` 只负责组合调用方给出的记忆文本。学习得到的 context 与项目记忆都会先清洗并加安全围栏，明确历史内容只是参考，不能覆盖系统指令、`SMITH.md`、当前用户请求或工具权限。预算不足时可裁剪 recent/检索记忆，但常驻 `context.md` 不被裁剪；其自身由 4K Policy 上限约束。
+语义召回默认关闭：需在 profile `config.yaml` 的 `knowledge.embeddings` 段显式启用（`enabled`/`base_url`/`model`/`api_key_env`），key 通过环境变量提供。provider 缺失、超时（10 秒）或异常只影响 topic 页面召回质量，静默降级为纯 FTS，不阻塞回答。
+
+生产路径由调用方把记忆文本传入 `PromptAssembler`；assembler 另保留一条自读 profile 文件的兼容回退路径（`memory_text` 为 `None` 时自读 `recent.md`/`durable.md` 整份装入 legacy 层），仅供未迁移的直接调用方使用。学习得到的 context 与项目记忆都会先清洗并加安全围栏，明确历史内容只是参考，不能覆盖系统指令、`SMITH.md`、当前用户请求或工具权限。预算不足时可裁剪 recent/检索记忆，但常驻 `context.md` 不被裁剪；其自身由 4K Policy 上限约束。
 
 ## 9. 模块边界
 
 | 模块 | 只负责什么 |
 |---|---|
-| `memory/store.py` | 证据写入、compile/Nudge/Dream 计数器调度、durable/episode 召回 |
-| `memory/policy.py` | 加载唯一 Policy、解析视图配置、校验 Markdown |
-| `memory/compile.py` | 视图筛选、Compiler/Reviewer 调用、指纹与 offset |
+| `memory/store.py` | 证据写入、compile/Nudge/Dream 计数器调度、重试冷却、durable/topic/episode 召回 |
+| `memory/policy.py` | 加载唯一 Policy、解析视图配置、校验 Markdown、kind 枚举权威定义 |
+| `memory/compile.py` | 视图筛选、Compiler/Reviewer 调用、fallback 文档、指纹与 offset、topic sync 编排 |
+| `memory/knowledge.py` | durable 条目 → topic 页面的路由关联存储与 `sync_durable_topics` |
+| `memory/search.py` | episodes/topic 页面的 FTS5 索引（trigram/CJK 切词、短词 LIKE 回退） |
+| `memory/vector.py` | 可选的 topic 页面向量索引（`TopicVectorIndex`） |
+| `memory/embeddings.py` | OpenAI 兼容 embedding provider 及其配置解析 |
+| `memory/_files.py` | 唯一的确定性写入与清洗原语（原子写、进程锁、密钥/注入清洗），被所有层依赖 |
 | `memory/nudge.py` | 每 20 个有效记忆回合的受限候选发现、精确证据和安全校验 |
 | `memory/_review.py` | 通用生成—审核重试协议 |
-| `memory/history.py` | 追加脱敏审计记录 |
+| `memory/history.py` | 追加脱敏审计记录（含保留窗口裁剪与失败连击统计） |
 | `memory/dream.py` | 低频清洗、durable 与事件增量对账、checkpoint 和受限日志回收 |
 | `memory/user_learner.py` | 只产出稳定偏好信号，不写 Markdown |
-| `memory/maintenance.py` | 生命周期锁、超时，以及由执行层注入的 LLM 依赖 |
+| `memory/maintenance.py` | 生命周期锁、超时、失败分类退避，以及由执行层注入的 LLM 依赖 |
 | `engine/context/assembler.py` | 组合已接受的记忆，不理解编译规则 |
 
-新增规则或模板优先修改 `MEMORY_POLICY.md`；外部调用方不需要了解具体模型提示词和文件写入细节。三份正式 Markdown 始终只有一个写入入口。
+新增规则或模板优先修改 `MEMORY_POLICY.md`；外部调用方不需要了解具体模型提示词和文件写入细节。三份正式 Markdown 的全部写入路径（通过 / fallback / 初始化 / 清除）都收敛到 `_commit_view()` 这一个确定性校验函数。
 
 ## 10. 失败语义
 
 | 失败 | 结果 |
 |---|---|
-| Compiler 异常或超时 | 不写文件，保留旧视图，记录 `failed` |
+| Compiler 异常或超时（`context.md`，或 Reviewer 缺失时） | 不写文件，保留旧视图，记录 `failed` |
+| Compiler 超时 / 多轮审核未过（`recent.md`、`durable.md`，Reviewer 存在时） | 写入抽取式 fallback 文档，记录 `fallback`，推进指纹与 offset |
 | Reviewer 拒绝或缺失 | 不写文件，保留旧视图，记录 `rejected` |
 | Markdown 结构/预算不合规 | 不写文件，记录 `rejected` |
 | 原子写入失败 | 临时文件清理，旧文件保持，记录 `failed` |
 | Nudge 候选为空 | 记录 `nudge=unchanged`，推进 Nudge checkpoint，不写正式记忆 |
 | Nudge 候选不合规、Reviewer 拒绝或提供方失败 | 不追加候选，不写正式记忆，保留 `.nudge_counter=20` 与 offset 供重试 |
 | durable/episode 检索失败 | 本轮不注入对应记忆，回答继续 |
-| 记忆收尾失败 | 当前对话结果不回滚，后续维护重试 |
+| topic sync 失败 | 写 `sync_pending` 与冷却标记，下次 durable 编译后重试，记录 `target="topic_sync"` 审计 |
+| 记忆收尾失败 | 当前对话结果不回滚，后续维护重试（传输/provider 失败有 600 秒冷却） |
 
-总原则：记忆可以暂时变旧，但不能用未经审核或损坏的内容替换已接受记忆，也不能阻塞用户当前任务。
+总原则：记忆可以暂时变旧，但不能用未经审核或损坏的内容替换已接受记忆，也不能阻塞用户当前任务。fallback 写入不违反此原则：它不含模型新增内容，只做确定性证据抽取，且仍通过全部结构与安全校验。
+
+**可观测性**：`maintenance_status()`（经 `GET /api/agent/memory/status` 暴露）报告 compile/nudge/dream/topic_sync 四个 lane 的 idle/pending/running 状态，以及 `consecutive_failures`（从 history 尾部统计的连续失败数）与 `last_error`。topic_sync 在 compile lane 内执行，因此永不显示为 `running`。
 
 ## 11. 验收标准
 
@@ -258,23 +286,23 @@ Dream 继续沿用每 50 个有效 turn 的低频机制，但它是长期记忆�
 2. 普通无价值纯聊天不会写入记忆。
 3. 稳定偏好达到三次后进入 evidence，再由 Compiler/Reviewer 更新 `context.md`。
 4. 三个 Markdown 都严格符合同一份 MemoryPolicy。
-5. Reviewer 拒绝、缺失或超时时，旧文件和指纹不变，并产生审计记录。
+5. Reviewer 拒绝或缺失时，旧文件和指纹不变，并产生审计记录；`recent.md`/`durable.md` 在 Compiler 超时或多轮审核未过时可写入抽取式 fallback（审计 status 为 `fallback`）。
 6. `recent.md` 在 3–7 天窗口为空时被清除。
 7. durable offset 防止旧事件重复合并。
 8. Dream 只根据当前 durable 与 `.dream_offset` 后的 JSONL 证据校正；审核失败时 durable、checkpoint 和未审计日志不变。
 9. Dream 的单个超大合法事件会以显式有界投影被处理，不会永久阻塞 checkpoint；审核通过但文本未变、durable 替换和 JSONL cleanup 的中断都不得触发同一证据的模型重放。
 10. 正常回答不读取 `recent.jsonl` 或 `memory_history.jsonl`。
-11. durable 不整份常驻，只按当前问题召回匹配条目。
+11. 生产 `prepare_runtime` 路径下 durable 不整份常驻，只按当前问题召回匹配条目（assembler 的自读兼容回退路径除外）。
 12. `SMITH.md` 永远不被自动学习修改。
 13. engine、server 回归测试与 wheel package-data 校验通过。
 14. 20 个有效记忆回合后，Nudge 的空候选不会生成 durable 内容；合格候选必须先以 `origin=periodic_nudge` 进入 JSONL，再经既有 Compiler/Reviewer 链路；拒绝或失败时计数保持待重试。
 
 ## 12. 当前限制
 
-- durable 按需召回目前是有界关键词匹配，不是向量语义检索；同义改写可能漏召回。
-- episodes 仍使用本地 FTS5，适合当前小规模数据；规模增长后再评估混合检索。
+- durable 主体召回仍是有界关键词匹配；被 durable 路由到的 topic 页面在启用 embeddings 时走向量 + FTS 混合召回，未启用时降级为纯 FTS。同义改写在 durable 主体层仍可能漏召回。
+- 向量索引是 `vectors.json` 全量扫描（余弦相似度），只覆盖 topic 页面；embedding 请求超时 10 秒后静默降级。适合当前小规模数据，规模增长后再评估。
 - 事件分类使用小型确定性信号集；复杂隐含偏好只有在重复启发式命中或用户明确表达后才进入正式记忆。
 - Nudge 的“是否足够可复用”仍需要 Generator/Reviewer 的语义判断；精确摘录、稳定 kind、确定性安全检查和可重试审计用于限制误判，而不是把 20 回合周期本身当作事实证据。
-- `.bak` 只保存上一个版本；完整变更轨迹依赖 `memory_history.jsonl` 的哈希和原始证据日志。
+- `.bak` 只保存上一个版本（且仅在内容有变化时产生）；变更轨迹依赖 `memory_history.jsonl` 的哈希和原始证据日志，但该审计日志是**有界的**——Dream 定期裁剪到 500 条 / 90 天。
 
-当前实现基线：2026-07-29。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/memory/test_memory_policy.py`、`engine/tests/memory/test_memory_pipeline.py` 与 `engine/tests/memory/test_memory_maintenance.py` 为准。
+当前实现基线：2026-08-05（durable-routed topic knowledge 合入后）。规则以 `engine/memory/MEMORY_POLICY.md` 为准，行为以 `engine/tests/memory/test_memory_policy.py`、`test_memory_pipeline.py`、`test_memory_maintenance.py`、`test_topic_knowledge.py` 与 `test_memory_files.py` 为准。

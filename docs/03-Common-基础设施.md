@@ -12,6 +12,7 @@
 - **配置常量** — 上层模块所需的全局路径常量
 - **SQLite 连接管理** — 异步数据库连接的单例与生命周期
 - **YAML 工具** — 配置文件的安全读写与深度合并
+- **哈希链审计日志** — 防篡改的 JSONL 追加日志原语，供 engine 的追踪与安全审计使用
 - **内置技能资源** — 从安装包或源码树发现、同步 Smith 自带技能到私有运行目录
 
 ### 1.1 零业务逻辑原则
@@ -37,12 +38,15 @@ server/ ──import──→ engine/ ──import──→ common/
 ```
 common/
 ├── __init__.py       # 空文件，使 common/ 成为 Python 包
-├── config.py         # 路径常量再导出 + ensure_dirs()
+├── config.py         # 路径常量再导出 + reset_paths() + ensure_dirs()
 ├── paths.py          # AppPaths 数据类，路径派生逻辑核心
 ├── database.py       # SQLite 异步连接管理（单例模式）
 ├── yaml_utils.py     # YAML 读写、深度合并、原子写入
+├── hash_chain.py     # 防篡改哈希链 JSONL 审计日志（HashChainLog）
 └── pyproject.toml    # 包元信息与依赖声明
 ```
+
+（`uv.lock` 锁文件省略。）
 
 ---
 
@@ -90,11 +94,13 @@ source_root = Path(__file__).resolve().parent.parent
 ```python
 working_dir = Path.cwd().resolve()
 for candidate in (working_dir, *working_dir.parents):
-    if has_all_smith_markers(candidate):
+    if not (candidate / "agents").is_dir():
+        continue
+    if _is_agent_smith_root(candidate):
         return candidate
 ```
 
-从当前工作目录开始逐级向父目录搜索，找到第一个具备全部 Smith 标记的目录即返回。单独存在通用的 `agents/` 目录不会命中，避免误将其他项目当作 Smith 根目录。
+从当前工作目录开始逐级向父目录搜索，找到第一个具备全部 Smith 标记（`_is_agent_smith_root()`）的目录即返回。单独存在通用的 `agents/` 目录不会命中，避免误将其他项目当作 Smith 根目录；命中 `agents/` 但缺标记的候选会记 debug 日志，便于诊断根目录发现失配。
 
 **兜底**
 
@@ -134,7 +140,7 @@ class AppPaths:
 
 ```python
 @classmethod
-def defaults(cls) -> "AppPaths":
+def defaults(cls) -> AppPaths:
     return cls(
         data_dir=Path.home() / ".agent-smith",
         project_root=_default_project_root(),
@@ -175,15 +181,19 @@ def ensure_base_dirs(self) -> None:
     self._install_builtin_skills()
 ```
 
-确保三个关键数据目录存在；新建目录的权限为 `0o700`，已有真实目录保持现有权限，并同步内置技能：
+显式确保三个基础数据目录存在（新建目录的权限为 `0o700`，已有真实目录保持现有权限），随后同步内置技能：
 
 1. `~/.agent-smith/` — 数据根目录
 2. `~/.agent-smith/agent/` — Agent 实例目录
 3. `~/.agent-smith/sqlite/` — SQLite 数据库所在目录
-4. 从 `bundled_skills_dir` 中找出包含顶层 `SKILL.md` 的目录，复制到 `~/.agent-smith/builtin/skills/`
-5. 删除该目标目录中不再属于当前分发集合的技能目录，并写入权限为 `0o600` 的 `.manifest.json`
 
-wheel 安装时，分发来源是 `sysconfig.get_path("data")` 下的 `agent_smith_common/builtin_skills/`；源码开发时才回退到仓库的 `agents/skills/`。若分发来源不存在，技能同步安全地跳过。`agent/skills/` 仍保留给用户安装的技能，不会被此同步覆盖。
+技能同步（`_install_builtin_skills()`）：
+
+4. 额外创建 `~/.agent-smith/builtin/` 与 `~/.agent-smith/builtin/skills/`（同为 `0o700`）
+5. 从 `bundled_skills_dir` 中找出包含顶层 `SKILL.md` 的目录，复制到 `~/.agent-smith/builtin/skills/`
+6. 删除该目标目录中不再属于当前分发集合的技能目录，并写入权限为 `0o600` 的 `.manifest.json`
+
+wheel 安装时，分发来源是 `sysconfig.get_path("data")` 下的 `agent_smith_common/builtin_skills/`；源码开发时才回退到仓库的 `agents/skills/`。若分发来源不存在，技能同步安全地跳过；若来源存在但发现的技能集合为空、且目标目录已装有技能，则记 warning 并整体跳过本次同步，不删除任何已装技能（防止空/损坏的分发包抹掉内置技能）。`agent/skills/` 仍保留给用户安装的技能，不会被此同步覆盖。
 
 `.manifest.json` 记录每个分发文件的 source/target `mtime_ns`、`size` 和源文件 SHA-256。两端元数据均未变化时，后续同步不会重新读取文件内容；任一元数据变化时才计算 SHA-256 并按内容决定是否复制。这样可以恢复普通篡改，同时保留重复启动的低 I/O 路径；刻意伪造时间戳和大小的攻击不在该元数据快路径的完整性保证内。
 
@@ -231,7 +241,7 @@ def __getattr__(name: str):
 | `BUILTIN_TOOLS_DIR` | `builtin_tools_dir` | `<repo>/agents/tools/` |
 | `SAFETY_RULES_PATH` | `safety_rules_path` | `<repo>/agents/safety/dangerous_commands.json` |
 
-`reset_paths(paths)` 可替换缓存实例，供测试或运行时重配置使用。通过 `config.PATHS`、`config.DATA_DIR` 等模块属性访问的代码会观察到替换后的值；`from common.config import PATHS` 遵循 Python 导入绑定语义，会保留导入时的快照，不能用来观察之后的 `reset_paths()`。
+`reset_paths(paths: AppPaths | None = None)` 可替换缓存实例，供测试或运行时重配置使用；不传或传 `None` 表示清空缓存，下次属性访问时惰性重建默认实例。通过 `config.PATHS`、`config.DATA_DIR` 等模块属性访问的代码会观察到替换后的值；`from common.config import PATHS` 遵循 Python 导入绑定语义，会保留导入时的快照，不能用来观察之后的 `reset_paths()`。
 
 ### 4.2 `ensure_dirs() -> None`
 
@@ -307,7 +317,7 @@ async def close_db() -> None:
 
 1. 获取初始化锁，避免关闭操作与新连接创建交错
 2. 检查 `_db is None` — 若已关闭则直接返回
-3. 将 `_db` 引用取出、置 `None`
+3. 将 `_db` 引用取出、置 `None`，`_db_path` 一并置 `None`（保证路径切换后能干净重连）
 4. 调用 `await db.close()`
 
 先置 `None` 再 `close()` 的顺序确保后续调用不会返回一个正在关闭的连接。`_db_lock` 保护缓存状态，`_db_init_lock` 则保证关闭完成后才会开始下一次连接创建。
@@ -352,7 +362,7 @@ class YamlConfigError(ValueError):
 
 ```python
 def _ensure_private_parent(path: Path) -> None:
-    _ensure_real_path(path)  # 拒绝路径链中的符号链接
+    _ensure_real_path(path, label="YAML path")  # 拒绝路径链中的符号链接
     # 只创建缺失的目录；已有目录保持权限
     ...
 ```
@@ -370,7 +380,7 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
 **行为：**
 
 1. 将参数转为 `Path` 对象
-2. 若文件不存在 → 返回空字典 `{}`（不报错）
+2. 若目标不是常规文件（不存在、是目录或特殊文件）→ 返回空字典 `{}`（不报错）
 3. 以 UTF-8 编码打开文件
 4. 使用 `yaml.safe_load()` 解析（`safe_load` 不执行任意 Python 对象构造，防止代码注入）
 5. 解析结果为 `None`（空文件或纯注释文件）→ 返回空字典 `{}`
@@ -379,7 +389,7 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
 
 **保证：**
 - 返回值类型始终为 `dict[str, Any]`
-- 文件不存在或为空时不抛异常，返回空字典
+- 目标不是常规文件或内容为空时不抛异常，返回空字典
 - YAML 格式错误时抛 `YamlConfigError`（包装了原始 `yaml.YAMLError`）
 - 根节点为列表、标量等非字典类型时抛 `YamlConfigError`
 
@@ -439,7 +449,7 @@ def merge_configs(*configs: dict[str, Any]) -> dict[str, Any]:
 
 - **列表不做合并** — 列表被视为标量，直接覆盖而非追加或合并。例如 `{"a": [1,2]}` 和 `{"a": [3,4]}` 合并结果为 `{"a": [3,4]}`
 - **`None` 是"不覆盖"标记** — 若某层配置的某个键值为 `None`，该键不会影响合并结果。这允许在叠加配置文件时表达"此项使用默认值"
-- **返回新字典** — 不修改任何输入字典，返回全新的合并结果
+- **顶层返回新字典，浅拷贝语义** — 合并过程不就地修改任何输入字典；但仅对双方均为 `dict` 的键递归重建，其余值（含列表与仅单侧出现的嵌套 `dict`）按引用共享进结果。调用方若要就地修改返回值的嵌套结构，需自行 `deepcopy` 以免污染输入配置
 - **递归深度无限制** — 嵌套字典无论多深都会递归合并
 
 **典型用法：**
@@ -451,7 +461,41 @@ final = merge_configs(default_config, user_config, runtime_overrides)
 
 ---
 
-## 7. `__init__.py`
+## 7. hash_chain.py — 防篡改哈希链审计日志
+
+为 engine 的追踪与安全审计提供可校验的追加式 JSONL 日志原语。消费方：`engine/observability/trace_store.py` 与 `engine/safety/tool_guard.py`。
+
+### 7.1 模块级常量与纯函数
+
+| 常量/函数 | 含义 |
+|------|------|
+| `CHAIN_VERSION = 1` | 链格式版本号 |
+| `CHAIN_FILE_MODE = 0o600`、`_PRIVATE_DIR_MODE = 0o700` | 日志文件/目录权限（模块内自行定义，未复用 `paths.py` 的同值常量——已知技术债） |
+| `canonical_json(value)` | 键序稳定的规范化 JSON 序列化 |
+| `sha256_hex(text)` | SHA-256 十六进制摘要 |
+| `genesis_hash(namespace)` | 按 namespace 派生创世哈希 |
+| `record_hash(record)` | 单条记录的链哈希 |
+
+### 7.2 `HashChainLog`
+
+追加式 JSONL 日志，每条记录携带 `seq` / `prev_hash` / `hash`，逐条链式绑定：
+
+- `append(record, *, sync=False)` — 追加一条记录并写入链字段
+- `seal()` — 将链头密封写入旁路 anchor 文件 `<log>.head`（用于检测整链回滚/截断）
+- `verify(anchor=None)` — 校验整链完整性，返回 `ChainVerification`（frozen dataclass）
+- `unseal()` / `close()` / `ensure_handle()` / `file_handle` — 生命周期与句柄管理
+
+**legacy 尾部处理**：对既有的无链纪录文件，链只绑定其最后一条记录，且首条链式记录必须显式声明 `legacy_linked: true`——校验方据此区分"合法迁移"与"降级攻击"，未声明的 legacy 拼接会校验失败。
+
+**多写者防护**：`_reload_if_externally_appended()` 检测其他进程对同一日志的追加，避免误报篡改。
+
+### 7.3 `verify_chain(path, *, namespace, anchor=None)`
+
+模块级校验入口，独立于写入方重放整条链并核对 anchor。
+
+---
+
+## 8. `__init__.py`
 
 空文件。仅使 `common/` 成为 Python 包，不导出任何符号。
 
@@ -462,31 +506,33 @@ from common.config import SQLITE_PATH, DATA_DIR, ensure_dirs
 from common.database import get_db, close_db
 from common.yaml_utils import load_yaml, save_yaml, merge_configs
 from common.paths import AppPaths  # 需要自定义路径时
+from common.hash_chain import HashChainLog, verify_chain  # 审计日志
 ```
 
 ---
 
-## 8. 依赖方向
+## 9. 依赖方向
 
-### 8.1 内部依赖
+### 9.1 内部依赖
 
 ```
 config.py ──import──→ paths.py
 database.py ──import──→ config.py ──import──→ paths.py
 yaml_utils.py ──import──→ paths.py（复用私有权限常量和符号链接防护）
+hash_chain.py（叶子模块，仅依赖标准库）
 ```
 
-`yaml_utils.py` 不依赖配置或数据库层，只复用 `paths.py` 中的权限常量和路径安全辅助函数。
+`yaml_utils.py` 不依赖配置或数据库层，只复用 `paths.py` 中的权限常量和路径安全辅助函数。`hash_chain.py` 是 common 内的第二个叶子模块，零 common 内部依赖；它自行重复定义了 `0o600`/`0o700` 权限常量而非从 `paths.py` 导入，属已知的常量重复。
 
-### 8.2 谁依赖 common
+### 9.2 谁依赖 common
 
 | 消费方 | 导入内容 | 用途 |
 |--------|---------|------|
-| `engine/` | `config.py` 路径常量、`database.py` 连接管理、`yaml_utils.py` 配置工具 | 记忆存储、Agent 配置加载、LLM 配置读取 |
-| `server/` | 同上，加上 `ensure_dirs()` | 启动时初始化目录、数据库连接、配置文件管理 |
-| `agents/` | 不直接 import（纯内容层），但通过 engine 间接消费路径 | 被 engine 按路径读取 |
+| `engine/` | `config.py` 路径常量、`database.py` 连接管理、`yaml_utils.py` 配置工具、`paths.py`（直接构造 `AppPaths`、私有权限常量）、`hash_chain.py`（trace_store、tool_guard 审计链） | 记忆存储、Agent 配置加载、LLM 配置读取、可观测性与安全审计 |
+| `server/` | 同上（`paths.py` 私有权限常量用于 auth、skill_service），加上 `ensure_dirs()` | 启动时初始化目录、数据库连接、配置文件管理 |
+| `agents/` | 主体是纯内容层不 import；唯一例外是可执行钩子 `agents/smith/hooks/cost_tracker.py` 直接 `from common.config import DATA_DIR`。纯内容文件（skills/identities/tools 定义）不 import common | 被 engine 按路径读取；hooks 由 HookLoader 动态加载执行 |
 
-### 8.3 common 不得依赖的模块
+### 9.3 common 不得依赖的模块
 
 - `engine/` — Agent 框架层，比 common 高一级
 - `server/` — 平台后端层，最高级
@@ -496,9 +542,9 @@ yaml_utils.py ──import──→ paths.py（复用私有权限常量和符号
 
 ---
 
-## 9. 与其他层的接口契约
+## 10. 与其他层的接口契约
 
-### 9.1 engine 对 common 的期望
+### 10.1 engine 对 common 的期望
 
 | 契约 | 具体要求 |
 |------|---------|
@@ -508,7 +554,7 @@ yaml_utils.py ──import──→ paths.py（复用私有权限常量和符号
 | 合并确定性 | `merge_configs()` 的覆盖语义一致，`None` 值不覆盖 |
 | 目录就绪 | 调用 `ensure_dirs()` 后，`data_dir`、`agent_dir`、`sqlite/` 目录已存在；新建目录为私有权限，可用分发资源会同步到 `builtin/skills/` |
 
-### 9.2 server 对 common 的期望
+### 10.2 server 对 common 的期望
 
 | 契约 | 具体要求 |
 |------|---------|
@@ -516,7 +562,7 @@ yaml_utils.py ──import──→ paths.py（复用私有权限常量和符号
 | 幂等初始化 | `ensure_dirs()` 和 `get_db()` 可多次调用；过期 managed 符号链接会被安全移除 |
 | 原子写入 | `save_yaml()` 不会在崩溃时产生半写文件，也不会跟随目标或父链符号链接 |
 
-### 9.3 common 不提供的东西
+### 10.3 common 不提供的东西
 
 - **Schema 管理** — common 不负责创建或迁移数据库表；当前表结构由 `server/app/infrastructure/schema.py` 管理
 - **配置校验** — common 只解析 YAML 为字典，不校验配置内容的业务语义
@@ -524,7 +570,7 @@ yaml_utils.py ──import──→ paths.py（复用私有权限常量和符号
 
 ---
 
-## 10. pyproject.toml — 依赖与分发资源
+## 11. pyproject.toml — 依赖与分发资源
 
 ```toml
 [project]
@@ -543,15 +589,15 @@ dependencies = ["pyyaml>=6.0", "aiosqlite>=0.21"]
 
 Python 版本要求 `>=3.11`（使用了 `X | Y` 联合类型语法等 3.10+ 特性，以及 `from __future__ import annotations`）。
 
-### 10.1 内置技能 data files
+### 11.1 内置技能 data files
 
 `[tool.setuptools.data-files]` 将每个内置技能的 `SKILL.md` 以及需要随技能分发的引用文件写入 wheel 的 `agent_smith_common/builtin_skills/` 目录。安装后的 `bundled_skills_dir` 优先读取该位置，因此源码目录存在技能并不等于安装包已经包含它。该 `common` wheel 不携带完整的 `agents/smith`、`agents/identities`、tools 或 safety 资源；脱离源码树运行时必须通过 `AGENT_SMITH_PROJECT_ROOT` 指向完整资源根目录。
 
-新增内置技能或其引用文件时，必须同步更新该清单；`server/tests/test_common_infrastructure.py` 会比较包含顶层 `SKILL.md` 的源码技能目录与已声明的技能根目录，防止遗漏技能本体。
+新增内置技能或其引用文件时，必须同步更新该清单；`server/tests/test_common_infrastructure.py`（`test_wheel_data_files_reproduce_every_bundled_skill_file`）用 `rglob` 遍历每个技能内的**每一个文件**（含 `references/` 等子目录），与声明的 data-files 做**双向精确集合比对**——漏写或多写任一引用文件都会导致测试失败，不止校验技能本体。
 
 ---
 
-## 11. 验证与维护
+## 12. 验证与维护
 
 修改 `common/` 的路径、配置、数据库或分发资源时，至少执行：
 
