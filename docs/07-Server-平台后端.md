@@ -1,15 +1,19 @@
 # 07 · Server 平台后端
 
-> **当前实现说明**：Server 是本机 FastAPI 服务，版本 `0.2.0`。接口定义的唯一事实来源是 `server/app/routers/agent.py` 和 `server/app/routers/config.py`；下表已按当前 router 重写。
+## 本章结论
 
-## 服务边界
+Server 是本机 FastAPI 服务，负责 HTTP/SSE、鉴权、持久化和 Engine 运行时装配；它不实现模型协议、ReAct、工具安全或终端渲染。接口的事实来源是 `server/app/routers/agent.py` 与 `server/app/routers/config.py`。
+
+## 总体架构
+
+## 工程拆解：服务边界
 
 `server/` 负责 HTTP/SSE、local token 鉴权、SQLite repositories、session/profile/auto task 持久化、Engine runtime 装配和 scheduler。它不实现模型协议、ReAct、工具安全或终端渲染；这些分别属于 Engine 或 Shell。
 
 启动时，`server/app/main.py` 会：初始化 local token 与数据库、加载 identity catalog、标记中断 Run 为可恢复、同步 token 统计、设置 generation sink 并启动 auto-task scheduler。关闭时会取消 scheduler、等待后台 auto-task、关闭共享 LLM client 与 SQLite。
 
 ```mermaid
-flowchart TB
+graph LR
   Shell["Shell / local client"] --> API["FastAPI routers"]
   API --> Service["services/"]
   Service --> Repo["infrastructure/repositories"]
