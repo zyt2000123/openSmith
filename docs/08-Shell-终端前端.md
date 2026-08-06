@@ -28,11 +28,17 @@ UI 组件不直接 import `engine/`，也不应把显示文本反向当作执行
 | 终端 UI | Ink 7 + React 19 |
 | 状态 | Zustand 5 (`zustand/vanilla` + React selector) |
 | 正文 Markdown | `@assistant-ui/react-ink-markdown` |
+| Smith UI 结构化渲染 | `@json-render/core` + `@json-render/ink` |
+| 图片附件 | `ink-picture` |
 | GFM 表格 AST | `marked` |
 | 宽度计算 | `string-width` |
 | 代码高亮 | Shiki / `@assistant-ui/react-ink-markdown` helper |
 | 静态检查 | Biome |
 | 测试 | TypeScript + `node:test`，同目录 `*.test.ts(x)` |
+
+`package.json` 通过 `overrides` 把 `ink` 强制 pin 到 7：`@json-render/ink` 声明的
+ink 6.8 在粘贴含 SGR 序列的文本时会让整个进程崩溃（ink#901），ink 7 已修复，
+且 `@json-render/ink` 用到的 API 在 7 中不变。
 
 在 `shell/` 下执行：
 
@@ -43,8 +49,9 @@ npm test
 npm pack --dry-run
 ```
 
-`npm test` 先做 TypeScript 类型检查，再由 `scripts/run-tests.mjs` 运行编译产物；
-脚本在测试报告完成后强制退出，以隔离第三方 Markdown 渲染器遗留的 MessagePort。
+`npm test` 先清空 `dist/` 并用 `tsc` 编译（同时完成类型检查），再由
+`scripts/run-tests.mjs` 运行编译产物；脚本在测试报告完成后强制退出，以隔离
+第三方 Markdown 渲染器遗留的 MessagePort。
 
 ## 3. 运行生命周期
 
@@ -69,7 +76,15 @@ Composer input
 
 `bridge.ts` 是所有后端交互的唯一入口。它拥有取消控制器、请求批处理、会话恢复、
 技能开关、token/observability 刷新和审批提交；`api.ts` 只定义 HTTP/SSE 协议和
-超时控制。`dev-server.ts` 先检查健康与 OpenAPI 所需操作，必要时才启动本地 FastAPI。
+超时控制。除此之外，`api.ts` 还承担两条安全职责：
+
+- 每个请求注入 `Authorization: Bearer <~/.agent-smith/auth_token>`（来自
+  `auth.ts` 的 `localAuthHeaders`）；
+- 入站文本的净化边界：所有来自服务端的文本在解码时统一经过 `sanitize.ts` 的
+  `sanitizeTerminalText`/`sanitizeUnknownText` 处理，而不是靠每个 renderer
+  各自记得净化。
+
+`dev-server.ts` 先检查健康与 OpenAPI 所需操作，必要时才启动本地 FastAPI。
 
 ## 4. 状态与键盘路由
 
@@ -101,7 +116,8 @@ SmithApp
 ├── ShellContent
 │   ├── setup → SetupPanel
 │   ├── runs → RunExplorerPanel
-│   ├── panels → sessions / skills / skill-toggle / mcp / hooks / tokens
+│   ├── panels → sessions / skill-actions / skills / skill-toggle / mcp /
+│   │             hooks / hook-details / tokens
 │   └── active TranscriptEntry
 └── ShellFooter
     ├── status / pending skill / queued input / running progress
@@ -122,6 +138,9 @@ SmithApp
 Setup、sessions、skills、MCP、runs 等面板使用 `PanelContainer`。选择、过滤和保存仍
 分别由 `input.ts`、`list-navigation.ts`、Store 与 `NodeBridge` 驱动。
 
+注：`HooksPanel` 与 `HookDetailsPanel` 是尚未收敛到 `PanelContainer` 的历史例外，
+目前仍是手写 `Box`/`Text` 布局。
+
 ## 6. Transcript 与结构化渲染
 
 转录状态在 `transcript-state.ts`，渲染在 `transcript.tsx`。完成的 entry 通过 Ink
@@ -138,8 +157,10 @@ SSE event
 
 ### Markdown、表格、diff
 
-- 常规正文继续由 `MarkdownText` 显示；`DisplayText` 用于需要显式、显示宽度感知换行
-  的终端文本。
+- 常规正文继续由 `MarkdownText`（第三方组件，来自 `@assistant-ui/react-ink-markdown`）
+  显示；需要显式、显示宽度感知换行的终端文本由 `text-layout.ts` 的函数提供
+  （`wrapDisplayText`/`padDisplayText`/`displayWidth`/`truncateDisplay`），调用方
+  是 `markdown-table.tsx` 与 `diff-block.tsx`——不存在独立的 `DisplayText` 组件。
 - `MarkdownTableBlock` 使用 `marked` AST，按真实终端显示宽度分配列宽，逐单元格强制
   换行，保留 CJK、emoji、URL、长 ID/路径的完整字符。表格始终保持 Unicode 网格，不做
   纵向卡片/字段回退；物理上无法容纳最小网格时显式记录 `overflowed`，不静默删除内容。
@@ -147,6 +168,13 @@ SSE event
   内容保留型换行。
 - `splitStreamingMarkdown` 会把未闭合表格或 fenced block 保留在动态区，直到结构完整再
   固化，避免一行 SSE 就把半张表写死到 scrollback。
+
+### Smith UI 结构化渲染
+
+Smith UI 事件在 `transcript-state.ts` 中归并为 `SmithUiBlock` / `SmithUiFallbackBlock`
+两种 block；渲染路径是 `smith-ui-schema.ts`（payload 校验与净化）→ `smith-ui.tsx`
+（基于 `@json-render/core` + `@json-render/ink` 的结构化渲染），校验失败时回退到
+`SmithUiFallbackBlock` 的降级展示。
 
 这条渲染路径只消费文本和显示宽度；它不改变 SSE、Bridge、Store 或 Engine 的执行语义。
 
@@ -161,6 +189,9 @@ SSE event
 
 - `/skills` 展示可启用技能、运行某个技能或进入启用/停用列表；disabled skill 不会进入
   `@` 选择器。
+- `/skill <name> [prompt]` 仅在 `/help` 中列出，不进入 slash palette——
+  `commands.ts` 的 `buildSlashItems` 有意排除它，技能通过 `@name` 与 `/skill`
+  直达而非 palette 补全。
 - `/mcp` 是已配置 MCP 服务及其工具的只读视图；Smith 当前是 MCP client，不在此暴露
   MCP server。
 - `/token` 显示本地 token 统计及 tab；`/runs` 与 `/trace` 显示可观测性投影及诊断。
