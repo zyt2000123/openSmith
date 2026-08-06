@@ -1,12 +1,21 @@
 # 07 · Server 平台后端
 
-> **当前实现说明**：Server 是本机 FastAPI 服务，版本 `0.2.0`。接口定义的唯一事实来源是 `server/app/routers/agent.py` 和 `server/app/routers/config.py`；下表已按当前 router 重写。
+> **当前实现说明**：Server 是本机 FastAPI 服务，版本 `0.2.0`。接口定义的唯一事实来源是 `server/app/routers/agent.py`、`server/app/routers/config.py`，外加 `server/app/main.py` 中直接定义的 `/api/health`（它不在任何 router 内）；下表已按当前实现重写。
 
 ## 服务边界
 
 `server/` 负责 HTTP/SSE、local token 鉴权、SQLite repositories、session/profile/auto task 持久化、Engine runtime 装配和 scheduler。它不实现模型协议、ReAct、工具安全或终端渲染；这些分别属于 Engine 或 Shell。
 
-启动时，`server/app/main.py` 会：初始化 local token 与数据库、加载 identity catalog、标记中断 Run 为可恢复、同步 token 统计、设置 generation sink 并启动 auto-task scheduler。关闭时会取消 scheduler、等待后台 auto-task、关闭共享 LLM client 与 SQLite。
+启动时，`server/app/main.py` 会：初始化 local token 与数据库、加载并校验 identity catalog 的可执行资产闭包（`validate_execution_assets`：route → pipeline → 节点 skill → allowlist → allowed_tools；校验失败即启动失败）、标记中断 Run 为可恢复、同步 token 统计、设置 generation sink 并启动 auto-task scheduler。
+
+关闭时按 6 步执行（`main.py`）：
+
+1. `set_default_generation_sink(None)` 摘除 generation sink；
+2. 取消 scheduler task；
+3. `cancel_background_runs()` 收尾后台 auto-task Run；
+4. `close_shared_llm_clients()` 关闭共享 LLM client；
+5. `close_audit_chains()` 封存审计链——这是审计链唯一定义良好的封链边界（此刻不再有 Run 追加写入），封链后对已封日志的回滚可在下次校验时被检出，属安全语义而非清理动作；
+6. `close_db()` 关闭 SQLite。
 
 ```mermaid
 flowchart TB
@@ -30,7 +39,9 @@ flowchart TB
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
-| GET | `/api/health` | 返回 `status` 和 server version；无 router 鉴权。 |
+| GET | `/api/health` | 返回 `status`、server version 和 `nonce`；无 router 鉴权。定义在 `main.py`，不属于任何 router。 |
+
+`nonce` 回显 `SMITH_SERVER_NONCE` 环境变量（未设置时为 `null`）。Shell 用它分辨"自己 spawn 的 server"：只有 nonce 与自己启动时注入的值一致才认领；`null` 意味着"不是我启动的，不要采纳"（`main.py`，`test_health_nonce.py`）。
 
 ### Agent、会话与消息
 
@@ -48,6 +59,8 @@ flowchart TB
 | POST | `/api/agent/sessions/{session_id}/messages/stream` | 创建消息 Run 并以 SSE 返回执行事件。 |
 
 流式消息 body 使用 `MessageCreate`，可提供 `content`、可选 `context`、`skill_name`、`identity_id` 与 `working_dir`。服务端不把普通 JSON 结果伪装为流式完成：Shell 应按 SSE 事件消费 Run 的真实状态。
+
+`POST /sessions` 也接受 `identity_id`。identity 在会话创建或首条消息时固定到会话，后续消息沿用；不存在修改会话 identity 的端点（`PATCH .../model` 只能改 `model_profile`），换身份必须新建会话。
 
 ### Skill、MCP 与项目指令
 
@@ -73,11 +86,11 @@ flowchart TB
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/api/agent/token-stats` | 获取 token 统计；可传 `year`。 |
-| GET | `/api/agent/observability/runs` | 最近 Run 摘要，`limit` 为 1–200。 |
+| GET | `/api/agent/observability/runs` | 最近 Run 摘要，`limit` 为 1–200，默认 50。 |
 | GET | `/api/agent/observability/runs/{run_id}` | 单个 Run 摘要。 |
-| GET | `/api/agent/observability/runs/{run_id}/trace` | Run trace，`limit` 为 1–1000。 |
-| GET | `/api/agent/observability/incidents` | 最近 incident。 |
-| GET | `/api/agent/observability/health` | Agent health 投影。 |
+| GET | `/api/agent/observability/runs/{run_id}/trace` | Run trace，`limit` 为 1–1000，默认 300。 |
+| GET | `/api/agent/observability/incidents` | 最近 incident，`limit` 为 1–200，默认 50。 |
+| GET | `/api/agent/observability/health` | Agent health 投影，`limit` 为 1–200，默认 50。 |
 | GET | `/api/agent/observability/runs/{run_id}/diagnosis` | Run 诊断。 |
 | GET | `/api/agent/observability/runs/{run_id}/improvement-proposal` | 改善建议。 |
 
@@ -100,13 +113,41 @@ flowchart TB
 | GET | `/api/config/llm/models` | 从兼容 relay 发现可用模型。 |
 | POST | `/api/config/llm` | 部分更新持久化 LLM 配置。 |
 
-`routes` 与 `timeout_profiles` 只允许 `interactive`、`gate`、`background` 三种 usage。详情、字段和 endpoint 校验见[LLM 模块](04b-LLM模块设计.md)。
+`routes` 与 `timeout_profiles` 只允许 `interactive`、`gate`、`background` 三种 usage。此外还有 `models` 维度：按模型名的覆盖表，key 是任意字符串（模型名），不受 usage 枚举限制；顶层字段另有 `vendor`、`provider`、`api_key`、`base_url`、`model`、`stream`、`max_output_tokens`、`context_window`。
+
+`POST /api/config/llm` 是三态部分更新语义：省略的字段保留现值；发送 `null` 删除对应 override；对 `routes`/`models`/`timeout_profiles` 发送空 mapping 清空整段。请求模型 `extra="forbid"`，未知字段返回 422。详情、字段和 endpoint 校验见[LLM 模块](04b-LLM模块设计.md)。
 
 ## 数据职责
 
 SQLite repositories 管理 profile、session、messages 与 auto task 等应用记录；Engine 自己的 Run/checkpoint/trace/记忆文件位于 agent 数据目录。Server 负责把二者编排起来，但不能把 Engine 私有数据结构泄漏成不稳定的数据库契约。
 
-Pydantic schema 集中在 `server/app/schemas/`。新增 endpoint 应先新增/复用 schema，再由 router 调用 service；router 不应直接嵌入数据库逻辑。
+Pydantic schema 集中在 `server/app/schemas/`，有一个例外：config router 在 `routers/config.py` 内联定义了 `LLMRoutePatch`、`LLMTimeoutProfilePatch`、`LLMConfig` 三个模型。新增 endpoint 应先新增/复用 schema，再由 router 调用 service；router 不应直接嵌入数据库逻辑。
+
+## Service 与职责
+
+`server/app/services/` 共 13 个 service，`server/app/infrastructure/repositories/` 共 3 个 repo。**`AgentService` 是 agent router 的唯一门面**：`routers/agent.py` 的所有端点只依赖它，由它组合其余 service。
+
+| 文件 | 职责 |
+| --- | --- |
+| `agent_service.py` | agent router 的唯一门面，组合下列 service 对外提供操作。 |
+| `agent_profile_service.py` | 本地 Agent profile 的创建与生命周期。 |
+| `session_service.py` | 会话与消息持久化、聊天 Run 的创建与执行编排。 |
+| `run_state_service.py` | Engine run state store 的只读/恢复/审批适配。 |
+| `skill_service.py` | 技能发现列表与启用状态更新。 |
+| `mcp_service.py` | 只读列出配置的 MCP server。 |
+| `project_instruction_service.py` | 为 working directory 初始化 `.smith/SMITH.md`。 |
+| `observability_service.py` | Run 摘要、trace、incident、health 的只读投影。 |
+| `token_stats_service.py` | token 用量事件的持久化、聚合与 generation sink。 |
+| `auto_task_service.py` | 自动任务 CRUD 与后台执行。 |
+| `scheduler.py` | 每 60 秒 tick 一次、执行到期自动任务的后台调度循环。 |
+| `config_service.py` | 用户可编辑 LLM 配置的持久化与脱敏展示。 |
+| `engine_runtime.py` | Engine runtime 装配、identity catalog 加载与资产校验、共享 LLM client 管理。 |
+
+| Repo | 职责 |
+| --- | --- |
+| `agent_profile_repo.py` | Agent profile 表。 |
+| `session_repo.py` | session 与 message 表。 |
+| `auto_task_repo.py` | 自动任务与执行记录表。 |
 
 ## 明确不存在的 API
 
