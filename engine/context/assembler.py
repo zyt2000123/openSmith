@@ -121,6 +121,24 @@ class PromptLoadReason(str, Enum):
     RUNTIME_ONLY = "runtime_only"
 
 
+# A layer joins the cacheable prefix only when its content does not depend on
+# the current request. Memory retrieval, runtime facts, and engine-control
+# layers do — the memory-governance fence, for one, appears only on the turns
+# where something was actually retrieved.
+_VOLATILE_PROMPT_SOURCES = frozenset({
+    PromptSource.MEMORY_STORE,
+    PromptSource.MEMORY_RECENT,
+    PromptSource.MEMORY_DURABLE,
+    PromptSource.MEMORY_EPISODES,
+    PromptSource.RUNTIME,
+})
+_VOLATILE_LOAD_REASONS = frozenset({
+    PromptLoadReason.QUERY_RETRIEVAL,
+    PromptLoadReason.EVAL_SENSITIVE,
+    PromptLoadReason.RUNTIME_ONLY,
+})
+
+
 @dataclass(frozen=True, slots=True)
 class PromptLayer:
     """One auditable system-prompt section.
@@ -291,8 +309,12 @@ class PromptAssembler:
         )
         # Bind the routing hint to the stable prefix that is actually rendered,
         # not to pre-trim source material that the provider never receives.
+        # Empty layers are skipped for the same reason ``render_layers`` skips
+        # them: the key must hash the bytes the provider really sees.
         stable_content = _SEPARATOR.join(
-            self._render_layer(layer) for layer in rendered_layers[:6]
+            self._render_layer(layer)
+            for layer in self._stable_prefix(rendered_layers)
+            if layer.content.strip()
         )
         stable_hash = hashlib.sha256(stable_content.encode()).hexdigest()
         cache_key = (str(agent_dir), PromptAssembler._profile_static_signature(agent_dir))
@@ -546,6 +568,32 @@ class PromptAssembler:
         return tuple(layers)
 
     @staticmethod
+    def _is_volatile_layer(layer: PromptLayer) -> bool:
+        """Report whether a layer's content is derived from the current request."""
+        return (
+            layer.authority is PromptAuthority.ENGINE_CONTROL
+            or layer.source in _VOLATILE_PROMPT_SOURCES
+            or layer.load_reason in _VOLATILE_LOAD_REASONS
+        )
+
+    @staticmethod
+    def _stable_prefix(layers: tuple[PromptLayer, ...]) -> tuple[PromptLayer, ...]:
+        """Return the leading run of layers that repeat unchanged across requests.
+
+        The prefix must be contiguous from the first layer, because provider
+        prompt caching matches on a byte prefix: the first request-derived layer
+        ends it no matter how stable the layers behind it are. Selecting by
+        layer semantics rather than by a fixed slice means inserting or
+        reordering a layer cannot silently move the boundary.
+        """
+        stable: list[PromptLayer] = []
+        for layer in layers:
+            if PromptAssembler._is_volatile_layer(layer):
+                break
+            stable.append(layer)
+        return tuple(stable)
+
+    @staticmethod
     def render_layers(layers: tuple[PromptLayer, ...]) -> str:
         """Render ordered layers with model-visible source and authority labels."""
         return _SEPARATOR.join(
@@ -656,10 +704,10 @@ class PromptAssembler:
 
         Do not adopt this as that path's source.  The cache is keyed on
         ``(agent_dir, profile-file signature)`` while the hash it stores also
-        covers the tool and skill layers, which no signature here can see: two
-        concurrent assemblies for the same profile with different identity tool
-        allowlists write the same key, so a lookup can return the other one's
-        hash.  Sending a prefix-cache hint that does not describe the prompt you
+        covers the tool, skill, and identity-guidance layers, which no signature
+        here can see: two concurrent assemblies for the same profile with
+        different routes or identity tool allowlists write the same key, so a
+        lookup can return the other one's hash.  Sending a prefix-cache hint that does not describe the prompt you
         actually sent defeats the provider-side cache it exists to hit.
         """
         cache_key = (
