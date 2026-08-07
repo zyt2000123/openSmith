@@ -1,4 +1,5 @@
 """Web fetch tool provider — validated, DNS-pinned HTTP text fetches."""
+# 每次请求和重定向都重新校验地址并固定 DNS 解析，防范 SSRF 与解析漂移。
 
 from __future__ import annotations
 
@@ -92,6 +93,12 @@ ALLOWED_CONTENT_TYPES = (
     "text/",
 )
 _FETCH_CONCURRENCY = asyncio.Semaphore(2)
+_UNTRUSTED_FENCE_CLOSE = "[/UNTRUSTED_EXTERNAL_CONTENT]"
+
+
+def _escape_untrusted_fence(value: str) -> str:
+    """Prevent remote text from terminating the envelope that labels it untrusted."""
+    return value.replace(_UNTRUSTED_FENCE_CLOSE, "[／UNTRUSTED_EXTERNAL_CONTENT]")
 
 
 class _PlainTextExtractor(HTMLParser):
@@ -290,7 +297,8 @@ def _fetch_pinned(url: str, timeout: int) -> str:
             output_truncated = len(body) > MAX_OUTPUT_CHARS
             body = body[:MAX_OUTPUT_CHARS]
             body_type = "text extracted from html" if is_html else "text"
-            source = current_url.replace('"', "%22")
+            source = _escape_untrusted_fence(current_url.replace('"', "%22"))
+            body = _escape_untrusted_fence(body)
             return (
                 f"[UNTRUSTED_EXTERNAL_CONTENT source=\"{source}\"]\n"
                 f"[status={response.status}, pinned HTTP, {body_type}"

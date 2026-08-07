@@ -1,4 +1,5 @@
 """Render one PDF page to a temporary PNG using Poppler."""
+# 将单页临时渲染为 PNG，避免把整份 PDF 的图像内容一次性物化。
 
 from __future__ import annotations
 

@@ -6,6 +6,7 @@ Aligned with engine/memory pipeline:
   - episode: creates an episode archive (wiki mode)
   - update/remove: operate on episodes only
 """
+# 记忆写入先记录可审计候选证据，计划和 Todo 始终属于会话状态而非长期记忆。
 
 from __future__ import annotations
 

@@ -1,4 +1,5 @@
 """Grep tool — search file contents using ripgrep (rg) or fallback to grep."""
+# 优先使用 rg，并主动跳过常见生成目录与二进制文件以控制噪声和开销。
 
 import asyncio
 import functools

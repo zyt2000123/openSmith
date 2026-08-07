@@ -6,6 +6,7 @@ arguments, builds the credential-free environment, and formats results. The
 ``environment`` argument is injected by the tool registry and is duck-typed
 so this content-layer module never imports engine code.
 """
+# Provider 不直接管理进程，仅负责参数与去凭据环境；执行隔离由 engine 强制实施。
 
 from __future__ import annotations
 

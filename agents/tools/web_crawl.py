@@ -1,4 +1,5 @@
 """Bounded crawler for public websites explicitly supplied by the user."""
+# 只在用户明确给定的站点内、遵守 robots.txt 地有限抓取，避免开放式扫描。
 
 import asyncio
 import hashlib
@@ -669,16 +670,25 @@ def _crawl(
 
 
 def _render_markdown(result: dict[str, Any]) -> str:
+    def escape(value: object) -> str:
+        return str(value).replace(
+            "[/UNTRUSTED_EXTERNAL_CONTENT]", "[／UNTRUSTED_EXTERNAL_CONTENT]"
+        )
+
     lines = [
-        f"[UNTRUSTED_EXTERNAL_CONTENT source=\"{result['seed']}\"]",
-        f"# Crawl: {result['seed']}",
+        f"[UNTRUSTED_EXTERNAL_CONTENT source=\"{escape(result['seed'])}\"]",
+        f"# Crawl: {escape(result['seed'])}",
         f"pages: {len(result['records'])}; changed: {result['changed']}; unchanged: {result['unchanged']}; robots skipped: {result['skipped_robots']}",
     ]
     for record in result["records"]:
         state = "changed" if record["changed"] else "unchanged"
-        lines.extend([f"\n## {record['title'] or record['url']}", f"source: {record['url']} ({state})", record["text"]])
+        lines.extend([
+            f"\n## {escape(record['title'] or record['url'])}",
+            f"source: {escape(record['url'])} ({state})",
+            escape(record["text"]),
+        ])
     if result["warnings"]:
-        lines.extend(["\n## Warnings", *[f"- {warning}" for warning in result["warnings"]]])
+        lines.extend(["\n## Warnings", *[f"- {escape(warning)}" for warning in result["warnings"]]])
     lines.append("[/UNTRUSTED_EXTERNAL_CONTENT]")
     return "\n".join(lines)
 

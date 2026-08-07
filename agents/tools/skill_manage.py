@@ -5,6 +5,7 @@ from __future__ import annotations
 Built-in skills (under agents/skills/) are READ-ONLY.
 Only Smith-installed skills (under ~/.agent-smith/agent/skills/) can be modified.
 """
+# 内置技能不可变；写操作只能落在 Smith 的运行时安装目录，且保留版本回滚。
 
 import asyncio
 import os

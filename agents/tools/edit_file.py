@@ -1,4 +1,5 @@
 """Edit file tool — precise string replacement without full rewrite."""
+# 只接受可验证的精确替换，避免整文件重写造成无关内容丢失。
 
 import asyncio
 import logging

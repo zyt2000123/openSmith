@@ -1,4 +1,5 @@
 """Skill loader tool provider — reads the runtime's registered skill catalog."""
+# 仅按注册名加载技能定义，避免模型把磁盘上的任意 Markdown 当作工作流指令。
 
 import asyncio
 from collections.abc import Callable
