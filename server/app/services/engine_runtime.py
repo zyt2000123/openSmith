@@ -11,7 +11,6 @@ from common import config as common_config
 from engine.execution import RuntimeContext, RuntimeServices, validate_execution_assets
 from engine.identity import IdentityCatalog, load_identity_catalog
 from engine.llm.model_config import LLMUsage, build_llm_client, resolve_llm_config
-from engine.llm.contracts import GEMINI_OPENAI_BASE_URL
 from engine.llm.factory import normalize_provider_name
 from engine.llm.port import LLMPort
 from engine.observability import RunObservation
@@ -31,10 +30,7 @@ def _normalize_llm_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(config)
     # Display metadata must never affect client reuse or provider requests.
     normalized.pop("vendor", None)
-    provider = normalize_provider_name(normalized.get("provider", ""))
-    normalized["provider"] = provider
-    if provider == "gemini" and not str(normalized.get("base_url") or "").strip():
-        normalized["base_url"] = GEMINI_OPENAI_BASE_URL
+    normalized["provider"] = normalize_provider_name(normalized.get("provider", ""))
     return normalized
 
 

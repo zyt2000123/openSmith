@@ -10,7 +10,7 @@
 
 LLM 模块位于 `engine/llm/`，负责把上层的统一模型请求翻译为具体模型协议，再把响应还原为统一结果。核心目标是：
 
-1. **协议隔离**：执行引擎不需要知道 OpenAI、Anthropic 或 Gemini 的请求/流式格式。
+1. **协议隔离**：执行引擎不需要知道 OpenAI 或 Anthropic 的请求/流式格式。
 2. **稳定契约**：无论供应商如何返回，上层只处理 `ChatResponse`、`ProviderEvent` 与 `LLMPort`。
 3. **配置分层**：可按交互、门禁、后台三类用途选择不同模型与超时策略。
 4. **本地安全**：API Key 不通过读取接口、提示词或运行时元数据暴露；调用端点受到统一校验和流式资源限制。
@@ -26,10 +26,8 @@ flowchart LR
   Factory --> Client["ProviderClient / LLMPort\n统一门面"]
   Client --> OA["OpenAI Adapter"]
   Client --> AN["Anthropic Adapter"]
-  Client --> GE["Gemini Adapter"]
   OA --> Relay["模型服务 / 中转站"]
   AN --> Relay
-  GE --> Relay
   Client --> Engine["engine.execution\n统一响应与工具循环"]
 ```
 
@@ -64,7 +62,7 @@ flowchart LR
 | 字段 | 含义 | 是否影响请求 |
 |---|---|---|
 | `vendor` | 供应商或中转站的展示名称，例如 `Sophnet` | 否；仅用于运行时身份展示 |
-| `provider` | 兼容协议：`openai`、`anthropic`、`gemini` | 是；决定 adapter 和认证/请求格式 |
+| `provider` | 兼容协议：`openai`、`anthropic` | 是；决定 adapter 和认证/请求格式 |
 | `base_url` | 模型端点根地址 | 是 |
 | `api_key` | 调用凭据 | 是 |
 | `model` | 服务端模型 ID | 是 |
@@ -73,7 +71,8 @@ flowchart LR
 
 - `openai`：OpenAI Chat Completions 兼容协议；`openai_compatible` 是兼容别名。
 - `anthropic`：原生 Messages API 与 `x-api-key` 认证。
-- `gemini`：使用 Gemini 的 OpenAI-compatible endpoint；未提供端点时使用内置默认地址。
+
+只有这两种线协议是原生实现的。其它厂商需经由兼容 OpenAI Chat Completions 的中转端点接入，按 `openai` 协议配置即可；不再提供 Gemini 专用 adapter。
 
 `vendor` 不会参与 adapter 构造、请求体、认证、路由选择或 LLM 客户端缓存键。它会被安全地裁剪为单行展示元数据，以便模型在被问到“当前由谁提供”时正确区分供应商和兼容协议。
 
@@ -170,7 +169,7 @@ Shell 已封装以下本地 API；其他本地客户端也可用同一接口（�
 |---|---|---|
 | `GET /api/config/llm` | 读取可展示配置 | 只返回 `has_api_key`，不回传真实 key |
 | `POST /api/config/llm` | 局部更新并保存配置 | 省略字段表示保留；传 `null` 可删除 override |
-| `GET /api/config/llm/models` | 发现 relay 可用模型 | 仅适用于 OpenAI-compatible / Gemini 协议 |
+| `GET /api/config/llm/models` | 发现 relay 可用模型 | 仅适用于 OpenAI-compatible 协议 |
 
 `POST` 的 body 与 YAML 的 `llm` 字段同构，可同时提交 `vendor`、`provider`、`base_url`、`model`、`stream`、`routes`、`models` 和 `timeout_profiles`。密钥是仅写字段：已保存密钥后，读取结果不会把它送回前端。
 
@@ -301,12 +300,12 @@ uv run pytest tests/test_config_service.py tests/test_config_loader.py tests/tes
 - 文本模型调用；
 - reasoning 的流式接收与后续轮次回传；
 - 流式与非流式响应；
-- OpenAI、Anthropic 和 Gemini OpenAI-compatible adapter；
+- OpenAI Chat Completions 与 Anthropic Messages 两个原生 adapter；
 - 工具调用参数累积、执行结果回灌及多轮 ReAct；
 - interactive、gate、background 三类用途路由；
 - 超时、重试、响应限制、用量记录和客户端生命周期。
 
-图片粘贴、图片消息和视觉模型路由已按产品范围移除，不属于该闭环，也不应作为 LLM 模块未完成项重新加入。Gemini 当前明确使用 OpenAI-compatible endpoint；这不等同于实现了一套独立的 Gemini 原生协议。
+图片粘贴、图片消息和视觉模型路由已按产品范围移除，不属于该闭环，也不应作为 LLM 模块未完成项重新加入。Gemini adapter 曾以 OpenAI-compatible endpoint 的形式存在，从未实现过 Gemini 原生协议，现已整体移除；`provider: gemini` 的旧配置会在构造客户端时报错并列出受支持协议。
 
 ### 11.2 当前验证快照
 

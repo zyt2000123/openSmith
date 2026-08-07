@@ -7,7 +7,6 @@ from dataclasses import replace
 
 from .adapters.anthropic import AnthropicAdapter
 from .adapters.base import ProviderAdapter
-from .adapters.gemini import GeminiAdapter
 from .adapters.openai import OpenAIAdapter
 from .client import ProviderClient
 from .contracts import LLMProviderConfig, UnsupportedProviderError
@@ -77,7 +76,6 @@ DEFAULT_PROVIDER_REGISTRY.register(
     aliases=("openai_compatible",),
 )
 DEFAULT_PROVIDER_REGISTRY.register("anthropic", AnthropicAdapter)
-DEFAULT_PROVIDER_REGISTRY.register("gemini", GeminiAdapter)
 
 
 def normalize_provider_name(provider: object) -> str:

@@ -367,32 +367,6 @@ def test_llm_client_manager_reuses_clients_for_identical_config(monkeypatch) -> 
     assert clients == [first]
 
 
-def test_llm_client_manager_normalizes_gemini_default_endpoint(monkeypatch) -> None:
-    clients: list[object] = []
-
-    def fake_build(config: dict) -> object:
-        client = object()
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(engine_runtime, "build_llm_client", fake_build)
-    manager = engine_runtime.LLMClientManager()
-    base = {
-        "provider": "gemini",
-        "api_key": "key",
-        "model": "gemini-3.5-flash",
-    }
-
-    first = manager.get_for_config(dict(base, base_url=""))
-    second = manager.get_for_config(dict(
-        base,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    ))
-
-    assert first is second
-    assert clients == [first]
-
-
 def test_llm_client_manager_closes_unique_cached_clients_once(monkeypatch) -> None:
     class FakeClient:
         def __init__(self) -> None:
@@ -464,15 +438,17 @@ llm:
         asyncio.run(client.close())
 
 
-def test_route_can_select_gemini_adapter_with_default_endpoint(tmp_path, monkeypatch) -> None:
+def test_route_can_select_anthropic_adapter(tmp_path, monkeypatch) -> None:
+    """A config.yaml naming the Anthropic protocol must build its native adapter."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "config.yaml").write_text(
         """
 llm:
-  provider: gemini
-  api_key: gemini-key
-  model: gemini-3.5-flash
+  provider: anthropic
+  api_key: anthropic-key
+  base_url: https://api.anthropic.com
+  model: claude-sonnet-4-20250514
 """.strip(),
         encoding="utf-8",
     )
@@ -483,10 +459,38 @@ llm:
     cfg = model_config.resolve_llm_config()
     client = model_config.build_llm_client(cfg)
     try:
-        assert cfg["provider"] == "gemini"
-        assert client.provider == "gemini"
-        assert type(client.adapter).__name__ == "GeminiAdapter"
-        assert client.adapter.base_url == "https://generativelanguage.googleapis.com/v1beta/openai"
+        assert cfg["provider"] == "anthropic"
+        assert client.provider == "anthropic"
+        assert type(client.adapter).__name__ == "AnthropicAdapter"
+        assert client.adapter.base_url == "https://api.anthropic.com"
     finally:
         import asyncio
         asyncio.run(client.close())
+
+
+def test_client_build_rejects_removed_gemini_protocol(tmp_path, monkeypatch) -> None:
+    """Only the two natively implemented protocols may produce a client.
+
+    ``resolve_llm_config`` is deliberately lenient — it reports whatever is
+    configured so the UI can render a half-finished setup — so the protocol
+    allowlist is enforced where a client is actually built.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text(
+        """
+llm:
+  provider: gemini
+  api_key: some-key
+  model: some-model
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(model_config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(model_config, "SMITH_PROFILE_DIR", tmp_path / "missing-smith")
+    monkeypatch.setattr(model_config, "AGENT_DIR", tmp_path / "missing-agent")
+
+    cfg = model_config.resolve_llm_config()
+    assert cfg["provider"] == "gemini"
+    with pytest.raises(YamlConfigError, match="Unsupported LLM provider"):
+        model_config.build_llm_client(cfg)

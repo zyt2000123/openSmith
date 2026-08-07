@@ -14,7 +14,7 @@ from engine.llm.contracts import (
     LLMResponseError,
     LLMTimeouts,
 )
-from engine.llm.adapters.gemini import GeminiAdapter
+from engine.llm.adapters.anthropic import AnthropicAdapter
 from engine.llm.events import ProviderEventType
 
 
@@ -393,11 +393,13 @@ def test_non_streaming_client_emits_normalized_events_without_sse() -> None:
 
 
 def test_client_rejects_unsupported_prefix_cache_key() -> None:
-    client = ProviderClient(GeminiAdapter(LLMProviderConfig(
-        provider="gemini",
+    # Anthropic is the adapter that declares prefix_cache_key=False: the key is
+    # an OpenAI-side routing hint, and Anthropic caches via cache_control marks.
+    client = ProviderClient(AnthropicAdapter(LLMProviderConfig(
+        provider="anthropic",
         api_key="key",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        model="gemini-test",
+        base_url="https://api.anthropic.com",
+        model="claude-test",
     )))
     try:
         with pytest.raises(LLMResponseError, match="prefix cache key"):

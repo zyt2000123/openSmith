@@ -11,7 +11,6 @@ from typing import Any
 
 import httpx
 
-GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # Conservative fallback when a model/route does not declare its real window.
 DEFAULT_CONTEXT_WINDOW = 128_000
 DEFAULT_MAX_OUTPUT_TOKENS = 4_096
