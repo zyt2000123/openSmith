@@ -12,6 +12,11 @@ set -e
 
 root=$(git rev-parse --show-toplevel)
 
+# git 给钩子注入 GIT_DIR 等变量，它们会顺着 uv 传进 pytest 子进程，劫持
+# git_ops 测试自建的临时仓库 —— 那 8 个测试于是只在 push 时失败，单独跑全绿。
+# root 已取到，后面不再需要 git 上下文，清掉即可。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+
 for pkg in engine server; do
 	printf '── %s\n' "$pkg"
 	if ! (cd "$root/$pkg" && uv run --with pytest --with pytest-asyncio pytest -q); then
