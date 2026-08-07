@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from common import config as common_config
 from common.yaml_utils import YamlConfigError, load_yaml, merge_configs
 
+from .config_fields import ENGINE_ROUTE_FIELDS, ROUTE_DEFAULTS
 from .contracts import (
     LLMProviderConfig,
     LLMTimeouts,
@@ -137,16 +138,7 @@ _TIMEOUT_DEFAULTS: dict[LLMUsage, dict[str, float]] = {
         "pool": 10.0,
     },
 }
-_ROUTE_FIELDS = (
-    "api_key",
-    "base_url",
-    "model",
-    "provider",
-    "stream",
-    "thinking",
-    "max_output_tokens",
-    "context_window",
-)
+_ROUTE_FIELDS = ENGINE_ROUTE_FIELDS
 _REMOVED_LEGACY_USAGE = "vision"
 
 
@@ -448,15 +440,8 @@ def resolve_llm_config(
 
     routes = _mapping(llm.get("routes"), "LLM routes")
     route = _mapping(routes.get(selected_usage.value), f"LLM route {selected_usage.value!r}")
-    defaults: dict[str, Any] = {
-        "provider": "",
-        "stream": True,
-        "thinking": False,
-        "max_output_tokens": None,
-        "context_window": None,
-    }
     selected = {
-        field: route[field] if field in route else llm.get(field, defaults.get(field, ""))
+        field: route[field] if field in route else llm.get(field, ROUTE_DEFAULTS.get(field, ""))
         for field in _ROUTE_FIELDS
     }
     if selected_profile:

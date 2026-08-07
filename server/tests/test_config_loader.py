@@ -468,6 +468,29 @@ llm:
         asyncio.run(client.close())
 
 
+def test_http_schema_matches_the_canonical_field_table() -> None:
+    """The HTTP models are the one projection that cannot be derived.
+
+    They are written out by hand for their validators and generated docs, so
+    guard them instead: a field added to the canonical table but not to the
+    schema would be rejected with a 422 that names no cause, and a field added
+    to the schema alone would be dropped before it reached the engine.
+    """
+    from app.routers.config import LLMConfig, LLMRoutePatch
+    from engine.llm.config_fields import BASE_ONLY_FIELDS, ROUTE_FIELDS
+
+    assert set(LLMRoutePatch.model_fields) == set(ROUTE_FIELDS)
+
+    # A route picks a shared timeout profile, so `timeout_profile` is
+    # route-scoped only; the top level instead carries the profile definitions
+    # and the nested route/model collections.
+    assert set(LLMConfig.model_fields) == (
+        (set(ROUTE_FIELDS) - {"timeout_profile"})
+        | set(BASE_ONLY_FIELDS)
+        | {"routes", "models", "timeout_profiles"}
+    )
+
+
 def test_route_level_thinking_reaches_the_anthropic_adapter(tmp_path, monkeypatch) -> None:
     """`thinking` must merge per route like every other route-scoped field."""
     data_dir = tmp_path / "data"
