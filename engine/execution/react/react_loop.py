@@ -78,6 +78,54 @@ class FailedAgentRunError(RuntimeError):
         super().__init__(f"Agent run failed: {reason}")
 
 
+_TOOL_SCHEMA_LOADER = "get_tool_schema"
+
+
+def _tool_schema_loader_definition() -> dict:
+    """Return the one stable provider tool used to load a capability contract."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _TOOL_SCHEMA_LOADER,
+            "description": (
+                "Load the complete input schema for an available tool before using it. "
+                "Pass the exact tool name from the Available Tools list."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact name of the tool whose schema is needed.",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _requested_tool_schema(
+    tool_registry: "ToolRegistry", arguments: dict,
+) -> tuple[str | None, dict | None, str | None]:
+    """Resolve a visible tool schema without exposing disabled capabilities."""
+    name = arguments.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None, None, "`name` must be a non-empty tool name."
+    requested = name.strip()
+    schemas = tool_registry.get_schemas(enabled=[requested])
+    if len(schemas) != 1:
+        return requested, None, f"Tool unavailable: {requested}"
+    schema = schemas[0]
+    function = schema.get("function")
+    canonical_name = function.get("name") if isinstance(function, dict) else None
+    if not isinstance(canonical_name, str):
+        return requested, None, f"Tool unavailable: {requested}"
+    return canonical_name, schema, None
+
+
+
 @dataclass
 class _StreamedToolCall:
     id: str | None = None
@@ -437,7 +485,16 @@ async def react_event_loop(
     hook_registry: "HookRegistry | None" = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """ReAct loop: model response, tool calls, results, and next turn in one history."""
-    tools = tool_registry.get_schemas() or None
+    lazy_tool_schemas = bool(getattr(tool_registry, "lazy_tool_schemas", False))
+    if lazy_tool_schemas:
+        # Tool descriptions live in the stable prompt prefix. The provider sees
+        # only this tiny loader schema until the model explicitly asks for one
+        # capability, keeping the large JSON contracts out of every initial turn.
+        tools: list[dict] | None = (
+            [_tool_schema_loader_definition()] if tool_registry.list_tools() else None
+        )
+    else:
+        tools = tool_registry.get_schemas() or None
     visible_tool_names = {
         schema["function"]["name"]
         for schema in (tools or [])
@@ -835,6 +892,62 @@ async def react_event_loop(
         round_had_failure = False
         round_had_preflight = False
         for tc in response.tool_calls:
+            if lazy_tool_schemas and tc.name == _TOOL_SCHEMA_LOADER:
+                requested_name, schema, error = _requested_tool_schema(
+                    tool_registry, tc.arguments,
+                )
+                content = (
+                    json.dumps(schema, ensure_ascii=False, sort_keys=True)
+                    if schema is not None
+                    else f"Error: {error}"
+                )
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": content,
+                })
+                yield ExecutionEvent(EventType.TOOL_CALL_START, {
+                    "name": tc.name,
+                    "id": tc.id,
+                    "arguments": tc.arguments,
+                })
+                yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                    "id": tc.id,
+                    "name": tc.name,
+                    "error": schema is None,
+                    "blocked": False,
+                    "preflight": False,
+                    "content": content[:200],
+                    "error_kind": "tool_unavailable" if schema is None else None,
+                    "retryable": False,
+                    "timed_out": False,
+                    "side_effect_status": "none",
+                    "metadata": {},
+                })
+                if schema is None:
+                    round_had_failure = True
+                    consecutive_errors += 1
+                else:
+                    assert requested_name is not None
+                    visible_tool_names.add(requested_name)
+                    if tools is None:
+                        tools = [_tool_schema_loader_definition(), schema]
+                    elif not any(
+                        isinstance(candidate.get("function"), dict)
+                        and candidate["function"].get("name") == requested_name
+                        for candidate in tools
+                    ):
+                        # Provider adapters may retain the argument list for
+                        # diagnostics; replace rather than mutate it so a past
+                        # request remains an accurate snapshot of its tools.
+                        tools = [*tools, schema]
+                    # Loading a schema consumes an iteration, but is not an
+                    # evidence-gathering tool success: a following text answer
+                    # is still valid even when no operational tool ran.
+                    round_had_success = True
+                    consecutive_errors = 0
+                continue
+
             call = tool_registry.normalize_call(
                 ToolCall(
                     id=tc.id,

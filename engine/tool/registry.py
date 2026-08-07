@@ -108,7 +108,11 @@ def _call_fingerprint(call: ToolCall) -> str:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, lazy_tool_schemas: bool = False) -> None:
+        # The product runtime enables this to keep complete schemas out of the
+        # first provider request.  Retaining the legacy default preserves the
+        # public registry contract for embedders that call ReAct directly.
+        self.lazy_tool_schemas = lazy_tool_schemas
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {}
         self._enabled: set[str] | None = None
         self._execution_ledger: ToolExecutionLedger | None = None
@@ -846,6 +850,10 @@ class ScopedToolRegistry:
     @property
     def working_directory(self) -> Path | None:
         return self._registry.working_directory
+
+    @property
+    def lazy_tool_schemas(self) -> bool:
+        return self._registry.lazy_tool_schemas
 
     def get_schemas(
         self,

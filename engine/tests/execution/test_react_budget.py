@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from engine.execution.react.react_loop import (
     react_event_loop as _react_event_loop,
@@ -104,6 +105,57 @@ def _registry() -> ToolRegistry:
     registry.register("fail_alt", "Also fails", {}, fail_alt)
     registry.register("ok", "Succeeds", {}, ok)
     return registry
+
+
+def test_react_event_loop_loads_only_requested_tool_schemas() -> None:
+    async def read_file(path: str) -> str:
+        return f"read {path}"
+
+    async def delete_file(path: str) -> str:
+        return f"deleted {path}"
+
+    async def run():
+        registry = ToolRegistry(lazy_tool_schemas=True)
+        registry.register(
+            "read_file", "Read one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            read_file,
+        )
+        registry.register(
+            "delete_file", "Delete one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            delete_file,
+        )
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[ToolCallData(
+                id="load-1", name="get_tool_schema", arguments={"name": "read_file"},
+            )]),
+            ChatResponse(tool_calls=[ToolCallData(
+                id="read-1", name="read_file", arguments={"path": "notes.txt"},
+            )]),
+            ChatResponse(text="done"),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm, [{"role": "user", "content": "Read notes"}], registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    first_tools = llm.chat_calls[0]["tools"]
+    assert [tool["function"]["name"] for tool in first_tools] == ["get_tool_schema"]
+    second_tools = llm.chat_calls[1]["tools"]
+    assert [tool["function"]["name"] for tool in second_tools] == [
+        "get_tool_schema", "read_file",
+    ]
+    assert "delete_file" not in json.dumps(second_tools)
+    schema_result = next(
+        message for message in llm.chat_calls[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "load-1"
+    )
+    assert '"name": "read_file"' in schema_result["content"]
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
+
 
 
 def test_react_loop_failed_tool_round_does_not_consume_main_budget():
