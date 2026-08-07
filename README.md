@@ -43,7 +43,7 @@ graph LR
 - **Skill chains** — requirements research, TDD development, and code review are routed by intent and run as gated skill chains
 - **Real tools** — file I/O, shell, Git, web search, MCP, all sandboxed with permission levels
 - **Persistent memory** — sessions, agent memory, and project context survive restarts
-- **Multi-provider LLM** — OpenAI-compatible, Anthropic, Gemini; routed by use case (interactive / gate / background)
+- **Multi-provider LLM** — OpenAI-compatible and Anthropic; routed by use case (interactive / gate / background)
 
 ## Quick Start
 
@@ -82,7 +82,7 @@ ls -l "$(which smith)"   # → .../lib/node_modules/smith-shell/bin/smith.js
 Set your LLM provider via environment variables:
 
 ```bash
-export AGENTSMITH_LLM_PROVIDER=openai          # openai / anthropic / gemini
+export AGENTSMITH_LLM_PROVIDER=openai          # openai / anthropic
 export AGENTSMITH_LLM_API_KEY="sk-..."
 export AGENTSMITH_LLM_BASE_URL="https://api.openai.com/v1"
 export AGENTSMITH_LLM_MODEL="your-model"

@@ -959,7 +959,7 @@ async function submitSetup(
       ? setProvider(state.setupDraft, value)
       : setSetupField(state.setupDraft, activeField, value);
   if (!draft) {
-    state.set({ statusLine: "Must be openai, anthropic, or gemini." });
+    state.set({ statusLine: "Must be openai or anthropic." });
     return;
   }
 

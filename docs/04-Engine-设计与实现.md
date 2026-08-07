@@ -134,7 +134,7 @@ provider / LLM → ExecutionEvent → RunStateStore + observability + memory hoo
 
 ### `llm/`：把协议差异收敛在 adapter，保留调用用途与账本
 
-`port.py` 定义 provider 无关契约，`adapters/` 承担协议差异，`factory.py` 负责选择实现，`client.py` 统一 chat/stream 和使用量，`observability.py` 用 contextvars 给每次调用标注 run、session 和 purpose。构思是让执行层面对稳定能力接口编程，而不是把 OpenAI、Anthropic、Gemini 的响应格式渗入 ReAct 和 pipeline。
+`port.py` 定义 provider 无关契约，`adapters/` 承担协议差异，`factory.py` 负责选择实现，`client.py` 统一 chat/stream 和使用量，`observability.py` 用 contextvars 给每次调用标注 run、session 和 purpose。构思是让执行层面对稳定能力接口编程，而不是把 OpenAI 与 Anthropic 的响应格式渗入 ReAct 和 pipeline。
 
 | 项目 | 说明 |
 | --- | --- |

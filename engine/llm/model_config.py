@@ -13,7 +13,6 @@ from common import config as common_config
 from common.yaml_utils import YamlConfigError, load_yaml, merge_configs
 
 from .contracts import (
-    GEMINI_OPENAI_BASE_URL,
     LLMProviderConfig,
     LLMTimeouts,
     UnsupportedProviderError,
@@ -243,10 +242,7 @@ def build_llm_client(config: dict) -> LLMPort:
     except UnsupportedProviderError as exc:
         raise YamlConfigError(str(exc)) from exc
 
-    base_url = config.get("base_url")
-    if provider == "gemini" and (base_url is None or str(base_url).strip() == ""):
-        base_url = GEMINI_OPENAI_BASE_URL
-    base_url = validate_llm_base_url(base_url)
+    base_url = validate_llm_base_url(config.get("base_url"))
 
     required_values = {
         "api_key": config.get("api_key"),

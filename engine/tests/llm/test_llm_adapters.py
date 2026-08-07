@@ -12,7 +12,11 @@ from engine.llm.adapters.openai import OpenAIAdapter
 from engine.llm.adapters._http import MAX_STREAM_EVENT_BYTES
 from engine.llm.adapters._retry import MAX_RETRY_AFTER_SECONDS, retry_after_seconds
 from engine.llm.client import ProviderClient
-from engine.llm.contracts import GEMINI_OPENAI_BASE_URL, LLMProviderConfig, LLMRequest
+from engine.llm.contracts import (
+    LLMProviderConfig,
+    LLMRequest,
+    UnsupportedProviderError,
+)
 from engine.llm.events import ProviderEventType
 from engine.llm.factory import create_llm_client, normalize_provider_name, supported_provider_names
 from engine.llm.model_config import build_llm_client
@@ -68,11 +72,6 @@ def test_factory_selects_real_adapters_and_preserves_openai_aliases() -> None:
         provider="openai",
         base_url="https://openai.test/v1",
     ))
-    gemini = create_llm_client(_anthropic_config(
-        provider="gemini",
-        base_url="",
-        model="gemini-3.5-flash",
-    ))
     legacy_openai = create_llm_client(_anthropic_config(
         provider="openai_compatible",
         base_url="https://openai.test/v1",
@@ -84,21 +83,19 @@ def test_factory_selects_real_adapters_and_preserves_openai_aliases() -> None:
         assert openai.provider == "openai"
         assert type(openai.adapter).__name__ == "OpenAIAdapter"
         assert legacy_openai.provider == "openai"
-        assert gemini.provider == "gemini"
-        assert type(gemini.adapter).__name__ == "GeminiAdapter"
-        assert gemini.adapter.base_url == GEMINI_OPENAI_BASE_URL.rstrip("/")
         assert normalize_provider_name("openai") == "openai"
         assert normalize_provider_name("openai_compatible") == "openai"
+        # Only the two natively implemented wire protocols are supported.
         assert supported_provider_names() == (
             "anthropic",
-            "gemini",
             "openai",
             "openai_compatible",
         )
+        with pytest.raises(UnsupportedProviderError):
+            normalize_provider_name("gemini")
     finally:
         asyncio.run(anthropic.close())
         asyncio.run(openai.close())
-        asyncio.run(gemini.close())
         asyncio.run(legacy_openai.close())
 
 

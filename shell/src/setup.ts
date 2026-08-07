@@ -4,7 +4,6 @@ import type { SetupDraft, SetupFlow } from "./store.js";
 export const PROVIDER_PRESETS = {
   openai: { base_url: "https://api.openai.com/v1", model: "gpt-4.1-mini" },
   anthropic: { base_url: "https://api.anthropic.com", model: "claude-sonnet-4-20250514" },
-  gemini: { base_url: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
 } as const;
 
 const LLM_USAGES = ["interactive", "gate", "background"] as const satisfies readonly LlmUsage[];
@@ -42,7 +41,7 @@ type JsonRecord = Record<string, unknown>;
 
 const SETUP_FIELD_LABELS: Record<SetupField, string> = {
   vendor: "supplier name",
-  provider: "compatible protocol (openai | anthropic | gemini)",
+  provider: "compatible protocol (openai | anthropic)",
   base_url: "base URL",
   model: "model",
   review_model: "review model (optional)",
@@ -323,7 +322,7 @@ function validateProvider(draft: SetupDraft): string {
   // an unsupported protocol through to the server.
   const provider = draft.provider.trim().toLowerCase();
   if (!Object.hasOwn(PROVIDER_PRESETS, provider)) {
-    throw new Error("Compatible protocol must be openai, anthropic, or gemini.");
+    throw new Error("Compatible protocol must be openai or anthropic.");
   }
   return provider;
 }

@@ -255,7 +255,7 @@ class ConfigService:
             return interactive[field] if field in interactive else llm.get(field)
 
         provider = self._string_or_empty(effective("provider")) or "openai"
-        if normalize_provider_name(provider) not in {"openai", "gemini"}:
+        if normalize_provider_name(provider) != "openai":
             self._invalid("Model discovery is available only for OpenAI-compatible protocols")
         api_key = self._string_or_empty(effective("api_key")).strip()
         base_url = self._string_or_empty(effective("base_url")).strip().rstrip("/")
