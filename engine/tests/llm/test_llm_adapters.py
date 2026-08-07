@@ -277,6 +277,38 @@ def test_anthropic_adapter_translates_tools_conversation_and_response() -> None:
     assert response.usage == {"input_tokens": 11, "output_tokens": 7}
 
 
+def test_anthropic_requests_thinking_only_when_configured() -> None:
+    """Thinking is opt-in: the field is rejected by models that lack it."""
+    messages = [{"role": "user", "content": "think it through"}]
+
+    default_adapter = AnthropicAdapter(_anthropic_config())
+    enabled_adapter = AnthropicAdapter(_anthropic_config(thinking=True))
+    try:
+        default_body = default_adapter._request_body(
+            LLMRequest(messages=messages), stream=False
+        )
+        enabled_body = enabled_adapter._request_body(
+            LLMRequest(messages=messages), stream=False
+        )
+    finally:
+        asyncio.run(default_adapter.close())
+        asyncio.run(enabled_adapter.close())
+
+    assert "thinking" not in default_body
+    assert enabled_body["thinking"] == {"type": "adaptive"}
+
+
+def test_build_llm_client_rejects_non_boolean_thinking() -> None:
+    with pytest.raises(YamlConfigError, match="thinking"):
+        build_llm_client({
+            "provider": "anthropic",
+            "api_key": "key",
+            "base_url": "https://api.anthropic.com",
+            "model": "claude-sonnet-4-6",
+            "thinking": "yes",
+        })
+
+
 def test_anthropic_cache_breakpoint_does_not_mutate_caller_history() -> None:
     """The loop reuses one history list; the breakpoint must not leak into it."""
     adapter = AnthropicAdapter(_anthropic_config())

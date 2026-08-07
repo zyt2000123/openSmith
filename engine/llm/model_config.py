@@ -143,6 +143,7 @@ _ROUTE_FIELDS = (
     "model",
     "provider",
     "stream",
+    "thinking",
     "max_output_tokens",
     "context_window",
 )
@@ -262,6 +263,10 @@ def build_llm_client(config: dict) -> LLMPort:
     if not isinstance(stream, bool):
         raise YamlConfigError("LLM stream configuration must be a boolean")
 
+    thinking = config.get("thinking", False)
+    if not isinstance(thinking, bool):
+        raise YamlConfigError("LLM thinking configuration must be a boolean")
+
     max_output_tokens = config.get("max_output_tokens")
     if max_output_tokens is not None and (
         isinstance(max_output_tokens, bool)
@@ -315,6 +320,7 @@ def build_llm_client(config: dict) -> LLMPort:
         timeouts=resolved_timeouts,
         max_output_tokens=max_output_tokens,
         context_window=context_window,
+        thinking=thinking,
     ))
 
 
@@ -445,6 +451,7 @@ def resolve_llm_config(
     defaults: dict[str, Any] = {
         "provider": "",
         "stream": True,
+        "thinking": False,
         "max_output_tokens": None,
         "context_window": None,
     }

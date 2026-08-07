@@ -79,6 +79,7 @@ class AnthropicAdapter(HTTPAdapterMixin):
         # Anthropic requires max_tokens; other adapters preserve their provider
         # defaults unless the shared configuration explicitly sets a limit.
         self.max_output_tokens = config.max_output_tokens or 4096
+        self.thinking = config.thinking
         self._http = httpx.AsyncClient(
             base_url=self.base_url,
             headers={
@@ -349,6 +350,12 @@ class AnthropicAdapter(HTTPAdapterMixin):
                 "text": system,
                 "cache_control": {"type": "ephemeral"},
             }]
+        if self.thinking:
+            # Adaptive is the only on-mode on current Claude models: the model
+            # decides per request how much to think.  Without this field those
+            # models do not think at all, which left the thinking blocks this
+            # adapter already parses unreachable.
+            body["thinking"] = {"type": "adaptive"}
         if request.tools:
             body["tools"] = self._translate_tools(request.tools)
         if stream:

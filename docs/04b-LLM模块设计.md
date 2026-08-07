@@ -63,6 +63,7 @@ flowchart LR
 |---|---|---|
 | `vendor` | 供应商或中转站的展示名称，例如 `Sophnet` | 否；仅用于运行时身份展示 |
 | `provider` | 兼容协议：`openai`、`anthropic` | 是；决定 adapter 和认证/请求格式 |
+| `thinking` | 是否请求模型先思考再作答，默认 `false` | 否；仅 `anthropic` 协议发送 `thinking: {"type": "adaptive"}`。默认关闭是因为不支持该字段的模型会直接 400，而 engine 无法从中转站的模型名判断能力。每个路由各自构造客户端，因此这是按路由生效的开关 |
 | `base_url` | 模型端点根地址 | 是 |
 | `api_key` | 调用凭据 | 是 |
 | `model` | 服务端模型 ID | 是 |
