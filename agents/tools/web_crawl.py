@@ -378,7 +378,7 @@ class _BrowserRenderer:
     page's cookies and storage.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pinned_hosts: dict[str, str] | None = None) -> None:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -386,10 +386,22 @@ class _BrowserRenderer:
                 "browser rendering requires the optional 'playwright' dependency and Chromium"
             ) from exc
         self._playwright = sync_playwright().start()
+        # Chromium resolves DNS itself, so ``_validate_url``'s getaddrinfo check
+        # only ever described a *previous* resolution: a record with a short TTL
+        # could answer public for our check and 127.0.0.1 / 169.254.169.254 for
+        # the browser's, defeating the SSRF guard that the pinned ``_download``
+        # path enforces properly.  Pin the crawl origin to the address we
+        # actually validated.  Sub-resource hosts are still browser-resolved and
+        # only URL-checked by ``guard_request`` — a documented residual, bounded
+        # by the same-origin crawl scope.
+        args = ["--disable-quic", "--no-first-run"]
+        if pinned_hosts:
+            rules = ",".join(f"MAP {host} {ip}" for host, ip in pinned_hosts.items())
+            args.append(f"--host-resolver-rules={rules}")
         try:
             self._browser = self._playwright.chromium.launch(
                 headless=True,
-                args=["--disable-quic", "--no-first-run"],
+                args=args,
             )
         except Exception:
             self._playwright.stop()
@@ -580,7 +592,10 @@ def _crawl(
     def ensure_renderer() -> _BrowserRenderer:
         nonlocal renderer
         if renderer is None:
-            renderer = _BrowserRenderer()
+            # The crawl never leaves this origin, so one validated mapping
+            # covers every page the browser will be asked to render.
+            infos = fetch._safe_addresses(origin[1], origin[2])
+            renderer = _BrowserRenderer({origin[1]: str(infos[0][4][0])})
         return renderer
 
     try:

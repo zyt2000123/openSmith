@@ -1,11 +1,13 @@
 """Shell command tool provider — runs commands via the bound execution environment.
 
 Process handling (spawn, timeout, process-group termination, output capping)
-lives in the engine's execution environment; this provider only validates
-arguments, builds the credential-free environment, and formats results. The
-``environment`` argument is injected by the tool registry and is duck-typed
+lives in the engine's execution environment, which also owns the child
+environment on the sandboxed path this tool declares; the dict built here is a
+host-execution fallback. This provider validates arguments and formats results.
+The ``environment`` argument is injected by the tool registry and is duck-typed
 so this content-layer module never imports engine code.
 """
+# Provider 不管理进程；沙箱路径下子进程环境也由 engine 决定，此处仅为宿主执行兜底。
 
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ TOOL_META = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in seconds (default 30, max 120)",
+                "description": "Timeout in seconds (default 30, max 600)",
                 "default": 30
             },
             "cwd": {
@@ -46,7 +48,9 @@ TOOL_META = {
     "execution_environment": "sandbox",
 }
 
-MAX_TIMEOUT = 120
+# A full project test suite is the evidence the TDD and review gates demand, so
+# the ceiling has to clear one; 120s did not.
+MAX_TIMEOUT = 600
 _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 
 
@@ -56,6 +60,23 @@ def _safe_environment(cwd: str | None) -> dict[str, str]:
     Provider credentials and other service secrets must never be exposed to a
     command string.  Pointing ``HOME`` at the project also prevents accidental
     reads of user-level config and credential files through shell expansion.
+
+    This is a *fallback*, not the operative policy.  The tool declares
+    ``execution_environment: "sandbox"``, and the bound backend builds the child
+    environment itself: the macOS Seatbelt adapter constructs ``PATH`` (from
+    ``os.defpath``), ``HOME``, ``TMPDIR`` and the same devnull config pins from
+    scratch, then copies through only ``_SAFE_ENV_KEYS``.  Everything else here
+    is discarded on that path.  Keep the two in agreement rather than assuming
+    this dict decides anything.
+
+    A package-manager cache root used to be set here too, with a comment
+    claiming it stopped ``uv run pytest`` from re-downloading dependencies into
+    the project on every call.  It never reached a process — the sandbox dropped
+    those keys — so that problem is still open, and it cannot be closed from
+    here: the Seatbelt profile denies reads outside the workspace (a toolchain
+    in ``/opt/homebrew/bin`` cannot be executed at all) and denies writes
+    outside it (a cache under ``~/.cache`` cannot be written).  Closing it needs
+    a deliberate profile decision.
     """
     home = os.path.abspath(cwd) if cwd else os.getcwd()
     environment = {
