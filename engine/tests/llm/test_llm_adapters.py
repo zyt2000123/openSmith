@@ -12,7 +12,11 @@ from engine.llm.adapters.openai import OpenAIAdapter
 from engine.llm.adapters._http import MAX_STREAM_EVENT_BYTES
 from engine.llm.adapters._retry import MAX_RETRY_AFTER_SECONDS, retry_after_seconds
 from engine.llm.client import ProviderClient
-from engine.llm.contracts import GEMINI_OPENAI_BASE_URL, LLMProviderConfig, LLMRequest
+from engine.llm.contracts import (
+    LLMProviderConfig,
+    LLMRequest,
+    UnsupportedProviderError,
+)
 from engine.llm.events import ProviderEventType
 from engine.llm.factory import create_llm_client, normalize_provider_name, supported_provider_names
 from engine.llm.model_config import build_llm_client
@@ -68,11 +72,6 @@ def test_factory_selects_real_adapters_and_preserves_openai_aliases() -> None:
         provider="openai",
         base_url="https://openai.test/v1",
     ))
-    gemini = create_llm_client(_anthropic_config(
-        provider="gemini",
-        base_url="",
-        model="gemini-3.5-flash",
-    ))
     legacy_openai = create_llm_client(_anthropic_config(
         provider="openai_compatible",
         base_url="https://openai.test/v1",
@@ -84,21 +83,19 @@ def test_factory_selects_real_adapters_and_preserves_openai_aliases() -> None:
         assert openai.provider == "openai"
         assert type(openai.adapter).__name__ == "OpenAIAdapter"
         assert legacy_openai.provider == "openai"
-        assert gemini.provider == "gemini"
-        assert type(gemini.adapter).__name__ == "GeminiAdapter"
-        assert gemini.adapter.base_url == GEMINI_OPENAI_BASE_URL.rstrip("/")
         assert normalize_provider_name("openai") == "openai"
         assert normalize_provider_name("openai_compatible") == "openai"
+        # Only the two natively implemented wire protocols are supported.
         assert supported_provider_names() == (
             "anthropic",
-            "gemini",
             "openai",
             "openai_compatible",
         )
+        with pytest.raises(UnsupportedProviderError):
+            normalize_provider_name("gemini")
     finally:
         asyncio.run(anthropic.close())
         asyncio.run(openai.close())
-        asyncio.run(gemini.close())
         asyncio.run(legacy_openai.close())
 
 
@@ -245,7 +242,11 @@ def test_anthropic_adapter_translates_tools_conversation_and_response() -> None:
     body = captured["body"]
     assert captured["url"] == "/v1/messages"
     assert isinstance(body, dict)
-    assert body["system"] == "Stay concise."
+    assert body["system"] == [{
+        "type": "text",
+        "text": "Stay concise.",
+        "cache_control": {"type": "ephemeral"},
+    }]
     assert body["max_tokens"] == 321
     assert body["messages"][0] == {"role": "user", "content": "Find the answer."}
     assert body["messages"][1]["content"] == [{
@@ -254,9 +255,15 @@ def test_anthropic_adapter_translates_tools_conversation_and_response() -> None:
         "name": "lookup",
         "input": {"query": "status"},
     }]
+    # The newest block carries the second cache breakpoint so the resent
+    # tool-result history is read from cache instead of re-billed.
     assert body["messages"][2]["content"] == [
         {"type": "tool_result", "tool_use_id": "call-1", "content": "green"},
-        {"type": "text", "text": "Now answer."},
+        {
+            "type": "text",
+            "text": "Now answer.",
+            "cache_control": {"type": "ephemeral"},
+        },
     ]
     assert body["tools"] == [{
         "name": "lookup",
@@ -268,6 +275,59 @@ def test_anthropic_adapter_translates_tools_conversation_and_response() -> None:
     assert response.finish_reason == "tool_calls"
     assert response.tool_calls[0].arguments == {"path": "README.md"}
     assert response.usage == {"input_tokens": 11, "output_tokens": 7}
+
+
+def test_anthropic_requests_thinking_only_when_configured() -> None:
+    """Thinking is opt-in: the field is rejected by models that lack it."""
+    messages = [{"role": "user", "content": "think it through"}]
+
+    default_adapter = AnthropicAdapter(_anthropic_config())
+    enabled_adapter = AnthropicAdapter(_anthropic_config(thinking=True))
+    try:
+        default_body = default_adapter._request_body(
+            LLMRequest(messages=messages), stream=False
+        )
+        enabled_body = enabled_adapter._request_body(
+            LLMRequest(messages=messages), stream=False
+        )
+    finally:
+        asyncio.run(default_adapter.close())
+        asyncio.run(enabled_adapter.close())
+
+    assert "thinking" not in default_body
+    assert enabled_body["thinking"] == {"type": "adaptive"}
+
+
+def test_build_llm_client_rejects_non_boolean_thinking() -> None:
+    with pytest.raises(YamlConfigError, match="thinking"):
+        build_llm_client({
+            "provider": "anthropic",
+            "api_key": "key",
+            "base_url": "https://api.anthropic.com",
+            "model": "claude-sonnet-4-6",
+            "thinking": "yes",
+        })
+
+
+def test_anthropic_cache_breakpoint_does_not_mutate_caller_history() -> None:
+    """The loop reuses one history list; the breakpoint must not leak into it."""
+    adapter = AnthropicAdapter(_anthropic_config())
+    history = [
+        {"role": "system", "content": "Stay concise."},
+        {"role": "user", "content": "Find the answer."},
+    ]
+    try:
+        body = adapter._request_body(LLMRequest(messages=history), stream=False)
+    finally:
+        asyncio.run(adapter.close())
+
+    # A plain string is promoted to a block so it can carry the breakpoint.
+    assert body["messages"][-1]["content"] == [{
+        "type": "text",
+        "text": "Find the answer.",
+        "cache_control": {"type": "ephemeral"},
+    }]
+    assert history[-1] == {"role": "user", "content": "Find the answer."}
 
 
 def test_anthropic_stream_normalizes_text_tools_usage_and_completion() -> None:

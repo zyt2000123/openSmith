@@ -12,7 +12,7 @@ from .summary_store import RunSummaryRecord
 _ERROR_KINDS = frozenset({"internal", "provider_http", "provider_protocol", "provider_transport"})
 _ERROR_STAGES = frozenset({"runtime_prepare", "agent_execution"})
 _ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,99}\Z")
-_PROVIDERS = frozenset({"anthropic", "gemini", "openai"})
+_PROVIDERS = frozenset({"anthropic", "openai"})
 _LEGACY_LLM_FAILURE = re.compile(
     r"⚠️ 执行失败：(?P<type>[A-Za-z_][A-Za-z0-9_]{0,99})（详情见服务端日志）\Z"
 )

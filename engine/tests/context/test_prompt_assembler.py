@@ -626,3 +626,38 @@ def test_prefix_cache_key_invalidates_when_profile_file_changes(tmp_path: Path) 
     second = PromptAssembler.get_prefix_cache_key(agent_dir)
 
     assert second != first
+
+
+@pytest.mark.usefixtures("_isolate_apppaths")
+def test_prefix_cache_key_ignores_per_request_layers(tmp_path: Path) -> None:
+    """Query-time retrieval must not move the cacheable prefix.
+
+    The key was cut at a fixed layer index, so inserting or reordering a layer
+    silently changed which content it covered.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    assembler = PromptAssembler()
+
+    bare = assembler.assemble_detailed(
+        agent_dir, FakeToolRegistry(), FakeSkillRegistry(), {}
+    )
+    retrieved = assembler.assemble_detailed(
+        agent_dir,
+        FakeToolRegistry(),
+        FakeSkillRegistry(),
+        {"session_id": "sess-1"},
+        retrieved_durable="## Relevant Durable Memory\n\n- decided on X",
+        retrieved_episodes="## Relevant Episodes\n\nlast week we shipped Y",
+    )
+
+    assert "decided on X" in retrieved.text
+    assert retrieved.prefix_cache_key == bare.prefix_cache_key
+
+    stable_layers = {
+        layer.name
+        for layer in PromptAssembler._stable_prefix(retrieved.layers)
+    }
+    assert "role" in stable_layers
+    assert "tool_definitions" in stable_layers
+    assert "durable_retrieval" not in stable_layers
+    assert "runtime_context" not in stable_layers

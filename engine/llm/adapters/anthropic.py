@@ -79,6 +79,7 @@ class AnthropicAdapter(HTTPAdapterMixin):
         # Anthropic requires max_tokens; other adapters preserve their provider
         # defaults unless the shared configuration explicitly sets a limit.
         self.max_output_tokens = config.max_output_tokens or 4096
+        self.thinking = config.thinking
         self._http = httpx.AsyncClient(
             base_url=self.base_url,
             headers={
@@ -334,15 +335,54 @@ class AnthropicAdapter(HTTPAdapterMixin):
         body: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_output_tokens,
-            "messages": messages,
+            "messages": self._with_cache_breakpoint(messages),
         }
         if system:
-            body["system"] = system
+            # Anthropic caches by byte prefix in render order (tools → system →
+            # messages), so one breakpoint on system covers the tool schemas as
+            # well.  A ReAct run resends both unchanged on every iteration.
+            # ponytail: the whole system prompt is one cached block, so a turn
+            # whose retrieval layers changed re-writes it. Splitting system into
+            # stable + retrieved blocks would hold the hit across turns too, but
+            # needs the assembler's stable/volatile boundary plumbed down here.
+            body["system"] = [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }]
+        if self.thinking:
+            # Adaptive is the only on-mode on current Claude models: the model
+            # decides per request how much to think.  Without this field those
+            # models do not think at all, which left the thinking blocks this
+            # adapter already parses unreachable.
+            body["thinking"] = {"type": "adaptive"}
         if request.tools:
             body["tools"] = self._translate_tools(request.tools)
         if stream:
             body["stream"] = True
         return body
+
+    @classmethod
+    def _with_cache_breakpoint(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Mark the newest content block so the conversation prefix is cached.
+
+        The ReAct loop resends the whole tool-result history on every iteration;
+        with only the system breakpoint the transcript would be re-billed each
+        time.  The caller's list is left alone because the same history object is
+        reused across requests.
+        """
+        if not messages:
+            return messages
+        last = dict(messages[-1])
+        blocks = cls._content_blocks(last.get("content"))
+        if not blocks:
+            return messages
+        blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+        last["content"] = blocks
+        return [*messages[:-1], last]
 
     @classmethod
     def _translate_messages(

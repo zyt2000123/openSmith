@@ -12,6 +12,12 @@ from fastapi import HTTPException
 
 from common import config as common_config
 from common.yaml_utils import YamlConfigError, load_yaml, save_yaml
+from engine.llm.config_fields import (
+    PUBLIC_ROUTE_FIELDS,
+    ROUTE_BOOL_FIELDS,
+    ROUTE_FIELDS,
+    ROUTE_STRING_FIELDS,
+)
 from engine.llm.factory import normalize_provider_name
 from engine.llm.model_config import LLMUsage, normalize_legacy_llm_config, validate_llm_base_url
 from engine.llm.contracts import UnsupportedProviderError
@@ -23,22 +29,14 @@ _USAGES = frozenset(usage.value for usage in LLMUsage)
 # A misconfigured or hostile relay must not be able to exhaust server memory
 # through GET /models: cap the accepted body well above any real model list.
 _MAX_RELAY_BODY_BYTES = 5 * 1024 * 1024
-_BASE_STRING_FIELDS = ("provider", "api_key", "base_url", "model")
+# Every projection below is derived from engine.llm.config_fields so a new
+# field cannot reach one layer and silently miss another.
+_BASE_STRING_FIELDS = ROUTE_STRING_FIELDS
 _VENDOR_FIELD = "vendor"
-_ROUTE_STRING_FIELDS = _BASE_STRING_FIELDS
-_ROUTE_FIELDS = frozenset(
-    (*_ROUTE_STRING_FIELDS, "stream", "max_output_tokens", "context_window", "timeout_profile")
-)
+_ROUTE_STRING_FIELDS = ROUTE_STRING_FIELDS
+_ROUTE_FIELDS = frozenset(ROUTE_FIELDS)
 _TIMEOUT_FIELDS = frozenset(("connect", "read", "stream_read", "write", "pool"))
-_PUBLIC_ROUTE_FIELDS = (
-    "provider",
-    "base_url",
-    "model",
-    "stream",
-    "max_output_tokens",
-    "context_window",
-    "timeout_profile",
-)
+_PUBLIC_ROUTE_FIELDS = PUBLIC_ROUTE_FIELDS
 
 
 class ConfigService:
@@ -108,6 +106,29 @@ class ConfigService:
         except YamlConfigError as exc:
             self._invalid(f"{label}: {exc}")
 
+    def _validate_bool_fields(self, section: Mapping[str, Any], label: str) -> None:
+        for field in ROUTE_BOOL_FIELDS:
+            if field in section and not isinstance(section[field], bool):
+                self._invalid(f"{label}.{field} must be a boolean")
+
+    def _apply_bool_patches(
+        self,
+        target: dict[str, Any],
+        patch: Mapping[str, Any],
+        label: str,
+    ) -> None:
+        """Apply every boolean field present in *patch*; ``None`` clears it."""
+        for field in ROUTE_BOOL_FIELDS:
+            if field not in patch:
+                continue
+            value = patch[field]
+            if value is None:
+                target.pop(field, None)
+            elif isinstance(value, bool):
+                target[field] = value
+            else:
+                self._invalid(f"{label}.{field} must be a boolean")
+
     def _validate_max_output_tokens(self, value: object, label: str) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             self._invalid(f"{label} must be a positive integer")
@@ -121,8 +142,7 @@ class ConfigService:
         if unknown:
             self._invalid(f"{label} has unknown fields: {', '.join(sorted(unknown))}")
         self._validate_string_fields(route, _ROUTE_STRING_FIELDS, label)
-        if "stream" in route and not isinstance(route["stream"], bool):
-            self._invalid(f"{label}.stream must be a boolean")
+        self._validate_bool_fields(route, label)
         if "max_output_tokens" in route:
             self._validate_max_output_tokens(route["max_output_tokens"], f"{label}.max_output_tokens")
         if "context_window" in route:
@@ -145,8 +165,7 @@ class ConfigService:
 
     def _validate_stored_llm(self, llm: Mapping[str, Any]) -> None:
         self._validate_string_fields(llm, (*_BASE_STRING_FIELDS, _VENDOR_FIELD), "llm", allow_none=True)
-        if "stream" in llm and not isinstance(llm["stream"], bool):
-            self._invalid("llm.stream must be a boolean")
+        self._validate_bool_fields(llm, "llm")
         if "max_output_tokens" in llm:
             self._validate_max_output_tokens(llm["max_output_tokens"], "llm.max_output_tokens")
         if "context_window" in llm:
@@ -255,7 +274,7 @@ class ConfigService:
             return interactive[field] if field in interactive else llm.get(field)
 
         provider = self._string_or_empty(effective("provider")) or "openai"
-        if normalize_provider_name(provider) not in {"openai", "gemini"}:
+        if normalize_provider_name(provider) != "openai":
             self._invalid("Model discovery is available only for OpenAI-compatible protocols")
         api_key = self._string_or_empty(effective("api_key")).strip()
         base_url = self._string_or_empty(effective("base_url")).strip().rstrip("/")
@@ -332,14 +351,7 @@ class ConfigService:
         for field in _ROUTE_STRING_FIELDS:
             if field in patch:
                 self._apply_string_patch(route, field, patch[field], label)
-        if "stream" in patch:
-            stream = patch["stream"]
-            if stream is None:
-                route.pop("stream", None)
-            elif isinstance(stream, bool):
-                route["stream"] = stream
-            else:
-                self._invalid(f"{label}.stream must be a boolean")
+        self._apply_bool_patches(route, patch, label)
         if "max_output_tokens" in patch:
             max_output_tokens = patch["max_output_tokens"]
             if max_output_tokens is None:
@@ -508,14 +520,7 @@ class ConfigService:
                 self._apply_string_patch(llm, field, updates[field], "llm")
         if _VENDOR_FIELD in updates:
             self._apply_string_patch(llm, _VENDOR_FIELD, updates[_VENDOR_FIELD], "llm")
-        if "stream" in updates:
-            stream = updates["stream"]
-            if stream is None:
-                llm.pop("stream", None)
-            elif isinstance(stream, bool):
-                llm["stream"] = stream
-            else:
-                self._invalid("llm.stream must be a boolean")
+        self._apply_bool_patches(llm, updates, "llm")
         if "max_output_tokens" in updates:
             max_output_tokens = updates["max_output_tokens"]
             if max_output_tokens is None:

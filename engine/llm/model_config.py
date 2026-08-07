@@ -12,8 +12,8 @@ from urllib.parse import urlsplit
 from common import config as common_config
 from common.yaml_utils import YamlConfigError, load_yaml, merge_configs
 
+from .config_fields import ENGINE_ROUTE_FIELDS, ROUTE_DEFAULTS
 from .contracts import (
-    GEMINI_OPENAI_BASE_URL,
     LLMProviderConfig,
     LLMTimeouts,
     UnsupportedProviderError,
@@ -138,15 +138,7 @@ _TIMEOUT_DEFAULTS: dict[LLMUsage, dict[str, float]] = {
         "pool": 10.0,
     },
 }
-_ROUTE_FIELDS = (
-    "api_key",
-    "base_url",
-    "model",
-    "provider",
-    "stream",
-    "max_output_tokens",
-    "context_window",
-)
+_ROUTE_FIELDS = ENGINE_ROUTE_FIELDS
 _REMOVED_LEGACY_USAGE = "vision"
 
 
@@ -243,10 +235,7 @@ def build_llm_client(config: dict) -> LLMPort:
     except UnsupportedProviderError as exc:
         raise YamlConfigError(str(exc)) from exc
 
-    base_url = config.get("base_url")
-    if provider == "gemini" and (base_url is None or str(base_url).strip() == ""):
-        base_url = GEMINI_OPENAI_BASE_URL
-    base_url = validate_llm_base_url(base_url)
+    base_url = validate_llm_base_url(config.get("base_url"))
 
     required_values = {
         "api_key": config.get("api_key"),
@@ -265,6 +254,10 @@ def build_llm_client(config: dict) -> LLMPort:
     stream = config.get("stream", True)
     if not isinstance(stream, bool):
         raise YamlConfigError("LLM stream configuration must be a boolean")
+
+    thinking = config.get("thinking", False)
+    if not isinstance(thinking, bool):
+        raise YamlConfigError("LLM thinking configuration must be a boolean")
 
     max_output_tokens = config.get("max_output_tokens")
     if max_output_tokens is not None and (
@@ -319,6 +312,7 @@ def build_llm_client(config: dict) -> LLMPort:
         timeouts=resolved_timeouts,
         max_output_tokens=max_output_tokens,
         context_window=context_window,
+        thinking=thinking,
     ))
 
 
@@ -446,14 +440,8 @@ def resolve_llm_config(
 
     routes = _mapping(llm.get("routes"), "LLM routes")
     route = _mapping(routes.get(selected_usage.value), f"LLM route {selected_usage.value!r}")
-    defaults: dict[str, Any] = {
-        "provider": "",
-        "stream": True,
-        "max_output_tokens": None,
-        "context_window": None,
-    }
     selected = {
-        field: route[field] if field in route else llm.get(field, defaults.get(field, ""))
+        field: route[field] if field in route else llm.get(field, ROUTE_DEFAULTS.get(field, ""))
         for field in _ROUTE_FIELDS
     }
     if selected_profile:
