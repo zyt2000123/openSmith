@@ -95,6 +95,11 @@ class LLMProviderConfig:
     timeouts: LLMTimeouts = field(default_factory=LLMTimeouts)
     max_output_tokens: int | None = None
     context_window: int | None = None
+    # Ask the model to think before answering.  Off by default: the request
+    # shape is rejected outright by models that do not support it, and the
+    # engine cannot tell from a relay's model name whether this one does.
+    # Each route builds its own client, so this is already per-route.
+    thinking: bool = False
 
 
 @dataclass(frozen=True)

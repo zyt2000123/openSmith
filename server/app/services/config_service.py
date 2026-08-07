@@ -26,15 +26,21 @@ _MAX_RELAY_BODY_BYTES = 5 * 1024 * 1024
 _BASE_STRING_FIELDS = ("provider", "api_key", "base_url", "model")
 _VENDOR_FIELD = "vendor"
 _ROUTE_STRING_FIELDS = _BASE_STRING_FIELDS
-_ROUTE_FIELDS = frozenset(
-    (*_ROUTE_STRING_FIELDS, "stream", "max_output_tokens", "context_window", "timeout_profile")
-)
+_ROUTE_FIELDS = frozenset((
+    *_ROUTE_STRING_FIELDS,
+    "stream",
+    "thinking",
+    "max_output_tokens",
+    "context_window",
+    "timeout_profile",
+))
 _TIMEOUT_FIELDS = frozenset(("connect", "read", "stream_read", "write", "pool"))
 _PUBLIC_ROUTE_FIELDS = (
     "provider",
     "base_url",
     "model",
     "stream",
+    "thinking",
     "max_output_tokens",
     "context_window",
     "timeout_profile",
@@ -121,6 +127,8 @@ class ConfigService:
         if unknown:
             self._invalid(f"{label} has unknown fields: {', '.join(sorted(unknown))}")
         self._validate_string_fields(route, _ROUTE_STRING_FIELDS, label)
+        if "thinking" in route and not isinstance(route["thinking"], bool):
+            self._invalid(f"{label}.thinking must be a boolean")
         if "stream" in route and not isinstance(route["stream"], bool):
             self._invalid(f"{label}.stream must be a boolean")
         if "max_output_tokens" in route:
@@ -147,6 +155,8 @@ class ConfigService:
         self._validate_string_fields(llm, (*_BASE_STRING_FIELDS, _VENDOR_FIELD), "llm", allow_none=True)
         if "stream" in llm and not isinstance(llm["stream"], bool):
             self._invalid("llm.stream must be a boolean")
+        if "thinking" in llm and not isinstance(llm["thinking"], bool):
+            self._invalid("llm.thinking must be a boolean")
         if "max_output_tokens" in llm:
             self._validate_max_output_tokens(llm["max_output_tokens"], "llm.max_output_tokens")
         if "context_window" in llm:
@@ -340,6 +350,14 @@ class ConfigService:
                 route["stream"] = stream
             else:
                 self._invalid(f"{label}.stream must be a boolean")
+        if "thinking" in patch:
+            thinking = patch["thinking"]
+            if thinking is None:
+                route.pop("thinking", None)
+            elif isinstance(thinking, bool):
+                route["thinking"] = thinking
+            else:
+                self._invalid(f"{label}.thinking must be a boolean")
         if "max_output_tokens" in patch:
             max_output_tokens = patch["max_output_tokens"]
             if max_output_tokens is None:
@@ -516,6 +534,14 @@ class ConfigService:
                 llm["stream"] = stream
             else:
                 self._invalid("llm.stream must be a boolean")
+        if "thinking" in updates:
+            thinking = updates["thinking"]
+            if thinking is None:
+                llm.pop("thinking", None)
+            elif isinstance(thinking, bool):
+                llm["thinking"] = thinking
+            else:
+                self._invalid("llm.thinking must be a boolean")
         if "max_output_tokens" in updates:
             max_output_tokens = updates["max_output_tokens"]
             if max_output_tokens is None:

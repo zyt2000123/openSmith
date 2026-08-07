@@ -468,6 +468,44 @@ llm:
         asyncio.run(client.close())
 
 
+def test_route_level_thinking_reaches_the_anthropic_adapter(tmp_path, monkeypatch) -> None:
+    """`thinking` must merge per route like every other route-scoped field."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text(
+        """
+llm:
+  provider: anthropic
+  api_key: anthropic-key
+  base_url: https://api.anthropic.com
+  model: claude-opus-4-8
+  routes:
+    interactive:
+      thinking: true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(model_config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(model_config, "SMITH_PROFILE_DIR", tmp_path / "missing-smith")
+    monkeypatch.setattr(model_config, "AGENT_DIR", tmp_path / "missing-agent")
+
+    import asyncio
+
+    interactive = model_config.build_llm_client(
+        model_config.resolve_llm_config(usage="interactive")
+    )
+    background = model_config.build_llm_client(
+        model_config.resolve_llm_config(usage="background")
+    )
+    try:
+        assert interactive.adapter.thinking is True
+        # Routes that did not opt in keep the safe default.
+        assert background.adapter.thinking is False
+    finally:
+        asyncio.run(interactive.close())
+        asyncio.run(background.close())
+
+
 def test_client_build_rejects_removed_gemini_protocol(tmp_path, monkeypatch) -> None:
     """Only the two natively implemented protocols may produce a client.
 

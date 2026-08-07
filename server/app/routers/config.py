@@ -28,6 +28,7 @@ class LLMRoutePatch(BaseModel):
     base_url: str | None = None
     model: str | None = None
     stream: bool | None = None
+    thinking: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
     context_window: int | None = Field(default=None, gt=0)
     timeout_profile: LLMUsageName | None = None
@@ -72,6 +73,7 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
     model: str | None = None
     stream: bool | None = None
+    thinking: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
     context_window: int | None = Field(default=None, gt=0)
     routes: dict[LLMUsageName, LLMRoutePatch | None] | None = None
