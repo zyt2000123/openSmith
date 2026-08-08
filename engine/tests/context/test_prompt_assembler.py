@@ -635,7 +635,7 @@ def test_prefix_cache_key_ignores_per_request_layers(tmp_path: Path) -> None:
         FakeToolRegistry(),
         FakeSkillRegistry(),
         {"session_id": "sess-1"},
-        retrieved_memory="## Relevant Durable Memory\n\n- decided on X",
+        memory_text="## Relevant Durable Memory\n\n- decided on X",
     )
 
     assert "decided on X" in retrieved.text

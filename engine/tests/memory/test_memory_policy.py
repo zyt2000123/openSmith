@@ -350,3 +350,80 @@ def test_assemble_memory_injects_the_whole_durable_view(tmp_path: Path) -> None:
     assert "use one shared MemoryPolicy" in assembled
     # Unrelated to any particular question, but still present.
     assert "Free-form summaries" in assembled
+
+
+def test_durable_fallback_stays_within_budget_when_memory_is_nearly_full(
+    tmp_path: Path,
+) -> None:
+    """The safety net must not fail exactly when memory has filled up.
+
+    The fallback carries the existing document forward, so without eviction an
+    almost-full durable view renders over budget, _commit_view rejects it, and
+    the compile checkpoint never advances — memory freezes permanently.
+    """
+    from engine.memory.compile import (
+        MAX_DURABLE_CHARS,
+        _fallback_durable_document,
+    )
+
+    bullets = "\n".join(
+        f"- **Fact {i}**: a verified project fact worth about eighty characters of text right here."
+        for i in range(115)
+    )
+    near_full = (
+        f"# Durable Project Memory\n\n## Active Work\n{bullets}\n\n"
+        "## Pending\n\n## Verified Outcomes\n\n## Decisions\n\n## Known Pitfalls\n"
+    )
+    assert len(near_full) > MAX_DURABLE_CHARS
+
+    event = {
+        "task": "new work",
+        "summary": "a fresh tool-backed result",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "work",
+        "scope": "project",
+        "evidence": "tool_result",
+    }
+    document = _fallback_durable_document(near_full, [event])
+
+    assert len(document) <= MAX_DURABLE_CHARS
+    validate_rendered_view(load_memory_policy(), "durable", document)
+    # The new evidence is why the fallback ran; it must survive the eviction.
+    assert "a fresh tool-backed result" in document
+    # Oldest goes first, newest is retained.
+    assert "Fact 0**" not in document
+    assert "Fact 114**" in document
+
+
+def test_durable_fallback_carries_pre_merge_sections_forward() -> None:
+    """A durable.md written before the view merge must not lose content.
+
+    The deterministic fallback matches on heading names, so retired headings
+    (`Confirmed Facts`, `Reusable Procedures`) need an explicit mapping — the
+    LLM path is safe because it receives the document in full.
+    """
+    from engine.memory.compile import _fallback_durable_document
+
+    legacy = (
+        "# Durable Project Memory\n\n"
+        "## Confirmed Facts\n- **Storage**: an important legacy fact.\n\n"
+        "## Decisions\n- **Policy**: 决定 keep this decision；适用范围：project。\n\n"
+        "## Reusable Procedures\n- **Deploy**: a legacy procedure；验证：tested。\n\n"
+        "## Known Pitfalls\n- **Trap**: 避免 the legacy trap；原因：verified。\n"
+    )
+    event = {
+        "task": "new work",
+        "summary": "fresh result",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "work",
+        "scope": "project",
+        "evidence": "tool_result",
+    }
+    document = _fallback_durable_document(legacy, [event])
+
+    validate_rendered_view(load_memory_policy(), "durable", document)
+    assert "an important legacy fact" in document
+    assert "a legacy procedure" in document
+    assert "keep this decision" in document
+    assert "the legacy trap" in document
+    assert "fresh result" in document

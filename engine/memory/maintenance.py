@@ -271,7 +271,7 @@ class MemoryMaintenanceService:
             except Exception:
                 logger.warning("could not trim memory history", exc_info=True)
             if not dream_report_completed(report):
-                reason = "; ".join(report.errors) if report.errors else report.skipped
+                reason = "; ".join(report.errors)
                 logger.warning("conversation-memory Dream did not complete: %s", reason)
                 if _failure_needs_backoff(error_text=reason):
                     _record_retry_attempt(memory_dir, "dream")

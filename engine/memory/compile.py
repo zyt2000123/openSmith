@@ -330,13 +330,26 @@ def _fallback_date(value: object) -> str:
 _DURABLE_FALLBACK_SECTIONS: tuple[str, ...] = _MEMORY_POLICY.view("durable").sections
 
 
+# Sections that existed before the memory views were merged. The LLM compiler
+# sees `existing` in full and can re-file them itself, but this deterministic
+# extractor matches on heading names — without the mapping it would silently
+# drop every bullet stored under a retired heading.
+_LEGACY_DURABLE_SECTIONS: dict[str, str] = {
+    "Confirmed Facts": "Verified Outcomes",
+    "Reusable Procedures": "Verified Outcomes",
+}
+
+
 def _existing_fallback_bullets(existing: str, section: str) -> list[str]:
     """Keep only bounded bullets from an accepted durable section."""
+    accepted = {section} | {
+        legacy for legacy, current in _LEGACY_DURABLE_SECTIONS.items() if current == section
+    }
     in_section = False
     bullets: list[str] = []
     for line in existing.splitlines():
         if line.startswith("## "):
-            in_section = line[3:].strip() == section
+            in_section = line[3:].strip() in accepted
             continue
         if in_section and line.lstrip().startswith("-"):
             item = _fallback_inline(line.lstrip()[1:], 320)
@@ -387,6 +400,30 @@ def _fallback_durable_document(existing: str, entries: list[dict]) -> str:
             if line not in grouped[section]:
                 grouped[section].append(line)
 
+    # The fallback carries `existing` forward, so an almost-full durable view
+    # would render over budget and _commit_view would reject it — the safety net
+    # failing exactly when memory has accumulated enough to need it. Evict in the
+    # order policy §5.1 prescribes until the document fits.
+    document = _render_durable_fallback(grouped)
+    for section in _DURABLE_EVICTION_ORDER:
+        while len(document) > MAX_DURABLE_CHARS and grouped[section]:
+            grouped[section].pop(0)  # oldest bullet in this section
+            document = _render_durable_fallback(grouped)
+    return document
+
+
+# Least valuable first: transient status before verified conclusions, and
+# decisions/pitfalls last because they are the entries worth keeping longest.
+_DURABLE_EVICTION_ORDER: tuple[str, ...] = (
+    "Active Work",
+    "Pending",
+    "Verified Outcomes",
+    "Decisions",
+    "Known Pitfalls",
+)
+
+
+def _render_durable_fallback(grouped: dict[str, list[str]]) -> str:
     parts = [f"# {_MEMORY_POLICY.view('durable').title}"]
     for section in _DURABLE_FALLBACK_SECTIONS:
         parts.extend(["", f"## {section}", *grouped[section]])

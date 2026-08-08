@@ -57,7 +57,6 @@ class DreamReport:
     secrets_removed: int = 0
     injection_lines_removed: int = 0
     log_lines_cleaned: int = 0
-    skipped: str = ""
     errors: list[str] = field(default_factory=list)
 
 
@@ -73,9 +72,7 @@ class DreamCleanup:
 
 def dream_report_completed(report: DreamReport) -> bool:
     """Return whether Dream maintenance should reset its retry counter."""
-    if report.errors:
-        return False
-    return report.skipped == ""
+    return not report.errors
 
 
 # ---------------------------------------------------------------------------

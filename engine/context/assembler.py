@@ -215,7 +215,6 @@ class PromptAssembler:
         skill_registry: "SkillRegistry",
         context: dict,
         max_tokens: int = 100_000,
-        retrieved_memory: str = "",
         working_dir: Path | None = None,
         memory_text: str | None = None,
         runtime_guidance: str = "",
@@ -230,7 +229,6 @@ class PromptAssembler:
             skill_registry,
             context,
             max_tokens=max_tokens,
-            retrieved_memory=retrieved_memory,
             working_dir=working_dir,
             memory_text=memory_text,
             runtime_guidance=runtime_guidance,
@@ -246,7 +244,6 @@ class PromptAssembler:
         skill_registry: "SkillRegistry",
         context: dict,
         max_tokens: int = 100_000,
-        retrieved_memory: str = "",
         working_dir: Path | None = None,
         memory_text: str | None = None,
         runtime_guidance: str = "",
@@ -260,7 +257,6 @@ class PromptAssembler:
             tool_registry,
             skill_registry,
             context,
-            retrieved_memory=retrieved_memory,
             working_dir=working_dir,
             memory_text=memory_text,
             runtime_guidance=runtime_guidance,
@@ -328,7 +324,6 @@ class PromptAssembler:
         tool_registry: "ToolRegistry",
         skill_registry: "SkillRegistry",
         context: dict,
-        retrieved_memory: str = "",
         working_dir: Path | None = None,
         memory_text: str | None = None,
         runtime_guidance: str = "",
@@ -456,9 +451,7 @@ class PromptAssembler:
 
         # Layer 13: engine-owned memory governance applies even when no memory
         # view is currently injected, because it governs future persistence.
-        # durable.md is the single project memory view and is injected whole;
-        # `retrieved_memory` stays accepted so direct callers predating the
-        # merge keep working.
+        # durable.md is the single project memory view and is injected whole.
         if memory_text is not None:
             durable_memory = self._sanitize_memory_reference(memory_text)
         else:
@@ -470,8 +463,6 @@ class PromptAssembler:
                 if memory_dir.is_dir()
                 else ""
             )
-        if not durable_memory and retrieved_memory:
-            durable_memory = self._sanitize_memory_reference(retrieved_memory)
         has_memory = bool(durable_memory)
         memory_governance = (
             "## Memory Governance\n"
