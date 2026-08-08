@@ -19,7 +19,6 @@ class MemoryMaintenanceOut(BaseModel):
     """
 
     compile: MaintenanceState
-    nudge: MaintenanceState
     dream: MaintenanceState
     consecutive_failures: int = 0
     last_error: str | None = None

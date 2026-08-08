@@ -119,6 +119,11 @@ def _execute_sync(
         return "Error: action must be a string"
     if isinstance(index, bool) or not isinstance(index, int):
         return "Error: index must be an integer"
+    # ``text`` reaches ``.strip()`` on the add/update paths, so a non-string
+    # raised AttributeError from inside the provider instead of reporting a
+    # bad argument.
+    if not isinstance(text, str):
+        return "Error: text must be a string"
     todos = _load_todos(todo_file)
     if todos is None:
         return "Error: Todo state is invalid; refusing to overwrite it"

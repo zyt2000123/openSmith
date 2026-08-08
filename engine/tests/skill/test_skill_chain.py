@@ -75,10 +75,11 @@ def test_shipped_coding_skillchains_load_gates_conditions_and_pause_contracts() 
     assert requirements.nodes[2].await_user_input_marker
     assert requirements.nodes[0].allowed_tools == (
         "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep",
+        "get_current_time",
     )
     assert set(requirements.nodes[1].allowed_tools or ()) == {
         "read_file", "read_pdf", "render_pdf_page", "write_file", "list_dir",
-        "glob_files", "grep", "web_search", "web_fetch",
+        "glob_files", "grep", "web_search", "web_fetch", "get_current_time",
     }
     assert "web_crawl" not in (requirements.nodes[1].allowed_tools or ())
 
@@ -91,6 +92,7 @@ def test_shipped_coding_skillchains_load_gates_conditions_and_pause_contracts() 
     assert tdd.nodes[0].condition is not None
     assert set(tdd.nodes[1].allowed_tools or ()) == {
         "read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell",
+        "get_current_time",
     }
     assert "scripts/setup-package-manager.js" in tdd.nodes[1].instructions
     assert "bare `npx`" in tdd.nodes[1].instructions
@@ -103,7 +105,11 @@ def test_shipped_coding_skillchains_load_gates_conditions_and_pause_contracts() 
     assert review.nodes[0].await_user_input_marker
     assert set(review.nodes[0].allowed_tools or ()) == {
         "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "shell",
+        "git_ops", "get_current_time",
     }
+    # git_ops is write-capable as a tool; the read-only contract lives in the
+    # node instructions plus the guard's read_actions downgrade.
+    assert "`status`, `diff`, `discover`" in review.nodes[0].instructions
     assert "write_file" not in (review.nodes[0].allowed_tools or ())
     assert "web_search" not in (review.nodes[0].allowed_tools or ())
 

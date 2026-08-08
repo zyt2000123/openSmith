@@ -39,3 +39,4 @@ tools:
     - skill_manage
     - todo
     - render_ui
+    - get_current_time

@@ -19,9 +19,9 @@ import importlib
 import sys
 from pathlib import Path
 
+import pytest
 from engine.safety.tool_guard import ToolGuard
 from engine.tool.interface import ToolCall
-
 
 ROOT = Path(__file__).resolve().parents[3]
 RULES = ROOT / "agents" / "safety" / "dangerous_commands.json"
@@ -130,3 +130,75 @@ def test_guard_gates_an_explicitly_named_secret(tmp_path: Path) -> None:
     )
 
     assert decision.approval_required or not decision.allowed
+
+
+@pytest.mark.parametrize("include", ["*", ".*", "*rc", "*.pem", "**/.env", "*.PEM"])
+def test_include_filter_cannot_defeat_the_secret_exclusion(
+    tmp_path: Path, include: str
+) -> None:
+    """A caller-supplied file filter must not re-include an excluded secret.
+
+    ``--include`` beats ``--exclude`` in BSD/GNU grep regardless of flag order,
+    and ripgrep gives precedence to the last matching glob — so an ``include``
+    that can name a secret file turned the whole exclusion off and returned
+    .env / *.pem / .npmrc contents from a plain directory search, on a tool that
+    requires no approval at all.
+    """
+    provider = _load_grep_provider()
+    ws = _workspace(tmp_path)
+
+    output = _grep(provider, pattern=SECRET, path=str(ws), include=include)
+
+    assert output.startswith("Error:"), f"include={include!r} was not rejected"
+    assert SECRET not in output
+
+
+def test_ordinary_include_filter_still_works(tmp_path: Path) -> None:
+    """The rejection must stay narrow: normal file-type filters keep working."""
+    provider = _load_grep_provider()
+    ws = _workspace(tmp_path)
+
+    output = _grep(provider, pattern=SECRET, path=str(ws), include="*.py")
+
+    assert "app.py" in output
+    assert ".env" not in output
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        ".env",                    # control: already covered before this change
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".git-credentials",
+        ".docker/config.json",
+        ".config/gh/hosts.yml",
+        ".config/gcloud/credentials.db",
+    ],
+)
+def test_read_guard_gates_every_credential_store(tmp_path: Path, relative: str) -> None:
+    """The read-side guard must cover the same names the Seatbelt profile denies.
+
+    ``grep`` disables its own secret exclusion for a directly named file on the
+    stated assumption that ToolGuard gates that basename.  For the credential
+    configs the assumption did not hold: the profile denied ``cat ~/.npmrc``
+    while ``read_file``/``grep`` returned the same npm token with no approval.
+
+    ``FileGuard.check_path`` is exercised directly because ``ToolGuard.check``
+    reaches it only once tool definitions are bound; without a registry it
+    returns a generic "unknown tool" approval that would pass this assertion
+    without ever consulting the sensitive-name rules.
+    """
+    target = tmp_path / "project" / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"token={SECRET}\n")
+    guard = ToolGuard(RULES, allowed_dirs=[tmp_path / "project"])
+
+    result = guard.file_guard.check_path(str(target), writing=False)
+
+    assert not result.allowed, f"{relative} was returned as a free read"
+    assert result.approval_scope is not None and result.approval_scope.high_risk, (
+        f"{relative} must need high-risk approval, not an ordinary boundary one "
+        "(ELEVATED path approvals are cached by ToolRegistry)"
+    )

@@ -2,6 +2,7 @@
 # 优先使用 rg，并主动跳过常见生成目录与二进制文件以控制噪声和开销。
 
 import asyncio
+import fnmatch
 import functools
 import os
 import subprocess
@@ -18,7 +19,13 @@ TOOL_META = {
         "properties": {
             "pattern": {"type": "string", "description": "Search pattern (regex supported)"},
             "path": {"type": "string", "description": "Directory or file to search in", "default": "."},
-            "include": {"type": "string", "description": "File glob filter, e.g. '*.py'"},
+            "include": {
+                "type": "string",
+                "description": (
+                    "File glob filter, e.g. '*.py'. A filter that could match a credential "
+                    "file (such as '*' or '*.pem') is rejected when searching a directory."
+                ),
+            },
             "ignore_case": {"type": "boolean", "default": False},
             "context_lines": {"type": "integer", "description": "Lines of context (0-5)", "default": 0},
             "files_only": {"type": "boolean", "description": "Only list matching file paths", "default": False},
@@ -41,13 +48,53 @@ EXCLUDED = [".git", "node_modules", "__pycache__", ".venv", "dist", ".build", "*
 # gate does not cover the subtree and the provider has to exclude these itself.
 # Naming such a file directly stays possible — the guard sees that basename and
 # gates it — so this list only narrows the recursive case.
+# Kept in sync by hand with ``engine.safety.tool_guard._CREDENTIAL_CONFIG_NAMES``
+# / ``FileGuard._ALWAYS_BLOCKED`` and ``engine.sandbox.macos_seatbelt``'s
+# credential sets.  ``agents/`` may not import the engine, so the duplication is
+# structural — but the three copies had drifted, and the weakest one set the
+# real security level.  Change all three together.
 SECRET_EXCLUDED = [
-    ".ssh", ".gnupg", ".aws", ".kube",              # credential directories
+    ".ssh", ".gnupg", ".aws", ".kube", ".docker",   # credential directories
     ".env*", ".npmrc", ".pypirc", ".netrc",         # credential files
+    ".git-credentials",                             # git credential store
     "*.pem", "*.key", "*.p12", "*.pfx",             # private keys and certs
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",   # ssh keys outside ~/.ssh
 ]
+# A caller-supplied file filter WINS over the exclusions above in both engines:
+# BSD/GNU grep applies --include before --exclude, and ripgrep gives precedence
+# to the last matching glob (ours are emitted first).  So `include='*'` — or any
+# glob that can name an excluded file — turned SECRET_EXCLUDED off entirely and
+# returned .env / *.pem / .npmrc contents from a plain directory search, with no
+# approval anywhere in the path.  Reordering the flags cannot fix this: grep's
+# precedence is order-independent.  Reject such a filter instead.
+#
+# Only the FILE entries above need this.  --exclude-dir is not overridden by
+# --include, so the credential directories stay protected either way.
+_SECRET_PROBE_NAMES = (
+    ".env", ".env.local", ".env.production",
+    ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+    "server.pem", "server.key", "cert.p12", "cert.pfx",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+)
 _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
+
+
+def _include_reaches_secret(include: str) -> bool:
+    """Whether a caller's file filter can name a SECRET_EXCLUDED file.
+
+    Matched case-insensitively because both engines exclude case-insensitively
+    (``--iglob`` / ``_casefold_glob``); a case-sensitive test here would let
+    ``*.PEM`` through to reach ``SERVER.PEM``.  grep matches ``--include``
+    against the base name while ripgrep matches the whole path, so the pattern's
+    last component is probed as well.
+    """
+    lowered = include.lower()
+    tail = lowered.replace("\\", "/").rsplit("/", 1)[-1]
+    return any(
+        fnmatch.fnmatchcase(name, candidate)
+        for name in _SECRET_PROBE_NAMES
+        for candidate in {lowered, tail}
+    )
 
 
 def _casefold_glob(pattern: str) -> str:
@@ -90,9 +137,11 @@ def _safe_environment(search_path: str) -> dict[str, str]:
 @functools.lru_cache(maxsize=1)
 def _has_rg() -> bool:
     try:
-        subprocess.run(["rg", "--version"], capture_output=True, check=True)
+        # A timeout is not optional: this probe runs before every search, and a
+        # wedged binary on PATH would hang the tool with no deadline of its own.
+        subprocess.run(["rg", "--version"], capture_output=True, timeout=5, check=True)
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
 
 
@@ -100,9 +149,21 @@ def _execute_sync(
     *, pattern: str, path: str = ".", include: str = "",
     ignore_case: bool = False, context_lines: int = 0, files_only: bool = False,
 ) -> str:
+    # Argument types are validated before use: every one of these reaches either
+    # a string method or an `argv` list, so a wrong type raised deep inside the
+    # provider and surfaced as an opaque exception instead of a usable message.
+    if not isinstance(pattern, str) or not pattern.strip():
+        return "Error: pattern is required and must be a string"
+    if not isinstance(path, str):
+        return "Error: path must be a string"
+    if include is not None and not isinstance(include, str):
+        return "Error: include must be a string"
+    if not isinstance(ignore_case, bool) or not isinstance(files_only, bool):
+        return "Error: ignore_case and files_only must be booleans"
+    if isinstance(context_lines, bool) or not isinstance(context_lines, int):
+        return "Error: context_lines must be an integer"
+
     include = include or None
-    if not pattern.strip():
-        return "Error: pattern is required"
     resolved = os.path.abspath(path)
     if not os.path.exists(resolved):
         return f"Error: path not found: {resolved}"
@@ -111,6 +172,14 @@ def _execute_sync(
     # names is a different case: ToolGuard sees that basename and gates it, so
     # excluding it here would block a search the user already approved.
     secret_globs = SECRET_EXCLUDED if os.path.isdir(resolved) else []
+
+    if secret_globs and include and _include_reaches_secret(include):
+        return (
+            f"Error: the include filter '{include}' can match credential files "
+            "that a directory search must never return. Narrow it to the file "
+            "types you actually need (for example '*.py'), or name the single "
+            "file directly as 'path' so the approval flow can gate it."
+        )
 
     use_rg = _has_rg()
     if use_rg:

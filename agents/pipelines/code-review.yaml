@@ -4,9 +4,10 @@ steps:
   - skill: code-review
     gate: review_report
     await_user_input_marker: "<!-- agent-smith:await-user-input -->"
-    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, shell]
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, shell, git_ops, get_current_time]
     instructions: |
-      This is a read-only review. Resolve the user-supplied fixed point before reviewing; if it is
+      This is a read-only review: use only the `git_ops` read actions (`status`, `diff`, `discover`).
+      Resolve the user-supplied fixed point before reviewing; if it is
       missing or invalid, ask only for that missing input instead of guessing and end with
       `<!-- agent-smith:await-user-input -->`. The runtime has one resident agent, so run Matt's
       Standards and Spec axes sequentially while keeping `## Standards` and `## Spec` fully separate.
@@ -18,9 +19,10 @@ steps:
 
   - skill: verification-loop
     gate: review_verification
-    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, shell]
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, shell, git_ops, get_current_time]
     instructions: |
-      Stay read-only. Run only applicable validation commands for the reviewed diff and preserve the
+      Stay read-only: `git_ops` is limited to `status`, `diff`, and `discover` here.
+      Run only applicable validation commands for the reviewed diff and preserve the
       earlier `## Standards` and `## Spec` sections verbatim or faithfully summarized. Append
       `## Verification` with actual command results and an `Overall:` verdict. Return one consolidated
       `ReviewReport`; do not rerank the two review axes and do not publish. End with

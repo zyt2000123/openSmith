@@ -42,6 +42,7 @@ _VALID_EXECUTION_ENVIRONMENTS = frozenset({"host", "sandbox", "either"})
 _BUILTIN_PROVIDER_FILENAMES = frozenset(
     {
         "edit_file.py",
+        "get_current_time.py",
         "git_ops.py",
         "glob_files.py",
         "grep.py",

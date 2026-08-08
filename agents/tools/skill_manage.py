@@ -409,6 +409,17 @@ async def execute(
         except ValueError as e:
             return f"Error: {e}"
 
+        # ``create`` and ``edit`` both cap the content they write; ``patch`` did
+        # not, so repeated section patches were an unbounded write path to a
+        # file that is loaded into every later prompt.  Check the *result*, not
+        # the fragment: a small fragment appended to an already-large file is
+        # what actually crosses the limit.
+        if len(new_content.encode("utf-8")) > MAX_SKILL_BYTES:
+            return (
+                f"Error: patched content exceeds the {MAX_SKILL_BYTES // (1024 * 1024)} MB "
+                "per-skill size limit"
+            )
+
         # Save the version only once the patch is known to apply.  Saving first
         # meant a run of failed patches — a model guessing at section names is
         # normal — consumed the bounded history and evicted the genuine pre-edit

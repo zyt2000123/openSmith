@@ -157,6 +157,34 @@ def test_react_event_loop_loads_only_requested_tool_schemas() -> None:
     assert any(event.type is EventType.TEXT_DELTA for event in events)
 
 
+def test_time_tool_result_is_appended_as_user_context() -> None:
+    async def current_time():
+        return '{"local_time":"2026-08-07T12:00:00+08:00","timezone":"Asia/Shanghai"}'
+
+    async def run():
+        registry = ToolRegistry()
+        registry.register("get_current_time", "Gets the current time", {}, current_time)
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[_tool_call("get_current_time")]),
+            ChatResponse(text="It is noon."),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm,
+            [{"role": "user", "content": "What time is it?"}],
+            registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    follow_up_messages = llm.chat_calls[1]["messages"]
+    assert {"role": "tool", "tool_call_id": "call-1", "content": "Time data was added to the user context."} in follow_up_messages
+    assert {
+        "role": "user",
+        "content": "[Current time]\n{\"local_time\":\"2026-08-07T12:00:00+08:00\",\"timezone\":\"Asia/Shanghai\"}",
+    } in follow_up_messages
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
+
 
 def test_react_loop_failed_tool_round_does_not_consume_main_budget():
     async def run():

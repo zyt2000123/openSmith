@@ -78,6 +78,8 @@ class FailedAgentRunError(RuntimeError):
         super().__init__(f"Agent run failed: {reason}")
 
 
+_CURRENT_TIME_TOOL = "get_current_time"
+_CURRENT_TIME_TOOL_ACK = "Time data was added to the user context."
 _TOOL_SCHEMA_LOADER = "get_tool_schema"
 
 
@@ -124,6 +126,20 @@ def _requested_tool_schema(
         return requested, None, f"Tool unavailable: {requested}"
     return canonical_name, schema, None
 
+
+def _tool_result_messages(tool_name: str, call_id: str, content: str, *, is_error: bool) -> list[dict[str, str]]:
+    """Keep tool-call protocol valid while placing live time in user context.
+
+    Providers require a matching ``tool`` turn for every assistant tool call.
+    The actual volatile value is also appended as a user turn, per product
+    policy, so it never alters the stable system-prompt prefix.
+    """
+    if tool_name == _CURRENT_TIME_TOOL and not is_error:
+        return [
+            {"role": "tool", "tool_call_id": call_id, "content": _CURRENT_TIME_TOOL_ACK},
+            {"role": "user", "content": f"[Current time]\n{content}"},
+        ]
+    return [{"role": "tool", "tool_call_id": call_id, "content": content}]
 
 
 @dataclass
@@ -1303,7 +1319,9 @@ async def react_event_loop(
                     warning_text = "\n\n".join(warnings)
                     conversation.append({"role": "system", "content": warning_text})
 
-            conversation.append({"role": "tool", "tool_call_id": result.call_id, "content": result.content})
+            conversation.extend(_tool_result_messages(
+                call.name, result.call_id, result.content, is_error=result.is_error,
+            ))
             result_event = {
                 "id": tc.id,
                 "name": call.name,

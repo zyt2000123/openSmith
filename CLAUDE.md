@@ -61,12 +61,19 @@ keywords — they stay in generic ReAct. A pipeline node falls back to generic
 ReAct when no matching `SKILL.md` is installed; the gate still runs, so the
 intermediate contract stays observable.
 
-Prompt assembly (`engine/context/assembler.py`) stacks 19 trust-tagged layers:
+Prompt assembly (`engine/context/assembler.py`) stacks 16 trust-tagged layers:
 Agent Role / Style / Workflow, Tool Usage Policy, Available Tools, Available
 Skills, Learned User Context, Global Instructions, Project Instructions,
 Identity Guidance, Evaluation Safety Guidance (conditional), Output Style,
-Memory Governance, Durable Memory, Recent Working Context, Durable Memory
-Retrieval, Relevant Episodes, Runtime Context, Engine Runtime Control.
+Memory Governance, Durable Memory, Runtime Context, Engine Runtime Control.
+
+Memory is two rendered views and nothing else: `context.md` (user
+collaboration) and `memory/durable.md` (project). Both are budget-capped by
+`engine/memory/MEMORY_POLICY.md` and injected **whole** — there is no
+query-time retrieval, no FTS index, no embeddings, and no episodes. Evidence
+accumulates in `memory/recent.jsonl`; `compile_durable()` merges it
+incrementally against `.compile_offset`, and Dream only sanitizes the rendered
+files and reclaims the expired prefix of the event log.
 
 ## 4. Product Language
 
@@ -89,7 +96,7 @@ Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 | Layer | Directory | Source lines | Responsibility |
 |---|---|---|---|
 | Infrastructure | `common/` | 578 | Paths, SQLite connection, YAML read/write. Zero business logic. |
-| Execution | `engine/` | 23.1k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
+| Execution | `engine/` | 24.8k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
 | Content | `agents/` | 4.8k | Smith identity seed, pipelines, gates, tools, skills, safety rules. Pure content. |
 | Platform | `server/` | 5.2k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints. |
 | Terminal UI | `shell/` | 10.1k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
@@ -254,8 +261,10 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 980 passed (59 skipped), server 222 passed (5 skipped),
-shell 275 passed.
+Current baseline (macOS): engine 1033 passed, server 232 passed (5 skipped),
+shell 297 passed. `server` carries one known failure predating the memory
+merge — `test_build_engine_runtime_selects_interactive_gate_and_background_clients`
+fails on the `lazy_tool_schemas` kwarg added by commit 3be4815.
 
 The engine's 59 skips are almost all macOS-only Seatbelt tests; every one carries
 `@pytest.mark.skipif(sys.platform != "darwin")`. A Seatbelt test *failing* rather

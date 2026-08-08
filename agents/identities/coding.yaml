@@ -20,8 +20,10 @@ tools:
     - glob_files
     - grep
     - shell
+    - git_ops
     - web_search
     - web_fetch
+    - get_current_time
 
 skills:
   enabled:

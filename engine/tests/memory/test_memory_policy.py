@@ -14,7 +14,6 @@ from engine.memory.compile import (
     assemble_memory,
     compile_context,
     compile_durable,
-    compile_recent,
 )
 from engine.memory.policy import (
     MemoryPolicyError,
@@ -22,7 +21,7 @@ from engine.memory.policy import (
     resolve_view_path,
     validate_rendered_view,
 )
-from engine.memory.store import save_conversation_memory, search_relevant_memories
+from engine.memory.store import save_conversation_memory
 from engine.memory.user_learner import UserPreferenceLearner
 
 
@@ -37,27 +36,18 @@ CONTEXT_DOC = """# Smith Context
 ## Stable User Context
 """
 
-RECENT_DOC = """# Recent Working Memory
+DURABLE_DOC = """# Durable Project Memory
 
 ## Active Work
 - **Memory upgrade** — 状态：implementing；下一步：run tests；更新：2026-07-13。
 
 ## Pending
 
-## Recent Verified Outcomes
+## Verified Outcomes
 - **Policy** — 结果：policy parsed；证据：unit test。
-"""
-
-DURABLE_DOC = """# Durable Project Memory
-
-## Confirmed Facts
-- **Storage**: Memory views are Markdown files.
 
 ## Decisions
 - **Policy**: 决定 use one shared MemoryPolicy；适用范围：memory compilation。
-
-## Reusable Procedures
-- **Compilation**: Generate, review, then atomically write；验证：pipeline test。
 
 ## Known Pitfalls
 - **Free-form summaries**: 避免 appending raw answers；原因：they pollute recall。
@@ -65,11 +55,13 @@ DURABLE_DOC = """# Durable Project Memory
 
 EMPTY_DURABLE_DOC = """# Durable Project Memory
 
-## Confirmed Facts
+## Active Work
+
+## Pending
+
+## Verified Outcomes
 
 ## Decisions
-
-## Reusable Procedures
 
 ## Known Pitfalls
 """
@@ -107,33 +99,33 @@ def _write_event(memory_dir: Path, **overrides: object) -> None:
     )
 
 
-def test_memory_policy_loads_one_canonical_three_view_contract(tmp_path: Path) -> None:
+def test_memory_policy_loads_one_canonical_two_view_contract(tmp_path: Path) -> None:
     policy = load_memory_policy()
 
-    assert policy.version == 2
-    assert set(policy.views) == {"context", "recent", "durable"}
+    assert policy.version == 3
+    assert set(policy.views) == {"context", "durable"}
     assert resolve_view_path(policy, tmp_path, "context") == tmp_path / "context.md"
-    assert resolve_view_path(policy, tmp_path, "recent") == tmp_path / "memory" / "recent.md"
-    assert "只写未来对话仍可能有用的信息" in policy.instructions_for("recent", role="compiler")
-    assert "## Recent Verified Outcomes" in policy.instructions_for(
-        "recent", role="compiler"
+    assert resolve_view_path(policy, tmp_path, "durable") == tmp_path / "memory" / "durable.md"
+    assert "只写未来对话仍可能有用的信息" in policy.instructions_for("durable", role="compiler")
+    assert "## Verified Outcomes" in policy.instructions_for("durable", role="compiler")
+    assert "## Confirmed Preferences" not in policy.instructions_for(
+        "durable", role="compiler"
     )
-    assert "## Confirmed Facts" not in policy.instructions_for(
-        "recent", role="compiler"
-    )
-    assert "Reviewer" in policy.instructions_for("recent", role="reviewer")
+    assert "Reviewer" in policy.instructions_for("durable", role="reviewer")
 
 
 def test_memory_policy_rejects_wrong_or_extra_markdown_sections() -> None:
     policy = load_memory_policy()
 
-    validate_rendered_view(policy, "recent", RECENT_DOC)
+    validate_rendered_view(policy, "durable", DURABLE_DOC)
 
     with pytest.raises(MemoryPolicyError, match="title"):
-        validate_rendered_view(policy, "recent", RECENT_DOC.replace("# Recent Working Memory", "# Notes"))
+        validate_rendered_view(
+            policy, "durable", DURABLE_DOC.replace("# Durable Project Memory", "# Notes")
+        )
 
     with pytest.raises(MemoryPolicyError, match="sections"):
-        validate_rendered_view(policy, "recent", RECENT_DOC + "\n## Random Notes\n- noise\n")
+        validate_rendered_view(policy, "durable", DURABLE_DOC + "\n## Random Notes\n- noise\n")
 
 
 def test_memory_policy_is_included_in_engine_package_data() -> None:
@@ -210,10 +202,14 @@ def test_formal_memory_view_requires_reviewer_before_write(tmp_path: Path) -> No
     _write_event(memory_dir)
 
     with pytest.raises(MemoryCompilationError, match="requires a reviewer"):
-        asyncio.run(compile_recent(memory_dir, StaticLLM(RECENT_DOC)))
+        asyncio.run(compile_durable(memory_dir, StaticLLM(DURABLE_DOC)))
 
-    assert not (memory_dir / "recent.md").exists()
-    history = json.loads((memory_dir / "memory_history.jsonl").read_text(encoding="utf-8"))
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ][-1]
     assert history["status"] == "rejected"
 
 
@@ -241,16 +237,16 @@ def test_compile_context_uses_policy_review_and_audit_history(tmp_path: Path) ->
     assert history["review_rounds"] == 1
 
 
-def test_compile_recent_writes_only_policy_structured_markdown(tmp_path: Path) -> None:
+def test_compile_durable_writes_only_policy_structured_markdown(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _write_event(memory_dir)
-    generator = StaticLLM(RECENT_DOC)
+    generator = StaticLLM(DURABLE_DOC)
     reviewer = PassReviewer()
 
-    assert asyncio.run(compile_recent(memory_dir, generator, reviewer)) is True
+    assert asyncio.run(compile_durable(memory_dir, generator, reviewer)) is True
 
-    assert (memory_dir / "recent.md").read_text(encoding="utf-8") == RECENT_DOC
-    assert "Recent Working Memory" in generator.calls[0][-1]["content"]
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == DURABLE_DOC
+    assert "Durable Project Memory" in generator.calls[0][-1]["content"]
     assert "Smith Memory Policy" in reviewer.calls[0][-1]["content"]
 
 
@@ -263,14 +259,30 @@ def test_compile_durable_creates_empty_template_without_events(tmp_path: Path) -
     assert generator.calls == []
 
 
-def test_generic_work_events_never_become_durable_memory_candidates(tmp_path: Path) -> None:
+def test_generic_work_events_reach_durable_memory(tmp_path: Path) -> None:
+    """Ordinary tool-backed work is admissible project memory.
+
+    The previous policy rejected `work` and then advanced the compile
+    checkpoint past it, so durable.md could never fill up at all.
+    """
     memory_dir = tmp_path / "memory"
     _write_event(memory_dir, kind="work", scope="project")
 
     assert asyncio.run(
         compile_durable(memory_dir, StaticLLM(DURABLE_DOC), PassReviewer())
-    ) is False
+    ) is True
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == DURABLE_DOC
+
+
+def test_user_scoped_events_stay_out_of_durable_memory(tmp_path: Path) -> None:
+    """Collaboration preferences belong to context.md, never to durable.md."""
+    memory_dir = tmp_path / "memory"
+    _write_event(memory_dir, kind="preference", scope="user", evidence="user_explicit")
+    generator = StaticLLM(DURABLE_DOC)
+
+    assert asyncio.run(compile_durable(memory_dir, generator, PassReviewer())) is False
     assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
+    assert generator.calls == []
 
 
 def test_explicit_stable_decision_remains_a_durable_memory_candidate(tmp_path: Path) -> None:
@@ -283,24 +295,29 @@ def test_explicit_stable_decision_remains_a_durable_memory_candidate(tmp_path: P
     assert (memory_dir / "durable.md").read_text(encoding="utf-8") == DURABLE_DOC
 
 
-def test_compile_recent_rejects_free_form_output_and_keeps_old_view(tmp_path: Path) -> None:
+def test_compile_durable_rejects_free_form_output_and_keeps_old_view(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     _write_event(memory_dir)
-    old = RECENT_DOC.replace("implementing", "old state")
-    (memory_dir / "recent.md").write_text(old, encoding="utf-8")
+    old = DURABLE_DOC.replace("implementing", "old state")
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "durable.md").write_text(old, encoding="utf-8")
 
     with pytest.raises(MemoryPolicyError, match="title"):
         asyncio.run(
-            compile_recent(
+            compile_durable(
                 memory_dir,
                 StaticLLM("free-form summary"),
                 PassReviewer(),
             )
         )
 
-    assert (memory_dir / "recent.md").read_text(encoding="utf-8") == old
-    history = json.loads((memory_dir / "memory_history.jsonl").read_text(encoding="utf-8"))
-    assert history["target"] == "recent"
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == old
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ][-1]
+    assert history["target"] == "durable"
     assert history["status"] == "rejected"
 
 
@@ -321,40 +338,15 @@ def test_compile_durable_accepts_complete_view_without_adding_legacy_wrapper(tmp
     assert "## Durable Memory" not in content
 
 
-def test_assemble_memory_can_exclude_durable_for_query_time_recall(tmp_path: Path) -> None:
+def test_assemble_memory_injects_the_whole_durable_view(tmp_path: Path) -> None:
+    """No retrieval step exists: every durable entry reaches the prompt."""
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
-    (memory_dir / "recent.md").write_text(RECENT_DOC, encoding="utf-8")
     (memory_dir / "durable.md").write_text(DURABLE_DOC, encoding="utf-8")
 
-    assembled = assemble_memory(memory_dir, include_durable=False)
+    assembled = assemble_memory(memory_dir)
 
-    assert "Recent Working Memory" in assembled
-    assert "Durable Project Memory" not in assembled
-
-
-def test_query_time_recall_reads_matching_durable_without_episode_directory(tmp_path: Path) -> None:
-    memory_dir = tmp_path / "memory"
-    memory_dir.mkdir()
-    (memory_dir / "durable.md").write_text(
-        DURABLE_DOC.replace("Memory views are Markdown files", "PostgreSQL is the project database"),
-        encoding="utf-8",
-    )
-
-    result = asyncio.run(search_relevant_memories(tmp_path, "PostgreSQL database migration"))
-
-    assert "## Relevant Durable Memory" in result
-    assert "PostgreSQL is the project database" in result
-    assert "Free-form summaries" not in result
-
-
-def test_query_time_recall_degrades_when_durable_reader_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fail_reader(*_args: object, **_kwargs: object) -> str:
-        raise OSError("unreadable")
-
-    monkeypatch.setattr("engine.memory.store._select_relevant_durable", fail_reader)
-
-    assert asyncio.run(search_relevant_memories(tmp_path, "anything")) == ""
+    assert "Durable Project Memory" in assembled
+    assert "use one shared MemoryPolicy" in assembled
+    # Unrelated to any particular question, but still present.
+    assert "Free-form summaries" in assembled

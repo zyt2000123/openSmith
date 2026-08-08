@@ -7,7 +7,7 @@ steps:
     gate: grilling_complete
     await_user_input_marker: "<!-- agent-smith:await-user-input -->"
     infer_await_user_input_from_question: true
-    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep]
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, get_current_time]
     instructions: |
       You are the upstream grilling skill inside Agent-Smith's requirements-research chain.
       Facts discoverable in the repository or sources must be looked up rather than asked.
@@ -18,7 +18,7 @@ steps:
 
   - skill: research
     gate: research_brief
-    allowed_tools: [read_file, read_pdf, render_pdf_page, write_file, list_dir, glob_files, grep, web_search, web_fetch]
+    allowed_tools: [read_file, read_pdf, render_pdf_page, write_file, list_dir, glob_files, grep, web_search, web_fetch, get_current_time]
     instructions: |
       Execute the upstream primary-source research method within this resident agent run;
       background subagents are not available in this chain. Use `web_search` only to discover
@@ -33,7 +33,7 @@ steps:
     gate: plan_confirmed
     await_user_input_marker: "<!-- agent-smith:await-user-input -->"
     infer_await_user_input_from_question: true
-    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep]
+    allowed_tools: [read_file, read_pdf, render_pdf_page, list_dir, glob_files, grep, get_current_time]
     instructions: |
       Use the just-created ResearchBrief as the plan input. Ground the plan in repository
       patterns and make it explicit that no source code will be changed in this chain. This is

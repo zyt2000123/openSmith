@@ -44,22 +44,20 @@ test("context percentage falls back safely when a compatible server returns a no
 // ── Ambient memory maintenance (dreaming indicator) ──
 
 test("memory label names the running pass, dreaming then curation then compilation", () => {
-  assert.equal(memoryMaintenanceLabel({ compile: "running", nudge: "running", dream: "running" }), "dreaming");
-  assert.equal(memoryMaintenanceLabel({ compile: "running", nudge: "running", dream: "idle" }), "curating memory");
-  assert.equal(memoryMaintenanceLabel({ compile: "running", nudge: "idle", dream: "idle" }), "compiling memory");
+  assert.equal(memoryMaintenanceLabel({ compile: "running", dream: "running" }), "dreaming");
+  assert.equal(memoryMaintenanceLabel({ compile: "running", dream: "idle" }), "compiling memory");
 });
 
 test("memory label prefers running work over queued work", () => {
-  assert.equal(memoryMaintenanceLabel({ compile: "running", nudge: "idle", dream: "pending" }), "compiling memory");
+  assert.equal(memoryMaintenanceLabel({ compile: "running", dream: "pending" }), "compiling memory");
 });
 
 test("memory label reports queued work when nothing is running", () => {
-  assert.equal(memoryMaintenanceLabel({ compile: "pending", nudge: "pending", dream: "pending" }), "dream queued");
-  assert.equal(memoryMaintenanceLabel({ compile: "pending", nudge: "pending", dream: "idle" }), "memory review queued");
-  assert.equal(memoryMaintenanceLabel({ compile: "pending", nudge: "idle", dream: "idle" }), "memory queued");
+  assert.equal(memoryMaintenanceLabel({ compile: "pending", dream: "pending" }), "dream queued");
+  assert.equal(memoryMaintenanceLabel({ compile: "pending", dream: "idle" }), "memory queued");
 });
 
 test("memory label shows nothing when idle or unavailable", () => {
-  assert.equal(memoryMaintenanceLabel({ compile: "idle", nudge: "idle", dream: "idle" }), null);
+  assert.equal(memoryMaintenanceLabel({ compile: "idle", dream: "idle" }), null);
   assert.equal(memoryMaintenanceLabel(null), null);
 });

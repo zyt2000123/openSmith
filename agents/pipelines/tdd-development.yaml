@@ -4,7 +4,7 @@ steps:
   - skill: diagnosing-bugs
     gate: red_loop
     condition: coding_bugfix_needs_diagnosis
-    allowed_tools: [read_file, write_file, edit_file, list_dir, glob_files, grep, shell]
+    allowed_tools: [read_file, write_file, edit_file, list_dir, glob_files, grep, shell, get_current_time]
     instructions: |
       This is the diagnostic handoff before TDD implementation. Reuse and run an existing
       red-capable loop if the report already supplies one; otherwise build, run, and minimize a
@@ -16,7 +16,7 @@ steps:
 
   - skill: tdd-workflow
     gate: tdd_evidence
-    allowed_tools: [read_file, write_file, edit_file, list_dir, glob_files, grep, shell]
+    allowed_tools: [read_file, write_file, edit_file, list_dir, glob_files, grep, shell, get_current_time]
     instructions: |
       Implement the requested feature or fix using the upstream RED → GREEN → refactor workflow.
       For a bug, use the prior red-capable loop; for a new feature, write and run a failing behavior
@@ -32,8 +32,10 @@ steps:
 
   - skill: verification-loop
     gate: tdd_verification
-    allowed_tools: [read_file, list_dir, glob_files, grep, shell]
+    allowed_tools: [read_file, list_dir, glob_files, grep, shell, git_ops, get_current_time]
     instructions: |
+      Verification is read-only: use only the `git_ops` read actions (`status`, `diff`, `discover`)
+      and do not commit, push, or create a worktree.
       Verify the implementation using only commands applicable to this repository. For build, types,
       lint, tests, security, and diff, report PASS, FAIL, or NOT_APPLICABLE with a reason and actual
       evidence. Reuse only commands evidenced by the target workspace or the prior TDD handoff; do

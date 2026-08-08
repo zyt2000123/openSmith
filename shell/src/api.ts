@@ -129,7 +129,6 @@ export type MaintenanceState = "idle" | "pending" | "running";
 
 export type MemoryMaintenance = {
   compile: MaintenanceState;
-  nudge: MaintenanceState;
   dream: MaintenanceState;
 };
 

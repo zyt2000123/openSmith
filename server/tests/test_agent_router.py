@@ -217,7 +217,6 @@ def test_memory_status_route_reports_deferred_maintenance() -> None:
         def memory_maintenance(self) -> dict:
             return {
                 "compile": "idle",
-                "nudge": "running",
                 "dream": "running",
                 "consecutive_failures": 213,
                 "last_error": "LLMResponseError: LLM request failed (HTTP 401)",
@@ -233,7 +232,6 @@ def test_memory_status_route_reports_deferred_maintenance() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "compile": "idle",
-        "nudge": "running",
         "dream": "running",
         "consecutive_failures": 213,
         "last_error": "LLMResponseError: LLM request failed (HTTP 401)",
@@ -245,7 +243,7 @@ def test_memory_status_rejects_an_unknown_state() -> None:
 
     class FakeAgentService:
         def memory_maintenance(self) -> dict:
-            return {"compile": "idle", "nudge": "idle", "dream": "sleepwalking"}
+            return {"compile": "idle", "dream": "sleepwalking"}
 
     app = FastAPI()
     app.include_router(router)

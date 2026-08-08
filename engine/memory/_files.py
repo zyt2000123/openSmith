@@ -15,7 +15,7 @@ from typing import AsyncIterator, BinaryIO, Iterator
 # Canonical memory layer filenames
 # ---------------------------------------------------------------------------
 
-MEMORY_LAYER_FILES: tuple[str, ...] = ("durable.md", "recent.md")
+MEMORY_LAYER_FILES: tuple[str, ...] = ("durable.md",)
 
 
 def _lock_file_path(target: Path) -> Path:

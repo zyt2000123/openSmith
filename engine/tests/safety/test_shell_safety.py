@@ -84,10 +84,18 @@ def test_shell_strips_inherited_secrets_and_caps_streamed_output(
         async def read(self, _: int) -> bytes:
             return self._chunks.pop(0) if self._chunks else b""
 
+    # A test runner puts its verdict on the last line, so the cap must retain
+    # both ends: a head-only cap dropped exactly the evidence the TDD and
+    # review gates require.
+    head_marker = b"HEAD-collection-error\n"
+    tail_marker = b"\nTAIL-VERDICT: 3 failed"
+    filler = b"x" * (MAX_OUTPUT * 2)
+    total_bytes = len(head_marker) + len(filler) + len(tail_marker)
+
     class Process:
         pid = 12345
         returncode = 0
-        stdout = Reader([b"x" * (MAX_OUTPUT + 32)])
+        stdout = Reader([head_marker, filler, tail_marker])
         stderr = Reader([])
 
         async def wait(self) -> int:
@@ -118,8 +126,10 @@ def test_shell_strips_inherited_secrets_and_caps_streamed_output(
     assert captured["cwd"] == str(tmp_path)
     if os.name == "posix":
         assert captured["start_new_session"] is True
-    assert "x" * MAX_OUTPUT in result
-    assert f"{MAX_OUTPUT + 32} bytes total" in result
+    assert head_marker.decode() in result
+    assert tail_marker.decode() in result, "the tail carries the verdict and must survive"
+    assert "middle truncated" in result
+    assert f"{total_bytes} bytes total" in result
 
 
 def test_shell_process_cannot_read_the_service_secret_environment(

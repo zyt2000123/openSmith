@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
+from itertools import pairwise
 from pathlib import Path
 from typing import Optional
 
@@ -218,6 +219,31 @@ _SENSITIVE_KEY_NAME_RE = re.compile(
 # ``config`` embeds remote URLs (often ``https://user:token@host``), the
 # ``credentials`` file stores passwords verbatim, ``config.worktree`` the same.
 _GIT_CREDENTIAL_FILES = frozenset({"config", "config.worktree", "credentials"})
+# Package-manager and VCS credential stores.  These live as ordinary files with
+# ordinary-looking names, so no extension or key-name rule below reaches them.
+#
+# This set is deliberately identical to ``macos_seatbelt._CREDENTIAL_CONFIGS``
+# and to the file entries of ``agents/tools/grep.py``'s ``SECRET_EXCLUDED``.
+# The three copies exist because the sandbox may not import the safety layer
+# and ``agents/`` may not import the engine at all; they had already drifted
+# apart, and the weakest copy set the real security level: the shell tool was
+# denied ``~/.npmrc`` by the Seatbelt profile while ``read_file`` returned the
+# same npm token with no approval at all.  Change all three together.
+_CREDENTIAL_CONFIG_NAMES = frozenset({".npmrc", ".pypirc", ".netrc", ".git-credentials"})
+# Credential stores identified by a parent/child directory pair rather than by a
+# single component, so ``_ALWAYS_BLOCKED`` cannot express them.
+_CREDENTIAL_PATH_PAIRS = frozenset(
+    {(".config", "gh"), (".config", "gcloud"), ("library", "keychains")}
+)
+
+
+def _credential_pair(path: Path) -> str | None:
+    """Return the ``parent/child`` credential directory this path enters, if any."""
+    folded = tuple(part.lower() for part in path.parts)
+    for parent, child in pairwise(folded):
+        if (parent, child) in _CREDENTIAL_PATH_PAIRS:
+            return f"{parent}/{child}"
+    return None
 
 
 def _is_sensitive_read_name(name: str) -> bool:
@@ -236,13 +262,17 @@ def _is_sensitive_read_name(name: str) -> bool:
         return False
     if folded.startswith(".env"):
         return not folded.endswith(_ENV_TEMPLATE_SUFFIXES)
+    if folded in _CREDENTIAL_CONFIG_NAMES:
+        return True
     if folded.endswith(_SENSITIVE_READ_EXTENSIONS):
         return True
     return bool(_SENSITIVE_KEY_NAME_RE.search(folded))
 
 
 class FileGuard:
-    _ALWAYS_BLOCKED = frozenset({".ssh", ".gnupg", ".aws", ".kube"})
+    # Mirrors ``macos_seatbelt._CREDENTIAL_DIRECTORIES`` minus ``.agent-smith``,
+    # which has its own dedicated platform-state and runtime-credential rules.
+    _ALWAYS_BLOCKED = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
     _SENSITIVE_WRITE = frozenset({".env", ".env.local", ".env.production", ".npmrc", ".pypirc"})
     _SENSITIVE_DIRS = frozenset({".git"})
 
@@ -418,6 +448,24 @@ class FileGuard:
                     high_risk=True,
                     reason=(
                         f"Access to {part}/ contains user credentials and requires "
+                        "high-risk approval"
+                    ),
+                )
+
+        # Some credential stores are only identifiable as a directory *pair*
+        # (``.config/gh``, ``Library/Keychains``).  Without this they fell
+        # through to the ordinary boundary approval, which is ELEVATED — and an
+        # ELEVATED path approval is cached by ToolRegistry, so one approval
+        # handed the model repeat access to a GitHub or gcloud token store.
+        for candidate in (target, lexical):
+            pair = _credential_pair(candidate)
+            if pair:
+                return self._path_approval(
+                    target,
+                    writing=writing,
+                    high_risk=True,
+                    reason=(
+                        f"Access to {pair}/ contains user credentials and requires "
                         "high-risk approval"
                     ),
                 )
@@ -1149,6 +1197,18 @@ class ToolGuard:
                 or tool_call.name
             )
             return ApprovalScope.network(str(target), high_risk=high_risk)
+
+        # A multi-action tool's capability is the action, not its path arguments.
+        # ``git_ops`` declares ``cwd`` as a path arg and ``normalize_call``
+        # always fills it with the workspace, so every action — including
+        # ``push``, which sends code to a remote — rendered as the same
+        # "write to <workspace>" card, describing neither what would happen nor
+        # where.  Naming the action keeps the approval honest.
+        action = str(tool_call.arguments.get("action") or "").strip()
+        if action:
+            return ApprovalScope.operation(
+                f"{tool_call.name}:{action}", high_risk=high_risk
+            )
 
         for argument_name in path_args:
             value = tool_call.arguments.get(argument_name)

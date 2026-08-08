@@ -235,17 +235,14 @@ function useMemoryMaintenance(baseUrl: string): MemoryMaintenance | null {
 /**
  * The label for ambient memory work, or null when there is nothing to show.
  *
- * Running work outranks owed work. Dreaming is the rarest, then periodic
- * curation, then ordinary compilation, so the most meaningful active pass is
- * the one named.
+ * Running work outranks owed work. Dreaming is the rarer pass, so it is named
+ * ahead of ordinary compilation.
  */
 export function memoryMaintenanceLabel(maintenance: MemoryMaintenance | null): string | null {
   if (!maintenance) return null;
   if (maintenance.dream === "running") return "dreaming";
-  if (maintenance.nudge === "running") return "curating memory";
   if (maintenance.compile === "running") return "compiling memory";
   if (maintenance.dream === "pending") return "dream queued";
-  if (maintenance.nudge === "pending") return "memory review queued";
   if (maintenance.compile === "pending") return "memory queued";
   return null;
 }
