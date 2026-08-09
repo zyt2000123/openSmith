@@ -293,6 +293,44 @@ test("trailing token_usage after done is not dropped", async () => {
   }
 });
 
+test("a trailing token_usage in its own read is yielded exactly once", async () => {
+  const originalFetch = globalThis.fetch;
+  // The realistic wire shape: the server frames done, then flushes the usage
+  // counter, and TCP puts them in separate reads.  The drain loop must consume
+  // its buffer, or the same counter is replayed on the next read and again in
+  // the post-loop flush — and the store adds usage up rather than replacing it.
+  const reads = [
+    'event: done\ndata: {"id":"message-1"}\n\n',
+    'event: token_usage\ndata: {"input_tokens":1,"output_tokens":2,"total_tokens":3}\n\n',
+  ];
+  let index = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const chunk = reads[index++];
+      if (chunk === undefined) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(new TextEncoder().encode(chunk));
+    },
+  });
+
+  globalThis.fetch = async () => new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+
+  try {
+    const events = [];
+    for await (const event of streamMessage("http://127.0.0.1:8140", "session-1", "hello", { timeoutMs: 1_000 })) {
+      events.push(event);
+    }
+    assert.deepEqual(events, [
+      { type: "done", id: "message-1", status: "completed" },
+      { type: "token_usage", input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("SSE decoder retains a tool preflight result", () => {
   const event = decodeSseEvent('event: tool_result\ndata: {"id":"tool-1","preflight":true,"summary":"facts first"}');
 

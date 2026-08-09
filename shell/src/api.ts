@@ -937,6 +937,13 @@ async function* readSseEvents(
           buffer += decoder.decode(trailingValue, { stream: true });
           const trailingParsed = splitSseBuffer(buffer);
           assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
+          // Consume the buffer, exactly as the main loop does.  Leaving the parsed
+          // frames behind re-yielded them on the next drain read and again in the
+          // post-loop flush, and after `done` the only events still allowed
+          // through are the usage counters — which the store *accumulates*, so a
+          // trailing token_usage arriving in its own TCP read doubled the turn and
+          // session totals.
+          buffer = trailingParsed.remainder;
           const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
           yield* trailingConsumed.events;
         }
