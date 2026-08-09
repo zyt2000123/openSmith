@@ -35,7 +35,7 @@ graph LR
 ```text
 lifecycle event boundary → RunEventRecorder.record
 record → TraceStore.append + RunSummaryStore.upsert
-terminal trace → IncidentDetector → RunDiagnoser → improvement proposal
+verified terminal trace → IncidentDetector → RunDiagnoser → improvement proposal
 summary history → HealthCalculator → Server read-only API / Shell panel
 ```
 
@@ -51,7 +51,9 @@ trace 保存单 Run 的时间线以支持追踪；summary 保存查询友好的�
 
 ### 观测数据也有安全边界
 
-`TraceStore` 对内容做 secret redaction 与深度/长度限制。观测系统不能因为“用于调试”而保存工具参数、响应或凭据的无限原文；恢复 Run 时还需要重新锚定 trace，保证时间线连续。
+`TraceStore` 对内容做 secret redaction 与深度/长度限制，并以 hash chain + terminal anchor 保证篡改可发现。`ObservabilityReader` 在把 trace 交给诊断、incident、health、token 导入或 API 前先验证链；验证失败时隔离原始事件，返回 `trace_integrity` 事故，而不是从不可信记录推导结论。观测系统不能因为“用于调试”而保存工具参数、响应或凭据的无限原文。
+
+服务重启会将遗留活跃 Run 置为 `cancelled/server_restarted`，随后补写其 terminal trace 和 summary；若进程恰好在 trace terminal 写入与 summary 写入之间退出，启动协调会从已经验证的 trace 物化缺失 summary。这样 RunState、trace 和可查询摘要不会长期分叉。
 
 ## 失败语义与测试
 

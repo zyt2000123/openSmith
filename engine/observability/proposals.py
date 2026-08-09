@@ -36,6 +36,17 @@ class ImprovementProposer:
                 suggested_change=None,
                 approval_required=False,
             )
+        if diagnosis.primary_category == "trace_integrity":
+            return RunImprovementProposal(
+                run_id=diagnosis.run_id,
+                agent_id=diagnosis.agent_id,
+                status="no_action",
+                category=diagnosis.primary_category,
+                title="Trace integrity investigation required",
+                rationale=diagnosis.summary,
+                suggested_change=None,
+                approval_required=False,
+            )
         title, change = _proposal_for(diagnosis.primary_category)
         return RunImprovementProposal(
             run_id=diagnosis.run_id,

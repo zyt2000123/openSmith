@@ -118,4 +118,3 @@ async def test_lease_columns_can_be_released(monkeypatch) -> None:
 
         assert updated["lease_until"] in (None, "")
         assert updated["lease_token"] in (None, "")
-

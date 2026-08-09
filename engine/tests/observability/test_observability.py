@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from engine.execution.events import EventType, ExecutionEvent
+import pytest
+
+from engine.execution.events import EventType, ExecutionEvent, RunObservationContext
 from engine.observability import (
     HealthCalculator,
     IncidentDetector,
+    ObservabilityReader,
     ObservabilityRetentionPolicy,
     RunDiagnoser,
     RunEventRecorder,
@@ -15,6 +19,8 @@ from engine.observability import (
     RunSummaryRecord,
     RunSummaryStore,
     TraceStore,
+    TraceIntegrityError,
+    finalize_interrupted_run,
 )
 
 
@@ -86,8 +92,6 @@ def test_recorder_continues_projecting_when_trace_write_fails() -> None:
 
 
 def test_observation_persists_the_route_selected_during_execution(tmp_path) -> None:
-    from engine.execution.events import RunObservationContext
-
     observation = RunObservation.start(RunObservationContext(
         run_id="run-route",
         agent_id="smith",
@@ -107,6 +111,107 @@ def test_observation_persists_the_route_selected_during_execution(tmp_path) -> N
     assert record.metadata.identity_id == "coding"
     assert record.metadata.route_id == "tdd-development"
     assert record.metadata.pipeline_id == "tdd-development"
+
+
+def test_interrupted_run_finalization_replays_only_the_unsettled_trace_tail(tmp_path) -> None:
+    """Startup recovery must make a crashed resumed run queryable without
+    double-counting the already-summarised earlier attempt."""
+    context = RunObservationContext(
+        run_id="run-recovered",
+        agent_id="smith",
+        session_id="session-1",
+        profile_dir=tmp_path,
+        created_at="2026-08-08T00:00:00+00:00",
+    )
+    first_attempt = RunObservation.start(context)
+    first_attempt.record(ExecutionEvent(EventType.RUN_STARTED, {"run_id": context.run_id}))
+    first_attempt.record(ExecutionEvent(EventType.TOOL_CALL_START, {"name": "search"}))
+    first_attempt.record(ExecutionEvent(EventType.RUN_FINISHED, {
+        "run_id": context.run_id,
+        "status": "cancelled",
+        "reason": "consumer_disconnected",
+    }))
+
+    resumed_attempt = RunObservation.start(context)
+    resumed_attempt.record(ExecutionEvent(EventType.RUN_STARTED, {"run_id": context.run_id}))
+    resumed_attempt.record(ExecutionEvent(EventType.TOKEN_USAGE, {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+    }))
+
+    final_summary = finalize_interrupted_run(
+        context,
+        status="cancelled",
+        reason="server_restarted",
+    )
+
+    trace = TraceStore(tmp_path)
+    assert [record["type"] for record in trace.read(context.run_id)] == [
+        "run_started",
+        "tool_call_start",
+        "run_finished",
+        "run_started",
+        "token_usage",
+        "run_finished",
+    ]
+    assert trace.verify(context.run_id).ok
+    assert final_summary.event_count == 6
+    assert final_summary.token_usage["total_tokens"] == 15
+
+    summary = RunSummaryStore(tmp_path).get(context.run_id)
+    assert summary is not None
+    assert summary.summary.event_count == 6
+    assert summary.summary.tool_call_count == 1
+    assert summary.summary.token_usage["total_tokens"] == 15
+    assert summary.summary.outcome == "cancelled"
+    assert summary.summary.reason == "server_restarted"
+
+
+def test_reader_quarantines_a_tampered_trace_from_derived_observability(tmp_path) -> None:
+    """Hash-chain verification is a read-path boundary, not a test-only API."""
+    context = RunObservationContext(
+        run_id="run-tampered",
+        agent_id="smith",
+        profile_dir=tmp_path,
+        created_at="2026-08-08T00:00:00+00:00",
+    )
+    observation = RunObservation.start(context)
+    observation.record(ExecutionEvent(EventType.TOOL_CALL_START, {"name": "shell"}))
+    observation.record(ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+        "name": "shell",
+        "error": False,
+    }))
+    observation.record(ExecutionEvent(EventType.RUN_FINISHED, {"status": "completed"}))
+
+    trace_path = tmp_path / "traces" / "run-tampered.jsonl"
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    records[0]["data"]["name"] = "forged-shell"
+    trace_path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    reader = ObservabilityReader(tmp_path)
+    verification = reader.verify_trace(context.run_id)
+    with pytest.raises(TraceIntegrityError):
+        reader.read_trace(context.run_id)
+    diagnosis = reader.get_diagnosis(context.run_id)
+    incidents = reader.list_incidents("smith", limit=10)
+    health = reader.get_health("smith", limit=10)
+
+    assert verification.ok is False
+    assert diagnosis is not None
+    assert diagnosis.primary_category == "trace_integrity"
+    assert diagnosis.failure_node == "trace"
+    assert diagnosis.status == "needs_attention"
+    assert any(incident.category == "trace_integrity" for incident in incidents)
+    proposal = reader.get_improvement_proposal(context.run_id)
+    assert proposal is not None
+    assert proposal.status == "no_action"
+    assert proposal.approval_required is False
+    # The trace's tool result was not trusted after verification failed.
+    assert health.tool_success_rate is None
 
 
 def test_summary_store_persists_aggregate_only_and_merges_resumed_run(tmp_path) -> None:

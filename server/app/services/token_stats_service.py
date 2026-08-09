@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 
 from common import config as common_config
-from engine.observability import ObservabilityReader
+from engine.observability import ObservabilityReader, TraceIntegrityError
 
 if TYPE_CHECKING:
     from engine.llm.observability import GenerationRecord
@@ -21,6 +22,7 @@ DbProvider = Callable[[], Awaitable[aiosqlite.Connection]]
 
 # These values describe unavailable or locally derived attribution, not a model.
 _NON_MODEL_STAT_KEYS = frozenset({"unknown", "local-estimate"})
+logger = logging.getLogger(__name__)
 
 
 class TokenStatsService:
@@ -354,10 +356,17 @@ class TokenStatsService:
                 if run_id in live_recorded_run_ids:
                     continue
                 cursor = cursors.get(run_id, {})
-                records, next_offset = self._observability.read_trace_from(
-                    run_id,
-                    offset=int(cursor.get("byte_offset") or 0),
-                )
+                try:
+                    records, next_offset = self._observability.read_trace_from(
+                        run_id,
+                        offset=int(cursor.get("byte_offset") or 0),
+                    )
+                except TraceIntegrityError:
+                    logger.warning(
+                        "skipping token import from unverifiable trace (run=%s)",
+                        run_id,
+                    )
+                    continue
                 batches.append((run_id, records, next_offset))
             return batches
 

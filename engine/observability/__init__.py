@@ -13,9 +13,9 @@ from .incidents import IncidentDetector, RunIncident
 from .index import ObservabilityRetentionPolicy
 from .projections import RunSummary, RunSummaryProjection
 from .proposals import ImprovementProposer, RunImprovementProposal
-from .reader import ObservabilityReader
+from .reader import ObservabilityReader, TraceIntegrityError
 from .recorder import RunEventRecorder
-from .runtime import RunObservation
+from .runtime import RunObservation, finalize_interrupted_run
 from .summary_store import RunMetadata, RunSummaryRecord, RunSummaryStore
 from .trace_store import TraceStore
 
@@ -30,6 +30,7 @@ __all__ = (
     "RunIncident",
     "RunImprovementProposal",
     "RunObservation",
+    "finalize_interrupted_run",
     "RunMetadata",
     "RunSummary",
     "RunSummaryRecord",
@@ -37,5 +38,6 @@ __all__ = (
     "RunSummaryStore",
     "TraceStore",
     "ObservabilityReader",
+    "TraceIntegrityError",
     "ObservabilityRetentionPolicy",
 )

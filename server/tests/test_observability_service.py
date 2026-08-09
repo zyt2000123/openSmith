@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -167,3 +168,24 @@ def test_observability_service_does_not_expose_another_agents_run(tmp_path: Path
     with pytest.raises(HTTPException) as exc:
         service.get_trace("another-agent", "run-1", limit=10)
     assert exc.value.status_code == 404
+
+
+def test_observability_service_quarantines_a_tampered_trace(tmp_path: Path) -> None:
+    service = _service_with_run(tmp_path)
+    trace_path = tmp_path / "traces" / "run-1.jsonl"
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    records[0]["data"]["name"] = "forged-shell"
+    trace_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.get_trace("smith-id", "run-1", limit=10)
+
+    assert exc_info.value.status_code == 409
+    diagnosis = service.get_diagnosis("smith-id", "run-1")
+    assert diagnosis.primary_category == "trace_integrity"
+    proposal = service.get_improvement_proposal("smith-id", "run-1")
+    assert proposal.status == "no_action"
+    assert proposal.approval_required is False

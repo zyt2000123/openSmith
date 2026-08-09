@@ -10,6 +10,9 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from common.paths import AppPaths  # noqa: E402
+from engine.execution import EventType, ExecutionEvent, RunObservationContext, RunStateStore  # noqa: E402
+from engine.observability import RunObservation, RunSummaryStore, TraceStore  # noqa: E402
 from app import main  # noqa: E402
 from app.infrastructure import auth  # noqa: E402
 
@@ -155,6 +158,71 @@ def test_server_lifespan_recovers_interrupted_runs_before_serving_requests(
 
     with TestClient(main.app):
         assert calls == ["store", "recover"]
+
+
+def test_startup_reconciliation_closes_a_recovered_run_in_trace_and_summary(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=tmp_path / "project")
+    main.common_config.reset_paths(paths)
+    try:
+        store = RunStateStore(paths.agent_dir)
+        store.create("run-recovered", agent_id="smith", session_id="session-1")
+        store.transition("run-recovered", "running")
+        observation = RunObservation.start(RunObservationContext(
+            run_id="run-recovered",
+            agent_id="smith",
+            session_id="session-1",
+            profile_dir=paths.agent_dir,
+        ))
+        observation.record(ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-recovered"}))
+
+        recovered = store.recover_interrupted()
+        main._reconcile_startup_observability(store, recovered_run_ids=recovered)
+
+        trace = TraceStore(paths.agent_dir)
+        records = trace.read("run-recovered")
+        assert [record["type"] for record in records] == ["run_started", "run_finished"]
+        assert records[-1]["data"] == {
+            "run_id": "run-recovered",
+            "status": "cancelled",
+            "reason": "server_restarted",
+        }
+        assert trace.verify("run-recovered").ok
+        summary = RunSummaryStore(paths.agent_dir).get("run-recovered")
+        assert summary is not None
+        assert summary.summary.outcome == "cancelled"
+        assert summary.summary.reason == "server_restarted"
+    finally:
+        main.common_config.reset_paths()
+
+
+def test_startup_reconciliation_materializes_a_summary_after_trace_terminal_write(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=tmp_path / "project")
+    main.common_config.reset_paths(paths)
+    try:
+        store = RunStateStore(paths.agent_dir)
+        store.create("run-terminal", agent_id="smith", session_id="session-1")
+        store.transition("run-terminal", "running")
+        store.transition("run-terminal", "completed")
+        trace = TraceStore(paths.agent_dir)
+        trace.append("run-terminal", ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-terminal"}))
+        trace.append("run-terminal", ExecutionEvent(EventType.RUN_FINISHED, {
+            "run_id": "run-terminal",
+            "status": "completed",
+        }))
+        trace.seal("run-terminal")
+
+        main._reconcile_startup_observability(store, recovered_run_ids=[])
+
+        summary = RunSummaryStore(paths.agent_dir).get("run-terminal")
+        assert summary is not None
+        assert summary.summary.event_count == 2
+        assert summary.summary.outcome == "completed"
+    finally:
+        main.common_config.reset_paths()
 
 
 def test_server_lifespan_survives_unavailable_run_state_storage(

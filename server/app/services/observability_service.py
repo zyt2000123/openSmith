@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
-from engine.observability import ObservabilityReader, RunSummaryRecord
+from engine.observability import ObservabilityReader, RunSummaryRecord, TraceIntegrityError
 
 from ..schemas.observability import AgentHealthOut, RunDiagnosisOut, RunImprovementProposalOut, RunIncidentOut, RunSummaryOut, RunTraceEventOut
 
@@ -23,6 +23,8 @@ class ObservabilityService:
         self._owned_record(agent_id, run_id)
         try:
             records = self.reader.read_trace(run_id, limit=limit)
+        except TraceIntegrityError as exc:
+            raise HTTPException(409, "Run trace integrity verification failed") from exc
         except ValueError as exc:
             raise HTTPException(404, "Run not found") from exc
         return [RunTraceEventOut(**record) for record in records]
