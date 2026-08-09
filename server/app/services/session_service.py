@@ -59,8 +59,13 @@ def _session_stream_lock(session_id: str) -> asyncio.Lock:
             _SESSION_STREAM_LOCKS[session_id] = lock
         return lock
 
-# Recent messages passed to the engine as short-term conversational context
-_HISTORY_LIMIT = 10
+# Recent messages passed to the engine as short-term conversational context.
+# Only visible reply text is stored per turn — tool calls, file reads and
+# command output never reach the next turn — so even a turn that ran dozens of
+# tools costs one short message here.  At 10 (5 exchanges) a working session
+# lost sight of its own opening question long before the work was done.  The
+# engine's context fitter still compacts whatever does not fit the window.
+_HISTORY_LIMIT = 40
 # Upper bound for one compress call; far beyond any real session while still
 # bounding the row count (compression already loads the conversation into memory).
 _COMPRESS_MESSAGE_CAP = 50_000
