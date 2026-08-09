@@ -322,6 +322,11 @@ def test_macos_seatbelt_blocks_nested_env_variants_but_allows_normal_files(
         ".config/gcloud/credentials.db",
         "Library/Keychains/login.keychain-db",
         "keys/id_ed25519",
+        # A key keeps its shape when copied or rotated.  Exact-name matching
+        # let the shell read what read_file refuses without high-risk approval.
+        "keys/id_rsa_old",
+        "keys/backup-id_ed25519",
+        "id_ecdsa.bak",
     ],
 )
 def test_macos_seatbelt_blocks_workspace_credentials_and_private_keys(

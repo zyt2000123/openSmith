@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import os
+import re
 import stat
 import sys
 from collections.abc import Iterable
@@ -21,7 +22,19 @@ _CREDENTIAL_DIRECTORIES = frozenset(
 )
 _CREDENTIAL_CONFIGS = frozenset({".npmrc", ".pypirc", ".netrc", ".git-credentials"})
 _PRIVATE_KEY_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx"})
-_PRIVATE_KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
+# An SSH-style private key keeps its shape when it is copied or rotated:
+# ``id_rsa_old``, ``backup-id_ed25519``.  Exact-name matching covered only the
+# pristine spelling, so the shell tool read a key that ``read_file`` refuses
+# without high-risk approval -- the weakest copy of a rule setting the real
+# security level, exactly as ``safety/tool_guard.py`` warns about this same
+# triplicated list.  Mirrors ``tool_guard._SENSITIVE_KEY_NAME_RE``; the sandbox
+# may not import the safety layer, so the shape is duplicated, not shared.
+#
+# Written as POSIX ERE (no ``(?:...)``): the identical source is embedded in
+# the Seatbelt profile below, which macOS compiles with regcomp.
+_PRIVATE_KEY_NAME_PATTERN = r"([^/]*[-_.])?id_(rsa|dsa|ecdsa|ed25519)([-_.][^/]*)?"
+_PRIVATE_KEY_NAME_RE = re.compile(rf"^{_PRIVATE_KEY_NAME_PATTERN}$")
+_PRIVATE_KEY_PROFILE_PLACEHOLDER = "__PRIVATE_KEY_NAME__"
 _DEFAULT_RUNTIME_SECRET_PATHS = (
     Path.home() / ".agent-smith" / "config.yaml",
     Path.home() / ".agent-smith" / "config.yml",
@@ -44,7 +57,7 @@ def _is_sensitive_data_path(path: Path) -> bool:
         or name == ".env"
         or name.startswith(".env.")
         or name in _CREDENTIAL_CONFIGS
-        or name in _PRIVATE_KEY_NAMES
+        or _PRIVATE_KEY_NAME_RE.fullmatch(name) is not None
         or path.suffix.lower() in _PRIVATE_KEY_SUFFIXES
     )
 
@@ -217,7 +230,7 @@ class MacOSSeatbeltEnvironment:
         #"/.*\.(pem|key|p12|pfx)$")))
 (deny file-read* file-write*
     (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?id_(rsa|dsa|ecdsa|ed25519)$")))
+        #"/(.*/)?__PRIVATE_KEY_NAME__$")))
 ; Git metadata can embed credentials (e.g. URL-embedded in .git/config or a
 ; repo-local credential store) and object files can contain committed
 ; secrets, so every .git read except plain .gitignore files is denied.  The
@@ -236,6 +249,12 @@ class MacOSSeatbeltEnvironment:
     (regex (string-append "^" (regex-quote (param "WORKSPACE"))
         #"/(.*/)?\.(npmrc|pypirc|netrc|git-credentials)$")))
 """
+        # One source for the private-key name shape: the Python check above and
+        # this profile drifted apart once already, and only the profile decides
+        # what the shell can actually open.
+        profile = profile.replace(
+            _PRIVATE_KEY_PROFILE_PLACEHOLDER, _PRIVATE_KEY_NAME_PATTERN
+        )
         if protected_write_denies:
             return f"{profile}{protected_write_denies}\n"
         return profile
