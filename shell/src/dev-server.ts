@@ -90,12 +90,8 @@ const LOOPBACK_HOST_RE = /^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?)$/;
  */
 function assertSafeServerTarget(target: ServerTarget): void {
   if (!target.envOverride) return;
-  let parsed: URL;
-  try {
-    parsed = new URL(target.baseUrl);
-  } catch {
-    throw new Error(`SMITH_SERVER_URL is not a valid URL: ${target.baseUrl}`);
-  }
+  // serverTarget() has already parsed and reported a malformed URL.
+  const parsed = new URL(target.baseUrl);
   const host = parsed.hostname
     .toLowerCase()
     .replace(/^\[|\]$/g, "")
@@ -226,7 +222,15 @@ export function resolveRepoRoot(): string {
 
 function serverTarget(): ServerTarget {
   const baseUrl = process.env.SMITH_SERVER_URL ?? DEFAULT_SERVER_URL;
-  const parsedUrl = new URL(baseUrl);
+  // Parse here, not only in assertSafeServerTarget(): this runs first, so its
+  // bare `TypeError: Invalid URL` was the only thing the user ever saw, and it
+  // names neither the variable at fault nor its value.
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(baseUrl);
+  } catch {
+    throw new Error(`SMITH_SERVER_URL is not a valid URL: ${baseUrl}`);
+  }
   const fallbackPort = parsedUrl.protocol === "https:" ? "443" : "80";
   return {
     baseUrl,
@@ -251,6 +255,29 @@ async function isHealthy(baseUrl: string): Promise<boolean> {
   }
 }
 
+/** Ask the server whether it is still running the code that is on disk.
+ *
+ * The OpenAPI probe only compares API *shape*, which a bug fix rarely changes,
+ * so a long-lived uvicorn kept being reused for hours after the fix it was
+ * missing had landed. The server reports this itself: it knows which files it
+ * imported and when it started.
+ */
+async function stalenessIssue(baseUrl: string): Promise<string | null> {
+  const timeout = createTimeoutSignal(SERVER_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(serverEndpoint(baseUrl, "/api/health"), { signal: timeout.signal });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as { stale?: unknown };
+    return payload.stale === true ? "it is running code older than the working tree; restart it" : null;
+  } catch {
+    // A server too old to report staleness, or an unreadable body, is handled by
+    // the API-shape probe; never fail the boot over this signal alone.
+    return null;
+  } finally {
+    timeout.dispose();
+  }
+}
+
 async function compatibilityIssue(baseUrl: string): Promise<string | null> {
   const timeout = createTimeoutSignal(SERVER_PROBE_TIMEOUT_MS);
   try {
@@ -259,7 +286,8 @@ async function compatibilityIssue(baseUrl: string): Promise<string | null> {
 
     const payload = (await response.json()) as { paths?: Record<string, unknown> };
     const missingOperations = findMissingApiOperations(payload.paths ?? {});
-    return missingOperations.length === 0 ? null : `missing API operations: ${missingOperations.join(", ")}`;
+    if (missingOperations.length > 0) return `missing API operations: ${missingOperations.join(", ")}`;
+    return await stalenessIssue(baseUrl);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return `could not inspect OpenAPI schema: ${message}`;

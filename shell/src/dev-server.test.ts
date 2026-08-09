@@ -75,7 +75,13 @@ test("configured server URLs with a trailing slash preserve a sub-path prefix", 
 
   try {
     await ensureLocalServer();
-    assert.deepEqual(requests, ["http://127.0.0.1:8140/smith/api/health", "http://127.0.0.1:8140/smith/openapi.json"]);
+    // The third request is the staleness probe, which re-reads /api/health after
+    // the API shape checks out — it has to keep the prefix too.
+    assert.deepEqual(requests, [
+      "http://127.0.0.1:8140/smith/api/health",
+      "http://127.0.0.1:8140/smith/openapi.json",
+      "http://127.0.0.1:8140/smith/api/health",
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalServerUrl === undefined) delete process.env.SMITH_SERVER_URL;

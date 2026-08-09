@@ -1,6 +1,10 @@
 import asyncio
 import logging
+import os
+import sys
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -127,6 +131,37 @@ app.include_router(agent.router, dependencies=[Depends(require_auth)])
 app.include_router(config.router, dependencies=[Depends(require_auth)])
 
 
+_STARTED_AT = time.time()
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+
+
+def _running_stale_code() -> bool:
+    """Report whether any loaded source file is newer than this process.
+
+    uvicorn imports each module once; editing the file afterwards changes
+    nothing until a restart.  A shell that only probes the API shape cannot see
+    that — every route still exists — so a fix could sit on disk for hours while
+    the running server kept serving the code it started with.  Only
+    already-imported files are considered, which is exactly the code in memory.
+    """
+    for module in list(sys.modules.values()):
+        path = getattr(module, "__file__", None)
+        if not path or not path.startswith(_REPO_ROOT):
+            continue
+        try:
+            if os.path.getmtime(path) > _STARTED_AT:
+                return True
+        except OSError:
+            # A deleted or unreadable module file says nothing about staleness.
+            continue
+    return False
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {
+        "status": "ok",
+        "version": "0.2.0",
+        "started_at": _STARTED_AT,
+        "stale": _running_stale_code(),
+    }
