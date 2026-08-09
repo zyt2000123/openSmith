@@ -273,10 +273,36 @@ def _normalize_markdown(text: str) -> str:
     return text.strip() + "\n" if text.strip() else ""
 
 
+class MemoryViewUnreadableError(MemoryCompilationError):
+    """An accepted view exists but could not be read back safely.
+
+    Compilation must not continue on this: ``existing`` is what tells the
+    model which facts are already recorded, so treating an unreadable view as
+    an empty one produces a draft containing only the newest evidence -- and
+    committing that silently replaces the whole document.
+    """
+
+
 def _read_view(path: Path) -> str:
+    """Return the accepted view, refusing to report a wiped one as empty.
+
+    ``sanitize_memory_text`` returns "" for the entire text when a secret or
+    injection pattern matches only across a line break (``api_key:`` ending one
+    line, ordinary prose beginning the next -- ``\\s`` spans the newline).  On a
+    non-empty file that answer means "this could not be cleaned line by line",
+    never "there was nothing here".  Dream already refuses to act on it when
+    writing (see ``dream._sanitize_all_layers``); the read side must refuse too,
+    because its caller overwrites the file rather than blanking it.
+    """
     if not path.is_file():
         return ""
-    content, _, _ = sanitize_memory_text(path.read_text(encoding="utf-8"))
+    raw = path.read_text(encoding="utf-8")
+    content, secrets_removed, injections_removed = sanitize_memory_text(raw)
+    if raw.strip() and not content.strip() and (secrets_removed or injections_removed):
+        raise MemoryViewUnreadableError(
+            f"{path.name} could not be sanitized without discarding the whole "
+            "document; refusing to compile over it"
+        )
     return _normalize_markdown(content)
 
 
@@ -296,8 +322,14 @@ def _commit_view(
         raise MemoryCompilationError(f"{view} compilation output contains unsafe content")
 
     target = resolve_view_path(policy, memory_dir.parent, view)
-    if existing and existing != draft:
-        atomic_write_text(target.with_name(f"{target.name}.bak"), existing)
+    # Back up what is on disk rather than the caller's ``existing``.  The two
+    # differ whenever the accepted view could not be read back in full, and
+    # that is exactly when the overwrite is least recoverable -- an empty
+    # ``existing`` used to skip the backup entirely.
+    if target.is_file():
+        on_disk = target.read_text(encoding="utf-8")
+        if on_disk.strip() and on_disk != draft:
+            atomic_write_text(target.with_name(f"{target.name}.bak"), on_disk)
     atomic_write_text(target, draft)
     append_memory_history(
         memory_dir,
@@ -527,7 +559,14 @@ async def compile_context(
         return False
 
     target = resolve_view_path(policy, memory_dir.parent, "context")
-    existing = _read_view(target)
+    try:
+        existing = _read_view(target)
+    except MemoryViewUnreadableError as exc:
+        # Audit it here: the read happens before the compile try-block, so
+        # without this the refusal would reach the log but never the history
+        # that ``recent_failure_streak`` reports to the client.
+        _record_compile_failure(memory_dir, "context", policy, "", exc)
+        raise
     fp_file = memory_dir / ".fp_context"
     fp = _fingerprint([
         f"{entry.get('timestamp', '')}:{entry.get('kind', '')}:{entry.get('task', '')[:80]}"
@@ -596,7 +635,11 @@ async def compile_durable(
     if _read_fp(fp_file) == fp and out.is_file():
         return False
 
-    existing = _read_view(out)
+    try:
+        existing = _read_view(out)
+    except MemoryViewUnreadableError as exc:
+        _record_compile_failure(memory_dir, "durable", policy, "", exc)
+        raise
     source = _entries_to_source(
         entries,
         summary_limit=1000,

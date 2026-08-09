@@ -398,8 +398,18 @@ class PromptAssembler:
         if learned_context:
             from engine.memory._files import sanitize_memory_text
 
-            learned_context, _, _ = sanitize_memory_text(learned_context)
-            learned_context = learned_context.strip()
+            cleaned, secrets_removed, injections_removed = sanitize_memory_text(
+                learned_context
+            )
+            if not cleaned.strip() and (secrets_removed or injections_removed):
+                # Dropping the layer is the safe answer, but doing it silently
+                # is indistinguishable from "nothing learned yet" — for every
+                # turn from here on. Say it instead.
+                _log.warning(
+                    "context.md was dropped from the prompt: it could not be "
+                    "sanitized without discarding the whole document"
+                )
+            learned_context = cleaned.strip()
         if learned_context:
             learned_context = _LEARNED_CONTEXT_FENCE + "\n\n" + learned_context
         layers.append(PromptLayer(

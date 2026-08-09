@@ -1500,3 +1500,95 @@ def test_save_conversation_memory_retries_dream_after_insufficient_output(tmp_pa
     asyncio.run(run())
 
     assert (memory_dir / ".dream_counter").read_text(encoding="utf-8") == "50"
+
+
+# A durable view whose only offence is a keyword ending one line and ordinary
+# prose beginning the next.  No single line matches the secret scan; the whole
+# text does, because ``\s`` in the pattern spans the newline.
+CROSS_LINE_FALSE_POSITIVE_DOC = """# Durable Project Memory
+
+## Active Work
+- **凭据配置** — 状态：待复核；下一步：统一改用环境变量 api_key:
+  从密钥管理器读取，不再硬编码；更新：2026-08-09。
+
+## Pending
+
+## Verified Outcomes
+- **路由回归** — 结果：CJK 边界四条全关；证据：test_result。
+
+## Decisions
+- **持久层** — 决定 SQLite 单文件；适用范围：当前项目；证据：user_explicit。
+
+## Known Pitfalls
+"""
+
+
+def test_read_view_refuses_to_report_a_wiped_document_as_empty(tmp_path: Path) -> None:
+    """A non-empty view that cannot be cleaned line by line is not an empty view.
+
+    Reporting it as empty made the compiler generate a document from the newest
+    evidence alone, and committing that replaced every accepted fact.
+    """
+    from engine.memory.compile import MemoryViewUnreadableError, _read_view
+
+    target = tmp_path / "durable.md"
+    target.write_text(CROSS_LINE_FALSE_POSITIVE_DOC, encoding="utf-8")
+
+    with pytest.raises(MemoryViewUnreadableError):
+        _read_view(target)
+
+    assert _read_view(tmp_path / "absent.md") == ""
+
+
+def test_compile_durable_refuses_to_overwrite_an_unreadable_view(tmp_path: Path) -> None:
+    """The accepted document must survive a cross-line false positive intact."""
+    from engine.memory.compile import MemoryViewUnreadableError
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    target = memory_dir / "durable.md"
+    target.write_text(CROSS_LINE_FALSE_POSITIVE_DOC, encoding="utf-8")
+    event = {
+        "task": "new task",
+        "summary": "completed",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    (memory_dir / "recent.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    with pytest.raises(MemoryViewUnreadableError):
+        asyncio.run(compile_durable(memory_dir, StaticLLM(), PassReviewer()))
+
+    assert target.read_text(encoding="utf-8") == CROSS_LINE_FALSE_POSITIVE_DOC
+    history = (memory_dir / "memory_history.jsonl").read_text(encoding="utf-8")
+    assert '"status": "rejected"' in history
+
+
+def test_commit_view_backs_up_the_file_on_disk_not_the_callers_existing(
+    tmp_path: Path,
+) -> None:
+    """The backup must survive even when the caller believes there was nothing.
+
+    ``existing`` and the file disagree precisely when the overwrite is least
+    recoverable, so the backup is taken from disk.
+    """
+    from engine.memory.compile import _MEMORY_POLICY, _commit_view
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    target = memory_dir / "durable.md"
+    target.write_text(
+        DURABLE_DOC.format(evidence="- **旧事实** — 必须留下备份。"), encoding="utf-8"
+    )
+
+    _commit_view(
+        _MEMORY_POLICY,
+        "durable",
+        memory_dir,
+        existing="",  # what an unreadable view used to look like to the caller
+        draft=EMPTY_DURABLE_DOC,
+        review_rounds=1,
+    )
+
+    backup = memory_dir / "durable.md.bak"
+    assert backup.is_file(), "overwrote the accepted view with no recoverable copy"
+    assert "旧事实" in backup.read_text(encoding="utf-8")
