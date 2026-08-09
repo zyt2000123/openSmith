@@ -1246,11 +1246,18 @@ async function exitWith(code: number): Promise<void> {
   process.exit(signalExitCode ?? code);
 }
 
+const SIGNAL_EXIT_HARD_TIMEOUT_MS = 3_000;
+
 async function exitOnSignal(code: number): Promise<void> {
   // Claim the signal exit code unconditionally: even if an exit is already in
   // flight (awaiting stopOwnedServer), the process must exit 130/143, not 0.
   signalExitCode = code;
   if (exiting) return;
+  // waitUntilExit() is the only thing that drives exitWith() below, so an unmount
+  // that never settles leaves the shell hung — and, worse, never reaps uvicorn,
+  // which then outlives the terminal as a port-holding orphan. Bound the wait.
+  const hardExit = setTimeout(() => void exitWith(code), SIGNAL_EXIT_HARD_TIMEOUT_MS);
+  hardExit.unref?.();
   try {
     app.unmount();
   } catch {
