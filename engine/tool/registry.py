@@ -341,8 +341,16 @@ class ToolRegistry:
         call directly).  They are excluded here — not just by the callers — so
         a scoped or explicitly-enabled view can never widen a model-facing
         schema list into the hidden set.
+
+        ``enabled`` narrows the profile/identity allowlist; it never replaces
+        it.  Asking for a single name by hand — as the lazy-schema loader does
+        for whatever tool the model names — must not hand back the contract of
+        a capability configuration disabled.
         """
-        active = set(enabled) if enabled is not None else self._enabled
+        active = self._enabled
+        if enabled is not None:
+            requested = set(enabled)
+            active = requested if active is None else active & requested
         result: list[dict] = []
         for name, (defn, _) in self._tools.items():
             if active is not None and name not in active:

@@ -972,6 +972,23 @@ async def react_event_loop(
                 )
             )
 
+            # Lazy schemas exist to keep large JSON contracts out of the stable
+            # prompt prefix; they are not a permission boundary.  A model that
+            # calls a tool by name without first loading its schema is asking
+            # for a capability the profile/identity allowlist already grants, so
+            # complete the handshake here.  Reporting it as ``Tool disabled``
+            # read as terminal and made runs abandon a working tool for the rest
+            # of the conversation.  ``_requested_tool_schema`` resolves through
+            # ``get_schemas``, so a pipeline-scoped registry still refuses a
+            # capability its node never had.
+            if lazy_tool_schemas and call.name not in visible_tool_names:
+                loaded_name, loaded_schema, _ = _requested_tool_schema(
+                    tool_registry, {"name": call.name},
+                )
+                if loaded_schema is not None and loaded_name is not None:
+                    visible_tool_names.add(loaded_name)
+                    tools = [*(tools or []), loaded_schema]
+
             # ``render_ui`` is an engine-owned presentation capability. It is
             # deliberately not executed like a provider tool: rendering it
             # cannot write files, call the network, or make arbitrary JSON a

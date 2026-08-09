@@ -157,6 +157,90 @@ def test_react_event_loop_loads_only_requested_tool_schemas() -> None:
     assert any(event.type is EventType.TEXT_DELTA for event in events)
 
 
+def test_react_event_loop_runs_a_tool_called_without_the_schema_handshake() -> None:
+    """Skipping ``get_tool_schema`` must not read as a disabled capability.
+
+    ``Tool disabled: <name>`` is terminal wording: a run that hit it abandoned
+    the tool for the rest of the conversation instead of loading its schema.
+    """
+    async def read_file(path: str) -> str:
+        return f"read {path}"
+
+    async def run():
+        registry = ToolRegistry(lazy_tool_schemas=True)
+        registry.register(
+            "read_file", "Read one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            read_file,
+        )
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[ToolCallData(
+                id="read-1", name="read_file", arguments={"path": "notes.txt"},
+            )]),
+            ChatResponse(text="done"),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm, [{"role": "user", "content": "Read notes"}], registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    result = next(
+        message for message in llm.chat_calls[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "read-1"
+    )
+    assert result["content"] == "read notes.txt"
+    # The schema joins the exposed list, so the next turn can call it directly.
+    assert [tool["function"]["name"] for tool in llm.chat_calls[1]["tools"]] == [
+        "get_tool_schema", "read_file",
+    ]
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
+
+
+def test_react_event_loop_still_refuses_a_tool_outside_the_allowlist() -> None:
+    """Completing the handshake must not widen the profile/identity allowlist."""
+    async def read_file(path: str) -> str:
+        return f"read {path}"
+
+    async def delete_file(path: str) -> str:
+        return f"deleted {path}"
+
+    async def run():
+        registry = ToolRegistry(lazy_tool_schemas=True)
+        registry.register(
+            "read_file", "Read one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            read_file,
+        )
+        registry.register(
+            "delete_file", "Delete one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            delete_file,
+        )
+        registry.set_enabled(["read_file"])
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[ToolCallData(
+                id="del-1", name="delete_file", arguments={"path": "notes.txt"},
+            )]),
+            ChatResponse(text="done"),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm, [{"role": "user", "content": "Delete notes"}], registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    result = next(
+        message for message in llm.chat_calls[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "del-1"
+    )
+    assert result["content"] == "Tool disabled: delete_file"
+    assert "delete_file" not in json.dumps(llm.chat_calls[1]["tools"])
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
+
+
 def test_time_tool_result_is_appended_as_user_context() -> None:
     async def current_time():
         return '{"local_time":"2026-08-07T12:00:00+08:00","timezone":"Asia/Shanghai"}'
