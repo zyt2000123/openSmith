@@ -70,6 +70,19 @@ test("leaves no escape byte behind for any payload", () => {
   }
 });
 
+test("bidi overrides are stripped so a rendered command cannot lie", () => {
+  // Built from code points, not literals: an RLO pasted into source is invisible
+  // in review, which is the whole point of stripping it.
+  const RLO = String.fromCharCode(0x202e);
+  const LRI = String.fromCharCode(0x2066);
+  const PDI = String.fromCharCode(0x2069);
+
+  assert.equal(sanitizeTerminalText(`rm -rf /${RLO}tmp${PDI}`), "rm -rf /tmp");
+  assert.equal(sanitizeTerminalText(`${LRI}safe${PDI}`), "safe");
+  // Strong RTL characters are content, not formatting, and must survive.
+  assert.equal(sanitizeTerminalText("مرحبا"), "مرحبا");
+});
+
 test("sanitizeUnknownText tolerates non-strings", () => {
   assert.equal(sanitizeUnknownText(`x${BEL}`), "x");
   assert.equal(sanitizeUnknownText(undefined), "");
