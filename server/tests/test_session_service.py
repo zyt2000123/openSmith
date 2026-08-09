@@ -371,6 +371,14 @@ async def test_stream_message_forwards_skillchain_lifecycle_events(
             data={"skill": "grilling", "verdict": "retry", "reason": "Need a target user."},
         )
         yield SimpleNamespace(
+            type=SimpleNamespace(value="gate_evidence"),
+            data={
+                "skill": "grilling",
+                "evidence": ["target=individual creators", "api_key=must-not-stream"],
+                "evidence_hash": "evidence-hash-1",
+            },
+        )
+        yield SimpleNamespace(
             type=SimpleNamespace(value="backtrack"),
             data={"from": "research", "to": "grilling", "reason": "Scope is still ambiguous."},
         )
@@ -402,7 +410,7 @@ async def test_stream_message_forwards_skillchain_lifecycle_events(
     lifecycle = {
         event["event"]: json.loads(event["data"])
         for event in events
-        if event["event"] in {"route_decided", "gate_result", "backtrack", "awaiting_input"}
+        if event["event"] in {"route_decided", "gate_result", "gate_evidence", "backtrack", "awaiting_input"}
     }
     assert lifecycle == {
         "route_decided": {
@@ -412,6 +420,11 @@ async def test_stream_message_forwards_skillchain_lifecycle_events(
             "pipeline_id": "requirements-research",
         },
         "gate_result": {"skill": "grilling", "verdict": "retry", "reason": "Need a target user."},
+        "gate_evidence": {
+            "skill": "grilling",
+            "evidence_hash": "evidence-hash-1",
+            "evidence_count": 2,
+        },
         "backtrack": {"from": "research", "to": "grilling", "reason": "Scope is still ambiguous."},
         "awaiting_input": {"skill": "grilling", "reason": "awaiting_user_input"},
     }

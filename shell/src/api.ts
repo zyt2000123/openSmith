@@ -181,6 +181,7 @@ export type StreamEvent =
   | { type: "skill"; name: string; status: string }
   | { type: "route_decided"; identityId: string; identityName: string; routeId: string; pipelineId: string }
   | { type: "gate_result"; skill: string; verdict: string; reason: string }
+  | { type: "gate_evidence"; skill: string; evidenceHash: string; evidenceCount: number }
   | { type: "backtrack"; from: string; to: string; reason: string }
   | { type: "awaiting_input"; skill: string; reason: string }
   | ({ type: "token_usage" } & TokenUsage)
@@ -799,6 +800,12 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     skill: terminalText(payload.skill).slice(0, 120),
     verdict: terminalText(payload.verdict).slice(0, 80),
     reason: terminalText(payload.reason).slice(0, 500),
+  }),
+  gate_evidence: (payload) => ({
+    type: "gate_evidence",
+    skill: terminalText(payload.skill).slice(0, 120),
+    evidenceHash: terminalText(payload.evidence_hash).slice(0, 128),
+    evidenceCount: Math.max(0, Math.floor(finiteNumber(payload.evidence_count, 0))),
   }),
   backtrack: (payload) => ({
     type: "backtrack",

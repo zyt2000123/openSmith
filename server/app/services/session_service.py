@@ -635,11 +635,10 @@ class SessionService:
                         payload["evidence_hash"] = ev.data["evidence_hash"]
                     yield sse("gate_result", payload)
                 elif t == "gate_evidence":
+                    evidence = ev.data.get("evidence")
                     yield sse("gate_evidence", {
                         "skill": str(ev.data.get("skill") or ""),
-                        "evidence": ev.data.get("evidence")
-                        if isinstance(ev.data.get("evidence"), list)
-                        else [],
+                        "evidence_count": len(evidence) if isinstance(evidence, list) else 0,
                         "evidence_hash": ev.data.get("evidence_hash"),
                     })
                 elif t == "backtrack":

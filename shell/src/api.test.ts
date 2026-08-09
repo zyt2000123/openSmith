@@ -70,6 +70,10 @@ test("SSE decoder exposes the SkillChain lifecycle", () => {
     { type: "gate_result", skill: "grilling", verdict: "retry", reason: "Need a target user." },
   );
   assert.deepEqual(
+    decodeSseEvent('event: gate_evidence\ndata: {"skill":"grilling","evidence_hash":"abc123","evidence_count":2}'),
+    { type: "gate_evidence", skill: "grilling", evidenceHash: "abc123", evidenceCount: 2 },
+  );
+  assert.deepEqual(
     decodeSseEvent('event: backtrack\ndata: {"from":"research","to":"grilling","reason":"Scope is ambiguous."}'),
     { type: "backtrack", from: "research", to: "grilling", reason: "Scope is ambiguous." },
   );
