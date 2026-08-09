@@ -318,6 +318,15 @@ def _fallback_inline(value: object, limit: int) -> str:
     return cleaned[:limit].rstrip(" .。；;")
 
 
+def _fallback_event_content(value: object, limit: int) -> str:
+    """Recover candidate content from the internal ``[memory]`` envelope."""
+    marker = "[memory] "
+    content = _fallback_inline(value, limit + len(marker))
+    if content.startswith(marker):
+        content = content[len(marker):]
+    return content[:limit].rstrip(" .。；;")
+
+
 def _fallback_date(value: object) -> str:
     parsed = None
     try:
@@ -352,7 +361,10 @@ def _existing_fallback_bullets(existing: str, section: str) -> list[str]:
             in_section = line[3:].strip() in accepted
             continue
         if in_section and line.lstrip().startswith("-"):
-            item = _fallback_inline(line.lstrip()[1:], 320)
+            # This text already came from the accepted, sanitized durable view.
+            # Keep the complete bullet; the document-level eviction pass below
+            # enforces the total budget without silently cutting facts in half.
+            item = line.lstrip()[1:].strip()
             if item:
                 bullets.append(f"- {item}")
     return bullets
@@ -370,17 +382,20 @@ def _fallback_durable_document(existing: str, entries: list[dict]) -> str:
         for section in _DURABLE_FALLBACK_SECTIONS
     }
     for entry in entries[-16:]:
-        topic = _fallback_inline(entry.get("task"), 80) or "未命名工作"
+        content = _fallback_event_content(entry.get("task"), 260)
+        topic = content[:80].rstrip(" .。；;") or "未命名工作"
         summary = _fallback_inline(entry.get("summary"), 260)
         evidence = _fallback_inline(entry.get("evidence"), 40) or "memory_event"
         kind = str(entry.get("kind") or "work")
         if kind == "decision":
-            lines = [("Decisions", f"- **{topic}**: 决定 {summary}；适用范围：当前项目；证据：{evidence}。")]
+            decision = content or topic
+            lines = [("Decisions", f"- **{topic}**: 决定 {decision}；适用范围：当前项目；证据：{evidence}。")]
         elif kind in {"correction", "pitfall"}:
-            lines = [("Known Pitfalls", f"- **{topic}**: 记录已确认修正：{summary}；证据：{evidence}。")]
+            pitfall = content or topic
+            lines = [("Known Pitfalls", f"- **{topic}**: 记录已确认陷阱：{pitfall}；证据：{evidence}。")]
         elif kind in {"work", "partial_work"}:
             date = _fallback_date(entry.get("timestamp"))
-            status = "未完成" if kind == "partial_work" else "已记录"
+            status = "未完成" if kind == "partial_work" else "待复核"
             reason = _fallback_inline(entry.get("reason"), 80)
             reason_suffix = f"；原因：{reason}" if reason else ""
             lines = [(
@@ -388,12 +403,19 @@ def _fallback_durable_document(existing: str, entries: list[dict]) -> str:
                 f"- **{topic}** — 状态：{status}{reason_suffix}；"
                 f"下一步：依据现有证据继续处理；更新：{date}。",
             )]
-            if summary:
+            if kind == "work" and summary:
                 lines.append(
-                    ("Verified Outcomes", f"- **{topic}** — 结果：{summary}；证据：{evidence}。")
+                    (
+                        "Pending",
+                        f"- **{topic}** — 待处理：待复核本回合摘要“{summary}”；"
+                        f"证据标签：{evidence}。",
+                    )
                 )
-        elif summary:
-            lines = [("Verified Outcomes", f"- **{topic}** — 结果：{summary}；证据：{evidence}。")]
+        elif content:
+            # Structured memory candidates put the asserted content in
+            # ``task`` and the supporting evidence description in ``summary``.
+            # The latter must never be promoted into the asserted fact.
+            lines = [("Verified Outcomes", f"- **{topic}** — 结果：{content}；证据：{evidence}。")]
         else:
             continue
         for section, line in lines:
@@ -606,7 +628,15 @@ async def compile_durable(
             review_rounds=rounds,
         )
     except Exception as exc:
-        if reviewer is None or not _can_use_compilation_fallback(exc):
+        requires_reviewed_merge = any(
+            str(entry.get("kind") or "") in {"correction", "forget"}
+            for entry in entries
+        )
+        if (
+            reviewer is None
+            or requires_reviewed_merge
+            or not _can_use_compilation_fallback(exc)
+        ):
             _record_compile_failure(memory_dir, "durable", policy, existing, exc)
             raise
         try:

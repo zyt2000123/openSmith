@@ -758,9 +758,3 @@ def test_dream_maintenance_trims_stale_audit_history(tmp_path: Path) -> None:
     ).splitlines()
     assert remaining
     assert all("2020-01-01" not in line for line in remaining)
-
-
-# ---------------------------------------------------------------------------
-# Nudge candidate handling
-# ---------------------------------------------------------------------------
-

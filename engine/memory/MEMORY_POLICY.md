@@ -111,7 +111,7 @@ views:
 
 ## 5. durable.md
 
-`durable.md` 是 Smith 唯一的长期项目记忆。它没有时间窗口，也不会因为一段时间没有新事件而被清空；每次编译都是「现有 durable + 本次新增证据」的增量合并。遗忘只能来自三种原因：用户要求忘记、被更新的条目取代、或为了守住字符预算而淘汰最旧且不再被引用的条目。
+`durable.md` 是 Smith 唯一的长期项目记忆。它没有时间窗口，也不会因为一段时间没有新事件而被清空；每次编译都是「现有 durable + 本次新增证据」的增量合并。遗忘只能来自三种原因：用户要求忘记、被更新的条目取代、或为了守住字符预算而按明确的价值顺序淘汰完整旧条目。
 
 ### 5.1 准入规则
 
@@ -132,7 +132,7 @@ views:
 
 工作完成或被放弃后，把它从 `Active Work` 移走：留下值得复用的结论时改写进 `Verified Outcomes`、`Decisions` 或 `Known Pitfalls`，没有可复用结论时直接删除。
 
-超出字符预算时，先淘汰最旧且不再被引用的 `Active Work` 与 `Pending` 条目；`Decisions` 和 `Known Pitfalls` 最后淘汰。
+超出字符预算时，按 `Active Work` → `Pending` → `Verified Outcomes` → `Decisions` → `Known Pitfalls` 的顺序淘汰完整条目；同一章节按文档中从前到后的顺序处理。
 
 ### 5.2 固定结构
 
@@ -167,6 +167,17 @@ Compiler 必须：
 - 删除已过期、被纠正或重复的条目；
 - 在证据不足时保留旧内容或保持对应章节为空；
 - 严格遵守目标模板和字符预算。
+
+### 6.1 durable 确定性 fallback
+
+`context.md` 没有 fallback。`durable.md` 已配置 Reviewer，且生成—审核尝试因审核未通过或超时失败时，Compiler 可以使用确定性 fallback，但只能将已接受的旧条目和本次结构化证据做抽取式合并，不得推断或改写事实。
+
+- 存在 `correction` 或 `forget` 证据时禁止 fallback；旧文件和未消费证据必须保留，等待下次完整审核；
+- `partial_work` 只能进入 `Active Work`，不得生成 `Verified Outcomes`；
+- 自动 `work` 事件的 summary 是助手回复而非原始工具证据，fallback 只能将它标为 `Pending` 待复核内容，不得写入 `Verified Outcomes`；
+- `memory_ops.add` 候选必须以 `content`（事件的 `task` 字段）作为记忆正文；`evidence` 说明（事件的 `summary` 字段）只能支持正文，不得反向成为事实；
+- 已接受旧条目必须整条保留；超出总字符预算时按 5.1 的顺序删除完整条目，不得截断条目；
+- fallback 输出仍必须通过路径、标题/章节、字符预算和密钥/注入检查，并以 `status=fallback` 备份、原子写入和审计。
 
 ## 7. Reviewer 合同
 
@@ -204,7 +215,7 @@ Dream 是低频的记忆卫生作业，不产生新知识，也不改写记忆�
 
 ## 9. 写入与审计
 
-正式 Markdown 只有在其 Reviewer 通过后才可写入，并必须执行路径检查、结构检查、字符预算、安全扫描、备份和原子替换。
+正式 Markdown 只有在其 Reviewer 通过后才可写入；唯一例外是 6.1 定义的 `durable.md` 确定性 fallback。两条路径都必须执行路径检查、结构检查、字符预算、安全扫描、备份和原子替换。
 
 每次尝试向 `memory/memory_history.jsonl` 追加一条脱敏记录，至少包含：
 

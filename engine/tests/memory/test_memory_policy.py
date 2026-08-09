@@ -112,6 +112,7 @@ def test_memory_policy_loads_one_canonical_two_view_contract(tmp_path: Path) -> 
         "durable", role="compiler"
     )
     assert "Reviewer" in policy.instructions_for("durable", role="reviewer")
+    assert "确定性 fallback" in policy.instructions_for("durable", role="compiler")
 
 
 def test_memory_policy_rejects_wrong_or_extra_markdown_sections() -> None:

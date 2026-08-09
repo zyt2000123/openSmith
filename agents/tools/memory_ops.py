@@ -261,5 +261,3 @@ def _search_sync(mem_dir: Path, query: str, memory_api: Any) -> str:
 
 async def _search(mem_dir: Path, query: str, memory_api: Any) -> str:
     return await asyncio.to_thread(_search_sync, mem_dir, query, memory_api)
-
-

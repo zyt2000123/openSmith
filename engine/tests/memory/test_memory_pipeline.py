@@ -107,6 +107,14 @@ class PassReviewer(StaticLLM):
         )
 
 
+class RejectReviewer(StaticLLM):
+    def __init__(self) -> None:
+        super().__init__(
+            '{"pass": false, "hard_fail": ["unsupported draft"], '
+            '"soft_fail": [], "feedback": "retry with supported content"}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Path traversal: episodes
 # ---------------------------------------------------------------------------
@@ -299,20 +307,11 @@ def test_compile_durable_uses_safe_fallback_when_review_fails(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    class AlwaysFailReviewer:
-        async def chat(self, messages, **_):
-            return ChatResponse(
-                text='{"pass": false, "hard_fail": [], "soft_fail": ["quality"], "feedback": "retry"}'
-            )
-
-        async def close(self):
-            pass
-
     assert asyncio.run(
         compile_durable(
             memory_dir,
             StaticLLM(DURABLE_DOC.format(evidence="- **Draft**: candidate.")),
-            reviewer=AlwaysFailReviewer(),
+            reviewer=RejectReviewer(),
         )
     ) is True
 
@@ -327,6 +326,243 @@ def test_compile_durable_uses_safe_fallback_when_review_fails(tmp_path: Path) ->
     ][-1]
     assert history["status"] == "fallback"
     assert history["review_rounds"] == 3
+
+
+def test_compile_durable_does_not_fallback_past_a_forget_request(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    existing = DURABLE_DOC.format(
+        evidence="- **Legacy backend**: keep using the retired backend."
+    )
+    (memory_dir / "durable.md").write_text(existing, encoding="utf-8")
+    event = {
+        "task": "忘记继续使用旧后端的决定",
+        "summary": "已确认不再保留该项目记忆",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "forget",
+        "scope": "user",
+        "evidence": "user_explicit",
+    }
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(event, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MemoryCompilationError, match="did not pass review"):
+        asyncio.run(
+            compile_durable(
+                memory_dir,
+                StaticLLM(DURABLE_DOC.format(evidence="")),
+                reviewer=RejectReviewer(),
+            )
+        )
+
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == existing
+
+
+def test_compile_durable_does_not_fallback_past_a_correction(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    existing = DURABLE_DOC.format(
+        evidence="- **Backend port**: the backend listens on port 8000."
+    )
+    (memory_dir / "durable.md").write_text(existing, encoding="utf-8")
+    event = {
+        "task": "纠正：后端现在监听 9000，不是 8000",
+        "summary": "已确认端口变更",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "correction",
+        "scope": "user",
+        "evidence": "user_explicit",
+    }
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(event, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MemoryCompilationError, match="did not pass review"):
+        asyncio.run(
+            compile_durable(
+                memory_dir,
+                StaticLLM(DURABLE_DOC.format(evidence="")),
+                reviewer=RejectReviewer(),
+            )
+        )
+
+    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == existing
+
+
+def test_compile_durable_fallback_does_not_verify_partial_work(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    event = {
+        "task": "deploy the backend",
+        "summary": "draft reply claimed the deployment succeeded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "partial_work",
+        "scope": "project",
+        "evidence": "partial_tool_result",
+        "status": "incomplete",
+        "reason": "provider timeout",
+    }
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(event) + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(
+        compile_durable(
+            memory_dir,
+            StaticLLM(DURABLE_DOC.format(evidence="")),
+            reviewer=RejectReviewer(),
+        )
+    ) is True
+
+    content = (memory_dir / "durable.md").read_text(encoding="utf-8")
+    active_work = content.split("## Active Work\n", 1)[1].split("\n## Pending", 1)[0]
+    verified = content.split("## Verified Outcomes\n", 1)[1].split(
+        "\n## Decisions", 1
+    )[0]
+    assert "deploy the backend" in active_work
+    assert "未完成" in active_work
+    assert "draft reply claimed the deployment succeeded" not in verified
+
+
+def test_compile_durable_fallback_marks_completed_work_summary_for_review(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    event = {
+        "task": "inspect the deployment",
+        "summary": "the assistant claimed production was fixed",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "work",
+        "scope": "project",
+        "evidence": "tool_result",
+    }
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(event) + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(
+        compile_durable(
+            memory_dir,
+            StaticLLM(DURABLE_DOC.format(evidence="")),
+            reviewer=RejectReviewer(),
+        )
+    ) is True
+
+    content = (memory_dir / "durable.md").read_text(encoding="utf-8")
+    pending = content.split("## Pending\n", 1)[1].split(
+        "\n## Verified Outcomes", 1
+    )[0]
+    verified = content.split("## Verified Outcomes\n", 1)[1].split(
+        "\n## Decisions", 1
+    )[0]
+    assert "待复核" in pending
+    assert "the assistant claimed production was fixed" in pending
+    assert "the assistant claimed production was fixed" not in verified
+
+
+def test_compile_durable_fallback_preserves_an_accepted_long_entry(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    suffix = "KEEP-THIS-ACCEPTED-SUFFIX"
+    existing_entry = "- **Architecture rationale**: " + ("verified detail " * 24) + suffix
+    existing = DURABLE_DOC.format(evidence=existing_entry)
+    (memory_dir / "durable.md").write_text(existing, encoding="utf-8")
+    event = {
+        "task": "run one more verification",
+        "summary": "the new check passed",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "work",
+        "scope": "project",
+        "evidence": "test_result",
+    }
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(event) + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(
+        compile_durable(
+            memory_dir,
+            StaticLLM(DURABLE_DOC.format(evidence="")),
+            reviewer=RejectReviewer(),
+        )
+    ) is True
+
+    assert suffix in (memory_dir / "durable.md").read_text(encoding="utf-8")
+
+
+def test_compile_durable_fallback_records_the_decision_not_its_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    event = {
+        "task": "Use SQLite for local persistence",
+        "summary": "Acknowledged the user's decision",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "decision",
+        "scope": "project",
+        "evidence": "user_explicit",
+    }
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(event) + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(
+        compile_durable(
+            memory_dir,
+            StaticLLM(DURABLE_DOC.format(evidence="")),
+            reviewer=RejectReviewer(),
+        )
+    ) is True
+
+    content = (memory_dir / "durable.md").read_text(encoding="utf-8")
+    decisions = content.split("## Decisions\n", 1)[1].split(
+        "\n## Known Pitfalls", 1
+    )[0]
+    assert "决定 Use SQLite for local persistence" in decisions
+    assert "决定 Acknowledged the user's decision" not in decisions
+
+
+def test_compile_durable_fallback_records_manual_fact_content_not_evidence_label(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    event = {
+        "task": "[memory] The backend listens on port 9000",
+        "summary": "Evidence: verified in the project configuration",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": "verified_fact",
+        "scope": "project",
+        "evidence": "source_document",
+    }
+    (memory_dir / "recent.jsonl").write_text(
+        json.dumps(event) + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(
+        compile_durable(
+            memory_dir,
+            StaticLLM(DURABLE_DOC.format(evidence="")),
+            reviewer=RejectReviewer(),
+        )
+    ) is True
+
+    content = (memory_dir / "durable.md").read_text(encoding="utf-8")
+    verified = content.split("## Verified Outcomes\n", 1)[1].split(
+        "\n## Decisions", 1
+    )[0]
+    assert "结果：The backend listens on port 9000" in verified
+    assert "结果：Evidence:" not in verified
 
 
 def test_compile_durable_bounds_a_slow_reviewer_with_safe_fallback(
