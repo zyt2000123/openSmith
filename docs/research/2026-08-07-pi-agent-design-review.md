@@ -1,7 +1,7 @@
 # Pi Agent 设计复核：对 Agent-Smith 内核收敛的启示
 
-> 调研日期：2026-08-07  
-> 基线：Pi `v0.84.0`，发布于 2026-08-06，对应 commit [`a5f43bf8aff3c55752432655f7334e3dafd1e256`](https://github.com/earendil-works/pi/commit/a5f43bf8aff3c55752432655f7334e3dafd1e256)。  
+> 调研日期：2026-08-07<br>
+> 基线：Pi `v0.84.0`，发布于 2026-08-06，对应 commit [`a5f43bf8aff3c55752432655f7334e3dafd1e256`](https://github.com/earendil-works/pi/commit/a5f43bf8aff3c55752432655f7334e3dafd1e256)。<br>
 > 范围：只使用 Pi 官方仓库源码和官方文档；源码链接固定到上述 commit。本文是设计比较，不代表 Agent-Smith 已支持 Pi 的能力，也不建议直接移植实现。
 
 ## 结论

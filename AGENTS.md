@@ -53,10 +53,16 @@ ReAct (see `agents/identities/coding.yaml` instructions). A pipeline whose
 skills are not installed falls back to direct ReAct for the whole run, and
 ROUTE_DECIDED reports the fallback (no pipeline) rather than the skipped chain.
 
-Prompt assembly (`engine/context/assembler.py`) stacks 12 trust-tagged layers:
+Prompt assembly (`engine/context/assembler.py`) stacks 16 trust-tagged layers:
 Agent Role / Style / Workflow, Tool Usage Policy, Available Tools, Available
 Skills, Learned User Context, Global Instructions, Project Instructions,
-Identity Guidance, Evaluation Safety Guidance (conditional), Output Style.
+Identity Guidance, Evaluation Safety Guidance (conditional), Output Style,
+Memory Governance, Durable Memory, Runtime Context, Engine Runtime Control.
+
+Memory has two rendered views: `context.md` (user collaboration) and
+`memory/durable.md` (project memory). Both are budget-capped and injected in
+full. `memory/recent.jsonl` is the evidence log; there is no query-time memory
+retrieval, FTS index, embeddings, or episode layer.
 
 ## 4. Product Language
 
