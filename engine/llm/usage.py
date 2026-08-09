@@ -58,7 +58,11 @@ def normalize_usage(raw: object) -> dict[str, int]:
     flag reads naturally as "how many calls reported usage" — no consumer sums
     this dict blindly, they all read named token keys.
     """
-    if not isinstance(raw, dict):
+    # An empty ``usage`` object carries exactly as much accounting information
+    # as no ``usage`` object at all.  Counting it as reported would defeat the
+    # only thing this flag exists for: telling a relay that stopped reporting
+    # apart from a call that genuinely consumed nothing.
+    if not isinstance(raw, dict) or not raw:
         return dict.fromkeys(USAGE_KEYS, 0) | {USAGE_REPORTED_KEY: 0}
 
     input_tokens = _first(raw, ("prompt_tokens",), ("input_tokens",))
