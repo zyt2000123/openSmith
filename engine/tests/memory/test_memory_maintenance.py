@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import engine.memory.maintenance as maintenance_module
+from engine.memory.store import _COMPILE_INTERVAL
 from engine.memory.maintenance import (
     MemoryLifecycleHooks,
     MemoryMaintenanceService,
@@ -176,7 +177,9 @@ def test_memory_after_turn_hook_records_and_compiles(tmp_path: Path) -> None:
     async def run() -> tuple[list[bool], StaticLLM]:
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
-        (memory_dir / ".compile_counter").write_text("4", encoding="utf-8")
+        (memory_dir / ".compile_counter").write_text(
+        str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+    )
         llm = StaticLLM()
         hooks = HookManager()
         hooks.register(MemoryLifecycleHooks(
@@ -253,7 +256,9 @@ def test_idle_maintenance_retries_pending_work_without_running_below_threshold(
     async def run() -> tuple[bool, bool]:
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
-        (memory_dir / ".compile_counter").write_text("5", encoding="utf-8")
+        (memory_dir / ".compile_counter").write_text(
+        str(_COMPILE_INTERVAL), encoding="utf-8"
+    )
         service = MemoryMaintenanceService(StaticLLM())  # type: ignore[arg-type]
         first = await service.run_idle_maintenance(memory_dir)
         # A failed, due compilation remains pending; a future idle tick retries it.
@@ -348,7 +353,9 @@ def test_deferred_memory_maintenance_does_not_block_turn_and_can_be_drained(
     async def run() -> tuple[bool, float, Path]:
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
-        (memory_dir / ".compile_counter").write_text("4", encoding="utf-8")
+        (memory_dir / ".compile_counter").write_text(
+        str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+    )
         service = MemoryMaintenanceService(
             StaticLLM(),
             reviewer=PassReviewer(),
@@ -380,7 +387,9 @@ def test_deferred_memory_maintenance_uses_background_llm(
     async def run() -> tuple[StaticLLM, StaticLLM]:
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
-        (memory_dir / ".compile_counter").write_text("4", encoding="utf-8")
+        (memory_dir / ".compile_counter").write_text(
+        str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+    )
         interactive = StaticLLM()
         background = StaticLLM()
         service = MemoryMaintenanceService(

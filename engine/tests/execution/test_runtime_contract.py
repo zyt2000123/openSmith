@@ -1832,7 +1832,11 @@ def test_runtime_compiles_tool_backed_work_into_durable_memory(tmp_path: Path) -
         services.gate_llm = PassReviewer()  # type: ignore[assignment]
         state_dir = runtime.profile_dir / "memory"
         state_dir.mkdir(parents=True)
-        (state_dir / ".compile_counter").write_text("4", encoding="utf-8")
+        from engine.memory.store import _COMPILE_INTERVAL
+
+        (state_dir / ".compile_counter").write_text(
+            str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+        )
 
         result = await reply_with_runtime(EngineRequest(message="use a tool"), runtime, services)
 

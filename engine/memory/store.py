@@ -33,7 +33,7 @@ MemoryMaintenance = Callable[[Path], Awaitable[bool]]
 # Conversation-level memory persistence
 # ---------------------------------------------------------------------------
 
-_COMPILE_INTERVAL = 5
+_COMPILE_INTERVAL = 10
 _MAX_EVENT_VALUE_CHARS = 16_000
 _MAX_LEARNING_SIGNALS = 16
 

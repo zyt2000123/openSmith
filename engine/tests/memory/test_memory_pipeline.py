@@ -24,6 +24,7 @@ from engine.memory._review import _generate_and_review_result
 from engine.memory.dream import dream_report_completed, run_dream
 from engine.memory.policy import MemoryPolicyError
 from engine.memory.store import (
+    _COMPILE_INTERVAL,
     _MAX_EVENT_VALUE_CHARS,
     save_conversation_memory,
 )
@@ -1046,7 +1047,9 @@ def test_generate_and_review_retries_on_hard_fail() -> None:
 def test_save_conversation_memory_retries_compilation_after_missing_config(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
-    (memory_dir / ".compile_counter").write_text("4", encoding="utf-8")
+    (memory_dir / ".compile_counter").write_text(
+        str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+    )
 
     async def run() -> None:
         maintenance = AsyncMock(return_value=False)
@@ -1068,13 +1071,17 @@ def test_save_conversation_memory_retries_compilation_after_missing_config(tmp_p
 
     asyncio.run(run())
 
-    assert (memory_dir / ".compile_counter").read_text(encoding="utf-8") == "5"
+    assert (memory_dir / ".compile_counter").read_text(encoding="utf-8") == str(
+        _COMPILE_INTERVAL
+    )
 
 
 def test_save_conversation_memory_resets_counter_after_success(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
-    (memory_dir / ".compile_counter").write_text("4", encoding="utf-8")
+    (memory_dir / ".compile_counter").write_text(
+        str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+    )
 
     async def run() -> None:
         maintenance = AsyncMock(return_value=True)
@@ -1095,7 +1102,9 @@ def test_save_conversation_memory_resets_counter_after_success(tmp_path: Path) -
 def test_save_conversation_memory_keeps_compile_counter_when_durable_output_is_rejected(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
-    (memory_dir / ".compile_counter").write_text("4", encoding="utf-8")
+    (memory_dir / ".compile_counter").write_text(
+        str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+    )
 
     async def run() -> None:
         maintenance = AsyncMock(return_value=False)
@@ -1109,7 +1118,9 @@ def test_save_conversation_memory_keeps_compile_counter_when_durable_output_is_r
 
     asyncio.run(run())
 
-    assert (memory_dir / ".compile_counter").read_text(encoding="utf-8") == "5"
+    assert (memory_dir / ".compile_counter").read_text(encoding="utf-8") == str(
+        _COMPILE_INTERVAL
+    )
 
 
 def test_save_conversation_memory_promotes_generic_work_into_durable(tmp_path: Path) -> None:
@@ -1131,7 +1142,7 @@ def test_save_conversation_memory_promotes_generic_work_into_durable(tmp_path: P
             )
             return True
 
-        for turn in range(5):
+        for turn in range(_COMPILE_INTERVAL):
             await save_conversation_memory(
                 tmp_path,
                 f"task {turn}",
