@@ -266,13 +266,20 @@ async function stalenessIssue(baseUrl: string): Promise<string | null> {
   const timeout = createTimeoutSignal(SERVER_PROBE_TIMEOUT_MS);
   try {
     const response = await fetch(serverEndpoint(baseUrl, "/api/health"), { signal: timeout.signal });
-    if (!response.ok) return null;
+    if (!response.ok) return `health responded with HTTP ${response.status}`;
     const payload = (await response.json()) as { stale?: unknown };
-    return payload.stale === true ? "it is running code older than the working tree; restart it" : null;
-  } catch {
-    // A server too old to report staleness, or an unreadable body, is handled by
-    // the API-shape probe; never fail the boot over this signal alone.
+    if (payload.stale === true) return "it is running code older than the working tree; restart it";
+    // A missing flag is not "probably fine": it means the process predates this
+    // field, which is exactly the long-lived server this check exists to catch —
+    // the most stale backend is the least likely to report that it is stale.
+    // The shape probe already demands every operation the shell needs, so
+    // demanding one health field alongside them is the same standard, not a
+    // stricter one.
+    if (typeof payload.stale !== "boolean") return "it is too old to report whether its code is current";
     return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `could not read the health report: ${message}`;
   } finally {
     timeout.dispose();
   }

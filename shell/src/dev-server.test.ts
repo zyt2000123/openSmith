@@ -60,6 +60,29 @@ test("startup rejects an explicitly configured server missing a shell API operat
   await assertConfiguredServerIsRejected(paths);
 });
 
+test("a server whose health omits the staleness flag is rejected", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalServerUrl = process.env.SMITH_SERVER_URL;
+  process.env.SMITH_SERVER_URL = "http://127.0.0.1:8140";
+  // Every operation the shell needs is present — this is exactly the server the
+  // shape probe used to wave through: old enough to predate the flag, which is
+  // itself the evidence that it is running code from another era.
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api/health")) return Response.json({ status: "ok", version: "0.2.0" });
+    if (url.endsWith("/openapi.json")) return Response.json({ paths: compatiblePaths() });
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    await assert.rejects(ensureLocalServer(), /too old to report whether its code is current/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalServerUrl === undefined) delete process.env.SMITH_SERVER_URL;
+    else process.env.SMITH_SERVER_URL = originalServerUrl;
+  }
+});
+
 test("configured server URLs with a trailing slash preserve a sub-path prefix", async () => {
   const originalFetch = globalThis.fetch;
   const originalServerUrl = process.env.SMITH_SERVER_URL;
@@ -68,7 +91,7 @@ test("configured server URLs with a trailing slash preserve a sub-path prefix", 
   globalThis.fetch = async (input) => {
     const url = String(input);
     requests.push(url);
-    if (url === "http://127.0.0.1:8140/smith/api/health") return new Response("ok");
+    if (url === "http://127.0.0.1:8140/smith/api/health") return Response.json({ status: "ok", stale: false });
     if (url === "http://127.0.0.1:8140/smith/openapi.json") return Response.json({ paths: compatiblePaths() });
     throw new Error(`Unexpected request: ${url}`);
   };

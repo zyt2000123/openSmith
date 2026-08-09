@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -133,6 +134,7 @@ app.include_router(config.router, dependencies=[Depends(require_auth)])
 
 _STARTED_AT = time.time()
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
+_VENDORED = re.compile(r"[/\\](?:\.venv|site-packages|node_modules)[/\\]")
 
 
 def _running_stale_code() -> bool:
@@ -147,6 +149,12 @@ def _running_stale_code() -> bool:
     for module in list(sys.modules.values()):
         path = getattr(module, "__file__", None)
         if not path or not path.startswith(_REPO_ROOT):
+            continue
+        # The virtualenv lives inside the repo, so a prefix match alone counts
+        # every third-party package as our own source: `uv sync` touching a
+        # dependency would then read as "the working tree moved on", and the
+        # shell would abandon a perfectly current server.
+        if _VENDORED.search(path):
             continue
         try:
             if os.path.getmtime(path) > _STARTED_AT:
