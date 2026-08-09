@@ -25,7 +25,6 @@ from engine.mcp.client import (
     MCPSessionExpiredError,
     StdioMCPTransport,
     StreamableHTTPMCPTransport,
-    register_mcp_tools,
     register_mcp_tools_with_prefix,
 )
 from engine.tool.registry import ToolRegistry
@@ -290,7 +289,7 @@ def test_mcp_tool_is_error_becomes_registry_error():
             client = await _new_client(Path(tmp))
             registry = ToolRegistry()
             try:
-                await register_mcp_tools(registry, client)
+                await register_mcp_tools_with_prefix(registry, client, prefix="mcp")
                 return await registry.execute(ToolCall(id="call-1", name="mcp_bad", arguments={}))
             finally:
                 await client.close()
@@ -316,7 +315,7 @@ def test_mcp_registration_skips_bad_tool_and_keeps_good_tool():
     async def run():
         registry = ToolRegistry()
         registry.register("mcp_dup", "", {}, lambda: "existing")
-        return await register_mcp_tools(registry, FakeClient())
+        return await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp")
 
     assert asyncio.run(run()) == 1
 
@@ -805,7 +804,7 @@ def test_registered_mcp_tools_always_require_approval():
 
     async def run():
         registry = ToolRegistry()
-        await register_mcp_tools(registry, FakeClient())
+        await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp")
         definition = registry.get("mcp_mutate_remote")
         result = ToolGuard(
             Path("missing-rules.json"), tool_registry=registry.definitions(),

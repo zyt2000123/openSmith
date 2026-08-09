@@ -623,15 +623,6 @@ class MCPClient:
         await self._transport.close()
 
 
-async def register_mcp_tools(registry: Any, client: MCPClient) -> int:
-    """Discover MCP tools and register them into a ToolRegistry.
-
-    Each tool is registered with an ``mcp_`` prefix to avoid name
-    collisions. Returns the number of tools registered.
-    """
-    return await register_mcp_tools_with_prefix(registry, client, prefix="mcp")
-
-
 async def register_mcp_tools_with_prefix(
     registry: Any,
     client: MCPClient,
