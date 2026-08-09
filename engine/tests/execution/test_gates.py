@@ -229,3 +229,42 @@ def test_llm_gate_reports_a_reason_for_a_lowercase_fail() -> None:
 
     assert result.verdict == "fail"
     assert result.retry_hint == "missing migration"
+
+
+def test_llm_gate_shows_the_model_the_end_of_a_long_output() -> None:
+    """Both gate layers must judge the same evidence.
+
+    The heuristic pre-filter scans the whole output while the LLM layer sees a
+    bounded copy.  Verification nodes put their evidence last -- the command
+    output they just produced -- so a head-only bound let the pre-filter
+    confirm evidence the model could not see, failing a correct node.
+    """
+    seen: list[str] = []
+
+    class _PreFilter:
+        async def check(self, output, context):
+            # What the real ValidationGate does: scan the entire output.
+            assert "12 passed" in output
+            return GateResult("pass", "heuristic ok")
+
+    class _LLM:
+        async def chat(self, messages, **kwargs):
+            seen.append(messages[-1]["content"])
+            return ChatResponse(text="PASS")
+
+    long_output = (
+        "开始执行验证流程。\n"
+        + "中间过程日志，逐条记录每一步操作。\n" * 400
+        + "最终测试结果：12 passed, 0 failed"
+    )
+    assert len(long_output) > 2000
+
+    gate = LLMGate(_PreFilter(), "Verify this report:\n{output}")
+    gate.set_llm(_LLM())
+    result = asyncio.run(gate.check(long_output, {}))
+
+    assert result.verdict == "pass"
+    prompt = seen[0]
+    assert "12 passed" in prompt, "the gate LLM never saw the evidence at the end"
+    assert "开始执行验证流程" in prompt, "the gate LLM lost the start of the output"
+    assert "omitted from gate input" in prompt, "truncation must be explicit"
