@@ -32,16 +32,40 @@ class ContextBudget:
     output_limit_declared: bool
 
 
+# Characters a byte-level BPE fallback spends up to three tokens on.  Limiting
+# this to CJK Unified Ideographs (U+4E00-U+9FFF) rated every kana, Hangul
+# syllable and CJK/full-width punctuation mark at 1/3 token instead of ~1 — a
+# systematic 3x *under*estimate for Japanese and Korean input, and every budget
+# below is derived from this number.  Chinese hid it: the 3x overestimate on
+# ideographs cancelled the underestimate on 。、「」.
+_WIDE_CHAR_RANGES = (
+    ("　", "〿"),  # CJK symbols and punctuation
+    ("぀", "ヿ"),  # Hiragana + Katakana
+    ("㐀", "䶿"),  # CJK Unified Ideographs Extension A
+    ("一", "鿿"),  # CJK Unified Ideographs
+    ("가", "힯"),  # Hangul syllables
+    ("豈", "﫿"),  # CJK compatibility ideographs
+    ("＀", "￯"),  # Half/full-width forms
+)
+
+
+def _is_wide_char(char: str) -> bool:
+    # Fast reject first: ASCII and Latin text never reaches the range scan.
+    if char < "　":
+        return False
+    return any(low <= char <= high for low, high in _WIDE_CHAR_RANGES)
+
+
 def estimate_tokens(text: str) -> int:
     """Conservatively estimate mixed CJK and non-CJK text.
 
-    A CJK ideograph is three UTF-8 bytes, which is the stable fallback upper
+    A CJK character is three UTF-8 bytes, which is the stable fallback upper
     bound when a provider tokenizer has no merged token for that character.
     """
     if not text:
         return 0
-    cjk = sum(1 for char in text if "一" <= char <= "鿿")
-    return (3 * cjk) + (len(text) - cjk + 2) // 3
+    wide = sum(1 for char in text if _is_wide_char(char))
+    return (3 * wide) + (len(text) - wide + 2) // 3
 
 
 def _estimate_json(value: Any) -> int:
