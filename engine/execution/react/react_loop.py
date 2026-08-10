@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from engine.context import ContextReceipt, fit_request, measure_request
 from engine.context.compression import (
+    RUNTIME_USER_NOTE_PREFIX,
     compaction_policy_for_llm,
     trim_conversation_for_context_limit,
 )
@@ -132,12 +133,14 @@ def _tool_result_messages(tool_name: str, call_id: str, content: str, *, is_erro
 
     Providers require a matching ``tool`` turn for every assistant tool call.
     The actual volatile value is also appended as a user turn, per product
-    policy, so it never alters the stable system-prompt prefix.
+    policy, so it never alters the stable system-prompt prefix.  It carries the
+    shared prefix so the context fitter can tell engine framing apart from the
+    request being executed (see ``compression._split_active_context``).
     """
     if tool_name == _CURRENT_TIME_TOOL and not is_error:
         return [
             {"role": "tool", "tool_call_id": call_id, "content": _CURRENT_TIME_TOOL_ACK},
-            {"role": "user", "content": f"[Current time]\n{content}"},
+            {"role": "user", "content": f"{RUNTIME_USER_NOTE_PREFIX}{content}"},
         ]
     return [{"role": "tool", "tool_call_id": call_id, "content": content}]
 
@@ -486,9 +489,21 @@ async def react_event_loop(
             # （provider 400）。向前回退到 assistant/user 边界：同一轮的 tool
             # 结果之间可能夹着 system 提示（TOOL_FAILURE_HINT 在 tool_calls
             # 循环内 append），只认 role=="tool" 会在提示处停下留下孤儿。
-            cut = len(conversation) - CONVERSATION_KEEP_RECENT
+            requested_cut = len(conversation) - CONVERSATION_KEEP_RECENT
+            cut = requested_cut
             while cut > CONVERSATION_KEEP_HEAD and conversation[cut].get("role") in ("tool", "system"):
                 cut -= 1
+            if cut <= CONVERSATION_KEEP_HEAD:
+                # 回退撞到 head 边界时 head+tail 就是整条对话，这道上限静默
+                # 失效：一轮 8 个并行工具调用即可（实测 41 条裁剪后仍是 41
+                # 条，30 个调用时 63 条原样返回）。改为向后找下一个边界 ——
+                # 丢弃的更多，但配对完整且一定有进展。整条尾巴都是
+                # tool/system 时没有安全切点，保持原样交给 fit_request 兜底。
+                forward = requested_cut
+                while forward < len(conversation) and conversation[forward].get("role") in ("tool", "system"):
+                    forward += 1
+                if forward < len(conversation):
+                    cut = forward
             tail = conversation[cut:]
             while head and head[-1].get("role") == "assistant" and head[-1].get("tool_calls"):
                 head.pop()
@@ -815,8 +830,12 @@ async def react_event_loop(
                     yield _provisional_retract_event(provision_id, "incomplete_final_repair")
                 active_provision_ids.clear()
                 incomplete_final_repairs += 1
+                # 只追加本轮分片：更早的分片已由 _append_length_continuation
+                # 写进 conversation，重复追加会让同一段文本在修复提示里出现
+                # 两次。（当前 looks_like_incomplete_final_after_tool 有 240
+                # 字上限，续写过的文本够不到，所以这是补一个陷阱而非在燃 bug。）
                 _append_incomplete_final_repair(
-                    conversation, final_text, response.reasoning
+                    conversation, response.text, response.reasoning
                 )
                 final_text_parts.clear()
                 final_text_was_streamed = False
