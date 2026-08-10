@@ -701,14 +701,19 @@ async def _run_events_with_runtime(
             and terminal_status in {"completed", "incomplete", "failed"}
         ):
             try:
-                memory_persist_failed = not await asyncio.wait_for(
-                    _persist_runtime_learning(
-                        state_dir, request.message, "".join(full_text), had_tools, services,
-                        terminal_status=terminal_status,
-                        terminal_reason=terminal_reason,
-                    ),
-                    timeout=_RUNTIME_LEARNING_TIMEOUT_SECONDS,
-                )
+                # This finally block runs after the stream's generation_context
+                # has exited, so re-enter it: memory compilation issues its own
+                # LLM calls and llm_generations.run_id/session_id would be NULL
+                # for exactly the side channel whose cost most needs explaining.
+                with generation_context(run_id=run_id, session_id=runtime.session_id):
+                    memory_persist_failed = not await asyncio.wait_for(
+                        _persist_runtime_learning(
+                            state_dir, request.message, "".join(full_text), had_tools, services,
+                            terminal_status=terminal_status,
+                            terminal_reason=terminal_reason,
+                        ),
+                        timeout=_RUNTIME_LEARNING_TIMEOUT_SECONDS,
+                    )
             except asyncio.TimeoutError:
                 memory_persist_failed = True
                 logger.warning(

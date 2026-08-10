@@ -22,6 +22,7 @@ from engine.execution import (
 from engine.context import CONTEXT_DISPLAY_WINDOW, summarize_session
 from engine.identity import IdentityCatalog, IdentityCatalogError
 from engine.llm.model_config import resolve_llm_config
+from engine.llm.observability import generation_context
 from engine.observability.trace_store import _redact_secrets_in_text
 from common.yaml_utils import YamlConfigError
 
@@ -305,10 +306,15 @@ class SessionService:
         profile_name = profile["name"] if profile else "Agent"
         _runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
         try:
-            summary_result = await summarize_session(
-                [{"role": row["role"], "content": row["content"]} for row in rows],
-                services.llm,
-            )
+            # Manual /compress runs outside any agent run, so nothing has
+            # installed a generation scope.  Without this the compaction's own
+            # LLM call lands in llm_generations with a NULL session_id we are
+            # holding right here.
+            with generation_context(session_id=session_id):
+                summary_result = await summarize_session(
+                    [{"role": row["role"], "content": row["content"]} for row in rows],
+                    services.llm,
+                )
         finally:
             close = getattr(services, "close", None)
             if close is not None:

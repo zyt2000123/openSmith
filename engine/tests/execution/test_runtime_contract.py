@@ -33,6 +33,7 @@ from engine.execution.orchestration.runtime import (
 from engine.identity import IdentityCatalog
 from engine.llm.client import ChatResponse, ToolCallData
 from engine.llm.contracts import LLMResponseError, ProviderCapabilities
+from engine.llm.observability import current_generation_scope
 from engine.observability import RunObservation, RunSummaryStore, TraceStore
 from engine.safety.approval import APPROVAL_BROKER
 from engine.safety.tool_guard import AuditLog, ToolGuard
@@ -1665,6 +1666,57 @@ def test_incomplete_run_persists_learning_with_partial_status(
         "terminal_reason": "model_output_limit",
     }
     assert events[-1].data["status"] == "incomplete"
+
+
+def test_memory_finalization_generations_stay_attributable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Memory-compile LLM calls must carry the run scope that caused them.
+
+    ``llm_generations`` has ``run_id`` and ``session_id`` columns and
+    ``engine/llm/observability.py`` promises side-channel calls (compaction,
+    memory compilation, gate review) are attributed by ``generation_context``.
+    Memory finalization runs from the lifecycle ``finally`` block, which sits
+    outside the ``generation_context`` wrapping the agent stream — so every
+    memory compilation used to land in the cost table as an unattributable
+    row, right where a 10-turn compile spike needs explaining.
+    """
+    runtime, services, _ = _runtime(tmp_path)
+    identity = runtime.identity_catalog.get("smith")  # type: ignore[union-attr]
+    setup = SimpleNamespace(
+        system_prompt="system",
+        identity=identity,
+        route=SimpleNamespace(identity_id="smith", route_id="direct", pipeline_id=None),
+        chain=None,
+        state_dir=runtime.profile_dir,
+        working_dir=tmp_path,
+    )
+    observed: dict[str, object] = {}
+
+    async def fake_prepare_runtime(*_args, **_kwargs):
+        return setup
+
+    async def fake_run_agent_stream(*_args, **_kwargs):
+        yield ExecutionEvent(EventType.TEXT_DELTA, {"text": "final reply"})
+        yield ExecutionEvent(EventType.DONE, {})
+
+    async def fake_persist(*_args, **_kwargs):
+        observed["scope"] = current_generation_scope()
+        return True
+
+    monkeypatch.setattr(lifecycle_module, "prepare_runtime", fake_prepare_runtime)
+    monkeypatch.setattr(lifecycle_module, "run_agent_stream", fake_run_agent_stream)
+    monkeypatch.setattr(lifecycle_module, "_persist_runtime_learning", fake_persist)
+
+    async def collect():
+        stream = run_stream_with_runtime(EngineRequest(message="hi"), runtime, services)
+        return [event async for event in stream.stream_events()]
+
+    events = asyncio.run(collect())
+    finished = events[-1]
+    assert finished.type is EventType.RUN_FINISHED
+    assert observed["scope"] == (finished.data["run_id"], "sess-1")
 
 
 def test_runtime_memory_requires_a_successful_tool_result(
