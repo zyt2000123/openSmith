@@ -361,10 +361,13 @@ async def _run_forced_skill_stream(
         EventType.SKILL_END,
         {"skill": forced_skill, "status": "passed"},
     )
-    data = {"text": "".join(output_parts)}
-    if output_was_streamed:
-        data["already_streamed"] = True
-    yield ExecutionEvent(EventType.TEXT_DELTA, data)
+    # Guarded like the terminal branch above: an empty TEXT_DELTA is not a
+    # reply, and consumers persist whatever text they receive.
+    if output_parts:
+        data = {"text": "".join(output_parts)}
+        if output_was_streamed:
+            data["already_streamed"] = True
+        yield ExecutionEvent(EventType.TEXT_DELTA, data)
     yield ExecutionEvent(EventType.DONE, {})
 
 

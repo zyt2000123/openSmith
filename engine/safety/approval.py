@@ -250,6 +250,9 @@ class ApprovalPresentation:
     details: tuple[ApprovalDetail, ...]
     reason: str
     # Optional risk tier label so a consumer can render the card distinctly.
+    # ``build_approval_presentation`` deliberately leaves it unset: the tier the
+    # SSE consumer actually reads comes from ``ApprovalRequest.risk`` and the
+    # TOOL_CALL_RESULT event.  This stays an explicit per-caller override.
     risk: str | None = None
 
     def to_dict(self) -> dict[str, object]:
