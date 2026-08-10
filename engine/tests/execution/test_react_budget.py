@@ -1029,6 +1029,55 @@ def test_react_event_loop_emits_token_usage():
     assert context["context_percent"] == 0
     assert context["estimated"] is False
     assert context["fit_status"] == "fit"
+    assert context["actions"] == []
+
+
+def test_context_usage_reports_which_fitting_actions_ran():
+    """A shrunk request must say WHAT was dropped, not merely that it shrank.
+
+    fit_status="compacted" covers both a cheap tool-output prune and a full
+    LLM re-summary of the history, and "recovered" means messages were
+    deleted outright.  Only fit.actions tells them apart, and it used to
+    reach the trace on the UNFIT path alone — so the one question a trace
+    gets asked after "the agent forgot my opening question" was the one it
+    could not answer.
+    """
+
+    async def run():
+        llm = FakeLLM([ChatResponse(text="done")], stream_chunks=["done"])
+        conversation: list[dict] = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [ToolCallData(id="c1", name="ok", arguments={})],
+            },
+        ]
+        # 3 x 6000 chars: walking backwards the newest two fill the 8000-char
+        # protect threshold, so the oldest is pruned — 6000 chars, over the
+        # 2000-char minimum that makes a prune worth doing.
+        for _ in range(3):
+            conversation.append(
+                {"role": "tool", "tool_call_id": "c1", "content": "x" * 6000}
+            )
+        events = []
+        async for event in _react_event_loop(
+            llm,
+            conversation,
+            _registry(),
+            max_iters=1,
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+    context = [
+        event for event in events if event.type == EventType.CONTEXT_USAGE
+    ][-1].data
+    assert any(
+        action.startswith("pruned_tool_output_chars:")
+        for action in context["actions"]
+    ), context["actions"]
 
 
 def test_react_event_loop_rejects_an_oversized_active_request_before_provider_call():

@@ -305,8 +305,16 @@ def _context_usage_event(
     *,
     input_tokens: int | None = None,
     fit_status: str,
+    actions: tuple[str, ...] = (),
 ) -> ExecutionEvent:
-    """Report selected-route capacity and the complete request cost."""
+    """Report selected-route capacity, request cost, and what fitting dropped.
+
+    ``fit_status`` alone cannot distinguish a cheap tool-output prune from an
+    LLM re-summary of the whole history, and ``recovered`` means messages were
+    deleted outright.  ``actions`` used to reach the trace only when the
+    request ended up UNFIT — the successful-but-lossy path recorded that the
+    conversation shrank without recording what left it.
+    """
     estimated = not isinstance(input_tokens, int) or input_tokens <= 0
     context_tokens = (
         input_tokens if not estimated else receipt.estimated_input_tokens
@@ -331,6 +339,7 @@ def _context_usage_event(
         "window_declared": receipt.window_declared,
         "output_limit_declared": receipt.output_limit_declared,
         "fit_status": fit_status,
+        "actions": list(actions),
     })
 
 
@@ -514,6 +523,7 @@ async def react_event_loop(
         yield _context_usage_event(
             fit.receipt,
             fit_status=fit.status.value,
+            actions=fit.actions,
         )
         if not fit.fits:
             for provision_id in active_provision_ids:
@@ -692,6 +702,7 @@ async def react_event_loop(
             fit.receipt,
             input_tokens=usage.get("input_tokens") if usage else None,
             fit_status=fit.status.value,
+            actions=fit.actions,
         )
 
         thought = (response.reasoning or (response.text if response.has_tool_calls else "")).strip()

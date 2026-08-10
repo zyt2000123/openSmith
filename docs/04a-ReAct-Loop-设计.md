@@ -176,7 +176,7 @@ react_loop 产出的所有事件类型：
 | `PROVISIONAL_RETRACT` | `{provision_id, reason}` | 草稿撤回（工具调用 / 错误 / 门禁失败） |
 | `TEXT_DELTA` | `{text, already_streamed?}` | 最终文本增量 |
 | `TOKEN_USAGE` | `{input_tokens, output_tokens, total_tokens}` | 每轮 token 用量 |
-| `CONTEXT_USAGE` | `{used, limit, percentage, ...}` | 每轮请求前的上下文占用与上限 |
+| `CONTEXT_USAGE` | `{context_tokens, safe_input_budget, fit_status, actions, ...}` | 每轮请求前后的上下文占用、判定结果，以及**本轮实际裁掉了什么**（`actions`：`pruned_tool_output_chars:N` / `compacted_history` / `deterministic_trim` / `compaction_failed` / `model_compaction_disabled`）。`fit_status` 区分不出"只剪了工具输出"和"整段历史被摘要替换"，`actions` 才能 |
 | `CONTEXT_COMPRESSION_START` / `END` | `{reason}` / `{recovered, ...}` | 上下文压缩开始 / 结束（触发时） |
 | `TOOL_CALL_START` | `{name, id, arguments}` | 工具执行开始 |
 | `TOOL_CALL_RESULT` | `{id, error, blocked, preflight, ...}` | 工具执行结果 |
