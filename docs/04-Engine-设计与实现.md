@@ -112,7 +112,7 @@ provider / LLM → ExecutionEvent → RunStateStore + observability + memory hoo
 
 ### `react/`：以单一事件协议驱动模型—工具闭环
 
-`react_event_loop()` 是真正的核心生成器；`react_loop()` 和 `react_stream_loop()` 只是分别消费最终文本和文本 delta 的适配器。该拆分的构思是让 pipeline、Shell、测试不必各自复制模型流解析与终态处理。循环的状态保存在局部计数器中，避免跨 Run 的可变共享状态。
+`react_event_loop()` 是本模块唯一对外的生成器，生产侧唯一消费者是 `orchestration/agent_loop.py`，它把事件原样交给 `lifecycle`（先 record 后 yield）。曾经并列的 `react_loop()` / `react_stream_loop()` 两个取文本适配器没有任何生产调用，已移入 `engine/tests/execution/react_text_adapters.py`。只产事件的设计让 pipeline、Shell、测试不必各自复制模型流解析与终态处理，也保证文本不会绕开 lifecycle 的记录边界。循环的状态保存在局部计数器中，避免跨 Run 的可变共享状态。
 
 | 项目 | 说明 |
 | --- | --- |

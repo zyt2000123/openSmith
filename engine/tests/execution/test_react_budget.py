@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 
-from engine.execution.react.react_loop import (
-    react_event_loop as _react_event_loop,
+from engine.execution.react.react_loop import react_event_loop as _react_event_loop
+from engine.tests.execution.react_text_adapters import (
     react_loop as _react_loop,
     react_stream_loop as _react_stream_loop,
 )

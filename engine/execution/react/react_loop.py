@@ -412,80 +412,10 @@ def _append_length_continuation(
     conversation.append({"role": "system", "content": CONTINUE_AFTER_LENGTH_HINT})
 
 
-async def react_loop(
-    llm: "LLMPort",
-    messages: list[dict],
-    tool_registry: "ToolRegistry",
-    tool_guard: "ToolGuard | None" = None,
-    max_iters: int = DEFAULT_MAX_REACT_ITERS,
-    *,
-    fact_gate: FactGate | None = None,
-    prefix_cache_key: str | None = None,
-    hook_registry: "HookRegistry | None" = None,
-) -> str:
-    """Run the canonical ReAct event loop and collect final assistant text."""
-    chunks: list[str] = []
-    async for event in react_event_loop(
-        llm,
-        messages,
-        tool_registry,
-        tool_guard,
-        max_iters,
-        fact_gate=fact_gate,
-        prefix_cache_key=prefix_cache_key,
-        hook_registry=hook_registry,
-    ):
-        if event.type == EventType.TEXT_DELTA:
-            chunks.append(str(event.data.get("text", "")))
-        elif event.type == EventType.INCOMPLETE:
-            raise IncompleteAgentRunError(
-                str(event.data.get("reason", "agent_incomplete"))
-            )
-        elif event.type == EventType.FAILED:
-            raise FailedAgentRunError(
-                str(event.data.get("reason", "agent_failed"))
-            )
-    return "".join(chunks)
-
-
-async def react_stream_loop(
-    llm: "LLMPort",
-    messages: list[dict],
-    tool_registry: "ToolRegistry",
-    tool_guard: "ToolGuard | None" = None,
-    max_iters: int = DEFAULT_MAX_REACT_ITERS,
-    *,
-    fact_gate: FactGate | None = None,
-    prefix_cache_key: str | None = None,
-    hook_registry: "HookRegistry | None" = None,
-) -> AsyncGenerator[str, None]:
-    """Run the canonical ReAct event loop and expose text deltas only.
-
-    Live streaming is handled by provisional events in the canonical loop;
-    this adapter yields only the final committed TEXT_DELTA.
-    """
-    async for event in react_event_loop(
-        llm,
-        messages,
-        tool_registry,
-        tool_guard,
-        max_iters,
-        fact_gate=fact_gate,
-        prefix_cache_key=prefix_cache_key,
-        hook_registry=hook_registry,
-    ):
-        if event.type == EventType.TEXT_DELTA:
-            text = event.data.get("text", "")
-            if text:
-                yield str(text)
-        elif event.type == EventType.INCOMPLETE:
-            raise IncompleteAgentRunError(
-                str(event.data.get("reason", "agent_incomplete"))
-            )
-        elif event.type == EventType.FAILED:
-            raise FailedAgentRunError(
-                str(event.data.get("reason", "agent_failed"))
-            )
+# The two text-collecting adapters that used to sit here (``react_loop`` and
+# ``react_stream_loop``) had no production caller: orchestration consumes
+# ``react_event_loop`` events directly.  They now live beside the tests that
+# wanted a plain string — engine/tests/execution/react_text_adapters.py.
 
 
 async def react_event_loop(

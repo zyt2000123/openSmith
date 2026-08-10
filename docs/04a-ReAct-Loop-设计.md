@@ -40,15 +40,15 @@ react_loop **只关心一件事**：拿到一组 messages，让 LLM 反复"生�
 
 ---
 
-## 二、三层 API 与消费模型
+## 二、一个生成器与它的消费者
 
-`react_loop.py` 对外暴露三个函数，它们是**同一个核心生成器的三种消费方式**：
+`react_loop.py` 对外只暴露一个函数：
 
 ```
 react_event_loop()   ← 核心：AsyncGenerator[ExecutionEvent]，全部事件
   ↑ 消费
-react_loop()         ← 文本适配器：收集 TEXT_DELTA，返回 str
-react_stream_loop()  ← 流式适配器：yield TEXT_DELTA 的 text，返回 AsyncGenerator[str]
+engine/execution/orchestration/agent_loop.py   ← 生产侧唯一消费者，逐事件转发
+engine/tests/execution/react_text_adapters.py  ← 仅测试用的取文本适配器
 ```
 
 ### 2.1 `react_event_loop` — 核心生成器
@@ -68,31 +68,27 @@ async def react_event_loop(
 
 **唯一的真正实现**。所有状态管理、预算控制、错误恢复都在这里。产出 `ExecutionEvent` 流，上层自选消费方式。
 
-### 2.2 `react_loop` — 文本适配器
+### 2.2 生产侧只有一个消费者
 
-```python
-async def react_loop(...) -> str
-```
+`agent_loop` 把事件原样转发给 `lifecycle`，`lifecycle` **先 `record` 再 `yield`**
+（`orchestration/lifecycle.py`），SSE 拿到的是完整事件流而不是纯文本流。文本从不
+在 react 层被拼装。
 
-收集所有 `TEXT_DELTA` 事件拼成字符串返回。遇到 `INCOMPLETE` / `FAILED` 事件时抛出对应异常。用于不需要流式传输的场景（CLI 单次对话、测试）。
+本模块早先还放过两个适配器：`react_loop()`（收集全文返回 `str`）与
+`react_stream_loop()`（只 yield `TEXT_DELTA` 文本）。文档给它们的存在理由是
+"CLI 单次对话"和"SSE 端点的直接文本流"——**两条路径都不存在**：CLI 走
+shell → HTTP，SSE 走 lifecycle 事件流。九个测试调用它们，让它们看上去是活的；
+但被测的一直是 `react_event_loop` 的行为，适配器只是测试取数的方式。现已移到
+`engine/tests/execution/react_text_adapters.py`。
 
-### 2.3 `react_stream_loop` — 流式适配器
-
-```python
-async def react_stream_loop(...) -> AsyncGenerator[str, None]
-```
-
-逐 chunk yield `TEXT_DELTA` 的文本。同样对 `INCOMPLETE` / `FAILED` 抛异常。用于 SSE 端点的直接文本流。
-
-### 2.4 为什么是三层而不是一个
+### 2.3 为什么核心只产事件
 
 | 设计选择 | 理由 |
 |---|---|
 | 核心只产事件 | pipeline / skill_chain 需要完整事件流做门禁判断 |
-| 文本适配器单独存在 | 大量测试和 CLI 路径只要最终文本 |
-| 流式适配器单独存在 | SSE 端点不关心工具事件，只要实时文字 |
+| 不在本层拼文本 | 观测的记录边界在 `lifecycle`（先 record 后 yield）。任何绕过 lifecycle 的文本通道都会直接变成观测盲区 |
 
-三个函数共享**零状态**——所有状态都在 `react_event_loop` 的局部变量里。没有类、没有实例、没有 mutable 共享。
+生成器共享**零状态**——所有状态都在 `react_event_loop` 的局部变量里。没有类、没有实例、没有 mutable 共享。
 
 ---
 
