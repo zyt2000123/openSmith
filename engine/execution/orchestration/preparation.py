@@ -79,7 +79,17 @@ def enabled_tools_from_config(
                 continue
             if name in available:
                 configured.append(name)
-            elif name not in known:
+            elif name in known:
+                # Registered but not model-facing (``TOOL_META["hidden"]``).
+                # This landed in an empty branch, so an allowlist naming a
+                # hidden tool was dropped with no signal at all — the very
+                # failure mode the sibling branch below exists to end.
+                logger.warning(
+                    "agent config enabled %r, which is registry-internal "
+                    "(hidden) and cannot be called by the model; ignoring it",
+                    name,
+                )
+            else:
                 # A typo in tools.enabled used to vanish silently: this function
                 # removed the name before set_enabled() could report it, so the
                 # unknown-tool warning in prepare_runtime was unreachable.  Log

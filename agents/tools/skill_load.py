@@ -6,7 +6,13 @@ from collections.abc import Callable
 
 TOOL_META = {
     "name": "skill_load",
-    "hidden": True,
+    # Model-facing on purpose: the prompt advertises a skill catalog and
+    # workflow.md tells Smith to load a matching skill on demand, and this is
+    # the only opener.  Hiding it left direct ReAct able to list every skill
+    # and open none.  The safety property is the name lookup against the
+    # request-scoped registry (see builtin_tools.bind_skill_load_tool), not
+    # invisibility: arbitrary Markdown on disk stays unreachable either way.
+    "hidden": False,
     "description": "Load a skill definition (SKILL.md) by name. Returns the skill's process and guidelines.",
     "parameters": {
         "type": "object",

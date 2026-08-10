@@ -37,6 +37,7 @@ tools:
     - web_crawl
     - git_ops
     - skill_manage
+    - skill_load  # workflow.md 承诺"按需加载 skill"，这是唯一的入口
     - todo
     - render_ui
     - get_current_time
