@@ -1,8 +1,27 @@
 # Smith 文档
 
-> **状态**：2026-08-06 基于 `main` 分支源码对齐（文档-源码对齐）。本文档目录把“当前已实现的契约”和“历史设计/外部调研”分开；前者描述现在能运行和可验证的能力，后者只保留决策背景，不能据此推断功能已存在。
+## 本章结论
 
-## 先从这里开始
+当前实现文档只描述已落地、可由代码或测试验证的契约；历史设计、调研与参考资料只提供背景，不代表产品能力。当前基线为 2026-08-06 的 `main` 源码对齐版本。阅读和维护规范见 [00 · 文档阅读指南与表达规范](00-文档阅读指南与表达规范.md)。
+
+## 阅读地图
+
+```mermaid
+graph LR
+    G[00: 阅读规范] --> P[01: 产品定位]
+    P --> A[02: 系统架构]
+    A --> C[03: Common]
+    A --> E[04: Engine]
+    E --> L[04b: LLM]
+    E --> M[05: 记忆]
+    A --> N[06: Agents]
+    A --> S[07: Server]
+    S --> H[08: Shell]
+    H --> D[10: 开发规范]
+    D --> R[11: 路线图]
+```
+
+## 按目标阅读
 
 | 目的 | 阅读入口 | 事实来源 |
 | --- | --- | --- |
@@ -10,7 +29,8 @@
 | 理解产品边界 | [01 · 产品设计与定位](01-产品设计与定位.md) | `README.md`、Shell/Server 入口 |
 | 理解当前架构与一次 Run | [02 · 系统架构](02-系统架构.md) | `server/app/main.py`、`engine/execution/` |
 | 修改执行运行时 | [04 · Engine 设计与实现](04-Engine-设计与实现.md) | `engine/` 与对应测试 |
-| 修改模型调用、记忆、身份或技能 | [04b · LLM](04b-LLM模块设计.md)、[05 · 记忆](05-Engine-记忆系统.md)、[06 · Agents](06-Agents-内容层.md) | `engine/{llm,memory,identity,skill}/`、`agents/`（目录地图见 [`agents/README.md`](../agents/README.md)） |
+| 修改 Engine 的任一模块 | [04 · Engine 总览](04-Engine-设计与实现.md) → 对应 04a–04k 专题 | `engine/` 与对应 `engine/tests/` |
+| 修改模型调用、记忆、身份或技能 | [04b · LLM](04b-LLM模块设计.md)、[05 · 记忆](05-Engine-记忆系统.md)、[04d · Identity](04d-Identity-身份与路由.md)、[04h · Skill](04h-Skill-技能系统.md) | `engine/{llm,memory,identity,skill}/`、`agents/`（目录地图见 [`agents/README.md`](../agents/README.md)） |
 | 修改本地 API 或终端 UI | [07 · Server](07-Server-平台后端.md)、[08 · Shell](08-Shell-终端前端.md) | `server/app/routers/`、`shell/src/` |
 | 开发、验证和下一阶段工作 | [10 · 开发规范](10-开发规范与约定.md)、[11 · 路线图](11-开发路线图与待办.md) | 包脚本、测试、Issue/ADR |
 

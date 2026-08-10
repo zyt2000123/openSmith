@@ -12,6 +12,30 @@
 
 Smith is a single, always-on agent that runs locally. It keeps conversation context, accumulates memory across sessions, and switches workflows via skills. One agent, no orchestration overhead.
 
+## 结论
+
+Smith 是一个本地运行的常驻 Agent：它保留会话上下文、跨会话积累记忆，并通过 skill 切换任务工作流。产品只运行一个 Agent，不包含子 Agent 或多 Agent 编排。
+
+## 架构总览
+
+```mermaid
+graph LR
+    U[User] --> S[Shell: Ink / React]
+    S -->|HTTP / SSE| V[Server: FastAPI]
+    V --> E[Engine: 执行运行时]
+    E --> A[Agents: 身份 / Skill / Tool]
+    E --> C[Common: 路径 / YAML / SQLite]
+    E --> L[LLM Provider]
+    E --> M[MCP Server]
+    L --> R[Execution Event]
+    M --> R
+    R --> V
+    V --> S
+    S --> O[Response]
+```
+
+依赖方向为 `server → engine → common`。`agents/` 由 Engine 在运行时加载；`shell/` 仅通过本地 HTTP/SSE 与 Server 通信。
+
 ## What It Does
 
 - **Interactive terminal** — a single rich Ink shell
@@ -114,8 +138,7 @@ Dependencies flow one way: `server → engine → common`. The engine never impo
 
 ## Documentation
 
-The documentation landing page separates source-backed implementation contracts
-from historical design and research notes: [docs/README.md](docs/README.md).
+从 [文档入口](docs/README.md) 开始；写作与图示规范见 [00 · 文档阅读指南与表达规范](docs/00-文档阅读指南与表达规范.md)。当前实现以源码和测试为准，调研及历史方案不代表已支持的功能。
 
 ## Development
 

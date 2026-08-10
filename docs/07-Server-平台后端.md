@@ -1,8 +1,10 @@
 # 07 · Server 平台后端
 
-> **当前实现说明**：Server 是本机 FastAPI 服务，版本 `0.2.0`。接口定义的唯一事实来源是 `server/app/routers/agent.py`、`server/app/routers/config.py`，外加 `server/app/main.py` 中直接定义的 `/api/health`（它不在任何 router 内）；下表已按当前实现重写。
+## 本章结论
 
-## 服务边界
+Server 是本机 FastAPI 服务，负责 HTTP/SSE、鉴权、持久化和 Engine 运行时装配；它不实现模型协议、ReAct、工具安全或终端渲染。接口定义的事实来源是 `server/app/routers/agent.py`、`server/app/routers/config.py`，以及 `server/app/main.py` 直接定义的 `/api/health`。
+
+## 工程拆解：服务边界
 
 `server/` 负责 HTTP/SSE、local token 鉴权、SQLite repositories、session/profile/auto task 持久化、Engine runtime 装配和 scheduler。它不实现模型协议、ReAct、工具安全或终端渲染；这些分别属于 Engine 或 Shell。
 
@@ -18,7 +20,7 @@
 6. `close_db()` 关闭 SQLite。
 
 ```mermaid
-flowchart TB
+graph LR
   Shell["Shell / local client"] --> API["FastAPI routers"]
   API --> Service["services/"]
   Service --> Repo["infrastructure/repositories"]
