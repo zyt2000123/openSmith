@@ -134,6 +134,12 @@ async def summarize_session(
 
 def _has_required_summary_structure(summary: str) -> bool:
     """Accept only the summary envelope the compaction prompt requires."""
+    if "<!DOCTYPE" in summary or "<!ENTITY" in summary:
+        # ElementTree expands internally declared entities, so a document
+        # carrying a DTD is a memory bomb rather than a summary: four levels of
+        # nesting already turn ten characters into ten thousand.  The compaction
+        # prompt never asks for one, so refusing costs nothing.
+        return False
     try:
         root = ElementTree.fromstring(summary)
     except (ElementTree.ParseError, ValueError):
