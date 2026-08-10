@@ -135,6 +135,7 @@ anchors its non-bypassable platform-write protection on it.
 | **Hook system** | `engine/execution/hooks/` (framework), `agents/smith/hooks/` (built-in implementations) |
 | Data root | `common/paths.py` |
 | Smith profile seed | `agents/smith/` |
+| **End-to-end map** | `docs/04e-Engine-全链路白盒地图.md` — one turn from input to output, node by node, and what each node records |
 
 ## 6a. Hook System
 
