@@ -3,22 +3,22 @@
 This module deliberately owns no domain taxonomy. Adding a legal, finance, or
 other domain route is content work in ``agents/identities/*.yaml``, not a
 Python edit here.
+
+Routing is lexical only. An LLM fallback classifier used to run on every
+keyword miss; it slowed ordinary direct-ReAct turns and could start a
+multi-step workflow the user never asked for, so a pipeline now requires a
+declared, high-confidence intent. See ``prepare_runtime``.
 """
 
 from __future__ import annotations
 
-import logging
-
 from engine.identity import IdentityCatalog, RouteDecision
-from engine.llm.observability import llm_purpose
 
 # Backward-compatible re-exports — canonical home is engine.safety.eval_guard.
 from engine.safety.eval_guard import (  # noqa: F401
     EVAL_SENSITIVE_GUIDANCE,
     detect_eval_sensitive,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def route_task(
@@ -29,64 +29,3 @@ def route_task(
 ) -> RouteDecision:
     """Resolve one request against the loaded identity catalog."""
     return catalog.resolve(user_message, identity_id=identity_id)
-
-
-async def route_task_with_llm(
-    user_message: str,
-    catalog: IdentityCatalog,
-    llm=None,
-    *,
-    identity_id: str | None = None,
-    allow_llm_fallback: bool = False,
-) -> RouteDecision:
-    """Use deterministic catalog matches, with an opt-in LLM paraphrase net.
-
-    The LLM is constrained to route ids already declared in the catalog; it
-    cannot invent a new identity or pipeline name.
-
-    Automatic routing sits on the interactive critical path. A keyword miss
-    therefore stays direct by default instead of adding a hidden model round
-    trip to every ordinary message. Explicit route-selection surfaces may opt
-    into the paraphrase net.
-    """
-    deterministic = route_task(user_message, catalog, identity_id=identity_id)
-    if (
-        deterministic.score > 0
-        or llm is None
-        or identity_id is not None
-        or not allow_llm_fallback
-    ):
-        return deterministic
-
-    choices = [
-        f"{identity.id}:{route.id}"
-        for identity in catalog.identities
-        for route in identity.routes
-    ]
-    if not choices:
-        return deterministic
-    try:
-        with llm_purpose("routing"):
-            response = await llm.chat([
-                {
-                    "role": "system",
-                    "content": (
-                        "Choose exactly one declared route token, or DIRECT. "
-                        f"Declared routes: {', '.join(choices)}"
-                    ),
-                },
-                {"role": "user", "content": user_message[:1000]},
-            ])
-        selected = response.text.strip()
-        if selected.upper() == "DIRECT":
-            return deterministic
-        identity_key, route_key = selected.split(":", 1)
-        identity = catalog.get(identity_key)
-        for route in identity.routes:
-            if route.id == route_key:
-                return RouteDecision(identity, route.id, route.pipeline, score=1)
-    except Exception:
-        # LLM 路由是可选增强，失败回退确定性路由是正确行为，
-        # 但必须留痕——静默吞掉会让路由质量退化永远无人发现。
-        logger.warning("LLM route selection failed; falling back to deterministic route", exc_info=True)
-    return deterministic

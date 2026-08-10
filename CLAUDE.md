@@ -35,7 +35,7 @@ The current priority is the terminal workbench experience:
 User ──▶ Ink shell ──HTTP + SSE──▶ server ──▶ engine
                                                 │
         identity_catalog (agents/identities/smith.yaml · coding.yaml)
-        keyword/example match → LLM fallback (declared routes only) ──▶ RouteDecision
+        keyword/example match (lexical only, no LLM) ──▶ RouteDecision
                                                 │
                         ┌───────────────────────┴──────────────────┐
                         ▼                                          ▼
@@ -246,11 +246,13 @@ skill chains (§3). Explicit entry points:
 | Review a diff before it lands | keywords (`code review`, `代码评审`, `评审一下`, …) → `code-review` chain |
 | Everything else | stays in generic direct ReAct |
 
-Routing is lexical first (`IdentityCatalog` keyword/example + priority match),
-then an LLM fallback classifier constrained to declared `identity:route`
-tokens (`route_task_with_llm`, wired into `prepare_runtime`); neither path can
-invent an identity, domain, or pipeline. `grill me` stops at shared
-understanding — it does not hand off or implement.
+Routing is **lexical only** — `IdentityCatalog` keyword/example matching with
+priority, via `route_task()`. There is no LLM fallback classifier: one existed,
+but running it on every keyword miss slowed ordinary direct-ReAct turns and
+could start a multi-step workflow the user never asked for, so a pipeline now
+requires a declared, high-confidence intent. Routing cannot invent an identity,
+domain, or pipeline. `grill me` stops at shared understanding — it does not
+hand off or implement.
 
 ## 9. Testing And Verification
 
