@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 
 
 class IncompleteAgentRunError(RuntimeError):
-    """Raised by text adapters when the canonical event stream ends incomplete."""
+    """Raised when a collected run ends incomplete, carrying the reason."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -71,7 +71,7 @@ class IncompleteAgentRunError(RuntimeError):
 
 
 class FailedAgentRunError(RuntimeError):
-    """Raised by text adapters when the canonical event stream ends with a hard failure."""
+    """Raised when a collected run ends in hard failure, carrying the reason."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason

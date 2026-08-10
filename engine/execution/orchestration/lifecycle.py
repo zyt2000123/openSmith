@@ -24,7 +24,10 @@ from engine.execution.events import (
     raw_text_delta,
 )
 from engine.execution.pipeline.backtrack import FailureLoopGuard
-from engine.execution.react.react_loop import IncompleteAgentRunError
+from engine.execution.react.react_loop import (
+    FailedAgentRunError,
+    IncompleteAgentRunError,
+)
 from engine.llm.contracts import LLMResponseError
 from engine.llm.observability import generation_context, llm_purpose
 from engine.safety.approval import APPROVAL_BROKER, use_approval_context
@@ -815,7 +818,7 @@ async def reply_with_runtime(
     if not stream.is_complete:
         raise RuntimeError("Agent run ended before a terminal state was emitted.")
     if stream.status == "failed":
-        raise RuntimeError(stream.reason or "agent_failed")
+        raise FailedAgentRunError(stream.reason or "agent_failed")
     if stream.status == "incomplete":
         raise IncompleteAgentRunError(stream.reason or "agent_incomplete")
 
