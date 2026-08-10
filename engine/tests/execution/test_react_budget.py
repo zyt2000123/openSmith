@@ -23,7 +23,7 @@ from engine.execution.react.budget import (
     MAX_PREFLIGHT_CHALLENGE_ITERS,
 )
 from engine.safety.fact_gate import FactGate, FactGateContext
-from engine.skill.executor import execute_skill
+from engine.skill.executor import execute_skill_events
 from engine.skill.loader import SkillBody, SkillMeta
 from engine.tool.registry import ToolRegistry
 
@@ -1180,21 +1180,32 @@ def test_react_event_loop_forwards_prefix_cache_key_to_capable_provider():
 
 
 def test_execute_skill_failed_tool_round_does_not_consume_main_budget():
+    """Driven through execute_skill_events — the entry pipeline.py actually uses.
+
+    The subject is react_event_loop's budget accounting, not the skill wrapper;
+    the wrapper is only the vehicle.  It used to run through execute_skill(),
+    whose injected react_loop_fn no longer has any production implementation.
+    """
+
     async def run():
         skill = SkillBody(meta=SkillMeta(name="sample"), content="Use tools if needed.")
         llm = FakeLLM([
             ChatResponse(tool_calls=[_tool_call()]),
             ChatResponse(text="skill recovered"),
         ])
-        return await execute_skill(
+        chunks = []
+        async for event in execute_skill_events(
             skill,
             llm,
             _registry(),
             [{"role": "user", "content": "try a tool"}],
             {"user_message": "try a tool"},
             max_iters=1,
-            react_loop_fn=_react_loop,
-        )
+            react_event_loop_fn=_react_event_loop,
+        ):
+            if event.type == EventType.TEXT_DELTA:
+                chunks.append(str(event.data.get("text", "")))
+        return "".join(chunks)
 
     assert asyncio.run(run()) == "skill recovered"
 

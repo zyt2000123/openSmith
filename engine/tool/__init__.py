@@ -7,7 +7,6 @@ note above ``_VALID_PERMISSION_LEVELS`` in :mod:`engine.tool.registry`.
 from .interface import ToolCall, ToolDefinition, ToolResult
 from .ledger import ToolExecutionLedger
 from .registry import ToolRegistry
-from .schema import function_to_schema
 from .snapshot import FileSnapshot, get_snapshot
 
 __all__ = (
@@ -17,6 +16,5 @@ __all__ = (
     "ToolRegistry",
     "ToolResult",
     "FileSnapshot",
-    "function_to_schema",
     "get_snapshot",
 )
