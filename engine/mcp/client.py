@@ -32,6 +32,12 @@ MAX_MCP_RESPONSE_BYTES = 1024 * 1024
 # every event/line, so only a server trickling data indefinitely should hit
 # this ceiling.  Loose on purpose: legitimate long calls are unaffected.
 MAX_MCP_SSE_STREAM_BYTES = 64 * MAX_MCP_RESPONSE_BYTES
+# A whole-request wall clock.  Both transports reset their read timeout on
+# every line, so a server that trickles progress notifications keeps a request
+# open for as long as it likes; the byte ceilings above cannot stop that,
+# because a trickle is precisely what does not spend bytes.  Loose enough that
+# a legitimately slow tool call is unaffected, finite so a hung one ends.
+MAX_MCP_REQUEST_SECONDS = 600.0
 MAX_MCP_TOOL_LIST_PAGES = 100
 _FRAMING_BROKEN_MESSAGE = (
     "MCP stdio transport retired: an earlier response exceeded the maximum "
@@ -275,12 +281,35 @@ class StdioMCPTransport:
 
             # The per-line timeout below resets on every read, so a server
             # sending periodic notifications can otherwise hold this request
-            # open forever.  A whole-request byte budget bounds the wait the
-            # same way MAX_MCP_SSE_STREAM_BYTES bounds an SSE stream.
+            # open forever.  Two ceilings bound it: total bytes against a
+            # flood, and a wall clock against a trickle — a byte budget alone
+            # would let ~1M tiny notifications run for months.
             total_bytes = 0
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + MAX_MCP_REQUEST_SECONDS
             while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    # Same reasoning as the byte cap below: we abandon the read
+                    # mid-stream, so the next request would desynchronize.
+                    self._framing_broken = True
+                    raise RuntimeError("MCP stdio response exceeded maximum total time")
                 try:
-                    line = await asyncio.wait_for(self._process.stdout.readline(), timeout=30)
+                    line = await asyncio.wait_for(
+                        self._process.stdout.readline(),
+                        timeout=min(30, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    # The last read is capped by whatever is left of the
+                    # deadline, so it expires first.  A genuine stall (nothing
+                    # for 30s) keeps surfacing as TimeoutError; only the
+                    # whole-request ceiling becomes the total-time error.
+                    if loop.time() >= deadline:
+                        self._framing_broken = True
+                        raise RuntimeError(
+                            "MCP stdio response exceeded maximum total time"
+                        ) from None
+                    raise
                 except ValueError as exc:
                     # Over the buffer limit readline() raises a bare
                     # ValueError.  Unlike the HTTP transport -- which is
@@ -623,15 +652,6 @@ class MCPClient:
         await self._transport.close()
 
 
-async def register_mcp_tools(registry: Any, client: MCPClient) -> int:
-    """Discover MCP tools and register them into a ToolRegistry.
-
-    Each tool is registered with an ``mcp_`` prefix to avoid name
-    collisions. Returns the number of tools registered.
-    """
-    return await register_mcp_tools_with_prefix(registry, client, prefix="mcp")
-
-
 async def register_mcp_tools_with_prefix(
     registry: Any,
     client: MCPClient,
@@ -731,7 +751,11 @@ async def _iter_sse_data_stream(response: Any):
     data_lines: list[str] = []
     payload_size = 0
     stream_size = 0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + MAX_MCP_REQUEST_SECONDS
     async for raw_line in response.aiter_lines():
+        if loop.time() >= deadline:
+            raise RuntimeError("MCP SSE stream exceeded maximum total time")
         line = raw_line.rstrip("\r")
         if not line:
             if data_lines:
@@ -752,7 +776,9 @@ async def _iter_sse_data_stream(response: Any):
             # Per-event reset above removes any bound on the stream as a whole,
             # which would let a server trickle small events forever (httpx's
             # timeout is per-read and resets on every chunk).  Keep a deliberately
-            # loose ceiling so legitimate long calls are unaffected.
+            # loose ceiling so legitimate long calls are unaffected — and note
+            # that this one stops a flood, not a trickle: MAX_MCP_REQUEST_SECONDS
+            # above is what actually bounds the trickle this comment names.
             if stream_size > MAX_MCP_SSE_STREAM_BYTES:
                 raise RuntimeError("MCP SSE stream exceeds maximum total size")
             data_lines.append(payload)

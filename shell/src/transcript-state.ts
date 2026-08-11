@@ -590,6 +590,9 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
     case "gate_result":
       return entries;
 
+    case "gate_evidence":
+      return entries;
+
     case "backtrack":
       return entries;
 

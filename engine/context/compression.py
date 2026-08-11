@@ -26,6 +26,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PRUNED_MARKER = "[pruned]"
+# react_loop appends the live clock as a *user* turn (see
+# ``react_loop._tool_result_messages``) so a volatile value never enters the
+# stable system-prompt prefix.  It is engine-injected framing, not the request
+# being executed: counting it as the active turn pushed the real user
+# instruction into compactable history, where compaction replaced it with a
+# summary of itself.
+RUNTIME_USER_NOTE_PREFIX = "[Current time]\n"
 PRUNE_PROTECT_THRESHOLD_CHARS = 8000
 PRUNE_MIN_CHARS = 2000
 CONTEXT_TRIGGER_RATIO = 0.7
@@ -41,6 +48,9 @@ def _split_active_context(
     The newest user turn is the request currently being executed. A context
     fitter may summarize or trim only the preceding history; the active turn
     and its subsequent assistant/tool trail stay verbatim.
+
+    Engine-injected user framing (:data:`RUNTIME_USER_NOTE_PREFIX`) is skipped
+    while looking for that turn — it carries no request of its own.
     """
     leading_system_count = 0
     for message in conversation:
@@ -50,9 +60,14 @@ def _split_active_context(
 
     active_start: int | None = None
     for index in range(len(conversation) - 1, leading_system_count - 1, -1):
-        if conversation[index].get("role") == "user":
-            active_start = index
-            break
+        message = conversation[index]
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.startswith(RUNTIME_USER_NOTE_PREFIX):
+            continue
+        active_start = index
+        break
 
     if active_start is None:
         return (
@@ -82,11 +97,11 @@ def prune_tool_outputs(
     """Remove old tool outputs in-place, protecting the most recent ones.
 
     Recency is measured in characters walked backwards, not in user turns.
-    Tool results only ever exist *after* the last user message — react_loop
-    appends ``role:"tool"`` but never ``role:"user"``, and session history
-    cannot supply them because ``messages.role`` is constrained to
-    user/assistant/system — so a user-turn counter protected every tool result
-    in existence and this function could never prune anything.
+    A user-turn counter protected every tool result in existence and this
+    function could never prune anything: session history cannot supply a tool
+    result (``messages.role`` is constrained to user/assistant/system), and the
+    only ``role:"user"`` message react_loop appends is the engine's own clock
+    note (:data:`RUNTIME_USER_NOTE_PREFIX`), which carries no request.
 
     Returns number of chars pruned.
     """

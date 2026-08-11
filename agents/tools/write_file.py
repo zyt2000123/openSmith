@@ -1,4 +1,5 @@
 """Write file tool provider — writes content to a file within the work directory."""
+# 写入被限定在工作目录内，并由上层安全守卫统一处理路径与审批。
 
 import asyncio
 import logging

@@ -1,4 +1,5 @@
 """Read file tool provider — reads local file content with safety limits."""
+# 单次读取受行数与字节预算双重限制，防止大文件或超长行撑爆上下文。
 
 import asyncio
 import os

@@ -249,8 +249,8 @@ export function memoryMaintenanceStalled(maintenance: MemoryMaintenance | null):
  *
  * A stalled pipeline outranks everything: "memory queued" would be actively
  * misleading while every attempt fails. Otherwise running work outranks owed
- * work. Dreaming is the rarest, then periodic curation, then ordinary
- * compilation, so the most meaningful active pass is the one named.
+ * work, and dreaming is the rarer pass, so it is named ahead of ordinary
+ * compilation.
  */
 export function memoryMaintenanceLabel(maintenance: MemoryMaintenance | null): string | null {
   if (!maintenance) return null;
@@ -258,10 +258,8 @@ export function memoryMaintenanceLabel(maintenance: MemoryMaintenance | null): s
     return `memory stalled ×${maintenance.consecutive_failures}`;
   }
   if (maintenance.dream === "running") return "dreaming";
-  if (maintenance.nudge === "running") return "curating memory";
   if (maintenance.compile === "running") return "compiling memory";
   if (maintenance.dream === "pending") return "dream queued";
-  if (maintenance.nudge === "pending") return "memory review queued";
   if (maintenance.compile === "pending") return "memory queued";
   return null;
 }

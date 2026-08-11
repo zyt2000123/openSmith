@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.session_service import SessionService  # noqa: E402
+from app.services.session_service import _HISTORY_LIMIT, SessionService  # noqa: E402
 
 
 DEFAULT_PAGE = 200
@@ -115,7 +115,23 @@ async def test_recent_history_without_compression_is_unchanged() -> None:
     contents = _contents(await _service(repo)._recent_history("sess-1"))
 
     assert contents[-1] == "msg-59"
-    assert len(contents) == 10
+    assert len(contents) == _HISTORY_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_recent_history_keeps_the_opening_question_of_a_working_session() -> None:
+    """Twelve exchanges of real work must still carry the request that started them.
+
+    Only visible reply text survives a turn, so a turn that ran dozens of tools
+    occupies one message here.  At the old limit of 10 an uncompressed session
+    dropped its own opening question after five exchanges and read as amnesia.
+    """
+    repo = CountingSessionRepo(total=24, cutoff=0)
+    repo.context_summary = ""
+
+    contents = _contents(await _service(repo)._recent_history("sess-1"))
+
+    assert "msg-0" in contents, f"opening question fell out of history: {contents}"
 
 
 @pytest.mark.asyncio

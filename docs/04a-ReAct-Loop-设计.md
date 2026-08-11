@@ -40,15 +40,15 @@ react_loop **只关心一件事**：拿到一组 messages，让 LLM 反复"生�
 
 ---
 
-## 二、三层 API 与消费模型
+## 二、一个生成器与它的消费者
 
-`react_loop.py` 对外暴露三个函数，它们是**同一个核心生成器的三种消费方式**：
+`react_loop.py` 对外只暴露一个函数：
 
 ```
 react_event_loop()   ← 核心：AsyncGenerator[ExecutionEvent]，全部事件
   ↑ 消费
-react_loop()         ← 文本适配器：收集 TEXT_DELTA，返回 str
-react_stream_loop()  ← 便利封装：仅 yield 最终提交的 TEXT_DELTA 文本
+engine/execution/orchestration/agent_loop.py   ← 生产侧唯一消费者，逐事件转发
+engine/tests/execution/react_text_adapters.py  ← 仅测试用的取文本适配器
 ```
 
 ### 2.1 `react_event_loop` — 核心生成器
@@ -73,33 +73,27 @@ async def react_event_loop(
 - `prefix_cache_key`：透传给支持 prefix cache 的 provider（能力检查后才附带）；
 - `hook_registry`：工具生命周期 Hook（PreToolUse / PostToolUse），见 [8.5 节](#85-hook-拦截点)。
 
-### 2.2 `react_loop` — 文本适配器
+### 2.2 生产侧只有一个消费者
 
-```python
-async def react_loop(..., *, fact_gate=None, prefix_cache_key=None, hook_registry=None) -> str
-```
+`agent_loop` 把事件原样转发给 `lifecycle`，`lifecycle` **先 `record` 再 `yield`**
+（`orchestration/lifecycle.py`），SSE 拿到的是完整事件流而不是纯文本流。文本从不
+在 react 层被拼装。
 
-收集所有 `TEXT_DELTA` 事件拼成字符串返回。遇到 `INCOMPLETE` / `FAILED` 事件时抛出对应异常。用于不需要流式传输的场景（CLI 单次对话、测试）。与核心生成器共享同一组关键字参数（`prefix_cache_key` / `hook_registry` 原样透传）。
+本模块早先还放过两个适配器：`react_loop()`（收集全文返回 `str`）与
+`react_stream_loop()`（只 yield `TEXT_DELTA` 文本）。文档给它们的存在理由是
+"CLI 单次对话"和"SSE 端点的直接文本流"——**两条路径都不存在**：CLI 走
+shell → HTTP，SSE 走 lifecycle 事件流。九个测试调用它们，让它们看上去是活的；
+但被测的一直是 `react_event_loop` 的行为，适配器只是测试取数的方式。现已移到
+`engine/tests/execution/react_text_adapters.py`。
 
-### 2.3 `react_stream_loop` — 测试/嵌入用便利封装
-
-```python
-async def react_stream_loop(..., *, fact_gate=None, prefix_cache_key=None, hook_registry=None) -> AsyncGenerator[str, None]
-```
-
-**不是实时流**。它只 yield 最终提交的那条 `TEXT_DELTA` 的文本——函数 docstring 明确写着 "Live streaming is handled by provisional events in the canonical loop; this adapter yields only the final committed TEXT_DELTA"。当前没有生产调用方，仅测试使用。
-
-真正的实时流由 `PROVISIONAL_TEXT_DELTA` 事件承担：SSE 消费方直接消费 `ExecutionEvent` 流（`engine/execution/orchestration/run_stream.py`），不经过 `react_stream_loop`。
-
-### 2.4 为什么是三层而不是一个
+### 2.3 为什么核心只产事件
 
 | 设计选择 | 理由 |
 |---|---|
-| 核心只产事件 | pipeline / skill_chain / SSE 都需要完整事件流做门禁判断与实时渲染 |
-| 文本适配器单独存在 | 大量测试和 CLI 路径只要最终文本 |
-| 便利封装单独存在 | 测试与简单嵌入场景想要"最终文本的异步生成器"形式，不必自己过滤事件 |
+| 核心只产事件 | pipeline / skill_chain 需要完整事件流做门禁判断 |
+| 不在本层拼文本 | 观测的记录边界在 `lifecycle`（先 record 后 yield）。任何绕过 lifecycle 的文本通道都会直接变成观测盲区 |
 
-三个函数共享**零状态**——所有状态都在 `react_event_loop` 的局部变量里。没有类、没有实例、没有 mutable 共享。
+生成器共享**零状态**——所有状态都在 `react_event_loop` 的局部变量里。没有类、没有实例、没有 mutable 共享。
 
 ---
 
@@ -202,8 +196,8 @@ react_loop 产出的所有事件类型：
 | `PROVISIONAL_RETRACT` | `{provision_id, reason}` | 草稿撤回（工具调用 / 错误 / 门禁失败） |
 | `TEXT_DELTA` | `{text, already_streamed?}` | 最终文本增量 |
 | `TOKEN_USAGE` | `{input_tokens, output_tokens, total_tokens}` | 每轮 token 用量 |
-| `CONTEXT_USAGE` | 见下方字段表 | 上下文占用与预算，每轮 2 次 |
-| `CONTEXT_COMPRESSION_START` / `END` | `{}` / `{}` | 上下文压缩开始 / 结束（载荷为空） |
+| `CONTEXT_USAGE` | `{context_tokens, safe_input_budget, fit_status, actions, ...}` | 每轮请求前后的上下文占用、判定结果，以及**本轮实际裁掉了什么**（`actions`：`pruned_tool_output_chars:N` / `compacted_history` / `deterministic_trim` / `compaction_failed` / `model_compaction_disabled`）。`fit_status` 区分不出"只剪了工具输出"和"整段历史被摘要替换"，`actions` 才能 |
+| `CONTEXT_COMPRESSION_START` / `END` | `{reason}` / `{recovered, ...}` | 上下文压缩开始 / 结束（触发时） |
 | `TOOL_CALL_START` | `{name, id, arguments}` | 工具执行开始 |
 | `TOOL_CALL_RESULT` | `{id, error, blocked, preflight, content, result_hash, ...}` + 审批字段 | 工具执行结果 |
 | `SMITH_UI` / `SMITH_UI_FALLBACK` | `{ui, ...}` / `{raw, ...}` | 结构化 UI 事件；无效 payload 降级为文本 |

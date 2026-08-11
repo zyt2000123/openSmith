@@ -55,6 +55,21 @@ const ESCAPE_SEQUENCE = new RegExp(
 const UNSAFE_CONTROL = new RegExp("[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]", "g");
 
 /**
+ * Bidirectional formatting characters, which reorder text without being visible.
+ *
+ * Same threat as an escape sequence — the rendered line does not say what the
+ * bytes say — but they survive a control-character filter because they are
+ * ordinary printable code points. The approval prompt renders model-supplied
+ * tool arguments, so an RLO can make the command the user reads differ from the
+ * one they are approving: the trojan-source trick, aimed at a human rather than
+ * a compiler. Both the explicit marks (202a-202e) and the isolates (2066-2069)
+ * go; text that legitimately needs RTL still renders from its own strong
+ * characters, which these only override.
+ */
+// biome-ignore lint/complexity/useRegexLiterals: built from an escaped string like its neighbours, so this file stays free of literal invisible characters. See the file header.
+const BIDI_OVERRIDE = new RegExp("[\\u202a-\\u202e\\u2066-\\u2069]", "g");
+
+/**
  * Strip escape sequences and unsafe control characters, keeping tabs/newlines.
  *
  * Order matters: escape sequences go first, because stripping the lone ESC byte
@@ -62,7 +77,7 @@ const UNSAFE_CONTROL = new RegExp("[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009
  */
 export function sanitizeTerminalText(text: string): string {
   if (!text) return text;
-  return text.replace(ESCAPE_SEQUENCE, "").replace(UNSAFE_CONTROL, "");
+  return text.replace(ESCAPE_SEQUENCE, "").replace(UNSAFE_CONTROL, "").replace(BIDI_OVERRIDE, "");
 }
 
 /** Sanitise a value that should be a string, tolerating anything else. */

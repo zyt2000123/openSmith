@@ -2,6 +2,7 @@
 
 Provider 字段预留：后续可接 tavily / brave / bing_browser（对齐 OpenHanako 分层）。
 """
+# 搜索只负责发现候选链接，读取页面正文必须再经 web_fetch 的网络校验。
 
 import asyncio
 import html
@@ -51,6 +52,12 @@ _SNIPPET_RE = re.compile(
 _TAG_RE = re.compile(r"<[^>]+>")
 MAX_QUERY_LENGTH = 1_000
 _SEARCH_CONCURRENCY = asyncio.Semaphore(4)
+_UNTRUSTED_FENCE_CLOSE = "[/UNTRUSTED_EXTERNAL_CONTENT]"
+
+
+def _escape_untrusted_fence(value: str) -> str:
+    """Prevent remote text from terminating the envelope that labels it untrusted."""
+    return value.replace(_UNTRUSTED_FENCE_CLOSE, "[／UNTRUSTED_EXTERNAL_CONTENT]")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -138,15 +145,22 @@ async def execute(*, query: str, max_results: int = 5, provider: str = "duckduck
             )
         return (
             f"[UNTRUSTED_EXTERNAL_CONTENT source=\"duckduckgo\"]\n"
-            f"No results for '{query}' (the result list parsed as empty; if that is "
+            f"No results for '{_escape_untrusted_fence(query)}' (the result list parsed as empty; if that is "
             "unexpected, the provider's markup may have changed)\n"
             "[/UNTRUSTED_EXTERNAL_CONTENT]"
         )
 
-    lines = ["[UNTRUSTED_EXTERNAL_CONTENT source=\"duckduckgo\"]", f"Search results for: {query}"]
+    lines = [
+        "[UNTRUSTED_EXTERNAL_CONTENT source=\"duckduckgo\"]",
+        f"Search results for: {_escape_untrusted_fence(query)}",
+    ]
     for i, (href, title) in enumerate(links[:max_results]):
         real_url = _decode_ddg_url(href)
         snippet = snippets[i] if i < len(snippets) else ""
-        lines.append(f"\n{i + 1}. {_clean(title)}\n   {real_url}\n   {snippet}")
+        lines.append(
+            f"\n{i + 1}. {_escape_untrusted_fence(_clean(title))}"
+            f"\n   {_escape_untrusted_fence(real_url)}"
+            f"\n   {_escape_untrusted_fence(snippet)}"
+        )
     lines.append("[/UNTRUSTED_EXTERNAL_CONTENT]")
     return "\n".join(lines)

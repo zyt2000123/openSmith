@@ -54,6 +54,30 @@ def coerce_gate_result(value: object) -> GateResult:
     return GateResult(verdict, reason, retry_hint=retry_hint)
 
 
+_MAX_GATE_OUTPUT_CHARS = 2000
+
+
+def _bounded_gate_output(output: str) -> str:
+    """Keep both ends of a long node output when feeding the gate LLM.
+
+    The two layers of a gate used to read different text: the heuristic
+    pre-filter scans the whole output, while this wrapper passed only its
+    first characters to the model.  Verification and review nodes put their
+    evidence last -- the command output they just produced -- so the
+    pre-filter would confirm evidence the LLM could not see, and the gate
+    rejected a node whose output was in fact correct.  Mirrors
+    ``engine.memory._review._truncate_source``: keep both ends, and say so.
+    """
+    if len(output) <= _MAX_GATE_OUTPUT_CHARS:
+        return output
+    marker = "\n[... middle of output omitted from gate input ...]\n"
+    available = _MAX_GATE_OUTPUT_CHARS - len(marker)
+    if available <= 0:  # pragma: no cover - marker is far shorter than the budget
+        return output[:_MAX_GATE_OUTPUT_CHARS]
+    head = available // 2
+    return f"{output[:head]}{marker}{output[-(available - head):]}"
+
+
 def _normalized_llm_verdict(text: str) -> str:
     """Upper-case a gate verdict, tolerating benign trailing punctuation.
 
@@ -107,7 +131,9 @@ class LLMGate:
             # template containing JSON samples or other literal braces (a
             # common content-authoring mistake) cannot make str.format raise
             # and silently turn every check into a permanent gate failure.
-            template = self._prompt_template.replace("{output}", output[:2000])
+            template = self._prompt_template.replace(
+                "{output}", _bounded_gate_output(output)
+            )
             with llm_purpose("gate"):
                 resp = await self._llm.chat([
                     {"role": "system", "content": "You are a quality gate. Evaluate the output and respond with ONLY 'PASS' or 'FAIL: <reason>'. Be strict."},

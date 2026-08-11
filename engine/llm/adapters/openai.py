@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -56,6 +57,55 @@ class _StreamTruncatedError(LLMResponseError):
     Kept distinct from other stream errors so the retry loop can treat a
     pre-content truncation as transient without retrying malformed payloads.
     """
+
+
+# Enum-like ``type``/``code`` values that mark a mid-stream failure as
+# transient.  Both sides are stripped to letters and digits before matching,
+# because relays spell the same condition as "rate_limit_exceeded",
+# "rate-limit-error", or "RateLimitReached".  The free-text ``message`` is
+# never consulted: relays echo request content (including the prompt) into it.
+_RETRYABLE_STREAM_ERROR_MARKERS = (
+    "ratelimit",
+    "overloaded",
+    "servererror",
+    "serviceunavailable",
+    "internalerror",
+    "apierror",
+)
+_NON_ALNUM = re.compile(r"[^a-z0-9]")
+_RETRYABLE_STREAM_ERROR_STATUS = frozenset({"429", "500", "502", "503", "504"})
+
+
+def _stream_error_is_retryable(chunk: dict) -> bool:
+    """Whether a mid-stream ``error`` member describes a transient failure.
+
+    The same overload that arrives as a retryable HTTP status before the stream
+    opens arrives as a 200 carrying an ``error`` member once it is open, so
+    refusing to retry the second form made recoverability depend on timing.
+    """
+    error = chunk.get("error")
+    if not isinstance(error, dict):
+        return False
+    for key in ("type", "code"):
+        value = error.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = str(value)
+        if not isinstance(value, str):
+            continue
+        folded = _NON_ALNUM.sub("", value.casefold())
+        if folded in _RETRYABLE_STREAM_ERROR_STATUS:
+            return True
+        if any(marker in folded for marker in _RETRYABLE_STREAM_ERROR_MARKERS):
+            return True
+    return False
+
+
+class _StreamProviderError(LLMResponseError):
+    """A mid-stream provider ``error`` member, with its retry classification."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class OpenAIAdapter(HTTPAdapterMixin):
@@ -199,7 +249,10 @@ class OpenAIAdapter(HTTPAdapterMixin):
                     # surface in exceptions or logs (see the boundary enforced
                     # for HTTP bodies in ``HTTPAdapterMixin._raise_for_status``).
                     if _provider_error_message(chunk) is not None:
-                        raise LLMResponseError("Provider stream error.")
+                        raise _StreamProviderError(
+                            "Provider stream error.",
+                            retryable=_stream_error_is_retryable(chunk),
+                        )
 
                     choices = chunk.get("choices", [])
                     if not isinstance(choices, list) or not choices:
@@ -298,6 +351,17 @@ class OpenAIAdapter(HTTPAdapterMixin):
                 logger.warning(
                     "LLM stream attempt %d failed (%s), retrying",
                     attempt + 1, type(exc).__name__,
+                )
+            except _StreamProviderError as exc:
+                # A 200 stream carrying an overload/rate-limit error member is
+                # the same transient failure the HTTP path already retries; only
+                # its timing differs.  Content already emitted cannot be
+                # replayed, so that case still fails hard.
+                if saw_content_event or not exc.retryable or attempt >= MAX_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "LLM stream attempt %d returned a retryable error event, retrying",
+                    attempt + 1,
                 )
             except _StreamTruncatedError as exc:
                 # A relay that drops the connection before [DONE] — with no

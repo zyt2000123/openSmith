@@ -1,4 +1,5 @@
 """Declarative presentation tool registered for the engine-owned UI event path."""
+# 只提交声明式 UI 规格；实际渲染与事件通道由 engine 统一掌控。
 
 TOOL_META = {
     "name": "render_ui",

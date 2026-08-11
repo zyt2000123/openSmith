@@ -96,15 +96,17 @@ def test_local_environment_times_out_and_reports_it() -> None:
 
 def test_local_environment_caps_stream_output() -> None:
     overflow = MAX_OUTPUT + 64
+    # The cap keeps both ends: a command's verdict sits on its last line.
+    script = f"print('HEAD' + 'x' * {overflow} + 'TAIL', end='')"
     result = asyncio.run(
-        LocalExecutionEnvironment().run_command(
-            argv=[sys.executable, "-c", f"print('x' * {overflow}, end='')"]
-        )
+        LocalExecutionEnvironment().run_command(argv=[sys.executable, "-c", script])
     )
 
     assert result.exit_code == 0
-    assert result.stdout.startswith("x" * MAX_OUTPUT)
-    assert f"(truncated, {overflow} bytes total)" in result.stdout
+    assert result.stdout.startswith("HEAD")
+    assert "TAIL" in result.stdout
+    assert "(middle truncated)" in result.stdout
+    assert f"(truncated, {overflow + 8} bytes total)" in result.stdout
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-specific")

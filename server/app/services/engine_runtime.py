@@ -159,7 +159,7 @@ def build_engine_runtime(
         llm=manager.get_for_config(interactive_config),
         gate_llm=manager.get_for_config(gate_config),
         background_llm=manager.get_for_config(background_config),
-        tool_registry=ToolRegistry(),
+        tool_registry=ToolRegistry(lazy_tool_schemas=True),
         skill_registry=skill_registry,
         tool_guard=ToolGuard(paths.safety_rules_path),
         mcp_session_pool=_mcp_client_session_pool,

@@ -23,6 +23,7 @@ from engine.execution import (
 from engine.context import CONTEXT_DISPLAY_WINDOW, summarize_session
 from engine.identity import IdentityCatalog, IdentityCatalogError
 from engine.llm.model_config import resolve_llm_config
+from engine.llm.observability import generation_context
 from engine.observability.trace_store import _redact_secrets_in_text
 from common.yaml_utils import YamlConfigError
 
@@ -95,8 +96,14 @@ async def _session_turn_lock(session_id: str) -> AsyncIterator[None]:
     finally:
         _release_session_lock_slot(session_id)
 
-# Recent messages passed to the engine as short-term conversational context
-_HISTORY_LIMIT = 10
+
+# Recent messages passed to the engine as short-term conversational context.
+# Only visible reply text is stored per turn — tool calls, file reads and
+# command output never reach the next turn — so even a turn that ran dozens of
+# tools costs one short message here.  At 10 (5 exchanges) a working session
+# lost sight of its own opening question long before the work was done.  The
+# engine's context fitter still compacts whatever does not fit the window.
+_HISTORY_LIMIT = 40
 # Upper bound for one compress call; far beyond any real session while still
 # bounding the row count (compression already loads the conversation into memory).
 _COMPRESS_MESSAGE_CAP = 50_000
@@ -342,10 +349,15 @@ class SessionService:
         profile_name = profile["name"] if profile else "Agent"
         _runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
         try:
-            summary_result = await summarize_session(
-                [{"role": row["role"], "content": row["content"]} for row in rows],
-                services.llm,
-            )
+            # Manual /compress runs outside any agent run, so nothing has
+            # installed a generation scope.  Without this the compaction's own
+            # LLM call lands in llm_generations with a NULL session_id we are
+            # holding right here.
+            with generation_context(session_id=session_id):
+                summary_result = await summarize_session(
+                    [{"role": row["role"], "content": row["content"]} for row in rows],
+                    services.llm,
+                )
         finally:
             close = getattr(services, "close", None)
             if close is not None:
@@ -668,11 +680,10 @@ class SessionService:
                         payload["evidence_hash"] = ev.data["evidence_hash"]
                     yield sse("gate_result", payload)
                 elif t == "gate_evidence":
+                    evidence = ev.data.get("evidence")
                     yield sse("gate_evidence", {
                         "skill": str(ev.data.get("skill") or ""),
-                        "evidence": ev.data.get("evidence")
-                        if isinstance(ev.data.get("evidence"), list)
-                        else [],
+                        "evidence_count": len(evidence) if isinstance(evidence, list) else 0,
                         "evidence_hash": ev.data.get("evidence_hash"),
                     })
                 elif t == "backtrack":

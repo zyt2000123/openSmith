@@ -79,7 +79,17 @@ def enabled_tools_from_config(
                 continue
             if name in available:
                 configured.append(name)
-            elif name not in known:
+            elif name in known:
+                # Registered but not model-facing (``TOOL_META["hidden"]``).
+                # This landed in an empty branch, so an allowlist naming a
+                # hidden tool was dropped with no signal at all — the very
+                # failure mode the sibling branch below exists to end.
+                logger.warning(
+                    "agent config enabled %r, which is registry-internal "
+                    "(hidden) and cannot be called by the model; ignoring it",
+                    name,
+                )
+            else:
                 # A typo in tools.enabled used to vanish silently: this function
                 # removed the name before set_enabled() could report it, so the
                 # unknown-tool warning in prepare_runtime was unreachable.  Log
@@ -377,18 +387,12 @@ async def prepare_runtime(
     services.hook_registry = hook_registry
 
     from engine.memory.compile import assemble_memory, ensure_durable_template
-    from engine.memory.embeddings import embedding_provider_from_config
-    from engine.memory.store import retrieve_relevant_memory
 
     try:
         ensure_durable_template(state_dir / "memory")
     except Exception:
         logger.warning("failed to initialize durable memory template", exc_info=True)
-    embedding_provider = services.embedding_provider or embedding_provider_from_config(profile_config)
-    retrieved = await retrieve_relevant_memory(
-        state_dir, request.message, embedding_provider=embedding_provider
-    )
-    memory_text = assemble_memory(state_dir / "memory", include_durable=False)
+    memory_text = assemble_memory(state_dir / "memory")
     eval_guidance = (
         EVAL_SENSITIVE_GUIDANCE if detect_eval_sensitive(request.message) else ""
     )
@@ -397,8 +401,6 @@ async def prepare_runtime(
         services.tool_registry,
         services.skill_registry,
         _runtime_prompt_context(runtime, identity),
-        retrieved_durable=retrieved.durable,
-        retrieved_episodes=retrieved.episodes,
         working_dir=working_dir,
         memory_text=memory_text,
         runtime_guidance=identity.prompt,

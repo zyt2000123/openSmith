@@ -86,6 +86,17 @@ def test_invalid_payloads_normalize_to_all_zero() -> None:
     assert normalize_usage({"prompt_tokens_details": "junk"})["cache_read_tokens"] == 0
 
 
+def test_empty_usage_object_counts_as_unreported() -> None:
+    """``usage: {}`` carries no accounting, so it must not read as reported.
+
+    A relay that stops populating usage would otherwise be indistinguishable
+    from a call that genuinely consumed nothing — the exact confusion this
+    flag exists to prevent.
+    """
+    assert normalize_usage({})["usage_reported"] == 0
+    assert normalize_usage({"prompt_tokens": 0})["usage_reported"] == 1
+
+
 def test_negative_and_float_values_are_sanitized() -> None:
     usage = normalize_usage({
         "prompt_tokens": -5,

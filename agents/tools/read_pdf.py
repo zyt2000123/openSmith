@@ -1,4 +1,5 @@
 """PDF reader tool provider with bounded, page-aware text extraction."""
+# 只抽取有页码边界的文本；版式、图表等视觉信息交给 render_pdf_page。
 
 from __future__ import annotations
 

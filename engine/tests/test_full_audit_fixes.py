@@ -176,39 +176,6 @@ def test_explicit_skillchain_intents_match_without_capturing_ordinary_coding() -
 
 # ── P1-3: CJK sentences never match the trigram FTS index ──
 
-@pytest.mark.asyncio
-async def test_cjk_sentence_query_finds_episode(tmp_path: Path) -> None:
-    """A whole-sentence Chinese query must retrieve a relevant episode."""
-    from engine.memory.search import SearchIndex
-
-    idx = SearchIndex(tmp_path)
-    await idx.open()
-    try:
-        await idx.index_entry(
-            "ep1", "用户上周要求优化数据库查询性能，已通过索引调整解决该问题。", "episode"
-        )
-        hits = await idx.search("之前数据库查询性能的问题怎么解决的", top_k=5)
-        assert hits, "whole-sentence CJK query must not return empty"
-        assert hits[0]["id"] == "ep1"
-    finally:
-        await idx.close()
-
-
-@pytest.mark.asyncio
-async def test_short_cjk_query_still_works(tmp_path: Path) -> None:
-    """The pre-existing short-keyword path must keep working."""
-    from engine.memory.search import SearchIndex
-
-    idx = SearchIndex(tmp_path)
-    await idx.open()
-    try:
-        await idx.index_entry("ep1", "关于记忆系统的讨论", "episode")
-        hits = await idx.search("记忆", top_k=5)
-        assert hits and hits[0]["id"] == "ep1"
-    finally:
-        await idx.close()
-
-
 def test_stem_plus_consonant_plus_e_does_not_misroute() -> None:
     """Round-3 review: an unrestricted ``[a-z]?`` reopened the prefix collision.
 
@@ -269,21 +236,6 @@ def test_hardlink_check_covers_git_worktree_layout(tmp_path: Path) -> None:
     assert not result.allowed, "hard link into a worktree's real hooks must be blocked"
 
 
-def test_long_cjk_run_does_not_crowd_out_later_terms() -> None:
-    """Round-3 review: a long leading CJK run filled every _MAX_TERMS slot.
-
-    The old whole-sentence term could never hit the cap, so slicing introduced
-    this truncation risk along with the fix.
-    """
-    from engine.memory.search import _MAX_TERMS, _search_terms
-
-    terms = _search_terms(
-        "今天我们讨论了一下关于项目进度和预算超支的问题以及后续计划安排 urgent"
-    )
-    assert len(terms) <= _MAX_TERMS
-    assert "urgent" in terms, f"trailing keyword was dropped: {terms}"
-
-
 def test_keyword_prefix_collisions_do_not_misroute() -> None:
     """Round-2 review: a leading-only \\b lets the keyword match as a word prefix.
 
@@ -301,63 +253,6 @@ def test_keyword_prefix_collisions_do_not_misroute() -> None:
         assert decision.route_id == "direct", (
             f"{message!r} misrouted to {decision.route_id}, expected no keyword match"
         )
-
-
-@pytest.mark.asyncio
-async def test_short_token_does_not_degrade_whole_cjk_query(tmp_path: Path) -> None:
-    """Round-2 review: one short token dragged the entire query onto the LIKE path.
-
-    Chinese prose almost always carries punctuation or a two-character greeting,
-    so this made the trigram slicing ineffective for most real input.
-    """
-    from engine.memory.search import SearchIndex
-
-    idx = SearchIndex(tmp_path)
-    await idx.open()
-    try:
-        await idx.index_entry(
-            "ep1", "上次帮你把数据库查询做了索引优化，效果很好。", "episode"
-        )
-        for query in (
-            "谢谢 数据库查询优化效果如何",
-            "数据库查询优化，效果如何？",
-        ):
-            hits = await idx.search(query, top_k=5)
-            assert hits, f"query with a short token must still match: {query!r}"
-            assert hits[0]["id"] == "ep1"
-    finally:
-        await idx.close()
-
-
-@pytest.mark.asyncio
-async def test_kana_only_japanese_query_is_sliced(tmp_path: Path) -> None:
-    """Round-2 review: the CJK class covered ideographs only, so kana stayed unsliced."""
-    from engine.memory.search import SearchIndex
-
-    idx = SearchIndex(tmp_path)
-    await idx.open()
-    try:
-        await idx.index_entry("ep1", "きのうデータベースのさくいんをなおしました", "episode")
-        hits = await idx.search("データベースのさくいんはどうなおしたのか", top_k=5)
-        assert hits, "kana-only Japanese query must not return empty"
-        assert hits[0]["id"] == "ep1"
-    finally:
-        await idx.close()
-
-
-@pytest.mark.asyncio
-async def test_unrelated_cjk_query_does_not_match(tmp_path: Path) -> None:
-    """Broadening recall must not make every query match everything."""
-    from engine.memory.search import SearchIndex
-
-    idx = SearchIndex(tmp_path)
-    await idx.open()
-    try:
-        await idx.index_entry("ep1", "用户上周要求优化数据库查询性能，已通过索引调整解决。", "episode")
-        hits = await idx.search("周末去哪里吃火锅比较好", top_k=5)
-        assert not hits, f"unrelated query should not match, got {hits}"
-    finally:
-        await idx.close()
 
 
 # ── P1-14: MCP SSE size cap counts the whole stream, not one message ──

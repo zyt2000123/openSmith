@@ -1,4 +1,5 @@
 """Todo tool — track tasks during a session."""
+# Todo 是当前会话的可变执行清单，不承担跨会话记忆职责。
 
 import asyncio
 import json

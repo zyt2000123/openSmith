@@ -1,4 +1,5 @@
 """Glob tool — find files by pattern."""
+# 仅按路径模式枚举文件；需要查找文件内容时应使用 grep。
 
 import asyncio
 import fnmatch

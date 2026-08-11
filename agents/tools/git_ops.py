@@ -6,6 +6,7 @@ Runs every git command through the injected execution environment in argv
 mode (no shell interpretation). Validates inputs to prevent injection and
 checks for sensitive files before staging.
 """
+# Git 参数以 argv 传递而非 shell 拼接，并在暂存前拦截敏感文件。
 
 import os
 import re

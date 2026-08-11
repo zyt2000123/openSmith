@@ -25,7 +25,6 @@ from engine.mcp.client import (
     MCPSessionExpiredError,
     StdioMCPTransport,
     StreamableHTTPMCPTransport,
-    register_mcp_tools,
     register_mcp_tools_with_prefix,
 )
 from engine.tool.registry import ToolRegistry
@@ -290,7 +289,7 @@ def test_mcp_tool_is_error_becomes_registry_error():
             client = await _new_client(Path(tmp))
             registry = ToolRegistry()
             try:
-                await register_mcp_tools(registry, client)
+                await register_mcp_tools_with_prefix(registry, client, prefix="mcp")
                 return await registry.execute(ToolCall(id="call-1", name="mcp_bad", arguments={}))
             finally:
                 await client.close()
@@ -316,7 +315,7 @@ def test_mcp_registration_skips_bad_tool_and_keeps_good_tool():
     async def run():
         registry = ToolRegistry()
         registry.register("mcp_dup", "", {}, lambda: "existing")
-        return await register_mcp_tools(registry, FakeClient())
+        return await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp")
 
     assert asyncio.run(run()) == 1
 
@@ -805,7 +804,7 @@ def test_registered_mcp_tools_always_require_approval():
 
     async def run():
         registry = ToolRegistry()
-        await register_mcp_tools(registry, FakeClient())
+        await register_mcp_tools_with_prefix(registry, FakeClient(), prefix="mcp")
         definition = registry.get("mcp_mutate_remote")
         result = ToolGuard(
             Path("missing-rules.json"), tool_registry=registry.definitions(),
@@ -1043,9 +1042,10 @@ def test_mcp_server_log_summary_redacts_command_args_and_url_query():
 
 
 def test_stdio_transport_raises_when_response_stream_exceeds_budget(monkeypatch):
-    """A server that keeps sending notifications must not hold a request open
-    forever: the per-line timeout resets on every read, so a whole-request byte
-    budget is the only bound on the wait."""
+    """A server that floods notifications must not hold a request open forever:
+    the per-line timeout resets on every read, so a whole-request byte budget
+    bounds the flood.  A trickle spends no bytes and needs the wall clock
+    instead — see test_stdio_transport_bounds_a_slow_notification_drip_by_time."""
     import engine.mcp.client as mcp_client
 
     notification = b'{"jsonrpc":"2.0","method":"notifications/message","params":{"x":1}}\n'
@@ -1083,6 +1083,91 @@ def test_stdio_transport_raises_when_response_stream_exceeds_budget(monkeypatch)
     assert "exceeds maximum total size" in message
     assert framing_broken is True
     assert reads == 4
+
+
+def test_stdio_transport_bounds_a_slow_notification_drip_by_time(monkeypatch):
+    """Bytes cannot bound a wait measured in time.
+
+    The byte budget above stops a server that floods; it cannot stop one that
+    trickles.  64MB of 64-byte notifications is ~1M messages — at one every
+    29s (inside the per-line timeout, which resets on every read) that is
+    months of wall clock with the request lock held the whole way.  And
+    notifications/progress during a long call is correct MCP behaviour, so
+    this needs no hostile server, just a hung upstream.
+    """
+    import engine.mcp.client as mcp_client
+
+    notification = b'{"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n'
+    monkeypatch.setattr(mcp_client, "MAX_MCP_REQUEST_SECONDS", 0.05)
+
+    class FakeStdin:
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class FakeStdout:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def readline(self) -> bytes:
+            self.calls += 1
+            await asyncio.sleep(0.01)
+            return notification
+
+    async def run():
+        transport = StdioMCPTransport(["fake"])
+        transport._process = SimpleNamespace(stdin=FakeStdin(), stdout=FakeStdout())
+        try:
+            await transport.send_request("tools/list", {})
+        except RuntimeError as exc:
+            return str(exc), transport._framing_broken, transport._process.stdout.calls
+        raise AssertionError("whole-request deadline was not enforced")
+
+    message, framing_broken, reads = asyncio.run(run())
+
+    assert "maximum total time" in message
+    assert framing_broken is True
+    # Far below the ~1M reads the byte budget alone would have allowed.
+    assert reads < 50
+
+
+def test_sse_stream_bounds_a_slow_event_drip_by_time(monkeypatch):
+    """The SSE path carries the same mistake as stdio's.
+
+    Its own comment names the risk — "let a server trickle small events
+    forever (httpx's timeout is per-read and resets on every chunk)" — and
+    then answers it with a byte ceiling, which is the one dimension a trickle
+    does not consume.
+    """
+    import engine.mcp.client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "MAX_MCP_REQUEST_SECONDS", 0.05)
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.lines = 0
+
+        async def aiter_lines(self):
+            while True:
+                self.lines += 1
+                await asyncio.sleep(0.01)
+                yield 'data: {"jsonrpc":"2.0","method":"notifications/progress"}'
+                yield ""
+
+    async def run():
+        response = FakeResponse()
+        try:
+            await mcp_client._response_from_sse_stream(response, 7)
+        except RuntimeError as exc:
+            return str(exc), response.lines
+        raise AssertionError("whole-request deadline was not enforced")
+
+    message, lines = asyncio.run(run())
+
+    assert "maximum total time" in message
+    assert lines < 50
 
 
 def test_streamable_http_transport_clears_session_on_expiry():

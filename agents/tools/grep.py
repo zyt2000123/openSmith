@@ -1,4 +1,5 @@
 """Grep tool — search file contents using ripgrep (rg) or fallback to grep."""
+# 优先使用 rg，并主动跳过常见生成目录与二进制文件以控制噪声和开销。
 
 import asyncio
 import fnmatch
@@ -57,13 +58,13 @@ SECRET_EXCLUDED = [
     ".env*", ".npmrc", ".pypirc", ".netrc",         # credential files
     ".git-credentials",                             # git credential store
     "*.pem", "*.key", "*.p12", "*.pfx",             # private keys and certs
-    # SSH keys, including copies affixed away from ~/.ssh (id_rsa_old,
-    # backup-id_ed25519).  ToolGuard._is_sensitive_read_name gates these with a
-    # word-boundary regex, so a bare-basename exclusion here let a directory
-    # walk dump exactly the affixed keys the guard blocks on a direct read.
-    # The globs over-match slightly (grid_rsa) — harmless: an over-excluded file
-    # is still searchable when named directly, where the guard then governs it.
-    "*id_rsa*", "*id_dsa*", "*id_ecdsa*", "*id_ed25519*",
+    # SSH keys outside ~/.ssh, including copies and rotations that keep the
+    # shape but not the exact name (id_rsa_old, backup-id_ed25519).  Exact
+    # names alone let grep return a private key that read_file refuses without
+    # high-risk approval; keep aligned with the same widening in
+    # engine/safety/tool_guard.py and engine/sandbox/macos_seatbelt.py.
+    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+    "*[-_.]id_rsa*", "*[-_.]id_dsa*", "*[-_.]id_ecdsa*", "*[-_.]id_ed25519*",
 ]
 # A caller-supplied file filter WINS over the exclusions above in both engines:
 # BSD/GNU grep applies --include before --exclude, and ripgrep gives precedence
@@ -80,6 +81,9 @@ _SECRET_PROBE_NAMES = (
     ".npmrc", ".pypirc", ".netrc", ".git-credentials",
     "server.pem", "server.key", "cert.p12", "cert.pfx",
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    # Copies and rotations must be probed too, or a filter naming one of them
+    # would slip past the reachability check that guards SECRET_EXCLUDED.
+    "id_rsa_old", "backup-id_ed25519",
 )
 _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 

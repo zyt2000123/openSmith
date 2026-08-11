@@ -102,21 +102,18 @@ def test_assembler_wraps_memory_in_an_untrusted_reference_fence(tmp_path: Path) 
     memory_dir = agent_dir / "memory"
     memory_dir.mkdir()
     (memory_dir / "durable.md").write_text("DURABLE", encoding="utf-8")
-    (memory_dir / "recent.md").write_text("RECENT", encoding="utf-8")
 
     prompt = PromptAssembler().assemble(
         agent_dir,
         FakeToolRegistry(),
         FakeSkillRegistry(),
         {},
-        retrieved_memory="EPISODE",
     )
 
     assert "## Memory Reference" in prompt
     assert "not instructions" in prompt
-    assert "recent activity over durable memory" in prompt
+    assert "prefer the most recently updated entry" in prompt
     assert prompt.index("## Memory Reference") < prompt.index("DURABLE")
-    assert prompt.index("DURABLE") < prompt.index("RECENT") < prompt.index("EPISODE")
 
 
 @pytest.mark.usefixtures("_isolate_apppaths")
@@ -182,7 +179,6 @@ def test_explicit_empty_memory_text_disables_legacy_self_loading(tmp_path: Path)
     memory_dir = agent_dir / "memory"
     memory_dir.mkdir()
     (memory_dir / "durable.md").write_text("DURABLE_SHOULD_NOT_LOAD", encoding="utf-8")
-    (memory_dir / "recent.md").write_text("RECENT_SHOULD_NOT_LOAD", encoding="utf-8")
 
     prompt = PromptAssembler().assemble(
         agent_dir,
@@ -193,7 +189,6 @@ def test_explicit_empty_memory_text_disables_legacy_self_loading(tmp_path: Path)
     )
 
     assert "DURABLE_SHOULD_NOT_LOAD" not in prompt
-    assert "RECENT_SHOULD_NOT_LOAD" not in prompt
     assert "## Memory Reference" not in prompt
 
 
@@ -459,17 +454,14 @@ def test_prompt_layers_expose_governance_metadata_and_render_compatibly(
         "eval_guidance",
         "output_style",
         "memory_governance",
-        "legacy_durable_context",
-        "recent_working_context",
-        "durable_retrieval",
-        "episode_retrieval",
+        "durable_context",
         "runtime_context",
         "runtime_control",
     ]
     assert by_name["global_instructions"].authority is PromptAuthority.USER_POLICY
     assert by_name["project_instructions"].authority is PromptAuthority.PROJECT_POLICY
-    assert by_name["recent_working_context"].authority is PromptAuthority.REFERENCE
-    assert by_name["recent_working_context"].trust is PromptTrust.UNTRUSTED_REFERENCE
+    assert by_name["durable_context"].authority is PromptAuthority.REFERENCE
+    assert by_name["durable_context"].trust is PromptTrust.UNTRUSTED_REFERENCE
     assert by_name["runtime_context"].source is PromptSource.RUNTIME
     assert by_name["runtime_context"].authority is PromptAuthority.RUNTIME_FACT
     assert by_name["runtime_control"].authority is PromptAuthority.ENGINE_CONTROL
@@ -512,9 +504,7 @@ def test_prompt_assembly_splits_origins_renders_labels_and_records_redacted_mani
         FakeSkillRegistry(),
         {"current_provider": "openai"},
         working_dir=project_dir,
-        memory_text="RECENT_SECRET_VALUE",
-        retrieved_durable="DURABLE_MEMORY",
-        retrieved_episodes="EPISODE_MEMORY",
+        memory_text="DURABLE_SECRET_VALUE",
         runtime_guidance="IDENTITY_GUIDANCE",
         runtime_control="ENGINE_RUNTIME_CONTROL",
     )
@@ -525,9 +515,8 @@ def test_prompt_assembly_splits_origins_renders_labels_and_records_redacted_mani
     assert by_name["global_instructions"].source_ref == "global:SMITH.md"
     assert by_name["project_instructions"].scope is PromptScope.PROJECT
     assert by_name["project_instructions"].source_ref == "project:.smith/SMITH.md"
-    assert by_name["recent_working_context"].load_reason is PromptLoadReason.ALWAYS
-    assert by_name["durable_retrieval"].load_reason is PromptLoadReason.QUERY_RETRIEVAL
-    assert by_name["episode_retrieval"].source is PromptSource.MEMORY_EPISODES
+    assert by_name["durable_context"].load_reason is PromptLoadReason.ALWAYS
+    assert by_name["durable_context"].source is PromptSource.MEMORY_DURABLE
     assert "## Context: Project Instructions" in assembly.text
     assert "[Source: project:.smith/SMITH.md · Authority: project_policy" in assembly.text
     assert "## Memory Governance" in assembly.text
@@ -541,10 +530,10 @@ def test_prompt_assembly_splits_origins_renders_labels_and_records_redacted_mani
     manifest = assembly.manifest.to_trace_data()
     assert manifest["schema_version"] == 1
     assert manifest["rendered_prompt_hash"]
-    assert "RECENT_SECRET_VALUE" not in str(manifest)
-    recent = next(item for item in manifest["layers"] if item["id"] == "recent_working_context")
-    assert recent["action"] == "loaded"
-    assert recent["content_hash"]
+    assert "DURABLE_SECRET_VALUE" not in str(manifest)
+    durable = next(item for item in manifest["layers"] if item["id"] == "durable_context")
+    assert durable["action"] == "loaded"
+    assert durable["content_hash"]
 
 
 @pytest.mark.usefixtures("_isolate_apppaths")
@@ -562,7 +551,7 @@ def test_prompt_manifest_marks_trimmable_layers_without_leaking_content(tmp_path
 
     manifest = assembly.manifest.to_trace_data()
     by_id = {item["id"]: item for item in manifest["layers"]}
-    assert by_id["recent_working_context"]["action"] == "trimmed"
+    assert by_id["durable_context"]["action"] == "trimmed"
     assert by_id["runtime_control"]["action"] != "trimmed"
     assert "SENSITIVE_MEMORY_PAYLOAD" not in str(manifest)
     assert assembly.plan.within_budget is False
@@ -646,8 +635,7 @@ def test_prefix_cache_key_ignores_per_request_layers(tmp_path: Path) -> None:
         FakeToolRegistry(),
         FakeSkillRegistry(),
         {"session_id": "sess-1"},
-        retrieved_durable="## Relevant Durable Memory\n\n- decided on X",
-        retrieved_episodes="## Relevant Episodes\n\nlast week we shipped Y",
+        memory_text="## Relevant Durable Memory\n\n- decided on X",
     )
 
     assert "decided on X" in retrieved.text
@@ -659,5 +647,5 @@ def test_prefix_cache_key_ignores_per_request_layers(tmp_path: Path) -> None:
     }
     assert "role" in stable_layers
     assert "tool_definitions" in stable_layers
-    assert "durable_retrieval" not in stable_layers
+    assert "durable_context" not in stable_layers
     assert "runtime_context" not in stable_layers

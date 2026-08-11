@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from engine.context import ContextReceipt, fit_request, measure_request
 from engine.context.compression import (
+    RUNTIME_USER_NOTE_PREFIX,
     compaction_policy_for_llm,
     trim_conversation_for_context_limit,
 )
@@ -63,7 +64,7 @@ if TYPE_CHECKING:
 
 
 class IncompleteAgentRunError(RuntimeError):
-    """Raised by text adapters when the canonical event stream ends incomplete."""
+    """Raised when a collected run ends incomplete, carrying the reason."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -71,11 +72,77 @@ class IncompleteAgentRunError(RuntimeError):
 
 
 class FailedAgentRunError(RuntimeError):
-    """Raised by text adapters when the canonical event stream ends with a hard failure."""
+    """Raised when a collected run ends in hard failure, carrying the reason."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"Agent run failed: {reason}")
+
+
+_CURRENT_TIME_TOOL = "get_current_time"
+_CURRENT_TIME_TOOL_ACK = "Time data was added to the user context."
+_TOOL_SCHEMA_LOADER = "get_tool_schema"
+
+
+def _tool_schema_loader_definition() -> dict:
+    """Return the one stable provider tool used to load a capability contract."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _TOOL_SCHEMA_LOADER,
+            "description": (
+                "Load the complete input schema for an available tool before using it. "
+                "Pass the exact tool name from the Available Tools list."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact name of the tool whose schema is needed.",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _requested_tool_schema(
+    tool_registry: "ToolRegistry", arguments: dict,
+) -> tuple[str | None, dict | None, str | None]:
+    """Resolve a visible tool schema without exposing disabled capabilities."""
+    name = arguments.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None, None, "`name` must be a non-empty tool name."
+    requested = name.strip()
+    schemas = tool_registry.get_schemas(enabled=[requested])
+    if len(schemas) != 1:
+        return requested, None, f"Tool unavailable: {requested}"
+    schema = schemas[0]
+    function = schema.get("function")
+    canonical_name = function.get("name") if isinstance(function, dict) else None
+    if not isinstance(canonical_name, str):
+        return requested, None, f"Tool unavailable: {requested}"
+    return canonical_name, schema, None
+
+
+def _tool_result_messages(tool_name: str, call_id: str, content: str, *, is_error: bool) -> list[dict[str, str]]:
+    """Keep tool-call protocol valid while placing live time in user context.
+
+    Providers require a matching ``tool`` turn for every assistant tool call.
+    The actual volatile value is also appended as a user turn, per product
+    policy, so it never alters the stable system-prompt prefix.  It carries the
+    shared prefix so the context fitter can tell engine framing apart from the
+    request being executed (see ``compression._split_active_context``).
+    """
+    if tool_name == _CURRENT_TIME_TOOL and not is_error:
+        return [
+            {"role": "tool", "tool_call_id": call_id, "content": _CURRENT_TIME_TOOL_ACK},
+            {"role": "user", "content": f"{RUNTIME_USER_NOTE_PREFIX}{content}"},
+        ]
+    return [{"role": "tool", "tool_call_id": call_id, "content": content}]
 
 
 @dataclass
@@ -241,8 +308,16 @@ def _context_usage_event(
     *,
     input_tokens: int | None = None,
     fit_status: str,
+    actions: tuple[str, ...] = (),
 ) -> ExecutionEvent:
-    """Report selected-route capacity and the complete request cost."""
+    """Report selected-route capacity, request cost, and what fitting dropped.
+
+    ``fit_status`` alone cannot distinguish a cheap tool-output prune from an
+    LLM re-summary of the whole history, and ``recovered`` means messages were
+    deleted outright.  ``actions`` used to reach the trace only when the
+    request ended up UNFIT — the successful-but-lossy path recorded that the
+    conversation shrank without recording what left it.
+    """
     estimated = not isinstance(input_tokens, int) or input_tokens <= 0
     context_tokens = (
         input_tokens if not estimated else receipt.estimated_input_tokens
@@ -267,6 +342,7 @@ def _context_usage_event(
         "window_declared": receipt.window_declared,
         "output_limit_declared": receipt.output_limit_declared,
         "fit_status": fit_status,
+        "actions": list(actions),
     })
 
 
@@ -348,80 +424,10 @@ def _append_length_continuation(
     conversation.append({"role": "system", "content": CONTINUE_AFTER_LENGTH_HINT})
 
 
-async def react_loop(
-    llm: "LLMPort",
-    messages: list[dict],
-    tool_registry: "ToolRegistry",
-    tool_guard: "ToolGuard | None" = None,
-    max_iters: int = DEFAULT_MAX_REACT_ITERS,
-    *,
-    fact_gate: FactGate | None = None,
-    prefix_cache_key: str | None = None,
-    hook_registry: "HookRegistry | None" = None,
-) -> str:
-    """Run the canonical ReAct event loop and collect final assistant text."""
-    chunks: list[str] = []
-    async for event in react_event_loop(
-        llm,
-        messages,
-        tool_registry,
-        tool_guard,
-        max_iters,
-        fact_gate=fact_gate,
-        prefix_cache_key=prefix_cache_key,
-        hook_registry=hook_registry,
-    ):
-        if event.type == EventType.TEXT_DELTA:
-            chunks.append(str(event.data.get("text", "")))
-        elif event.type == EventType.INCOMPLETE:
-            raise IncompleteAgentRunError(
-                str(event.data.get("reason", "agent_incomplete"))
-            )
-        elif event.type == EventType.FAILED:
-            raise FailedAgentRunError(
-                str(event.data.get("reason", "agent_failed"))
-            )
-    return "".join(chunks)
-
-
-async def react_stream_loop(
-    llm: "LLMPort",
-    messages: list[dict],
-    tool_registry: "ToolRegistry",
-    tool_guard: "ToolGuard | None" = None,
-    max_iters: int = DEFAULT_MAX_REACT_ITERS,
-    *,
-    fact_gate: FactGate | None = None,
-    prefix_cache_key: str | None = None,
-    hook_registry: "HookRegistry | None" = None,
-) -> AsyncGenerator[str, None]:
-    """Run the canonical ReAct event loop and expose text deltas only.
-
-    Live streaming is handled by provisional events in the canonical loop;
-    this adapter yields only the final committed TEXT_DELTA.
-    """
-    async for event in react_event_loop(
-        llm,
-        messages,
-        tool_registry,
-        tool_guard,
-        max_iters,
-        fact_gate=fact_gate,
-        prefix_cache_key=prefix_cache_key,
-        hook_registry=hook_registry,
-    ):
-        if event.type == EventType.TEXT_DELTA:
-            text = event.data.get("text", "")
-            if text:
-                yield str(text)
-        elif event.type == EventType.INCOMPLETE:
-            raise IncompleteAgentRunError(
-                str(event.data.get("reason", "agent_incomplete"))
-            )
-        elif event.type == EventType.FAILED:
-            raise FailedAgentRunError(
-                str(event.data.get("reason", "agent_failed"))
-            )
+# The two text-collecting adapters that used to sit here (``react_loop`` and
+# ``react_stream_loop``) had no production caller: orchestration consumes
+# ``react_event_loop`` events directly.  They now live beside the tests that
+# wanted a plain string — engine/tests/execution/react_text_adapters.py.
 
 
 async def react_event_loop(
@@ -437,7 +443,16 @@ async def react_event_loop(
     hook_registry: "HookRegistry | None" = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """ReAct loop: model response, tool calls, results, and next turn in one history."""
-    tools = tool_registry.get_schemas() or None
+    lazy_tool_schemas = bool(getattr(tool_registry, "lazy_tool_schemas", False))
+    if lazy_tool_schemas:
+        # Tool descriptions live in the stable prompt prefix. The provider sees
+        # only this tiny loader schema until the model explicitly asks for one
+        # capability, keeping the large JSON contracts out of every initial turn.
+        tools: list[dict] | None = (
+            [_tool_schema_loader_definition()] if tool_registry.list_tools() else None
+        )
+    else:
+        tools = tool_registry.get_schemas() or None
     visible_tool_names = {
         schema["function"]["name"]
         for schema in (tools or [])
@@ -474,9 +489,21 @@ async def react_event_loop(
             # （provider 400）。向前回退到 assistant/user 边界：同一轮的 tool
             # 结果之间可能夹着 system 提示（TOOL_FAILURE_HINT 在 tool_calls
             # 循环内 append），只认 role=="tool" 会在提示处停下留下孤儿。
-            cut = len(conversation) - CONVERSATION_KEEP_RECENT
+            requested_cut = len(conversation) - CONVERSATION_KEEP_RECENT
+            cut = requested_cut
             while cut > CONVERSATION_KEEP_HEAD and conversation[cut].get("role") in ("tool", "system"):
                 cut -= 1
+            if cut <= CONVERSATION_KEEP_HEAD:
+                # 回退撞到 head 边界时 head+tail 就是整条对话，这道上限静默
+                # 失效：一轮 8 个并行工具调用即可（实测 41 条裁剪后仍是 41
+                # 条，30 个调用时 63 条原样返回）。改为向后找下一个边界 ——
+                # 丢弃的更多，但配对完整且一定有进展。整条尾巴都是
+                # tool/system 时没有安全切点，保持原样交给 fit_request 兜底。
+                forward = requested_cut
+                while forward < len(conversation) and conversation[forward].get("role") in ("tool", "system"):
+                    forward += 1
+                if forward < len(conversation):
+                    cut = forward
             tail = conversation[cut:]
             while head and head[-1].get("role") == "assistant" and head[-1].get("tool_calls"):
                 head.pop()
@@ -511,6 +538,7 @@ async def react_event_loop(
         yield _context_usage_event(
             fit.receipt,
             fit_status=fit.status.value,
+            actions=fit.actions,
         )
         if not fit.fits:
             for provision_id in active_provision_ids:
@@ -689,6 +717,7 @@ async def react_event_loop(
             fit.receipt,
             input_tokens=usage.get("input_tokens") if usage else None,
             fit_status=fit.status.value,
+            actions=fit.actions,
         )
 
         thought = (response.reasoning or (response.text if response.has_tool_calls else "")).strip()
@@ -801,8 +830,12 @@ async def react_event_loop(
                     yield _provisional_retract_event(provision_id, "incomplete_final_repair")
                 active_provision_ids.clear()
                 incomplete_final_repairs += 1
+                # 只追加本轮分片：更早的分片已由 _append_length_continuation
+                # 写进 conversation，重复追加会让同一段文本在修复提示里出现
+                # 两次。（当前 looks_like_incomplete_final_after_tool 有 240
+                # 字上限，续写过的文本够不到，所以这是补一个陷阱而非在燃 bug。）
                 _append_incomplete_final_repair(
-                    conversation, final_text, response.reasoning
+                    conversation, response.text, response.reasoning
                 )
                 final_text_parts.clear()
                 final_text_was_streamed = False
@@ -835,6 +868,62 @@ async def react_event_loop(
         round_had_failure = False
         round_had_preflight = False
         for tc in response.tool_calls:
+            if lazy_tool_schemas and tc.name == _TOOL_SCHEMA_LOADER:
+                requested_name, schema, error = _requested_tool_schema(
+                    tool_registry, tc.arguments,
+                )
+                content = (
+                    json.dumps(schema, ensure_ascii=False, sort_keys=True)
+                    if schema is not None
+                    else f"Error: {error}"
+                )
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": content,
+                })
+                yield ExecutionEvent(EventType.TOOL_CALL_START, {
+                    "name": tc.name,
+                    "id": tc.id,
+                    "arguments": tc.arguments,
+                })
+                yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                    "id": tc.id,
+                    "name": tc.name,
+                    "error": schema is None,
+                    "blocked": False,
+                    "preflight": False,
+                    "content": content[:200],
+                    "error_kind": "tool_unavailable" if schema is None else None,
+                    "retryable": False,
+                    "timed_out": False,
+                    "side_effect_status": "none",
+                    "metadata": {},
+                })
+                if schema is None:
+                    round_had_failure = True
+                    consecutive_errors += 1
+                else:
+                    assert requested_name is not None
+                    visible_tool_names.add(requested_name)
+                    if tools is None:
+                        tools = [_tool_schema_loader_definition(), schema]
+                    elif not any(
+                        isinstance(candidate.get("function"), dict)
+                        and candidate["function"].get("name") == requested_name
+                        for candidate in tools
+                    ):
+                        # Provider adapters may retain the argument list for
+                        # diagnostics; replace rather than mutate it so a past
+                        # request remains an accurate snapshot of its tools.
+                        tools = [*tools, schema]
+                    # Loading a schema consumes an iteration, but is not an
+                    # evidence-gathering tool success: a following text answer
+                    # is still valid even when no operational tool ran.
+                    round_had_success = True
+                    consecutive_errors = 0
+                continue
+
             call = tool_registry.normalize_call(
                 ToolCall(
                     id=tc.id,
@@ -842,6 +931,23 @@ async def react_event_loop(
                     arguments=tc.arguments,
                 )
             )
+
+            # Lazy schemas exist to keep large JSON contracts out of the stable
+            # prompt prefix; they are not a permission boundary.  A model that
+            # calls a tool by name without first loading its schema is asking
+            # for a capability the profile/identity allowlist already grants, so
+            # complete the handshake here.  Reporting it as ``Tool disabled``
+            # read as terminal and made runs abandon a working tool for the rest
+            # of the conversation.  ``_requested_tool_schema`` resolves through
+            # ``get_schemas``, so a pipeline-scoped registry still refuses a
+            # capability its node never had.
+            if lazy_tool_schemas and call.name not in visible_tool_names:
+                loaded_name, loaded_schema, _ = _requested_tool_schema(
+                    tool_registry, {"name": call.name},
+                )
+                if loaded_schema is not None and loaded_name is not None:
+                    visible_tool_names.add(loaded_name)
+                    tools = [*(tools or []), loaded_schema]
 
             # ``render_ui`` is an engine-owned presentation capability. It is
             # deliberately not executed like a provider tool: rendering it
@@ -1190,7 +1296,9 @@ async def react_event_loop(
                     warning_text = "\n\n".join(warnings)
                     conversation.append({"role": "system", "content": warning_text})
 
-            conversation.append({"role": "tool", "tool_call_id": result.call_id, "content": result.content})
+            conversation.extend(_tool_result_messages(
+                call.name, result.call_id, result.content, is_error=result.is_error,
+            ))
             result_event = {
                 "id": tc.id,
                 "name": call.name,

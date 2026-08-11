@@ -33,6 +33,7 @@ from engine.execution.orchestration.runtime import (
 from engine.identity import IdentityCatalog
 from engine.llm.client import ChatResponse, ToolCallData
 from engine.llm.contracts import LLMResponseError, ProviderCapabilities
+from engine.llm.observability import current_generation_scope
 from engine.observability import RunObservation, RunSummaryStore, TraceStore
 from engine.safety.approval import APPROVAL_BROKER
 from engine.safety.tool_guard import AuditLog, ToolGuard
@@ -43,9 +44,10 @@ from engine.tool.registry import ToolRegistry
 
 EMPTY_DURABLE_DOC = (
     "# Durable Project Memory\n\n"
-    "## Confirmed Facts\n\n"
+    "## Active Work\n\n"
+    "## Pending\n\n"
+    "## Verified Outcomes\n\n"
     "## Decisions\n\n"
-    "## Reusable Procedures\n\n"
     "## Known Pitfalls\n"
 )
 
@@ -170,25 +172,18 @@ class ToolCallingMemoryLLM(ToolCallingLLM):
         if self.responses:
             return self.responses.pop(0)
         prompt = messages[-1]["content"]
-        if "`memory/recent.md`" in prompt:
-            return ChatResponse(text="""# Recent Working Memory
+        if "`memory/durable.md`" in prompt:
+            return ChatResponse(text="""# Durable Project Memory
 
 ## Active Work
 - **Runtime memory** — 状态：active；下一步：verify；更新：2026-07-13。
 
 ## Pending
 
-## Recent Verified Outcomes
-""")
-        if "`memory/durable.md`" in prompt:
-            return ChatResponse(text="""# Durable Project Memory
-
-## Confirmed Facts
-- **Runtime memory**: Tool-assisted turns enter the memory pipeline.
+## Verified Outcomes
+- **Runtime memory** — 结果：Tool-assisted turns enter the memory pipeline；证据：tool_result。
 
 ## Decisions
-
-## Reusable Procedures
 
 ## Known Pitfalls
 """)
@@ -1010,20 +1005,24 @@ def test_prepare_runtime_excludes_a_disabled_skill_from_the_live_registry(tmp_pa
     assert asyncio.run(run())
 
 
-def test_prepare_runtime_keeps_recent_and_retrieves_only_matching_durable(
+def test_prepare_runtime_injects_the_whole_durable_view(
     tmp_path: Path,
 ) -> None:
+    """durable.md is budget-capped, so it is injected entire — never filtered.
+
+    The previous design selected only bullets matching the current message,
+    which silently hid facts whose wording differed from the question.
+    """
+
     async def run() -> tuple[str, dict[str, object]]:
         runtime, services, _ = _runtime(tmp_path)
         memory_dir = runtime.profile_dir / "memory"
         memory_dir.mkdir()
-        (memory_dir / "recent.md").write_text(
-            "# Recent Working Memory\n\n## Active Work\n- RECENT_ACTIVE_WORK\n",
-            encoding="utf-8",
-        )
         (memory_dir / "durable.md").write_text(
             "# Durable Project Memory\n\n"
-            "## Confirmed Facts\n"
+            "## Active Work\n"
+            "- ACTIVE_WORK_ENTRY\n\n"
+            "## Verified Outcomes\n"
             "- PostgreSQL migration uses Alembic.\n"
             "- Redis caching uses a separate worker.\n",
             encoding="utf-8",
@@ -1038,16 +1037,14 @@ def test_prepare_runtime_keeps_recent_and_retrieves_only_matching_durable(
 
     prompt, manifest = asyncio.run(run())
 
-    assert "RECENT_ACTIVE_WORK" in prompt
+    assert "ACTIVE_WORK_ENTRY" in prompt
     assert "PostgreSQL migration uses Alembic" in prompt
-    assert "Redis caching uses a separate worker" not in prompt
-    assert "## Context: Recent Working Context" in prompt
-    assert "## Context: Durable Memory Retrieval" in prompt
+    # Unrelated to the question, but still injected: no retrieval step exists.
+    assert "Redis caching uses a separate worker" in prompt
+    assert "## Context: Durable Memory" in prompt
     layers = {item["id"]: item for item in manifest["layers"]}  # type: ignore[index]
-    assert layers["recent_working_context"]["source"] == "memory_recent"
-    assert layers["recent_working_context"]["action"] == "loaded"
-    assert layers["durable_retrieval"]["source"] == "memory_durable"
-    assert layers["durable_retrieval"]["action"] == "loaded"
+    assert layers["durable_context"]["source"] == "memory_durable"
+    assert layers["durable_context"]["action"] == "loaded"
 
 
 def test_prepare_runtime_initializes_empty_durable_memory(tmp_path: Path) -> None:
@@ -1671,6 +1668,57 @@ def test_incomplete_run_persists_learning_with_partial_status(
     assert events[-1].data["status"] == "incomplete"
 
 
+def test_memory_finalization_generations_stay_attributable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Memory-compile LLM calls must carry the run scope that caused them.
+
+    ``llm_generations`` has ``run_id`` and ``session_id`` columns and
+    ``engine/llm/observability.py`` promises side-channel calls (compaction,
+    memory compilation, gate review) are attributed by ``generation_context``.
+    Memory finalization runs from the lifecycle ``finally`` block, which sits
+    outside the ``generation_context`` wrapping the agent stream — so every
+    memory compilation used to land in the cost table as an unattributable
+    row, right where a 10-turn compile spike needs explaining.
+    """
+    runtime, services, _ = _runtime(tmp_path)
+    identity = runtime.identity_catalog.get("smith")  # type: ignore[union-attr]
+    setup = SimpleNamespace(
+        system_prompt="system",
+        identity=identity,
+        route=SimpleNamespace(identity_id="smith", route_id="direct", pipeline_id=None),
+        chain=None,
+        state_dir=runtime.profile_dir,
+        working_dir=tmp_path,
+    )
+    observed: dict[str, object] = {}
+
+    async def fake_prepare_runtime(*_args, **_kwargs):
+        return setup
+
+    async def fake_run_agent_stream(*_args, **_kwargs):
+        yield ExecutionEvent(EventType.TEXT_DELTA, {"text": "final reply"})
+        yield ExecutionEvent(EventType.DONE, {})
+
+    async def fake_persist(*_args, **_kwargs):
+        observed["scope"] = current_generation_scope()
+        return True
+
+    monkeypatch.setattr(lifecycle_module, "prepare_runtime", fake_prepare_runtime)
+    monkeypatch.setattr(lifecycle_module, "run_agent_stream", fake_run_agent_stream)
+    monkeypatch.setattr(lifecycle_module, "_persist_runtime_learning", fake_persist)
+
+    async def collect():
+        stream = run_stream_with_runtime(EngineRequest(message="hi"), runtime, services)
+        return [event async for event in stream.stream_events()]
+
+    events = asyncio.run(collect())
+    finished = events[-1]
+    assert finished.type is EventType.RUN_FINISHED
+    assert observed["scope"] == (finished.data["run_id"], "sess-1")
+
+
 def test_runtime_memory_requires_a_successful_tool_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1820,7 +1868,14 @@ def test_reply_with_runtime_marks_actual_tool_activity(tmp_path: Path) -> None:
     assert llm.closed is True
 
 
-def test_runtime_reuses_llm_for_recent_memory_compilation(tmp_path: Path) -> None:
+def test_runtime_compiles_tool_backed_work_into_durable_memory(tmp_path: Path) -> None:
+    """A plain tool-backed turn must reach durable.md.
+
+    Regression guard: durable admission used to reject `work` events and then
+    advance the compile checkpoint past them, so durable.md stayed empty
+    forever no matter how many tool-assisted turns ran.
+    """
+
     async def run() -> ToolCallingMemoryLLM:
         runtime, services, _ = _runtime(tmp_path)
         _register_successful_test_tool(runtime, services)
@@ -1829,13 +1884,19 @@ def test_runtime_reuses_llm_for_recent_memory_compilation(tmp_path: Path) -> Non
         services.gate_llm = PassReviewer()  # type: ignore[assignment]
         state_dir = runtime.profile_dir / "memory"
         state_dir.mkdir(parents=True)
-        (state_dir / ".compile_counter").write_text("4", encoding="utf-8")
+        from engine.memory.store import _COMPILE_INTERVAL
+
+        (state_dir / ".compile_counter").write_text(
+            str(_COMPILE_INTERVAL - 1), encoding="utf-8"
+        )
 
         result = await reply_with_runtime(EngineRequest(message="use a tool"), runtime, services)
 
         assert result.had_tools is True
-        assert (state_dir / "recent.md").is_file()
-        assert (state_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
+        assert not (state_dir / "recent.md").exists()
+        durable = (state_dir / "durable.md").read_text(encoding="utf-8")
+        assert durable != EMPTY_DURABLE_DOC
+        assert "Tool-assisted turns enter the memory pipeline" in durable
         assert (state_dir / ".compile_counter").read_text(encoding="utf-8") == "0"
         return llm
 
@@ -2059,11 +2120,11 @@ def test_shipped_tdd_identity_executes_every_declared_stage(tmp_path: Path) -> N
     ]
     assert all(event.type not in {EventType.BLOCKED, EventType.FAILED} for event in events)
     assert llm.tool_sets[:2] == [
-        {"read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell"},
-        {"read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell"},
+        {"read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell", "get_current_time"},
+        {"read_file", "write_file", "edit_file", "list_dir", "glob_files", "grep", "shell", "get_current_time"},
     ]
     assert llm.tool_sets[2] == {
-        "read_file", "list_dir", "glob_files", "grep", "shell",
+        "read_file", "list_dir", "glob_files", "grep", "shell", "git_ops", "get_current_time",
     }
     assert events[-2].type is EventType.DONE
     assert events[-1].type is EventType.RUN_FINISHED
@@ -2117,11 +2178,11 @@ def test_shipped_requirements_identity_executes_every_declared_stage(
         "pass",
     ]
     assert llm.tool_sets[0] == {
-        "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep",
+        "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "get_current_time",
     }
     assert llm.tool_sets[1] == {
         "read_file", "read_pdf", "render_pdf_page", "write_file", "list_dir",
-        "glob_files", "grep", "web_search", "web_fetch",
+        "glob_files", "grep", "web_search", "web_fetch", "get_current_time",
     }
     assert llm.tool_sets[2] == llm.tool_sets[0]
     assert events[-2].type is EventType.DONE
@@ -2161,8 +2222,14 @@ def test_shipped_review_identity_executes_every_declared_stage(tmp_path: Path) -
         "pass",
     ]
     assert llm.tool_sets == [
-        {"read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "shell"},
-        {"read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "shell"},
+        {
+        "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep", "get_current_time",
+                "shell", "git_ops", "get_current_time",
+        },
+        {
+            "read_file", "read_pdf", "render_pdf_page", "list_dir", "glob_files", "grep",
+                "shell", "git_ops", "get_current_time",
+        },
     ]
     assert events[-2].type is EventType.DONE
     assert events[-1].type is EventType.RUN_FINISHED

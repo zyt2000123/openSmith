@@ -35,7 +35,7 @@ The current priority is the terminal workbench experience:
 User ──▶ Ink shell ──HTTP + SSE──▶ server ──▶ engine
                                                 │
         identity_catalog (agents/identities/smith.yaml · coding.yaml)
-        keyword/example match → LLM fallback (declared routes only) ──▶ RouteDecision
+        keyword/example match (lexical only, no LLM) ──▶ RouteDecision
                                                 │
                         ┌───────────────────────┴──────────────────┐
                         ▼                                          ▼
@@ -61,12 +61,19 @@ keywords — they stay in generic ReAct. A pipeline node falls back to generic
 ReAct when no matching `SKILL.md` is installed; the gate still runs, so the
 intermediate contract stays observable.
 
-Prompt assembly (`engine/context/assembler.py`) stacks 19 trust-tagged layers:
+Prompt assembly (`engine/context/assembler.py`) stacks 16 trust-tagged layers:
 Agent Role / Style / Workflow, Tool Usage Policy, Available Tools, Available
 Skills, Learned User Context, Global Instructions, Project Instructions,
 Identity Guidance, Evaluation Safety Guidance (conditional), Output Style,
-Memory Governance, Durable Memory, Recent Working Context, Durable Memory
-Retrieval, Relevant Episodes, Runtime Context, Engine Runtime Control.
+Memory Governance, Durable Memory, Runtime Context, Engine Runtime Control.
+
+Memory is two rendered views and nothing else: `context.md` (user
+collaboration) and `memory/durable.md` (project). Both are budget-capped by
+`engine/memory/MEMORY_POLICY.md` and injected **whole** — there is no
+query-time retrieval, no FTS index, no embeddings, and no episodes. Evidence
+accumulates in `memory/recent.jsonl`; `compile_durable()` merges it
+incrementally against `.compile_offset`, and Dream only sanitizes the rendered
+files and reclaims the expired prefix of the event log.
 
 ## 4. Product Language
 
@@ -88,10 +95,10 @@ Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 
 | Layer | Directory | Source lines (non-test) | Responsibility |
 |---|---|---|---|
-| Infrastructure | `common/` | 1.1k | Paths, SQLite connection, YAML read/write, hash chain. Zero business logic. |
-| Execution | `engine/` | 27.4k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
-| Content | `agents/` | 9.7k | Smith identity seed, pipelines, gates, conditions, tools, skills, hooks. Pure content. |
-| Platform | `server/` | 6.0k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints (34 router + `/api/health`). |
+| Infrastructure | `common/` | 1.4k | Paths, SQLite connection, YAML read/write, hash chain. Zero business logic. |
+| Execution | `engine/` | 25.3k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
+| Content | `agents/` | 9.9k | Smith identity seed, pipelines, gates, conditions, tools, skills, hooks. Pure content. |
+| Platform | `server/` | 6.1k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints (34 router + `/api/health`). |
 | Terminal UI | `shell/` | 10.7k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
 
 Rules:
@@ -128,6 +135,7 @@ anchors its non-bypassable platform-write protection on it.
 | **Hook system** | `engine/execution/hooks/` (framework), `agents/smith/hooks/` (built-in implementations) |
 | Data root | `common/paths.py` |
 | Smith profile seed | `agents/smith/` |
+| **End-to-end map** | `docs/04e-Engine-全链路白盒地图.md` — one turn from input to output, node by node, and what each node records |
 
 ## 6a. Hook System
 
@@ -250,11 +258,13 @@ skill chains (§3). Explicit entry points:
 | Review a diff before it lands | keywords (`code review`, `代码评审`, `评审一下`, …) → `code-review` chain |
 | Everything else | stays in generic direct ReAct |
 
-Routing is lexical first (`IdentityCatalog` keyword/example + priority match),
-then an LLM fallback classifier constrained to declared `identity:route`
-tokens (`route_task_with_llm`, wired into `prepare_runtime`); neither path can
-invent an identity, domain, or pipeline. `grill me` stops at shared
-understanding — it does not hand off or implement.
+Routing is **lexical only** — `IdentityCatalog` keyword/example matching with
+priority, via `route_task()`. There is no LLM fallback classifier: one existed,
+but running it on every keyword miss slowed ordinary direct-ReAct turns and
+could start a multi-step workflow the user never asked for, so a pipeline now
+requires a declared, high-confidence intent. Routing cannot invent an identity,
+domain, or pipeline. `grill me` stops at shared understanding — it does not
+hand off or implement.
 
 ## 9. Testing And Verification
 
@@ -265,8 +275,11 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 1046 passed (59 skipped), server 237 passed (5 skipped),
-shell 301 passed (with `~/.agent-smith/auth_token` present).
+Current baseline (macOS, measured on this merge): engine 1064 passed, server 243
+passed (5 skipped), shell 303 passed. The engine's ~59 Seatbelt skips appear on
+Linux only; every one carries `@pytest.mark.skipif(sys.platform != "darwin")`,
+so on macOS they run instead. A Seatbelt test *failing* rather than skipping on
+Linux means that marker is missing — add it.
 
 The engine's 59 skips are almost all macOS-only Seatbelt tests; every one carries
 `@pytest.mark.skipif(sys.platform != "darwin")`. A Seatbelt test *failing* rather

@@ -22,7 +22,6 @@ from .loader import SkillBody
 
 # Execution callers already import both domains and inject the concrete loop.
 # This keeps skill/ free from any execution/ import.
-ReactLoopFn = Callable[..., Coroutine[Any, Any, str]]
 EventT = TypeVar("EventT")
 WORKFLOW_HANDOFF_TOKEN_BUDGET = 2_000
 # Skill bodies are injected after the assembled prompt has already been
@@ -31,38 +30,10 @@ WORKFLOW_HANDOFF_TOKEN_BUDGET = 2_000
 WORKFLOW_SKILL_TOKEN_BUDGET = 8_000
 
 
-async def execute_skill(
-    skill: SkillBody,
-    llm: "LLMPort",
-    tool_registry: "ToolRegistry",
-    messages: list[dict],
-    context: dict,
-    max_iters: int,
-    tool_guard: "ToolGuard | None" = None,
-    *,
-    react_loop_fn: ReactLoopFn | None = None,
-    prefix_cache_key: str | None = None,
-) -> str:
-    """Inject SKILL.md content into prompt and run a ReAct loop.
-
-    Returns the final assistant text output.
-
-    ``react_loop_fn`` is the concrete react-loop implementation injected
-    by the caller (usually ``engine.execution.react.react_loop.react_loop``).
-    """
-    if react_loop_fn is None:
-        raise TypeError(
-            "react_loop_fn is required — caller must inject the react loop implementation"
-        )
-    conversation = _skill_conversation(skill, messages, context)
-    return await react_loop_fn(
-        llm,
-        conversation,
-        tool_registry,
-        tool_guard,
-        max_iters,
-        prefix_cache_key=prefix_cache_key,
-    )
+# A text-returning execute_skill() used to sit here, taking an injected
+# react_loop_fn.  pipeline.py only ever calls the two event-stream entries
+# below, and the adapter its parameter expected no longer exists in production
+# — so the function could not have been called even if something wanted to.
 
 
 async def execute_skill_events(

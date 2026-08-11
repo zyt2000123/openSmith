@@ -869,3 +869,35 @@ def test_api_key_hidden_from_config_repr() -> None:
 
 async def _collect_events_generic(client):
     return [event async for event in client.chat_events([{"role": "user", "content": "hi"}])]
+
+
+def test_openai_stream_error_retry_classification_matches_the_http_path() -> None:
+    """A 200 stream carrying an overload error is as transient as HTTP 503.
+
+    Relays report the same outage either way depending only on whether the
+    stream had already opened; classifying one as permanent made recovery a
+    matter of timing.  Only the enum-like ``type``/``code`` decide — the
+    free-text ``message`` echoes the prompt and is never consulted.
+    """
+    from engine.llm.adapters.openai import _stream_error_is_retryable
+
+    retryable = [
+        {"error": {"type": "rate_limit_exceeded"}},
+        {"error": {"type": "overloaded_error"}},
+        {"error": {"code": "server_error"}},
+        {"error": {"code": 503}},
+        {"error": {"type": "RateLimitReached"}},
+    ]
+    for chunk in retryable:
+        assert _stream_error_is_retryable(chunk), chunk
+
+    permanent = [
+        {"error": {"type": "invalid_request_error"}},
+        {"error": {"code": "context_length_exceeded"}},
+        {"error": {"code": 400}},
+        {"error": "plain string error"},
+        {"error": {"message": "rate_limit hint buried in free text"}},
+        {},
+    ]
+    for chunk in permanent:
+        assert not _stream_error_is_retryable(chunk), chunk

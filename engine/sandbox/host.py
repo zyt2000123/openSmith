@@ -15,6 +15,14 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 MAX_OUTPUT = 10 * 1024
+# Retained output is split head/tail rather than head-only: a test runner puts
+# collection errors at the top but its failure summary and verdict at the very
+# bottom, and a head-only cap dropped exactly the evidence the TDD and review
+# gates ask for.  The stream is consumed incrementally, so what is not retained
+# here is unrecoverable — there is no later disk sink to fall back on.
+_GAP_MARKER = b"\n... (middle truncated) ...\n"
+_HEAD_BYTES = (MAX_OUTPUT - len(_GAP_MARKER)) // 2
+_TAIL_BYTES = MAX_OUTPUT - len(_GAP_MARKER) - _HEAD_BYTES
 _STREAM_CHUNK_SIZE = 4096
 _OUTPUT_DRAIN_TIMEOUT = 1.0
 _TERMINATION_GRACE_SECONDS = 1.0
@@ -63,10 +71,32 @@ class _StreamBuffer:
     """
 
     chunks: list[bytes] = field(default_factory=list)
+    tail: bytearray = field(default_factory=bytearray)
+    head: int = 0
     total: int = 0
 
+    def add(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        room = _HEAD_BYTES - self.head
+        if room > 0:
+            self.chunks.append(chunk[:room])
+            self.head += min(len(chunk), room)
+            chunk = chunk[room:]
+            if not chunk:
+                return
+        self.tail += chunk
+        if len(self.tail) > _TAIL_BYTES:
+            del self.tail[:-_TAIL_BYTES]
+
     def value(self) -> tuple[bytes, int]:
-        return b"".join(self.chunks), self.total
+        head = b"".join(self.chunks)
+        if not self.tail:
+            return head, self.total
+        # Only mark a gap when bytes were actually dropped: output that merely
+        # spilled past the head budget is still contiguous.
+        dropped = self.total - self.head - len(self.tail)
+        joiner = _GAP_MARKER if dropped > 0 else b""
+        return head + joiner + bytes(self.tail), self.total
 
 
 async def _read_limited(
@@ -74,17 +104,14 @@ async def _read_limited(
 ) -> tuple[bytes, int]:
     """Read a stream to EOF, retaining at most ``MAX_OUTPUT`` bytes.
 
+    Retention keeps the head and the tail; the middle is what gets dropped.
+
     ``buffer`` accumulates as data arrives, so a caller forced to abandon this
     task on timeout can still recover what was read and how much was produced.
     """
     sink = buffer if buffer is not None else _StreamBuffer()
-    retained = 0
     while chunk := await stream.read(_STREAM_CHUNK_SIZE):
-        sink.total += len(chunk)
-        remaining = MAX_OUTPUT - retained
-        if remaining > 0:
-            sink.chunks.append(chunk[:remaining])
-            retained += min(len(chunk), remaining)
+        sink.add(chunk)
     return sink.value()
 
 

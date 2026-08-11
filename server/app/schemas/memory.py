@@ -19,7 +19,6 @@ class MemoryMaintenanceOut(BaseModel):
     """
 
     compile: MaintenanceState
-    nudge: MaintenanceState
     dream: MaintenanceState
     # The derived topic-knowledge lane runs inside compile, so it is only ever
     # idle or pending; pending means a failed sync owes a retry.

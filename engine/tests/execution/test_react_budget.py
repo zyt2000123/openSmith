@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
-from engine.execution.react.react_loop import (
-    react_event_loop as _react_event_loop,
+from engine.execution.react.react_loop import react_event_loop as _react_event_loop
+from engine.tests.execution.react_text_adapters import (
     react_loop as _react_loop,
     react_stream_loop as _react_stream_loop,
 )
@@ -22,7 +23,7 @@ from engine.execution.react.budget import (
     MAX_PREFLIGHT_CHALLENGE_ITERS,
 )
 from engine.safety.fact_gate import FactGate, FactGateContext
-from engine.skill.executor import execute_skill
+from engine.skill.executor import execute_skill_events
 from engine.skill.loader import SkillBody, SkillMeta
 from engine.tool.registry import ToolRegistry
 
@@ -104,6 +105,169 @@ def _registry() -> ToolRegistry:
     registry.register("fail_alt", "Also fails", {}, fail_alt)
     registry.register("ok", "Succeeds", {}, ok)
     return registry
+
+
+def test_react_event_loop_loads_only_requested_tool_schemas() -> None:
+    async def read_file(path: str) -> str:
+        return f"read {path}"
+
+    async def delete_file(path: str) -> str:
+        return f"deleted {path}"
+
+    async def run():
+        registry = ToolRegistry(lazy_tool_schemas=True)
+        registry.register(
+            "read_file", "Read one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            read_file,
+        )
+        registry.register(
+            "delete_file", "Delete one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            delete_file,
+        )
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[ToolCallData(
+                id="load-1", name="get_tool_schema", arguments={"name": "read_file"},
+            )]),
+            ChatResponse(tool_calls=[ToolCallData(
+                id="read-1", name="read_file", arguments={"path": "notes.txt"},
+            )]),
+            ChatResponse(text="done"),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm, [{"role": "user", "content": "Read notes"}], registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    first_tools = llm.chat_calls[0]["tools"]
+    assert [tool["function"]["name"] for tool in first_tools] == ["get_tool_schema"]
+    second_tools = llm.chat_calls[1]["tools"]
+    assert [tool["function"]["name"] for tool in second_tools] == [
+        "get_tool_schema", "read_file",
+    ]
+    assert "delete_file" not in json.dumps(second_tools)
+    schema_result = next(
+        message for message in llm.chat_calls[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "load-1"
+    )
+    assert '"name": "read_file"' in schema_result["content"]
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
+
+
+def test_react_event_loop_runs_a_tool_called_without_the_schema_handshake() -> None:
+    """Skipping ``get_tool_schema`` must not read as a disabled capability.
+
+    ``Tool disabled: <name>`` is terminal wording: a run that hit it abandoned
+    the tool for the rest of the conversation instead of loading its schema.
+    """
+    async def read_file(path: str) -> str:
+        return f"read {path}"
+
+    async def run():
+        registry = ToolRegistry(lazy_tool_schemas=True)
+        registry.register(
+            "read_file", "Read one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            read_file,
+        )
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[ToolCallData(
+                id="read-1", name="read_file", arguments={"path": "notes.txt"},
+            )]),
+            ChatResponse(text="done"),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm, [{"role": "user", "content": "Read notes"}], registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    result = next(
+        message for message in llm.chat_calls[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "read-1"
+    )
+    assert result["content"] == "read notes.txt"
+    # The schema joins the exposed list, so the next turn can call it directly.
+    assert [tool["function"]["name"] for tool in llm.chat_calls[1]["tools"]] == [
+        "get_tool_schema", "read_file",
+    ]
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
+
+
+def test_react_event_loop_still_refuses_a_tool_outside_the_allowlist() -> None:
+    """Completing the handshake must not widen the profile/identity allowlist."""
+    async def read_file(path: str) -> str:
+        return f"read {path}"
+
+    async def delete_file(path: str) -> str:
+        return f"deleted {path}"
+
+    async def run():
+        registry = ToolRegistry(lazy_tool_schemas=True)
+        registry.register(
+            "read_file", "Read one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            read_file,
+        )
+        registry.register(
+            "delete_file", "Delete one file",
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            delete_file,
+        )
+        registry.set_enabled(["read_file"])
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[ToolCallData(
+                id="del-1", name="delete_file", arguments={"path": "notes.txt"},
+            )]),
+            ChatResponse(text="done"),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm, [{"role": "user", "content": "Delete notes"}], registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    result = next(
+        message for message in llm.chat_calls[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "del-1"
+    )
+    assert result["content"] == "Tool disabled: delete_file"
+    assert "delete_file" not in json.dumps(llm.chat_calls[1]["tools"])
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
+
+
+def test_time_tool_result_is_appended_as_user_context() -> None:
+    async def current_time():
+        return '{"local_time":"2026-08-07T12:00:00+08:00","timezone":"Asia/Shanghai"}'
+
+    async def run():
+        registry = ToolRegistry()
+        registry.register("get_current_time", "Gets the current time", {}, current_time)
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[_tool_call("get_current_time")]),
+            ChatResponse(text="It is noon."),
+        ])
+        events = [event async for event in _react_event_loop(
+            llm,
+            [{"role": "user", "content": "What time is it?"}],
+            registry,
+        )]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    follow_up_messages = llm.chat_calls[1]["messages"]
+    assert {"role": "tool", "tool_call_id": "call-1", "content": "Time data was added to the user context."} in follow_up_messages
+    assert {
+        "role": "user",
+        "content": "[Current time]\n{\"local_time\":\"2026-08-07T12:00:00+08:00\",\"timezone\":\"Asia/Shanghai\"}",
+    } in follow_up_messages
+    assert any(event.type is EventType.TEXT_DELTA for event in events)
 
 
 def test_react_loop_failed_tool_round_does_not_consume_main_budget():
@@ -865,6 +1029,55 @@ def test_react_event_loop_emits_token_usage():
     assert context["context_percent"] == 0
     assert context["estimated"] is False
     assert context["fit_status"] == "fit"
+    assert context["actions"] == []
+
+
+def test_context_usage_reports_which_fitting_actions_ran():
+    """A shrunk request must say WHAT was dropped, not merely that it shrank.
+
+    fit_status="compacted" covers both a cheap tool-output prune and a full
+    LLM re-summary of the history, and "recovered" means messages were
+    deleted outright.  Only fit.actions tells them apart, and it used to
+    reach the trace on the UNFIT path alone — so the one question a trace
+    gets asked after "the agent forgot my opening question" was the one it
+    could not answer.
+    """
+
+    async def run():
+        llm = FakeLLM([ChatResponse(text="done")], stream_chunks=["done"])
+        conversation: list[dict] = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [ToolCallData(id="c1", name="ok", arguments={})],
+            },
+        ]
+        # 3 x 6000 chars: walking backwards the newest two fill the 8000-char
+        # protect threshold, so the oldest is pruned — 6000 chars, over the
+        # 2000-char minimum that makes a prune worth doing.
+        for _ in range(3):
+            conversation.append(
+                {"role": "tool", "tool_call_id": "c1", "content": "x" * 6000}
+            )
+        events = []
+        async for event in _react_event_loop(
+            llm,
+            conversation,
+            _registry(),
+            max_iters=1,
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+    context = [
+        event for event in events if event.type == EventType.CONTEXT_USAGE
+    ][-1].data
+    assert any(
+        action.startswith("pruned_tool_output_chars:")
+        for action in context["actions"]
+    ), context["actions"]
 
 
 def test_react_event_loop_rejects_an_oversized_active_request_before_provider_call():
@@ -967,21 +1180,32 @@ def test_react_event_loop_forwards_prefix_cache_key_to_capable_provider():
 
 
 def test_execute_skill_failed_tool_round_does_not_consume_main_budget():
+    """Driven through execute_skill_events — the entry pipeline.py actually uses.
+
+    The subject is react_event_loop's budget accounting, not the skill wrapper;
+    the wrapper is only the vehicle.  It used to run through execute_skill(),
+    whose injected react_loop_fn no longer has any production implementation.
+    """
+
     async def run():
         skill = SkillBody(meta=SkillMeta(name="sample"), content="Use tools if needed.")
         llm = FakeLLM([
             ChatResponse(tool_calls=[_tool_call()]),
             ChatResponse(text="skill recovered"),
         ])
-        return await execute_skill(
+        chunks = []
+        async for event in execute_skill_events(
             skill,
             llm,
             _registry(),
             [{"role": "user", "content": "try a tool"}],
             {"user_message": "try a tool"},
             max_iters=1,
-            react_loop_fn=_react_loop,
-        )
+            react_event_loop_fn=_react_event_loop,
+        ):
+            if event.type == EventType.TEXT_DELTA:
+                chunks.append(str(event.data.get("text", "")))
+        return "".join(chunks)
 
     assert asyncio.run(run()) == "skill recovered"
 

@@ -22,7 +22,7 @@ graph LR
 | 文件 | 解决的问题 | 核心对象/函数 |
 | --- | --- | --- |
 | `identity/catalog.py` | YAML 的加载、校验、缓存与匹配 | `IdentitySpec`、`RouteSpec`、`RouteDecision`、`IdentityCatalog` |
-| `execution/routing/task_router.py` | 将输入委托给 catalog，并在需要时走 LLM fallback | `route_task()`、`route_task_with_llm()` |
+| `execution/routing/task_router.py` | 将输入委托给 catalog 做纯词法匹配 | `route_task()` |
 
 ## 核心数据结构
 
@@ -36,7 +36,7 @@ graph LR
 
 ```text
 prepare_runtime → load_identity_catalog → IdentityCatalog.resolve
-resolve → route_task / optional LLM fallback → RouteDecision
+resolve → route_task（纯词法，无 LLM 兜底） → RouteDecision
 RouteDecision → run_agent_stream → direct ReAct | forced skill | SkillChain
 ```
 

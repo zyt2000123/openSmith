@@ -71,7 +71,7 @@ provider / LLM → ExecutionEvent → RunStateStore + observability + memory hoo
 | `tool/` | 工具 schema、注册、调用账本和截断 | `registry.py`、`schema.py`、`ledger.py` |
 | `skill/` | SKILL.md 发现、启用状态与执行 | `loader.py`、`registry.py`、`executor.py` |
 | `safety/` | 工具策略、文件/命令 guard、审批与事实检查 | `tool_guard.py`、`approval.py` |
-| `memory/` | 证据、编译、审核、Nudge、Dream 与检索 | `store.py`、`compile.py`、`maintenance.py` |
+| `memory/` | 证据日志、两视图编译与审核、Dream 清理和维护调度 | `store.py`、`compile.py`、`maintenance.py` |
 | `mcp/` | stdio/streamable HTTP client 与 session pool | `client.py`、`config.py`、`session_pool.py` |
 | `observability/` | Run trace、摘要、健康、事故与诊断投影 | `recorder.py`、`projections.py` |
 
@@ -114,7 +114,7 @@ provider / LLM → ExecutionEvent → RunStateStore + observability + memory hoo
 
 ### `react/`：以单一事件协议驱动模型—工具闭环
 
-`react_event_loop()` 是真正的核心生成器；`react_loop()` 和 `react_stream_loop()` 只是分别消费最终文本和文本 delta 的适配器。该拆分的构思是让 pipeline、Shell、测试不必各自复制模型流解析与终态处理。循环的状态保存在局部计数器中，避免跨 Run 的可变共享状态。
+`react_event_loop()` 是本模块唯一对外的生成器，生产侧唯一消费者是 `orchestration/agent_loop.py`，它把事件原样交给 `lifecycle`（先 record 后 yield）。曾经并列的 `react_loop()` / `react_stream_loop()` 两个取文本适配器没有任何生产调用，已移入 `engine/tests/execution/react_text_adapters.py`。只产事件的设计让 pipeline、Shell、测试不必各自复制模型流解析与终态处理，也保证文本不会绕开 lifecycle 的记录边界。循环的状态保存在局部计数器中，避免跨 Run 的可变共享状态。
 
 | 项目 | 说明 |
 | --- | --- |
@@ -136,7 +136,7 @@ provider / LLM → ExecutionEvent → RunStateStore + observability + memory hoo
 
 ### `llm/`：把协议差异收敛在 adapter，保留调用用途与账本
 
-`port.py` 定义 provider 无关契约，`adapters/` 承担协议差异，`factory.py` 负责选择实现，`client.py` 统一 chat/stream 和使用量，`observability.py` 用 contextvars 给每次调用标注 run、session 和 purpose。构思是让执行层面对稳定能力接口编程，而不是把 OpenAI、Anthropic、Gemini 的响应格式渗入 ReAct 和 pipeline。
+`port.py` 定义 provider 无关契约，`adapters/` 承担协议差异，`factory.py` 负责选择实现，`client.py` 统一 chat/stream 和使用量，`observability.py` 用 contextvars 给每次调用标注 run、session 和 purpose。构思是让执行层面对稳定能力接口编程，而不是把 OpenAI 与 Anthropic 的响应格式渗入 ReAct 和 pipeline。
 
 | 项目 | 说明 |
 | --- | --- |
@@ -158,14 +158,14 @@ provider / LLM → ExecutionEvent → RunStateStore + observability + memory hoo
 
 ### `memory/`：将长期上下文视为编译产物，而非原始聊天备份
 
-`memory/` 从清洗后的事件/证据产生候选，再通过 compiler、reviewer、deterministic writer 形成 `context.md`、`recent.md`、`durable.md` 等受控视图；maintenance 负责 Nudge、Dream 和失败可见性。这个设计意图是积累可复用知识而不将敏感、错误或短期噪声永久放大。
+`memory/` 把清洗后的事件和结构化候选追加到 `memory/recent.jsonl`，再通过 compiler、reviewer 和确定性 writer 形成两个受控视图：用户级 `context.md` 与项目级 `memory/durable.md`。两个视图均有字符预算，并在后续请求中整份注入；不存在查询时检索、FTS、向量索引或 episode 层。maintenance 负责编译/Dream 调度和失败可见性，Dream 只做安全清洗与已消费证据前缀的可恢复回收。
 
 | 项目 | 说明 |
 | --- | --- |
 | 输入 | 完成、失败或不完整 Run 的受限证据与维护调度信号。 |
-| 输出 | 可召回的记忆视图、topic knowledge 和维护状态。 |
+| 输出 | 两个有界正式视图、追加式证据/审计记录和维护状态。 |
 | 上游 / 下游 | lifecycle/hooks 提供事件；context assembler 在后续请求中消费。 |
-| 失败与边界 | 写入失败要可见；去重、清理 orphan、敏感信息过滤与 offset/recovery 防止重复或污染。 |
+| 失败与边界 | Reviewer、结构/预算与安全校验先于正式写入；受限 fallback 不得跨过纠正/忘记；offset 与 cleanup journal 防止证据丢失或重放。 |
 
 ### `mcp/` 与 `observability/`：扩展能力与审计能力都不逃离 Run
 
@@ -275,7 +275,7 @@ graph LR
 | 把主机能力变成受控能力 | `adfc1ef`、`ee4e168`、`7880a0a` | 审批、运行时边界和安全审计 | 模型的工具请求只是一项意图，不能直接获得文件、命令或网络副作用 |
 | 把工作流做成可审查链 | `58e14c5`、`39b51f3`、`2a0413f` | coding identity、声明式 pipeline、节点级 ReAct fallback | 结构化任务按 gate 提交；缺失或失败的 skill 不让整条体验失效 |
 | 保持流式体验的正确性 | `a079181`、`9f84ac6`、`3e3b031` | provisional streaming、draft retraction、usage accounting | 用户可以看到过程，但失败节点的草稿不能成为最终事实 |
-| 让记忆可治理 | `9677ba9`、`cf2f1c9`、`b9c4ee5`、`d3cd2a7` | secret redaction、topic knowledge、去重与失败可见性 | 长期记忆是经过筛选的知识资产，不是对话日志的复制品 |
+| 让记忆可治理 | `d3cd2a7`、`b71be4b`、`8f88412` | secret redaction、双视图收敛、审核、受限 fallback 与可恢复清理 | 长期记忆是有证据、有预算的编译产物，不是对话日志的复制品 |
 | 让结论有证据 | `fa34ce0` | evidence binding、risk-tier triage、hash-chained audit logs | gate 结论、工具证据和审计记录需要可对应、可回放、可发现篡改 |
 | 以真实失效模式加固 | `36d7ad5`、`69ea7c0`、`ddad1c3`、`0425d05` | 原子审批、hook 取消、硬链接敏感文件检测、对抗审计修复 | 并发、TOCTOU、文件别名和取消不是边缘问题，必须进入运行时设计 |
 
@@ -284,7 +284,7 @@ graph LR
 1. 改动执行路径前，先确认事件是否仍是唯一的跨层事实来源；不要让 Shell 或 Server 解析模型文本猜状态。
 2. 改动 tool provider 时，先确认参数仍经过 `ToolPolicy`、`ToolGuard` 和审批路径；安全层必须先于可重试的软挑战执行。
 3. 改动 pipeline 时，明确每个 node 的输入产物、允许工具、gate 证据、回退目标和用户暂停语义。
-4. 改动记忆时，验证敏感信息过滤、失败写入与召回预算；不能把完整原始聊天直接写入长期视图。
+4. 改动记忆时，验证敏感信息过滤、Reviewer/fallback 边界、两视图预算、offset 与可恢复清理；不能把完整原始聊天直接写入长期视图。
 5. 改动 Run 恢复或并发行为时，补充所有权、取消和重复提交的回归测试。
 
 ## 自测题
@@ -309,7 +309,7 @@ graph LR
 | 外部 MCP | [04i · MCP](04i-MCP-外部工具协议.md) | 理解 transport、session pool 与本地治理 |
 | 可观测性 | [04j · Observability](04j-Observability-可观测性.md) | 理解 trace、summary、incident 与 health |
 | 主机执行环境 | [04k · Sandbox](04k-Sandbox-主机执行环境.md) | 理解进程组、I/O 上限、取消与 Seatbelt |
-| 记忆系统 | [05 · Memory](05-Engine-记忆系统.md) | 理解证据、编译、召回与维护 |
+| 记忆系统 | [05 · Memory](05-Engine-记忆系统.md) | 理解证据、双视图编译、审核与维护 |
 | 内容层编辑方式 | [06 · Agents](06-Agents-内容层.md) | 理解 identity、pipeline、skill 与 tool provider 的内容来源 |
 | 审批决策背景 | [ADR 0001](adr/0001-approval-gated-host-capabilities.md) | 追溯 host capability 的审批设计 |
 

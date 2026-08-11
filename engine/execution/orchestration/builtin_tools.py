@@ -13,21 +13,9 @@ def bind_memory_ops_tool(services: RuntimeServices, state_dir: Path) -> None:
     memory_dir = state_dir / "memory"
     memory_api = MemoryToolApi()
 
-    async def episode_runner(memory_dir: Path, topic: str, related: list[dict]):
-        from engine.memory.compile import compact_episode
-
-        return await compact_episode(
-            memory_dir,
-            services.llm,
-            topic,
-            related,
-            reviewer=services.gate_llm,
-        )
-
     def wrapper(func):
         async def execute_with_memory_context(**kwargs):
             kwargs["memory_dir"] = memory_dir
-            kwargs["episode_runner"] = episode_runner
             kwargs["memory_api"] = memory_api
             return await func(**kwargs)
 
@@ -52,16 +40,6 @@ class MemoryToolApi:
         self.safe_file_in_dir = memory.safe_file_in_dir
         self.safe_markdown_files = memory.safe_markdown_files
         self.atomic_write_text = memory.atomic_write_text
-
-    async def remove_episode_from_index(self, memory_dir: Path, episode_id: str) -> None:
-        from engine.memory.search import SearchIndex
-
-        index = SearchIndex(memory_dir / "episodes")
-        await index.open()
-        try:
-            await index.remove_entry(episode_id)
-        finally:
-            await index.close()
 
 
 def bind_snapshot_tools(services: RuntimeServices, session_id: str | None) -> None:

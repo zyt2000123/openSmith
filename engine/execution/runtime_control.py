@@ -60,10 +60,3 @@ def continue_after_length_prompt() -> str:
     )
 
 
-def finalize_without_tools_prompt(reason: str) -> str:
-    """Force a terminal report when the engine has stopped further tool calls."""
-    return (
-        f"{reason}\n"
-        "Do not call more tools. Give the user a concise final answer summarizing "
-        "what was completed, what failed, and the next concrete step."
-    )

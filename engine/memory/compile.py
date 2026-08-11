@@ -1,11 +1,14 @@
-"""Memory compilation — recent events + durable facts + episode summaries.
+"""Memory compilation — turn evidence into the two rendered memory views.
 
-Four compilation targets:
+Two compilation targets:
   compile_context()  → ../context.md  (stable user collaboration memory)
-  compile_recent()   → recent.md     (last 3-7 days, budget-capped)
-  compile_durable()  → durable.md    (incremental merge of stable facts)
-  compact_episode()  → episodes/*.md (on an explicit user summary request)
-  assemble_memory()  → combined str  (for prompt injection)
+  compile_durable()  → durable.md     (incremental merge of project memory)
+  assemble_memory()  → combined str   (for prompt injection)
+
+``durable.md`` has no time window: each run merges new evidence into the
+existing document, so a fact survives until it is corrected, superseded, or
+evicted for budget. Both views are injected in full — there is no query-time
+retrieval layer, and therefore no index and no embeddings.
 
 Fingerprint caching: MD5 of input keys. Same input → skip compilation.
 """
@@ -16,8 +19,7 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,14 +33,11 @@ from ._files import (
 )
 from ._review import (
     MemoryCompilationError,
-    _generate_and_review,
     _generate_and_review_result,
-    _llm_summarize,
     _truncate_source,
 )
 from .history import append_memory_history
 from .policy import (
-    DURABLE_MEMORY_KINDS,
     MemoryPolicy,
     MemoryPolicyError,
     MemoryViewName,
@@ -51,19 +50,11 @@ if TYPE_CHECKING:
     from engine.llm.port import LLMPort
 
 _MEMORY_POLICY = load_memory_policy()
-MAX_RECENT_CHARS = _MEMORY_POLICY.view("recent").max_chars
 MAX_DURABLE_CHARS = _MEMORY_POLICY.view("durable").max_chars
-MAX_RECENT_SOURCE_CHARS = 24_000
-MAX_DURABLE_SOURCE_CHARS = 16_000
-MAX_EPISODE_SOURCE_CHARS = 16_000
-# Hard cap on an episode summary; oversized output is rejected rather than
-# silently truncated before it is written.
-_MAX_EPISODE_CHARS = 800
-MIN_WINDOW_DAYS, MAX_WINDOW_DAYS = _MEMORY_POLICY.view("recent").window_days
+MAX_DURABLE_SOURCE_CHARS = 24_000
 # Compilation is deferred from the interactive turn and may require several
 # generator/reviewer calls. Keep a finite bound, but do not make a normal
 # background request fail at the same 30-second budget as a chat turn.
-_RECENT_REVIEW_TIMEOUT_SECONDS = 300.0
 _DURABLE_REVIEW_TIMEOUT_SECONDS = 300.0
 
 logger = logging.getLogger(__name__)
@@ -82,33 +73,6 @@ def _read_fp(path: Path) -> str:
 
 def _write_fp(path: Path, fp: str) -> None:
     atomic_write_text(path, fp)
-
-
-def _clear_recent_view(memory_dir: Path) -> bool:
-    """Remove stale derived recent-memory artifacts without touching events."""
-    removed = False
-    recent_path = memory_dir / "recent.md"
-    old_text = ""
-    safe_recent = safe_file_in_dir(memory_dir, recent_path)
-    if safe_recent is not None:
-        old_text = safe_recent.read_text(encoding="utf-8")
-        atomic_write_text(memory_dir / "recent.md.bak", old_text)
-
-    for name in ("recent.md", ".fp_recent"):
-        path = memory_dir / name
-        if path.is_file() or path.is_symlink():
-            path.unlink()
-            removed = True
-    if removed:
-        append_memory_history(
-            memory_dir,
-            target="recent",
-            policy_version=_MEMORY_POLICY.version,
-            status="written",
-            old_text=old_text,
-            new_text="",
-        )
-    return removed
 
 
 def _load_recent(
@@ -161,50 +125,11 @@ def _write_offset(memory_dir: Path, offset: int) -> None:
     atomic_write_text(memory_dir / ".compile_offset", str(offset))
 
 
-def _read_durable_offset(memory_dir: Path) -> int:
-    """Read the durable-specific checkpoint, falling back during migration."""
-    offset_file = memory_dir / ".durable_offset"
-    if not offset_file.exists() and not offset_file.is_symlink():
-        return _read_offset(memory_dir)
-    if offset_file.is_symlink():
-        raise OSError("durable offset is unavailable or unsafe")
-    safe_path = safe_file_in_dir(memory_dir, offset_file)
-    if safe_path is None:
-        raise OSError("durable offset is unavailable or unsafe")
-    try:
-        return max(0, int(safe_path.read_text(encoding="utf-8").strip()))
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise OSError("durable offset is unavailable or unsafe") from exc
-
-
-def _write_durable_offset(memory_dir: Path, offset: int) -> None:
-    atomic_write_text(memory_dir / ".durable_offset", str(offset))
-
-
 def _total_lines(memory_dir: Path) -> int:
     recent = memory_dir / "recent.jsonl"
     if not recent.is_file():
         return 0
     return len(recent.read_text(encoding="utf-8").strip().splitlines())
-
-
-def _parse_ts(ts: str) -> datetime | None:
-    if not isinstance(ts, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _filter_by_time(entries: list[dict], after: datetime) -> list[dict]:
-    return [
-        e for e in entries
-        if (_parse_ts(e.get("timestamp", "")) or datetime.min.replace(tzinfo=timezone.utc)) >= after
-    ]
 
 
 def _entries_to_source(
@@ -257,7 +182,7 @@ def _safe_source_metadata(value: object, *, limit: int = 500) -> str:
     return _truncate_source(normalized, limit) if len(normalized) > limit else normalized
 
 
-_RECENT_KINDS = {
+DURABLE_KINDS = {
     "work", "partial_work", "decision", "correction", "remember", "forget",
     "verified_fact", "procedure", "pitfall",
 }
@@ -272,13 +197,8 @@ def _entries_for_view(entries: list[dict], view: MemoryViewName) -> list[dict]:
         if view == "context":
             if scope == "user":
                 selected.append(entry)
-        elif view == "recent":
-            if kind in _RECENT_KINDS and (scope == "project" or kind in {"correction", "forget"}):
-                selected.append(entry)
         elif view == "durable":
-            if kind in DURABLE_MEMORY_KINDS and (
-                scope == "project" or kind in {"correction", "remember", "forget"}
-            ):
+            if kind in DURABLE_KINDS and (scope == "project" or kind in {"correction", "forget"}):
                 selected.append(entry)
     return selected
 
@@ -353,10 +273,36 @@ def _normalize_markdown(text: str) -> str:
     return text.strip() + "\n" if text.strip() else ""
 
 
+class MemoryViewUnreadableError(MemoryCompilationError):
+    """An accepted view exists but could not be read back safely.
+
+    Compilation must not continue on this: ``existing`` is what tells the
+    model which facts are already recorded, so treating an unreadable view as
+    an empty one produces a draft containing only the newest evidence -- and
+    committing that silently replaces the whole document.
+    """
+
+
 def _read_view(path: Path) -> str:
+    """Return the accepted view, refusing to report a wiped one as empty.
+
+    ``sanitize_memory_text`` returns "" for the entire text when a secret or
+    injection pattern matches only across a line break (``api_key:`` ending one
+    line, ordinary prose beginning the next -- ``\\s`` spans the newline).  On a
+    non-empty file that answer means "this could not be cleaned line by line",
+    never "there was nothing here".  Dream already refuses to act on it when
+    writing (see ``dream._sanitize_all_layers``); the read side must refuse too,
+    because its caller overwrites the file rather than blanking it.
+    """
     if not path.is_file():
         return ""
-    content, _, _ = sanitize_memory_text(path.read_text(encoding="utf-8"))
+    raw = path.read_text(encoding="utf-8")
+    content, secrets_removed, injections_removed = sanitize_memory_text(raw)
+    if raw.strip() and not content.strip() and (secrets_removed or injections_removed):
+        raise MemoryViewUnreadableError(
+            f"{path.name} could not be sanitized without discarding the whole "
+            "document; refusing to compile over it"
+        )
     return _normalize_markdown(content)
 
 
@@ -376,8 +322,14 @@ def _commit_view(
         raise MemoryCompilationError(f"{view} compilation output contains unsafe content")
 
     target = resolve_view_path(policy, memory_dir.parent, view)
-    if existing and existing != draft:
-        atomic_write_text(target.with_name(f"{target.name}.bak"), existing)
+    # Back up what is on disk rather than the caller's ``existing``.  The two
+    # differ whenever the accepted view could not be read back in full, and
+    # that is exactly when the overwrite is least recoverable -- an empty
+    # ``existing`` used to skip the backup entirely.
+    if target.is_file():
+        on_disk = target.read_text(encoding="utf-8")
+        if on_disk.strip() and on_disk != draft:
+            atomic_write_text(target.with_name(f"{target.name}.bak"), on_disk)
     atomic_write_text(target, draft)
     append_memory_history(
         memory_dir,
@@ -398,99 +350,135 @@ def _fallback_inline(value: object, limit: int) -> str:
     return cleaned[:limit].rstrip(" .。；;")
 
 
+def _fallback_event_content(value: object, limit: int) -> str:
+    """Recover candidate content from the internal ``[memory]`` envelope."""
+    marker = "[memory] "
+    content = _fallback_inline(value, limit + len(marker))
+    if content.startswith(marker):
+        content = content[len(marker):]
+    return content[:limit].rstrip(" .。；;")
+
+
 def _fallback_date(value: object) -> str:
-    parsed = _parse_ts(str(value or ""))
+    parsed = None
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        pass
     return (parsed or datetime.now(timezone.utc)).date().isoformat()
 
 
-def _fallback_recent_document(entries: list[dict]) -> str:
-    """Build a safe, extractive recent view when the model pipeline is unavailable."""
-    active_lines: list[str] = []
-    outcome_lines: list[str] = []
-    for entry in entries[-16:]:
-        topic = _fallback_inline(entry.get("task"), 80) or "未命名工作"
-        date = _fallback_date(entry.get("timestamp"))
-        is_partial = entry.get("kind") == "partial_work"
-        status = "未完成" if is_partial else "已记录"
-        reason = _fallback_inline(entry.get("reason"), 80)
-        reason_suffix = f"；原因：{reason}" if reason else ""
-        active_lines.append(
-            f"- **{topic}** — 状态：{status}{reason_suffix}；"
-            f"下一步：依据现有证据继续处理；更新：{date}。"
-        )
-        summary = _fallback_inline(entry.get("summary"), 180)
-        if summary:
-            evidence = _fallback_inline(entry.get("evidence"), 40) or "memory_event"
-            outcome_lines.append(
-                f"- **{topic}** — 结果：{summary}；证据：{evidence}。"
-            )
-
-    return "\n".join([
-        "# Recent Working Memory",
-        "",
-        "## Active Work",
-        *(active_lines or ["- **暂无近期工作** — 状态：空；下一步：无；更新：" + _fallback_date(None) + "。"]),
-        "",
-        "## Pending",
-        "",
-        "## Recent Verified Outcomes",
-        *outcome_lines,
-        "",
-    ])
+_DURABLE_FALLBACK_SECTIONS: tuple[str, ...] = _MEMORY_POLICY.view("durable").sections
 
 
-_DURABLE_FALLBACK_SECTIONS: tuple[str, ...] = (
-    "Confirmed Facts",
-    "Decisions",
-    "Reusable Procedures",
-    "Known Pitfalls",
-)
+# Sections that existed before the memory views were merged. The LLM compiler
+# sees `existing` in full and can re-file them itself, but this deterministic
+# extractor matches on heading names — without the mapping it would silently
+# drop every bullet stored under a retired heading.
+_LEGACY_DURABLE_SECTIONS: dict[str, str] = {
+    "Confirmed Facts": "Verified Outcomes",
+    "Reusable Procedures": "Verified Outcomes",
+}
 
 
 def _existing_fallback_bullets(existing: str, section: str) -> list[str]:
     """Keep only bounded bullets from an accepted durable section."""
+    accepted = {section} | {
+        legacy for legacy, current in _LEGACY_DURABLE_SECTIONS.items() if current == section
+    }
     in_section = False
     bullets: list[str] = []
     for line in existing.splitlines():
         if line.startswith("## "):
-            in_section = line[3:].strip() == section
+            in_section = line[3:].strip() in accepted
             continue
         if in_section and line.lstrip().startswith("-"):
-            item = _fallback_inline(line.lstrip()[1:], 320)
+            # This text already came from the accepted, sanitized durable view.
+            # Keep the complete bullet; the document-level eviction pass below
+            # enforces the total budget without silently cutting facts in half.
+            item = line.lstrip()[1:].strip()
             if item:
                 bullets.append(f"- {item}")
     return bullets
 
 
 def _fallback_durable_document(existing: str, entries: list[dict]) -> str:
-    """Build a safe extractive durable view without inventing facts."""
+    """Build a safe extractive durable view without inventing facts.
+
+    Existing bullets are carried over first: this fallback runs on an
+    *incremental* merge, so dropping them would silently erase every fact the
+    reviewed pipeline had already accepted.
+    """
     grouped = {
         section: _existing_fallback_bullets(existing, section)
         for section in _DURABLE_FALLBACK_SECTIONS
     }
-    for entry in entries:
-        topic = _fallback_inline(entry.get("task"), 80) or "未命名事实"
+    for entry in entries[-16:]:
+        content = _fallback_event_content(entry.get("task"), 260)
+        topic = content[:80].rstrip(" .。；;") or "未命名工作"
         summary = _fallback_inline(entry.get("summary"), 260)
-        if not summary:
-            continue
         evidence = _fallback_inline(entry.get("evidence"), 40) or "memory_event"
         kind = str(entry.get("kind") or "work")
         if kind == "decision":
-            section = "Decisions"
-            line = f"- **{topic}**: 决定 {summary}；适用范围：当前项目；证据：{evidence}。"
-        elif kind == "correction":
-            section = "Known Pitfalls"
-            line = f"- **{topic}**: 记录已确认修正：{summary}；证据：{evidence}。"
-        elif kind == "work":
-            section = "Confirmed Facts"
-            line = f"- **{topic}**: 已记录项目事实：{summary}；证据：{evidence}。"
+            decision = content or topic
+            lines = [("Decisions", f"- **{topic}**: 决定 {decision}；适用范围：当前项目；证据：{evidence}。")]
+        elif kind in {"correction", "pitfall"}:
+            pitfall = content or topic
+            lines = [("Known Pitfalls", f"- **{topic}**: 记录已确认陷阱：{pitfall}；证据：{evidence}。")]
+        elif kind in {"work", "partial_work"}:
+            date = _fallback_date(entry.get("timestamp"))
+            status = "未完成" if kind == "partial_work" else "待复核"
+            reason = _fallback_inline(entry.get("reason"), 80)
+            reason_suffix = f"；原因：{reason}" if reason else ""
+            lines = [(
+                "Active Work",
+                f"- **{topic}** — 状态：{status}{reason_suffix}；"
+                f"下一步：依据现有证据继续处理；更新：{date}。",
+            )]
+            if kind == "work" and summary:
+                lines.append(
+                    (
+                        "Pending",
+                        f"- **{topic}** — 待处理：待复核本回合摘要“{summary}”；"
+                        f"证据标签：{evidence}。",
+                    )
+                )
+        elif content:
+            # Structured memory candidates put the asserted content in
+            # ``task`` and the supporting evidence description in ``summary``.
+            # The latter must never be promoted into the asserted fact.
+            lines = [("Verified Outcomes", f"- **{topic}** — 结果：{content}；证据：{evidence}。")]
         else:
-            section = "Confirmed Facts"
-            line = f"- **{topic}**: {summary}；证据：{evidence}。"
-        if line not in grouped[section]:
-            grouped[section].append(line)
+            continue
+        for section, line in lines:
+            if line not in grouped[section]:
+                grouped[section].append(line)
 
-    parts = ["# Durable Project Memory"]
+    # The fallback carries `existing` forward, so an almost-full durable view
+    # would render over budget and _commit_view would reject it — the safety net
+    # failing exactly when memory has accumulated enough to need it. Evict in the
+    # order policy §5.1 prescribes until the document fits.
+    document = _render_durable_fallback(grouped)
+    for section in _DURABLE_EVICTION_ORDER:
+        while len(document) > MAX_DURABLE_CHARS and grouped[section]:
+            grouped[section].pop(0)  # oldest bullet in this section
+            document = _render_durable_fallback(grouped)
+    return document
+
+
+# Least valuable first: transient status before verified conclusions, and
+# decisions/pitfalls last because they are the entries worth keeping longest.
+_DURABLE_EVICTION_ORDER: tuple[str, ...] = (
+    "Active Work",
+    "Pending",
+    "Verified Outcomes",
+    "Decisions",
+    "Known Pitfalls",
+)
+
+
+def _render_durable_fallback(grouped: dict[str, list[str]]) -> str:
+    parts = [f"# {_MEMORY_POLICY.view('durable').title}"]
     for section in _DURABLE_FALLBACK_SECTIONS:
         parts.extend(["", f"## {section}", *grouped[section]])
     parts.append("")
@@ -571,7 +559,14 @@ async def compile_context(
         return False
 
     target = resolve_view_path(policy, memory_dir.parent, "context")
-    existing = _read_view(target)
+    try:
+        existing = _read_view(target)
+    except MemoryViewUnreadableError as exc:
+        # Audit it here: the read happens before the compile try-block, so
+        # without this the refusal would reach the log but never the history
+        # that ``recent_failure_streak`` reports to the client.
+        _record_compile_failure(memory_dir, "context", policy, "", exc)
+        raise
     fp_file = memory_dir / ".fp_context"
     fp = _fingerprint([
         f"{entry.get('timestamp', '')}:{entry.get('kind', '')}:{entry.get('task', '')[:80]}"
@@ -609,132 +604,48 @@ async def compile_context(
     return True
 
 
-async def compile_recent(
-    memory_dir: Path,
-    llm: "LLMPort",
-    reviewer: "LLMPort | None" = None,
-) -> bool:
-    """Compile recent events into recent.md. Budget-capped, elastic 3-7 day window."""
-    policy = _MEMORY_POLICY
-    now = datetime.now(timezone.utc)
-    # ponytail: recent.md is a rolling window — must read ALL events, not just
-    # new ones. Offset is only for compile_durable's incremental merge.
-    all_entries = _load_recent(memory_dir, from_offset=False)
-
-    entries = _entries_for_view(
-        _filter_by_time(all_entries, now - timedelta(days=MIN_WINDOW_DAYS)),
-        "recent",
-    )
-    if not entries:
-        entries = _entries_for_view(
-            _filter_by_time(all_entries, now - timedelta(days=MAX_WINDOW_DAYS)),
-            "recent",
-        )
-    if not entries:
-        return _clear_recent_view(memory_dir)
-
-    out = resolve_view_path(policy, memory_dir.parent, "recent")
-    fp_file = memory_dir / ".fp_recent"
-
-    fp = _fingerprint([f"{e.get('timestamp', '')}:{e.get('task', '')[:50]}" for e in entries])
-    if _read_fp(fp_file) == fp and out.is_file():
-        return False
-
-    existing = _read_view(out)
-    source = _entries_to_source(entries, source_limit=MAX_RECENT_SOURCE_CHARS)
-    try:
-        draft, rounds = await asyncio.wait_for(
-            _generate_view(
-                policy,
-                "recent",
-                llm,
-                reviewer,
-                existing=existing,
-                source=source,
-            ),
-            timeout=_RECENT_REVIEW_TIMEOUT_SECONDS,
-        )
-        _commit_view(
-            policy,
-            "recent",
-            memory_dir,
-            existing=existing,
-            draft=draft,
-            review_rounds=rounds,
-        )
-    except Exception as exc:
-        if reviewer is None or not _can_use_compilation_fallback(exc):
-            _record_compile_failure(memory_dir, "recent", policy, existing, exc)
-            raise
-        try:
-            fallback = _fallback_recent_document(entries)
-            _commit_view(
-                policy,
-                "recent",
-                memory_dir,
-                existing=existing,
-                draft=fallback,
-                review_rounds=getattr(exc, "review_rounds", 0),
-                status="fallback",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        except Exception:
-            _record_compile_failure(memory_dir, "recent", policy, existing, exc)
-            raise
-        _write_fp(fp_file, fp)
-        return True
-
-    _write_fp(fp_file, fp)
-    return True
-
-
 async def compile_durable(
     memory_dir: Path,
     llm: "LLMPort",
     reviewer: "LLMPort | None" = None,
 ) -> bool:
-    """Incrementally merge new events into durable.md."""
+    """Merge new events into durable.md — the single long-term project view.
+
+    This is an incremental merge against ``.compile_offset``: only evidence the
+    previous run did not consume is sent to the model, and the existing document
+    is supplied as context so untouched facts survive. There is deliberately no
+    time window — durable memory is never cleared just because a quiet period
+    produced no events.
+    """
     policy = _MEMORY_POLICY
-    total = _total_lines(memory_dir)
-    durable_offset = _read_durable_offset(memory_dir)
-    if durable_offset > total:
-        # recent.jsonl was truncated (e.g. by Dream cleanup) below the stored
-        # checkpoint.  Without this reset, _load_recent slices past the end of
-        # the log forever, durable compilation returns False every call and the
-        # durable view silently stops merging new facts.
-        logger.warning(
-            "durable offset %s exceeds %s recent.jsonl lines — resetting checkpoint",
-            durable_offset,
-            total,
-        )
-        _write_durable_offset(memory_dir, 0)
-        durable_offset = 0
-    all_entries = _load_recent(memory_dir, offset=durable_offset)
-    entries = _entries_for_view(all_entries, "durable")
+    entries = _entries_for_view(_load_recent(memory_dir, from_offset=True), "durable")
 
     out = resolve_view_path(policy, memory_dir.parent, "durable")
     fp_file = memory_dir / ".fp_durable"
     ensure_durable_template(memory_dir)
 
+    # No qualifying evidence is a no-op, never a checkpoint advance. The
+    # previous design skipped the log forward here whenever *any* event was
+    # present, which silently discarded every event that did not qualify and
+    # left durable.md permanently empty.
     if not entries:
-        if all_entries:
-            _write_durable_offset(memory_dir, total)
         return False
 
     fp = _fingerprint([f"{e.get('timestamp', '')}:{e.get('task', '')[:50]}" for e in entries])
     if _read_fp(fp_file) == fp and out.is_file():
-        if not (memory_dir / ".durable_offset").is_file():
-            _write_durable_offset(memory_dir, total)
         return False
 
-    existing = _read_view(out)
-    new_source = _entries_to_source(
+    try:
+        existing = _read_view(out)
+    except MemoryViewUnreadableError as exc:
+        _record_compile_failure(memory_dir, "durable", policy, "", exc)
+        raise
+    source = _entries_to_source(
         entries,
         summary_limit=1000,
         source_limit=MAX_DURABLE_SOURCE_CHARS,
     )
-
-    if not new_source.strip():
+    if not source.strip():
         return False
 
     try:
@@ -745,7 +656,7 @@ async def compile_durable(
                 llm,
                 reviewer,
                 existing=existing,
-                source=new_source,
+                source=source,
             ),
             timeout=_DURABLE_REVIEW_TIMEOUT_SECONDS,
         )
@@ -760,7 +671,15 @@ async def compile_durable(
             review_rounds=rounds,
         )
     except Exception as exc:
-        if reviewer is None or not _can_use_compilation_fallback(exc):
+        requires_reviewed_merge = any(
+            str(entry.get("kind") or "") in {"correction", "forget"}
+            for entry in entries
+        )
+        if (
+            reviewer is None
+            or requires_reviewed_merge
+            or not _can_use_compilation_fallback(exc)
+        ):
             _record_compile_failure(memory_dir, "durable", policy, existing, exc)
             raise
         try:
@@ -779,128 +698,25 @@ async def compile_durable(
             _record_compile_failure(memory_dir, "durable", policy, existing, exc)
             raise
         _write_fp(fp_file, fp)
-        _write_durable_offset(memory_dir, total)
         return True
 
     _write_fp(fp_file, fp)
-    _write_durable_offset(memory_dir, total)
     return True
-
-
-# ---------------------------------------------------------------------------
-# compact_episode: compress a completed topic into an episode file
-# ---------------------------------------------------------------------------
-
-async def compact_episode(
-    memory_dir: Path,
-    llm: "LLMPort",
-    topic: str,
-    related_entries: list[dict],
-    reviewer: "LLMPort | None" = None,
-) -> Path | None:
-    """Generate an episode summary for a completed topic. Returns the file path."""
-    if not related_entries:
-        return None
-    if contains_secret(topic) or contains_injection(topic):
-        logger.warning("episode topic contains unsafe content — skipping write")
-        return None
-
-    episodes_dir = memory_dir / "episodes"
-    episodes_dir.mkdir(parents=True, exist_ok=True)
-
-    slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", topic.lower()).strip("-_")[:60]
-    if not slug:
-        return None
-
-    episodes_root = episodes_dir.resolve()
-    out = (episodes_dir / f"{slug}.md").resolve()
-    if not out.is_relative_to(episodes_root):
-        raise ValueError("episode path escaped its storage directory")
-
-    source = _entries_to_source(
-        related_entries[-20:],
-        summary_limit=1200,
-        source_limit=MAX_EPISODE_SOURCE_CHARS,
-    )
-    prompt = (
-        f"Write a concise episode summary for the topic: {topic}\n\n"
-        f"Include: background, process, applicability boundaries, and exceptions.\n"
-        f"Do not restate the source facts verbatim; the durable memory already supplies "
-        f"those core conclusions, so add only the detail needed to understand or apply them.\n"
-        f"Max 800 chars.\n\n{source}"
-    )
-    if reviewer:
-        summary = await _generate_and_review(llm, reviewer, prompt, source)
-    else:
-        summary = await _llm_summarize(llm, prompt)
-
-    if len(summary) > _MAX_EPISODE_CHARS:
-        logger.warning(
-            "episode summary exceeded %s characters — skipping write",
-            _MAX_EPISODE_CHARS,
-        )
-        raise MemoryCompilationError("episode summary exceeded character budget")
-
-    if contains_secret(summary):
-        logger.warning("episode output contains secrets — skipping write")
-        return None
-    if contains_injection(summary):
-        logger.warning("episode output contains injection markers — skipping write")
-        return None
-
-    # Compacting the same topic twice, or two topics whose slugs collide after the
-    # 60-character truncation above, used to overwrite the earlier episode with no
-    # backup — and _sync_episode_index then replaced the stale text in the FTS
-    # index too, leaving the old content unrecoverable.  durable.md already keeps a
-    # .bak on update; do the same here, and keep distinct topics in distinct files.
-    if out.is_file():
-        try:
-            existing = out.read_text(encoding="utf-8")
-        except OSError:
-            existing = ""
-        if existing and not existing.startswith(f"# {topic}\n"):
-            # Slug collision between different topics: derive a distinct filename
-            # instead of destroying an unrelated episode.
-            digest = hashlib.sha256(topic.encode("utf-8")).hexdigest()[:8]
-            out = (episodes_dir / f"{slug}-{digest}.md").resolve()
-            if not out.is_relative_to(episodes_root):
-                raise ValueError("episode path escaped its storage directory")
-        if out.is_file():
-            try:
-                atomic_write_text(
-                    out.with_name(f"{out.name}.bak"), out.read_text(encoding="utf-8")
-                )
-            except OSError:
-                logger.warning("failed to back up episode before overwrite: %s", out)
-
-    atomic_write_text(out, f"# {topic}\n\n{summary}\n")
-    return out
 
 
 # ---------------------------------------------------------------------------
 # assemble_memory: combine compiled layers for prompt injection
 # ---------------------------------------------------------------------------
 
-def assemble_memory(
-    memory_dir: Path,
-    *,
-    include_durable: bool = True,
-    include_recent: bool = True,
-) -> str:
-    """Combine durable + recent into a single memory block for prompt injection.
+def assemble_memory(memory_dir: Path) -> str:
+    """Read the rendered project memory block for prompt injection.
 
-    Episodes are not included here — they should be retrieved via FTS5
-    based on the current query and injected separately.
+    durable.md is injected whole: it is budget-capped by policy, so there is
+    nothing to retrieve and nothing to rank.
     """
     sections = []
 
-    enabled = {
-        "durable.md": include_durable,
-        "recent.md": include_recent,
-    }
     for name in MEMORY_LAYER_FILES:
-        if not enabled.get(name, True):
-            continue
         path = safe_file_in_dir(memory_dir, memory_dir / name)
         if path is not None:
             content, _, _ = sanitize_memory_text(path.read_text(encoding="utf-8"))
@@ -912,7 +728,7 @@ def assemble_memory(
 
 
 # ---------------------------------------------------------------------------
-# run_compilation: lifecycle entry point for the three formal views
+# run_compilation: lifecycle entry point for the two formal views
 # ---------------------------------------------------------------------------
 
 async def run_compilation(
@@ -923,7 +739,6 @@ async def run_compilation(
     raise_on_error: bool = False,
     allow_partial_progress: bool = False,
     return_diagnostics: bool = False,
-    sync_topics: bool = False,
 ) -> dict:
     """Run compilation, optionally surfacing failures for retry control.
 
@@ -933,7 +748,7 @@ async def run_compilation(
     """
     memory_dir.mkdir(parents=True, exist_ok=True)
     total = _total_lines(memory_dir)
-    results = {"context": False, "recent": False, "durable": False}
+    results = {"context": False, "durable": False}
     errors: dict[str, str] = {}
     error_causes: dict[str, Exception] = {}
     try:
@@ -943,65 +758,11 @@ async def run_compilation(
         errors["context"] = "context-memory compilation failed"
         error_causes["context"] = exc
     try:
-        results["recent"] = await compile_recent(memory_dir, llm, reviewer)
-    except Exception as exc:
-        logger.warning("recent-memory compilation failed", exc_info=True)
-        errors["recent"] = "recent-memory compilation failed"
-        error_causes["recent"] = exc
-    try:
         results["durable"] = await compile_durable(memory_dir, llm, reviewer)
     except Exception as exc:
         logger.warning("durable-memory compilation failed", exc_info=True)
         errors["durable"] = "durable-memory compilation failed"
         error_causes["durable"] = exc
-    topic_sync_pending = False
-    if sync_topics:
-        try:
-            from .knowledge import TopicAssociationStore
-            topic_sync_pending = TopicAssociationStore(memory_dir).is_sync_pending()
-        except Exception:
-            logger.warning("durable topic synchronization state unavailable", exc_info=True)
-    if sync_topics and (results["durable"] or topic_sync_pending):
-        from .history import append_memory_history
-        from .store import _clear_retry_attempt, _record_retry_attempt
-
-        try:
-            from .knowledge import sync_durable_topics
-
-            await sync_durable_topics(memory_dir, llm, reviewer)
-            _clear_retry_attempt(memory_dir, "topic_sync")
-            # The status probe's failure streak reads the history; a success
-            # record is what ends a topic-sync streak once the lane recovers.
-            append_memory_history(
-                memory_dir,
-                target="topic_sync",
-                policy_version=_MEMORY_POLICY.version,
-                status="written",
-            )
-        except Exception as exc:
-            # Topic pages are a derived knowledge view.  They must never make
-            # an already-reviewed durable memory update fail or retry forever.
-            logger.warning("durable topic synchronization failed", exc_info=True)
-            try:
-                from .knowledge import TopicAssociationStore
-
-                TopicAssociationStore(memory_dir).mark_sync_pending()
-                # This exception never reaches the maintenance service's own
-                # backoff, so the cooldown has to be recorded here; otherwise a
-                # classifier that keeps failing burns one LLM call per tick.
-                _record_retry_attempt(memory_dir, "topic_sync")
-                # Without a history record this lane was invisible to the
-                # failure-streak probe: it could starve forever while the
-                # status endpoint reported a healthy pipeline.
-                append_memory_history(
-                    memory_dir,
-                    target="topic_sync",
-                    policy_version=_MEMORY_POLICY.version,
-                    status="failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-            except Exception:
-                logger.warning("could not persist durable topic sync retry state", exc_info=True)
     if not errors and any(results.values()):
         _write_offset(memory_dir, total)
     # A successful layer is useful progress even when a later layer failed.
@@ -1010,7 +771,7 @@ async def run_compilation(
     partial_progress_is_safe = (
         allow_partial_progress
         and set(errors) == {"durable"}
-        and results["recent"]
+        and results["context"]
     )
     if errors and raise_on_error and not partial_progress_is_safe:
         if len(error_causes) == 1:

@@ -199,34 +199,6 @@ def _as_list(value: object) -> list:
     return [value]
 
 
-async def _generate_and_review(
-    generator: "LLMPort",
-    reviewer: "LLMPort",
-    prompt: str,
-    source: str,
-    *,
-    system_prompt: str | None = None,
-    target_view: str = "memory",
-    review_policy: str = "(legacy quality rules)",
-) -> str:
-    """Run the generator-evaluator loop: generate -> review -> retry up to 3 rounds.
-
-    Invariant: every returned draft passed review. The loop generates a draft,
-    reviews it, and retries rejected drafts up to the configured limit. A final
-    rejection is a failed compilation, never a silently accepted memory write.
-    """
-    outcome = await _generate_and_review_result(
-        generator,
-        reviewer,
-        prompt,
-        source,
-        system_prompt=system_prompt,
-        target_view=target_view,
-        review_policy=review_policy,
-    )
-    return outcome.text
-
-
 async def _generate_and_review_result(
     generator: "LLMPort",
     reviewer: "LLMPort",

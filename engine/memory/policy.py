@@ -10,11 +10,11 @@ from typing import Literal
 
 import yaml
 
-MemoryViewName = Literal["context", "recent", "durable"]
+MemoryViewName = Literal["context", "durable"]
 
 # These machine-readable allowlists are the write-time counterpart to the
-# Markdown policy.  They intentionally reject generic "work" and task-plan
-# entries from durable memory even when a caller labels them as evidence.
+# Markdown policy.  They reject task-plan entries even when a caller labels
+# them as evidence.
 MANUAL_MEMORY_KINDS = frozenset({
     "preference",
     "correction",
@@ -30,15 +30,6 @@ MANUAL_EVIDENCE_TYPES = frozenset({
     "tool_result",
     "test_result",
     "source_document",
-})
-DURABLE_MEMORY_KINDS = frozenset({
-    "correction",
-    "decision",
-    "remember",
-    "forget",
-    "verified_fact",
-    "procedure",
-    "pitfall",
 })
 
 
@@ -57,7 +48,6 @@ class MemoryViewPolicy:
     load: str
     max_chars: int
     sections: tuple[str, ...]
-    window_days: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,11 +74,11 @@ class MemoryPolicy:
         sections = _split_policy_sections(self.markdown)
         prefixes = ["1.", "2.", "3.", _VIEW_SECTION_PREFIX[name]]
         if role == "compiler":
-            prefixes.append("7.")
+            prefixes.append("6.")
         elif role == "reviewer":
-            prefixes.append("8.")
+            prefixes.append("7.")
         elif role == "dream":
-            prefixes.extend(("8.", "9."))
+            prefixes.extend(("7.", "8."))
         else:  # pragma: no cover - Literal protects normal callers
             raise MemoryPolicyError(f"unknown policy role: {role}")
 
@@ -106,8 +96,7 @@ class MemoryPolicy:
 
 _VIEW_SECTION_PREFIX: dict[MemoryViewName, str] = {
     "context": "4.",
-    "recent": "5.",
-    "durable": "6.",
+    "durable": "5.",
 }
 
 
@@ -128,9 +117,9 @@ def load_memory_policy(path: Path | None = None) -> MemoryPolicy:
     if not isinstance(raw_views, dict):
         raise MemoryPolicyError("views must be a mapping")
 
-    expected = {"context", "recent", "durable"}
+    expected = {"context", "durable"}
     if set(raw_views) != expected:
-        raise MemoryPolicyError("policy must define context, recent, and durable views")
+        raise MemoryPolicyError("policy must define context and durable views")
 
     views: dict[MemoryViewName, MemoryViewPolicy] = {}
     for raw_name, raw in raw_views.items():
@@ -157,18 +146,6 @@ def load_memory_policy(path: Path | None = None) -> MemoryPolicy:
             raise MemoryPolicyError(f"view {name} scope is required")
         if not isinstance(load, str) or not load.strip():
             raise MemoryPolicyError(f"view {name} load strategy is required")
-        window_days = raw.get("window_days", [])
-        if not isinstance(window_days, list) or not all(
-            isinstance(day, int) and day > 0 for day in window_days
-        ):
-            raise MemoryPolicyError(f"view {name} window_days must be positive integers")
-        if name == "recent" and (
-            len(window_days) != 2 or window_days != sorted(window_days)
-        ):
-            raise MemoryPolicyError(
-                "recent window_days must contain two ascending values"
-            )
-
         views[name] = MemoryViewPolicy(
             name=name,
             path=relative_path,
@@ -177,7 +154,6 @@ def load_memory_policy(path: Path | None = None) -> MemoryPolicy:
             load=load.strip(),
             max_chars=max_chars,
             sections=tuple(section.strip() for section in sections),
-            window_days=tuple(window_days),
         )
 
     policy = MemoryPolicy(version=version, views=views, markdown=markdown.strip())

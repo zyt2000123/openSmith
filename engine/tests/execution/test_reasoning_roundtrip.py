@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import asyncio
 
-from engine.execution.react.react_loop import react_loop
 from engine.llm.client import ChatResponse, ToolCallData
+from engine.tests.execution.react_text_adapters import react_loop
 from engine.tool.registry import ToolRegistry
 
 

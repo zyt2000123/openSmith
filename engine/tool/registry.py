@@ -42,6 +42,7 @@ _VALID_EXECUTION_ENVIRONMENTS = frozenset({"host", "sandbox", "either"})
 _BUILTIN_PROVIDER_FILENAMES = frozenset(
     {
         "edit_file.py",
+        "get_current_time.py",
         "git_ops.py",
         "glob_files.py",
         "grep.py",
@@ -108,7 +109,11 @@ def _call_fingerprint(call: ToolCall) -> str:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, lazy_tool_schemas: bool = False) -> None:
+        # The product runtime enables this to keep complete schemas out of the
+        # first provider request.  Retaining the legacy default preserves the
+        # public registry contract for embedders that call ReAct directly.
+        self.lazy_tool_schemas = lazy_tool_schemas
         self._tools: dict[str, tuple[ToolDefinition, Callable]] = {}
         self._enabled: set[str] | None = None
         self._execution_ledger: ToolExecutionLedger | None = None
@@ -336,8 +341,16 @@ class ToolRegistry:
         call directly).  They are excluded here — not just by the callers — so
         a scoped or explicitly-enabled view can never widen a model-facing
         schema list into the hidden set.
+
+        ``enabled`` narrows the profile/identity allowlist; it never replaces
+        it.  Asking for a single name by hand — as the lazy-schema loader does
+        for whatever tool the model names — must not hand back the contract of
+        a capability configuration disabled.
         """
-        active = set(enabled) if enabled is not None else self._enabled
+        active = self._enabled
+        if enabled is not None:
+            requested = set(enabled)
+            active = requested if active is None else active & requested
         result: list[dict] = []
         for name, (defn, _) in self._tools.items():
             if active is not None and name not in active:
@@ -660,7 +673,8 @@ class ToolRegistry:
                 side_effect_status="unknown" if defn.side_effect != "none" else "none",
             )
 
-        result = await asyncio.to_thread(self._finalize_result, result, tool_name)
+        # Plain string truncation: a thread hop costs more than the work.
+        result = self._finalize_result(result, tool_name)
         if ledger is not None and claimed:
             ledger.finish(
                 call_id=call.id,
@@ -846,6 +860,10 @@ class ScopedToolRegistry:
     @property
     def working_directory(self) -> Path | None:
         return self._registry.working_directory
+
+    @property
+    def lazy_tool_schemas(self) -> bool:
+        return self._registry.lazy_tool_schemas
 
     def get_schemas(
         self,

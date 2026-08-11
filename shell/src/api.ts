@@ -129,7 +129,6 @@ export type MaintenanceState = "idle" | "pending" | "running";
 
 export type MemoryMaintenance = {
   compile: MaintenanceState;
-  nudge: MaintenanceState;
   dream: MaintenanceState;
   /** Derived topic-knowledge lane; runs inside compile, so never "running". */
   topic_sync?: MaintenanceState;
@@ -192,6 +191,7 @@ export type StreamEvent =
   | { type: "skill"; name: string; status: string }
   | { type: "route_decided"; identityId: string; identityName: string; routeId: string; pipelineId: string }
   | { type: "gate_result"; skill: string; verdict: string; reason: string }
+  | { type: "gate_evidence"; skill: string; evidenceHash: string; evidenceCount: number }
   | { type: "backtrack"; from: string; to: string; reason: string }
   | { type: "awaiting_input"; skill: string; reason: string }
   | ({ type: "token_usage" } & TokenUsage)
@@ -815,6 +815,12 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     verdict: terminalText(payload.verdict).slice(0, 80),
     reason: terminalText(payload.reason).slice(0, 500),
   }),
+  gate_evidence: (payload) => ({
+    type: "gate_evidence",
+    skill: terminalText(payload.skill).slice(0, 120),
+    evidenceHash: terminalText(payload.evidence_hash).slice(0, 128),
+    evidenceCount: Math.max(0, Math.floor(finiteNumber(payload.evidence_count, 0))),
+  }),
   backtrack: (payload) => ({
     type: "backtrack",
     from: terminalText(payload.from).slice(0, 120),
@@ -945,10 +951,12 @@ async function* readSseEvents(
           buffer += decoder.decode(trailingValue, { stream: true });
           const trailingParsed = splitSseBuffer(buffer);
           assertSseFrameLimit(trailingParsed.chunks, trailingParsed.remainder);
-          // Advance past the frames just consumed, exactly as the main loop does
-          // at :921.  Without this the buffer keeps every parsed chunk, so the
-          // next drain read and the final flush re-yield them — and applyStreamState
-          // *adds* usage deltas, inflating a split-out trailing token_usage 2-3x.
+          // Consume the buffer, exactly as the main loop does.  Leaving the parsed
+          // frames behind re-yielded them on the next drain read and again in the
+          // post-loop flush, and after `done` the only events still allowed
+          // through are the usage counters — which the store *accumulates*, so a
+          // trailing token_usage arriving in its own TCP read doubled the turn and
+          // session totals.
           buffer = trailingParsed.remainder;
           const trailingConsumed = consumeSseChunks(trailingParsed.chunks, sawDone);
           yield* trailingConsumed.events;

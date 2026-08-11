@@ -318,7 +318,7 @@ def test_build_engine_runtime_selects_interactive_gate_and_background_clients(mo
     monkeypatch.setattr(engine_runtime, "resolve_llm_config", fake_resolve)
     monkeypatch.setattr(engine_runtime, "build_llm_client", fake_build)
     monkeypatch.setattr(engine_runtime, "load_runtime_identity_catalog", lambda: object())
-    monkeypatch.setattr(engine_runtime, "ToolRegistry", lambda: object())
+    monkeypatch.setattr(engine_runtime, "ToolRegistry", lambda **_: object())
     monkeypatch.setattr(engine_runtime, "SkillRegistry", FakeSkillRegistry)
     monkeypatch.setattr(engine_runtime, "ToolGuard", lambda _path: object())
 

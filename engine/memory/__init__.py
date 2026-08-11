@@ -43,11 +43,3 @@ __all__ += [
     "MemoryMaintenanceService",
     "memory_maintenance_status",
 ]
-
-# search depends on aiosqlite, which may be absent when this package is
-# imported standalone by content-layer tools; everything else is stdlib-only.
-try:
-    from .search import SearchIndex
-    __all__ += ["SearchIndex"]
-except ModuleNotFoundError:
-    pass

@@ -1,4 +1,5 @@
 """List directory tool — tree-style directory listing."""
+# 以受限深度和条目数展示目录结构，适合先建立项目全貌。
 
 import asyncio
 import os

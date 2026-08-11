@@ -578,6 +578,31 @@ class RunStateStore:
                 recovered.append(run_id)
         return recovered
 
+    def list_states(self) -> list[RunState]:
+        """Return readable run states for startup reconciliation.
+
+        A malformed state file is left untouched and does not prevent healthy
+        runs from being reconciled into their observability summaries.
+        """
+        states: list[RunState] = []
+        with self._lock:
+            for path in sorted(self.root.glob("*.json")):
+                run_id = path.stem
+                if not _RUN_ID_RE.fullmatch(run_id):
+                    continue
+                try:
+                    state = self.get(run_id)
+                except RunStateError:
+                    logger.warning(
+                        "skipping unreadable run state file %s during listing",
+                        path.name,
+                        exc_info=True,
+                    )
+                    continue
+                if state is not None:
+                    states.append(state)
+        return states
+
     def get(self, run_id: str) -> RunState | None:
         path = self._path(run_id)
         if not path.is_file():

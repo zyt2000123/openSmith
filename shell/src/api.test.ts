@@ -70,6 +70,10 @@ test("SSE decoder exposes the SkillChain lifecycle", () => {
     { type: "gate_result", skill: "grilling", verdict: "retry", reason: "Need a target user." },
   );
   assert.deepEqual(
+    decodeSseEvent('event: gate_evidence\ndata: {"skill":"grilling","evidence_hash":"abc123","evidence_count":2}'),
+    { type: "gate_evidence", skill: "grilling", evidenceHash: "abc123", evidenceCount: 2 },
+  );
+  assert.deepEqual(
     decodeSseEvent('event: backtrack\ndata: {"from":"research","to":"grilling","reason":"Scope is ambiguous."}'),
     { type: "backtrack", from: "research", to: "grilling", reason: "Scope is ambiguous." },
   );
@@ -289,44 +293,39 @@ test("trailing token_usage after done is not dropped", async () => {
   }
 });
 
-test("a token_usage frame split into a later read is yielded exactly once", async () => {
-  // The frame arrives in a SEPARATE read after done — the TCP split the drain
-  // loop exists for.  Without advancing the drain buffer past consumed chunks,
-  // the next drain read and the final flush re-yield it, and applyStreamState
-  // *adds* usage deltas, inflating the trailing frame 2-3x.
+test("a trailing token_usage in its own read is yielded exactly once", async () => {
   const originalFetch = globalThis.fetch;
-  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  // The realistic wire shape: the server frames done, then flushes the usage
+  // counter, and TCP puts them in separate reads.  The drain loop must consume
+  // its buffer, or the same counter is replayed on the next read and again in
+  // the post-loop flush — and the store adds usage up rather than replacing it.
+  const reads = [
+    'event: done\ndata: {"id":"message-1"}\n\n',
+    'event: token_usage\ndata: {"input_tokens":1,"output_tokens":2,"total_tokens":3}\n\n',
+  ];
+  let index = 0;
   const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      streamController = controller;
-      controller.enqueue(new TextEncoder().encode('event: done\ndata: {"id":"message-1"}\n\n'));
+    pull(controller) {
+      const chunk = reads[index++];
+      if (chunk === undefined) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(new TextEncoder().encode(chunk));
     },
   });
 
-  globalThis.fetch = async () =>
-    new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  globalThis.fetch = async () => new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
 
   try {
-    const events: Array<Record<string, unknown>> = [];
-    const consume = (async () => {
-      for await (const event of streamMessage("http://127.0.0.1:8140", "session-1", "hello", { timeoutMs: 1_000 })) {
-        events.push(event as Record<string, unknown>);
-      }
-    })();
-
-    // Deliver the trailing usage frame in its own read, then close the stream.
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    streamController?.enqueue(
-      new TextEncoder().encode(
-        'event: token_usage\ndata: {"input_tokens":1,"output_tokens":2,"total_tokens":3}\n\n',
-      ),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    streamController?.close();
-    await consume;
-
-    const usageFrames = events.filter((event) => event.type === "token_usage");
-    assert.equal(usageFrames.length, 1, "the split-out token_usage frame must be yielded exactly once");
+    const events = [];
+    for await (const event of streamMessage("http://127.0.0.1:8140", "session-1", "hello", { timeoutMs: 1_000 })) {
+      events.push(event);
+    }
+    assert.deepEqual(events, [
+      { type: "done", id: "message-1", status: "completed" },
+      { type: "token_usage", input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
