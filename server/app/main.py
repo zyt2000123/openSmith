@@ -167,9 +167,15 @@ def _running_stale_code() -> bool:
 
 @app.get("/api/health")
 async def health():
+    # Two independent launcher concerns, both required: ``stale`` tells a shell
+    # its server is running code older than the tree, and ``nonce`` echoes the
+    # launcher-supplied value so a shell can tell its own process apart from a
+    # foreign one that won the same port in a startup race.  Absent (a manually
+    # started server) → null, which the launcher treats as "not mine".
     return {
         "status": "ok",
         "version": "0.2.0",
         "started_at": _STARTED_AT,
         "stale": _running_stale_code(),
+        "nonce": os.environ.get("SMITH_SERVER_NONCE") or None,
     }

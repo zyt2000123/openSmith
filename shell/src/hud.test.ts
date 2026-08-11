@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildRunProgressParts, displayContextPercent, formatElapsed, memoryMaintenanceLabel } from "./hud.js";
+import {
+  buildRunProgressParts,
+  displayContextPercent,
+  formatElapsed,
+  MEMORY_FAILURE_STREAK_THRESHOLD,
+  memoryMaintenanceLabel,
+} from "./hud.js";
 import { MUTED } from "./theme.js";
 
 test("formats active run duration for the status HUD", () => {
@@ -60,4 +66,34 @@ test("memory label reports queued work when nothing is running", () => {
 test("memory label shows nothing when idle or unavailable", () => {
   assert.equal(memoryMaintenanceLabel({ compile: "idle", dream: "idle" }), null);
   assert.equal(memoryMaintenanceLabel(null), null);
+});
+
+test("a trailing failure streak outranks every other memory label", () => {
+  // "memory queued" would be actively misleading while every attempt fails.
+  assert.equal(
+    memoryMaintenanceLabel({
+      compile: "pending",
+      dream: "running",
+      consecutive_failures: MEMORY_FAILURE_STREAK_THRESHOLD,
+      last_error: "LLMResponseError: HTTP 401",
+    }),
+    `memory stalled ×${MEMORY_FAILURE_STREAK_THRESHOLD}`,
+  );
+});
+
+test("failures below the streak threshold stay invisible", () => {
+  // One or two failures are routine transients; the next tick retries them.
+  assert.equal(
+    memoryMaintenanceLabel({
+      compile: "idle",
+      dream: "idle",
+      consecutive_failures: MEMORY_FAILURE_STREAK_THRESHOLD - 1,
+      last_error: "boom",
+    }),
+    null,
+  );
+});
+
+test("servers without the failure fields keep their old labels", () => {
+  assert.equal(memoryMaintenanceLabel({ compile: "pending", dream: "idle" }), "memory queued");
 });

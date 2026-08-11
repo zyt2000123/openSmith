@@ -404,6 +404,69 @@ async def test_failed_scheduled_auto_task_is_requeued_with_retry_state(
 
 
 @pytest.mark.asyncio
+async def test_failed_run_is_recorded_before_the_lease_is_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing run must finalize its own run row, never leave it phantom-'running'.
+
+    Production's finish_run is lease-gated: with auto_task_id and force=False it
+    writes only while the task is still 'running' with this token.  The failure
+    path used to release the lease (finish_task) *before* recording the failure,
+    so the gated finish_run found the lease gone and skipped the write — the run
+    row stayed 'running' with error=NULL forever.  This repo models that gate.
+    """
+    class LeaseGatedRepo(FakeAutoTaskRepo):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lease_held = True
+            self.forced: list[str] = []
+
+        async def finish_task(self, task_id, status, next_run_at, lease_token, *, retry_count=None) -> bool:
+            self.lease_held = False  # releasing the lease nulls the token
+            return await super().finish_task(
+                task_id, status, next_run_at, lease_token, retry_count=retry_count
+            )
+
+        async def finish_run(
+            self, run_id, status, output, error=None, *,
+            auto_task_id=None, lease_token=None, force=False,
+        ) -> dict | None:
+            if auto_task_id is not None and not force and not self.lease_held:
+                return None  # the production gate: lease no longer held
+            if force:
+                self.forced.append(run_id)
+            return await super().finish_run(
+                run_id, status, output, error, auto_task_id=auto_task_id, lease_token=lease_token
+            )
+
+    async def fail_reply(request, runtime, services):
+        raise RuntimeError("provider outage with a secret-free message")
+
+    monkeypatch.setattr(
+        auto_task_service_module, "load_runtime_identity_catalog",
+        lambda: SimpleNamespace(resolve=lambda message: SimpleNamespace(identity_id="smith")),
+    )
+    monkeypatch.setattr(
+        auto_task_service_module, "build_engine_runtime",
+        lambda *args, **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(auto_task_service_module, "engine_reply_with_runtime", fail_reply)
+
+    task_repo = LeaseGatedRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+    task = _task(trigger_type="interval", trigger_config="3600", retry_count=0, max_retries=2)
+
+    finished = await _run_to_completion(service, task)
+
+    # The run row was finalized as failed with the error text, not left running.
+    assert finished["status"] == "failed"
+    assert finished["error"] and "provider outage" in finished["error"]
+    # The task was still rescheduled for retry afterwards.
+    task_update = next(u for u in task_repo.updates if u.get("task_id") == "task-1")
+    assert task_update["status"] == "idle"
+
+
+@pytest.mark.asyncio
 async def test_exhausted_retry_chain_resets_before_next_schedule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -612,6 +675,45 @@ async def test_success_schedules_next_run_from_completion_not_start(
         update for update in task_repo.updates if update.get("task_id") == "task-1"
     )
     assert task_update["next_run_at"] == "scheduled-after-completion"
+
+
+@pytest.mark.asyncio
+async def test_schedule_edited_mid_run_takes_effect_on_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """trigger_type/config are snapshotted at claim time; a mid-run edit must
+    still be honored on completion, not overwritten from the stale snapshot."""
+    class EditedMidRunRepo(FakeAutoTaskRepo):
+        async def get(self, task_id: str) -> dict:
+            # The user switched the task to manual after it was claimed and while
+            # the engine turn was still running.
+            return _task(task_id, trigger_type="manual", trigger_config="")
+
+    async def ok_reply(request, runtime, services):
+        return SimpleNamespace(text="done")
+
+    monkeypatch.setattr(
+        auto_task_service_module, "load_runtime_identity_catalog",
+        lambda: SimpleNamespace(resolve=lambda message: SimpleNamespace(identity_id="smith")),
+    )
+    monkeypatch.setattr(
+        auto_task_service_module, "build_engine_runtime",
+        lambda *args, **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(auto_task_service_module, "engine_reply_with_runtime", ok_reply)
+
+    task_repo = EditedMidRunRepo()
+    service = AutoTaskService(task_repo, FakeProfileRepo(), FakeSessionRepo())
+    # Claim-time config is a live interval; the edit above switches it to manual.
+    finished = await _run_to_completion(
+        service, _task(trigger_type="interval", trigger_config="3600")
+    )
+
+    assert finished["status"] == "completed"
+    task_update = next(u for u in task_repo.updates if u.get("task_id") == "task-1")
+    # Honoring the edit means the task stops (manual → no next run); the stale
+    # interval snapshot would have scheduled a concrete next_run_at.
+    assert task_update["next_run_at"] is None
 
 
 @pytest.mark.asyncio

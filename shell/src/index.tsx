@@ -1278,6 +1278,20 @@ process.once("SIGINT", () => {
 process.once("SIGTERM", () => {
   void exitOnSignal(143);
 });
+// SIGHUP (terminal/tab closed, ssh dropped) and SIGQUIT must reap the backend
+// too.  Without a handler here, Ink's signal-exit restores the terminal and
+// re-raises, killing the shell by signal — Node never emits "exit", so the
+// backend's own exit-time cleanup never runs and the detached uvicorn is
+// orphaned: holding its port and auth token, still spending tokens on memory
+// maintenance.  Routing through exitOnSignal unmounts and runs stopOwnedServer;
+// registering the listener also suppresses signal-exit's bare re-raise so this
+// cleanup can complete.  128 + signal number: SIGHUP=1 → 129, SIGQUIT=3 → 131.
+process.once("SIGHUP", () => {
+  void exitOnSignal(129);
+});
+process.once("SIGQUIT", () => {
+  void exitOnSignal(131);
+});
 
 void app.waitUntilExit().then(
   () => exitWith(0),

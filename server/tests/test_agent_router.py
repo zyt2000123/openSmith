@@ -218,6 +218,7 @@ def test_memory_status_route_reports_deferred_maintenance() -> None:
             return {
                 "compile": "idle",
                 "dream": "running",
+                "topic_sync": "pending",
                 "consecutive_failures": 213,
                 "last_error": "LLMResponseError: LLM request failed (HTTP 401)",
             }
@@ -233,6 +234,7 @@ def test_memory_status_route_reports_deferred_maintenance() -> None:
     assert response.json() == {
         "compile": "idle",
         "dream": "running",
+        "topic_sync": "pending",
         "consecutive_failures": 213,
         "last_error": "LLMResponseError: LLM request failed (HTTP 401)",
     }

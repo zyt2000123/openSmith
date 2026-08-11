@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
@@ -106,6 +107,7 @@ function assertSafeServerTarget(target: ServerTarget): void {
 
 type LaunchedServer = {
   child: ChildProcess;
+  nonce: string;
   getSpawnError: () => Error | undefined;
   getStderrTail: () => string;
 };
@@ -146,18 +148,14 @@ function cleanupOwnedServer(): void {
   ownedServer = null;
   if (!child || child.exitCode !== null) return;
 
-  // Synchronous best-effort fallback for paths that cannot await (the process
-  // 'exit' event).  SIGTERM alone left a busy uvicorn running as an orphan
-  // holding the port, so escalate to SIGKILL via an unref'd timer; the async
-  // stopOwnedServer() covers the paths that CAN wait.
-  if (!signalProcessGroup(child, "SIGTERM")) {
-    signalProcessGroup(child, "SIGKILL");
-    return;
-  }
-  const escalation = setTimeout(() => {
-    if (child.exitCode === null) signalProcessGroup(child, "SIGKILL");
-  }, SERVER_TERMINATION_GRACE_MS);
-  escalation.unref?.();
+  // Last-resort reap for paths that cannot await: the process 'exit' event.  A
+  // setTimeout scheduled here never fires — the event loop is already tearing
+  // down — so the previous SIGTERM-then-timer-SIGKILL escalation delivered only
+  // SIGTERM and left a wedged uvicorn orphaned holding the port and auth token.
+  // Normal exits use the awaitable stopOwnedServer() with a real grace period;
+  // this path is only reached on a crash/uncaught exception, where the child has
+  // no other client, so go straight to SIGKILL to guarantee the reap.
+  signalProcessGroup(child, "SIGKILL");
 }
 
 /** Stop the owned server and await its exit.  Safe to call multiple times. */
@@ -356,6 +354,11 @@ function launchLocalServer(baseUrl: string): LaunchedServer {
     );
   }
 
+  // A per-launch identity so the health probe can distinguish the server we
+  // spawned from a foreign one that won the same port in a near-simultaneous
+  // startup race (two shells, empty port, both spawn uvicorn — one loses the
+  // bind and dies).  The server echoes SMITH_SERVER_NONCE from /api/health.
+  const nonce = randomUUID();
   const child = spawn("uv", ["run", "uvicorn", "app.main:app", "--port", port], {
     cwd: serverDir,
     // Detached so `uv` leads its own process group: signalling the group (a
@@ -367,7 +370,7 @@ function launchLocalServer(baseUrl: string): LaunchedServer {
     // message left the user with "exited before becoming healthy" and no way to
     // diagnose it. Bounded so a chatty server cannot grow this without limit.
     stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    env: { ...process.env, PYTHONUNBUFFERED: "1", SMITH_SERVER_NONCE: nonce },
   });
   let spawnError: Error | undefined;
   child.once("error", (error) => {
@@ -382,7 +385,23 @@ function launchLocalServer(baseUrl: string): LaunchedServer {
 
   ownedServer = child;
   registerCleanup();
-  return { child, getSpawnError: () => spawnError, getStderrTail: () => stderrTail(diagnostics) };
+  return { child, nonce, getSpawnError: () => spawnError, getStderrTail: () => stderrTail(diagnostics) };
+}
+
+async function healthNonce(baseUrl: string): Promise<string | null | undefined> {
+  // undefined = probe failed/not-yet-up (retryable); null = healthy server with
+  // no nonce (a foreign or manually started one); string = a server's identity.
+  const timeout = createTimeoutSignal(SERVER_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(serverEndpoint(baseUrl, "/api/health"), { signal: timeout.signal });
+    if (!response.ok) return undefined;
+    const body = (await response.json()) as { nonce?: string | null };
+    return body.nonce ?? null;
+  } catch {
+    return undefined;
+  } finally {
+    timeout.dispose();
+  }
 }
 
 /** Append the server's own stderr, which is usually the whole diagnosis. */
@@ -399,7 +418,24 @@ async function waitForCompatibleServer(
   const startedAt = Date.now();
   for (let attempt = 0; attempt < 40; attempt += 1) {
     if (Date.now() - startedAt >= SERVER_STARTUP_TIMEOUT_MS) break;
-    if (await isCompatibleServer(baseUrl)) {
+
+    // Check OUR child's health before adopting whatever answers the port.  If
+    // our spawn lost a bind race and died, a foreign but compatible server
+    // replying here is not ours to keep — when it exits it takes our session
+    // with it.  Fail loudly instead of silently riding someone else's server.
+    const spawnError = launch.getSpawnError();
+    if (spawnError) {
+      throw new Error(`Could not launch the local Smith server: ${spawnError.message}`);
+    }
+    if (launch.child.exitCode !== null) {
+      throw new Error(withServerDiagnostics("Local server exited before becoming healthy.", launch));
+    }
+
+    // Adopt the server only once it proves it is the one we spawned (our nonce)
+    // AND is compatible.  A foreign server on the same port answers with a
+    // different nonce (or none), so we keep waiting for our own child instead.
+    const nonce = await healthNonce(baseUrl);
+    if (nonce === launch.nonce && (await isCompatibleServer(baseUrl))) {
       return {
         baseUrl,
         started: true,
@@ -407,14 +443,6 @@ async function waitForCompatibleServer(
           ? `Found an older Smith server; started an isolated shell server on ${baseUrl}.`
           : undefined,
       };
-    }
-
-    const spawnError = launch.getSpawnError();
-    if (spawnError) {
-      throw new Error(`Could not launch the local Smith server: ${spawnError.message}`);
-    }
-    if (launch.child.exitCode !== null) {
-      throw new Error(withServerDiagnostics("Local server exited before becoming healthy.", launch));
     }
     await sleep(500);
   }

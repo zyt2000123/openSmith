@@ -4,15 +4,20 @@
 也不含执行逻辑。这里只放"素材"——身份声明、pipeline 编排、skill 方法体、工具 provider、
 门禁与条件、危险命令规则。全部执行框架在 `engine/`，由引擎在启动时按约定扫描并加载本目录。
 
-**铁律**：本目录任何文件不得 `import` engine / server / common。内容通过注入的辅助函数
+**铁律**：本目录的纯内容文件不得 `import` engine / server / common。内容通过注入的辅助函数
 （`output_key`、`environment`、`runtime` 等）访问引擎能力；契约是"命名约定 + 鸭子类型"，
 不是类型继承。架构边界由 `engine/tests/architecture/` 强制验证。
+**唯一例外**：`smith/hooks/*.py` 是可执行钩子实现，会 import
+`engine.execution.hooks` 的 Hook 基类（`cost_tracker.py` 还 import
+`common.config`）；除此之外的内容文件仍不得 import。
 
 ## 目录职责与加载方
 
 | 路径 | 内容 | 被谁加载 |
 | --- | --- | --- |
 | `smith/` | 默认身份种子：`config.yaml` + `role.md` / `style.md` / `workflow.md` / `toolbox.md` / `context.md` | `engine/context/assembler.py` 逐层装配 |
+| `smith/hooks/` | 内置 Hook 实现（PreTool / PostTool / Stop 钩子类） | `engine/execution/hooks/tool/loader.py`（由 `orchestration/preparation.py` 触发） |
+| `smith/hooks.yaml` | Hook 启用配置（声明加载哪些内置 Hook） | 同上 |
 | `identities/` | 声明式领域身份（YAML `agentsmith.identity/v1`） | `engine/identity/catalog.py` |
 | `pipelines/` | SkillChain 编排定义（YAML） | `engine/execution/pipeline/skill_chain.py` |
 | `skills/` | 任务 SOP（SKILL.md 方法体） | `engine/skill/registry.py` |
@@ -60,11 +65,14 @@
 | 身份 | YAML `schema: agentsmith.identity/v1` |
 | Pipeline | YAML `steps:` 节点列表 + 顶层 `base_gate(s)` / `backtrack` |
 
-Pipeline 执行规则：`steps[].skill` 是严格的运行时依赖。引擎必须先从
-`SkillRegistry` 解析出同名 `SKILL.md`，再经 `execute_skill_events()` 进入该
-Skill 的执行上下文；节点缺少 Skill 时以 `blocked` 结束，**不得**退回为通用
-ReAct。被用户禁用的节点 Skill 同样会阻断；只有该节点的 `condition` 返回
-`false` 才可跳过。通用 ReAct 只适用于没有绑定 Pipeline 的 route（`pipeline: null`）。
+Pipeline 执行规则：节点先从 `SkillRegistry` 解析出与 `steps[].skill` 同名的
+`SKILL.md`，再经 `execute_skill_events()` 进入该 Skill 的执行上下文。运行期
+该 Skill 缺失或被用户禁用时，节点**退回节点内（node-local）ReAct**——保留该
+节点的 `instructions` 与工具范围，且该节点的 gate 照跑，不通过就不进下一节点
+（`engine/execution/pipeline/pipeline.py`）。启动期则由
+`validate_execution_assets` / `IdentityCatalog` 校验提前暴露缺失配置。只有该
+节点的 `condition` 返回 `false` 才可跳过整个节点。通用 ReAct 作为完整流程只
+适用于没有绑定 Pipeline 的 route（`pipeline: null`）。
 
 加载规则：
 
@@ -90,4 +98,3 @@ ReAct。被用户禁用的节点 Skill 同样会阻断；只有该节点的 `con
 - `identities/README.md` — 身份目录契约、路由选择规则与最小格式
 - `skills/README.md` — SKILL.md 运行时契约
 - `skills/SOURCES.md` — 上游技能来源与锁定版本
-- `tools/PRD-2026-07-30-tool-hardening.md` — 工具加固 PRD（含 18 个 provider 的加固记录）
