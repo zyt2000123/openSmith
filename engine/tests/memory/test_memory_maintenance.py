@@ -27,6 +27,8 @@ from engine.llm.client import ChatResponse
 from engine.skill.registry import SkillRegistry
 from engine.tool.registry import ToolRegistry
 
+from _changeset_fixtures import changeset_add
+
 
 class StaticLLM:
     def __init__(self, text: str | None = None) -> None:
@@ -44,30 +46,21 @@ class StaticLLM:
             return ChatResponse(text=self.text)
         prompt = messages[-1]["content"]
         if "`memory/durable.md`" in prompt:
-            return ChatResponse(text="""# Durable Project Memory
-
-## Active Work
-- **Hook test** — 状态：active；下一步：verify；更新：2026-07-13。
-
-## Pending
-
-## Verified Outcomes
-- **Hook test** — 结果：The memory hook records tool-assisted work；证据：tool_result。
-
-## Decisions
-
-## Known Pitfalls
-""")
+            return ChatResponse(
+                text=changeset_add(
+                    "Active Work",
+                    "- **Maintenance work** — 状态：进行中；下一步：继续；更新：2026-08-12。",
+                    prompt,
+                )
+            )
         if "`context.md`" in prompt:
-            return ChatResponse(text="""# Smith Context
-
-## Confirmed Preferences
-- **Memory**: Honor explicit remember requests.
-
-## Collaboration Patterns
-
-## Stable User Context
-""")
+            return ChatResponse(
+                text=changeset_add(
+                    "Confirmed Preferences",
+                    "- **Maintenance preference**: 中文回复。",
+                    prompt,
+                )
+            )
         return ChatResponse(text="stable memory summary")
 
 

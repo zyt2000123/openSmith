@@ -29,6 +29,7 @@ def append_memory_history(
     new_text: str = "",
     review_rounds: int = 0,
     error: str | None = None,
+    notes: list[str] | None = None,
 ) -> bool:
     """Append one sanitized compile/review/write outcome without blocking memory."""
     cleaned_error: str | None = None
@@ -46,6 +47,18 @@ def append_memory_history(
         "review_rounds": max(0, review_rounds),
         "error": cleaned_error,
     }
+    if notes:
+        # What the change set proposed but did not land: rejected edits and
+        # bullets evicted for budget.  Sanitized like everything else, because a
+        # rejected edit can still quote the content that got it rejected.
+        cleaned_notes = []
+        for note in notes[:20]:
+            cleaned, _, _ = sanitize_memory_text(str(note))
+            cleaned = cleaned.strip()[:300]
+            if cleaned:
+                cleaned_notes.append(cleaned)
+        if cleaned_notes:
+            entry["not_written"] = cleaned_notes
     try:
         memory_dir.mkdir(parents=True, exist_ok=True)
         append_private_lines(
@@ -105,6 +118,42 @@ def recent_failure_streak(memory_dir: Path) -> tuple[int, str | None]:
             if isinstance(error, str) and error.strip():
                 last_error = error.strip()[:_FAILURE_ERROR_CHARS]
     return streak, last_error
+
+
+def deferred_streak(memory_dir: Path, target: str) -> int:
+    """Count the trailing run of "nothing was applicable" outcomes for one view.
+
+    Only ``deferred`` counts -- the one failure that repeating cannot fix. Every
+    other status breaks the run: a provider outage (``failed``) and an unsafe or
+    malformed draft (``rejected``) say nothing about whether the evidence is
+    usable, and a batch must never be given up on for someone else's fault. The
+    ``skipped`` record written when a batch is given up breaks the run too, so the
+    count restarts per batch.
+    """
+    path = memory_dir / "memory_history.jsonl"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _FAILURE_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return 0
+    streak = 0
+    for line in reversed(tail.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("target") != target:
+            # Another view's outcome says nothing about this one's streak.
+            continue
+        if record.get("status") != "deferred":
+            break
+        streak += 1
+    return streak
 
 
 def trim_memory_history(

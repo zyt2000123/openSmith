@@ -24,6 +24,8 @@ from engine.memory.policy import (
 from engine.memory.store import save_conversation_memory
 from engine.memory.user_learner import UserPreferenceLearner
 
+from _changeset_fixtures import changeset_from_document
+
 
 CONTEXT_DOC = """# Smith Context
 
@@ -77,6 +79,20 @@ class StaticLLM:
         return ChatResponse(text=self.text)
 
 
+class DocLLM(StaticLLM):
+    """Return the change set that reproduces a target document."""
+
+    def __init__(self, document: str) -> None:
+        super().__init__(None)
+        self.document = document
+
+    async def chat(self, messages: list[dict], **_: object) -> ChatResponse:
+        self.calls.append(messages)
+        return ChatResponse(
+            text=changeset_from_document(self.document, messages[-1]["content"])
+        )
+
+
 class PassReviewer(StaticLLM):
     def __init__(self) -> None:
         super().__init__('{"pass": true, "hard_fail": [], "soft_fail": [], "feedback": ""}')
@@ -102,7 +118,12 @@ def _write_event(memory_dir: Path, **overrides: object) -> None:
 def test_memory_policy_loads_one_canonical_two_view_contract(tmp_path: Path) -> None:
     policy = load_memory_policy()
 
-    assert policy.version == 3
+    # v4 moved the compiler contract from "emit the whole document" to "emit a
+    # change set", and lifted the evidence-strength rules out of the fallback
+    # path so they bind every write.  v5 turned those rules into three code
+    # guards that run before the reviewer, so a compiler prompt written against
+    # v4 will now have changes refused it did not expect.
+    assert policy.version == 5
     assert set(policy.views) == {"context", "durable"}
     assert resolve_view_path(policy, tmp_path, "context") == tmp_path / "context.md"
     assert resolve_view_path(policy, tmp_path, "durable") == tmp_path / "memory" / "durable.md"
@@ -190,7 +211,7 @@ def test_repeated_learning_signal_reaches_context_compiler(tmp_path: Path) -> No
         learning_signals=["tech_level=expert"],
     ))
     memory_dir = tmp_path / "memory"
-    generator = StaticLLM(CONTEXT_DOC)
+    generator = DocLLM(CONTEXT_DOC)
 
     assert asyncio.run(
         compile_context(memory_dir, generator, PassReviewer())
@@ -203,7 +224,7 @@ def test_formal_memory_view_requires_reviewer_before_write(tmp_path: Path) -> No
     _write_event(memory_dir)
 
     with pytest.raises(MemoryCompilationError, match="requires a reviewer"):
-        asyncio.run(compile_durable(memory_dir, StaticLLM(DURABLE_DOC)))
+        asyncio.run(compile_durable(memory_dir, DocLLM(DURABLE_DOC)))
 
     assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
     history = [
@@ -224,7 +245,7 @@ def test_compile_context_uses_policy_review_and_audit_history(tmp_path: Path) ->
         scope="user",
         evidence="user_explicit",
     )
-    generator = StaticLLM(CONTEXT_DOC)
+    generator = DocLLM(CONTEXT_DOC)
     reviewer = PassReviewer()
 
     assert asyncio.run(compile_context(memory_dir, generator, reviewer)) is True
@@ -240,8 +261,10 @@ def test_compile_context_uses_policy_review_and_audit_history(tmp_path: Path) ->
 
 def test_compile_durable_writes_only_policy_structured_markdown(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    _write_event(memory_dir)
-    generator = StaticLLM(DURABLE_DOC)
+    # verified_fact, because DURABLE_DOC carries a Verified Outcomes bullet and
+    # adjudication will not let a plain `work` event establish one.
+    _write_event(memory_dir, kind="verified_fact")
+    generator = DocLLM(DURABLE_DOC)
     reviewer = PassReviewer()
 
     assert asyncio.run(compile_durable(memory_dir, generator, reviewer)) is True
@@ -253,7 +276,7 @@ def test_compile_durable_writes_only_policy_structured_markdown(tmp_path: Path) 
 
 def test_compile_durable_creates_empty_template_without_events(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    generator = StaticLLM(DURABLE_DOC)
+    generator = DocLLM(DURABLE_DOC)
 
     assert asyncio.run(compile_durable(memory_dir, generator, PassReviewer())) is False
     assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
@@ -265,21 +288,38 @@ def test_generic_work_events_reach_durable_memory(tmp_path: Path) -> None:
 
     The previous policy rejected `work` and then advanced the compile
     checkpoint past it, so durable.md could never fill up at all.
+
+    It is admissible everywhere except `Verified Outcomes`: a `work` summary is
+    the assistant's own account of what it did, so policy 6.1 refuses to let it
+    establish a verified result. That single bullet is dropped and the rest of
+    the change set still lands -- partial success, not a failed compile.
     """
     memory_dir = tmp_path / "memory"
     _write_event(memory_dir, kind="work", scope="project")
 
     assert asyncio.run(
-        compile_durable(memory_dir, StaticLLM(DURABLE_DOC), PassReviewer())
+        compile_durable(memory_dir, DocLLM(DURABLE_DOC), PassReviewer())
     ) is True
-    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == DURABLE_DOC
+    written = (memory_dir / "durable.md").read_text(encoding="utf-8")
+    assert "**Memory upgrade**" in written
+    assert "**Free-form summaries**" in written
+    assert "结果：policy parsed" not in written
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ][-1]
+    assert any(
+        "unverified_evidence_in_verified_outcomes" in note
+        for note in history["not_written"]
+    )
 
 
 def test_user_scoped_events_stay_out_of_durable_memory(tmp_path: Path) -> None:
     """Collaboration preferences belong to context.md, never to durable.md."""
     memory_dir = tmp_path / "memory"
     _write_event(memory_dir, kind="preference", scope="user", evidence="user_explicit")
-    generator = StaticLLM(DURABLE_DOC)
+    generator = DocLLM(DURABLE_DOC)
 
     assert asyncio.run(compile_durable(memory_dir, generator, PassReviewer())) is False
     assert (memory_dir / "durable.md").read_text(encoding="utf-8") == EMPTY_DURABLE_DOC
@@ -291,7 +331,7 @@ def test_explicit_stable_decision_remains_a_durable_memory_candidate(tmp_path: P
     _write_event(memory_dir, kind="decision", scope="project", evidence="user_explicit")
 
     assert asyncio.run(
-        compile_durable(memory_dir, StaticLLM(DURABLE_DOC), PassReviewer())
+        compile_durable(memory_dir, DocLLM(DURABLE_DOC), PassReviewer())
     ) is True
     assert (memory_dir / "durable.md").read_text(encoding="utf-8") == DURABLE_DOC
 
@@ -303,7 +343,7 @@ def test_compile_durable_rejects_free_form_output_and_keeps_old_view(tmp_path: P
     memory_dir.mkdir(parents=True, exist_ok=True)
     (memory_dir / "durable.md").write_text(old, encoding="utf-8")
 
-    with pytest.raises(MemoryPolicyError, match="title"):
+    with pytest.raises(MemoryCompilationError, match="no applicable change"):
         asyncio.run(
             compile_durable(
                 memory_dir,
@@ -319,7 +359,10 @@ def test_compile_durable_rejects_free_form_output_and_keeps_old_view(tmp_path: P
         if line.strip()
     ][-1]
     assert history["target"] == "durable"
-    assert history["status"] == "rejected"
+    # deferred, not rejected: nothing applicable came out of the cycle, so nothing
+    # was written.  `rejected` is reserved for a draft that was unsafe or malformed
+    # in a way that must never be allowed to give up on the evidence batch.
+    assert history["status"] == "deferred"
 
 
 def test_compile_durable_accepts_complete_view_without_adding_legacy_wrapper(tmp_path: Path) -> None:
@@ -331,7 +374,7 @@ def test_compile_durable_accepts_complete_view_without_adding_legacy_wrapper(tmp
         evidence="user_explicit",
     )
 
-    assert asyncio.run(compile_durable(memory_dir, StaticLLM(DURABLE_DOC), PassReviewer())) is True
+    assert asyncio.run(compile_durable(memory_dir, DocLLM(DURABLE_DOC), PassReviewer())) is True
 
     content = (memory_dir / "durable.md").read_text(encoding="utf-8")
     assert content == DURABLE_DOC
@@ -353,78 +396,3 @@ def test_assemble_memory_injects_the_whole_durable_view(tmp_path: Path) -> None:
     assert "Free-form summaries" in assembled
 
 
-def test_durable_fallback_stays_within_budget_when_memory_is_nearly_full(
-    tmp_path: Path,
-) -> None:
-    """The safety net must not fail exactly when memory has filled up.
-
-    The fallback carries the existing document forward, so without eviction an
-    almost-full durable view renders over budget, _commit_view rejects it, and
-    the compile checkpoint never advances — memory freezes permanently.
-    """
-    from engine.memory.compile import (
-        MAX_DURABLE_CHARS,
-        _fallback_durable_document,
-    )
-
-    bullets = "\n".join(
-        f"- **Fact {i}**: a verified project fact worth about eighty characters of text right here."
-        for i in range(115)
-    )
-    near_full = (
-        f"# Durable Project Memory\n\n## Active Work\n{bullets}\n\n"
-        "## Pending\n\n## Verified Outcomes\n\n## Decisions\n\n## Known Pitfalls\n"
-    )
-    assert len(near_full) > MAX_DURABLE_CHARS
-
-    event = {
-        "task": "new work",
-        "summary": "a fresh tool-backed result",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "kind": "work",
-        "scope": "project",
-        "evidence": "tool_result",
-    }
-    document = _fallback_durable_document(near_full, [event])
-
-    assert len(document) <= MAX_DURABLE_CHARS
-    validate_rendered_view(load_memory_policy(), "durable", document)
-    # The new evidence is why the fallback ran; it must survive the eviction.
-    assert "a fresh tool-backed result" in document
-    # Oldest goes first, newest is retained.
-    assert "Fact 0**" not in document
-    assert "Fact 114**" in document
-
-
-def test_durable_fallback_carries_pre_merge_sections_forward() -> None:
-    """A durable.md written before the view merge must not lose content.
-
-    The deterministic fallback matches on heading names, so retired headings
-    (`Confirmed Facts`, `Reusable Procedures`) need an explicit mapping — the
-    LLM path is safe because it receives the document in full.
-    """
-    from engine.memory.compile import _fallback_durable_document
-
-    legacy = (
-        "# Durable Project Memory\n\n"
-        "## Confirmed Facts\n- **Storage**: an important legacy fact.\n\n"
-        "## Decisions\n- **Policy**: 决定 keep this decision；适用范围：project。\n\n"
-        "## Reusable Procedures\n- **Deploy**: a legacy procedure；验证：tested。\n\n"
-        "## Known Pitfalls\n- **Trap**: 避免 the legacy trap；原因：verified。\n"
-    )
-    event = {
-        "task": "new work",
-        "summary": "fresh result",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "kind": "work",
-        "scope": "project",
-        "evidence": "tool_result",
-    }
-    document = _fallback_durable_document(legacy, [event])
-
-    validate_rendered_view(load_memory_policy(), "durable", document)
-    assert "an important legacy fact" in document
-    assert "a legacy procedure" in document
-    assert "keep this decision" in document
-    assert "the legacy trap" in document
-    assert "fresh result" in document

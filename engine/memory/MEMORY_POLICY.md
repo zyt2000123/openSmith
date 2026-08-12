@@ -1,5 +1,5 @@
 ---
-policy_version: 3
+policy_version: 5
 views:
   context:
     path: context.md
@@ -109,6 +109,8 @@ views:
 - **{主题}**: {对未来协作持续有用的用户背景}。
 ```
 
+超出字符预算时，按 `Stable User Context` → `Collaboration Patterns` → `Confirmed Preferences` 的顺序淘汰完整条目，同一章节按文档中从前到后的顺序处理。明确说出口的偏好最有价值，最后才淘汰；背景信息最不可操作，先淘汰。不得截断条目。
+
 ## 5. durable.md
 
 `durable.md` 是 Smith 唯一的长期项目记忆。它没有时间窗口，也不会因为一段时间没有新事件而被清空；每次编译都是「现有 durable + 本次新增证据」的增量合并。遗忘只能来自三种原因：用户要求忘记、被更新的条目取代、或为了守住字符预算而按明确的价值顺序淘汰完整旧条目。
@@ -159,29 +161,78 @@ views:
 
 Compiler 每次只处理一个目标视图，并接收：目标 View Policy、当前 Markdown、筛选后的证据和当前时间。
 
+Compiler **不输出完整 Markdown**，而是输出一组变更。整篇输出无法说明它改了什么：漏抄一条旧条目等于静默删除，而一条不合格内容会让整份草稿作废、连带丢掉旁边所有合格内容。变更集把每次编辑显式说出来，于是没被声明的条目天然不动，单条不合格也只驳回它自己。
+
+```json
+{
+  "nothing_to_record": false,
+  "changes": [
+    {"op": "add", "view": "durable", "section": "Decisions",
+     "content": "- **{主题}**: 决定 {内容}；适用范围：{范围}。",
+     "evidence": {"ref": "{recent.jsonl 中该条事件的 timestamp}",
+                  "quote": "{该条事件文本中的原文片段}"}},
+    {"op": "remove", "view": "durable", "section": "Active Work",
+     "target": "**{主题}**", "reason": "{已完成 / 已被取代 / 用户要求忘记}",
+     "evidence": {"ref": "...", "quote": "..."}},
+    {"op": "replace", "view": "durable", "section": "Active Work",
+     "target": "**{主题}**", "content": "- **{主题}** — {更新后的整条内容}",
+     "evidence": {"ref": "...", "quote": "..."}}
+  ]
+}
+```
+
 Compiler 必须：
 
-- 输出完整目标 Markdown；
-- 基于证据更新旧内容，而不是盲目追加；
-- 保留本次证据没有涉及、也没有被否定的旧条目；
-- 删除已过期、被纠正或重复的条目；
-- 在证据不足时保留旧内容或保持对应章节为空；
-- 严格遵守目标模板和字符预算。
+- 只输出上述 JSON，不输出 Markdown 文档、不输出解释文字；
+- 用 `**{主题}**` 定位既有条目（`target`），不使用行号，也不要求逐字符复述原文；
+- `add` / `replace` 的 `content` 必须是一整条符合目标模板的 bullet，且以 `**{主题}**` 开头；
+- `replace` 不得更改主题键 —— 改名要拆成 `remove` + `add`，否则旧键对后续变更不可达；
+- 每条 `add` / `replace` / `remove` 都必须给出 `evidence`，且 `ref` 必须是本批证据中真实存在的事件、`quote` 必须是该事件文本中的原文片段；
+- 没有任何值得记录的内容时，输出 `nothing_to_record: true` 与空 `changes` —— **交白卷是合法且正确的结果**，不要为了有产出而硬凑；
+- 不得提出与本批证据无关的变更；证据不足就不提。
 
-### 6.1 durable 确定性 fallback
+变更的应用、章节归位与字符预算淘汰由确定性代码执行，Compiler 不负责渲染最终文件，也不负责淘汰。
 
-`context.md` 没有 fallback。`durable.md` 已配置 Reviewer，且生成—审核尝试因审核未通过或超时失败时，Compiler 可以使用确定性 fallback，但只能将已接受的旧条目和本次结构化证据做抽取式合并，不得推断或改写事实。
+### 6.1 三道程序裁决
 
-- 存在 `correction` 或 `forget` 证据时禁止 fallback；旧文件和未消费证据必须保留，等待下次完整审核；
-- `partial_work` 只能进入 `Active Work`，不得生成 `Verified Outcomes`；
-- 自动 `work` 事件的 summary 是助手回复而非原始工具证据，fallback 只能将它标为 `Pending` 待复核内容，不得写入 `Verified Outcomes`；
-- `memory_ops.add` 候选必须以 `content`（事件的 `task` 字段）作为记忆正文；`evidence` 说明（事件的 `summary` 字段）只能支持正文，不得反向成为事实；
-- 已接受旧条目必须整条保留；超出总字符预算时按 5.1 的顺序删除完整条目，不得截断条目；
-- fallback 输出仍必须通过路径、标题/章节、字符预算和密钥/注入检查，并以 `status=fallback` 备份、原子写入和审计。
+以下规则过去只约束确定性 fallback，也就是**代码写的兜底路径比 LLM 走的主路径管得更严**。现在它们对每一条变更生效，由程序在 Reviewer 之前裁决，不再依赖模型自觉。裁决按变更逐条进行：一条被驳回不影响旁边合格的变更。
+
+**第一道 · 溯源**：变更声明的证据必须真的存在，内容必须留在证据之内。
+
+- `evidence.ref` 必须是本批证据里真实出现过的事件时间戳；
+- `evidence.quote` 必须是该事件文本中的原文片段（只忽略空白差异）；
+- `content` 里每一个**可证伪锚点**必须能在该事件文本中找到：URL、反引号内容、带扩展名的文件路径（可带 `:行号`）、6 位以上数字。散文式表述无法这样校验，交给 Reviewer；
+- `replace` 可以沿用被改写条目里已有的锚点 —— 那条已经通过过一次审核，只有**新增**的内容需要新证据。
+
+**第二道 · 保留**：条目离开文档必须有依据。
+
+- 结论类章节（`Verified Outcomes`、`Decisions`、`Known Pitfalls`、以及 `context.md` 全部三节）的 `remove` 必须由本批的 `forget` / `correction` 证据支持 —— 又干了一些活不能推翻一条已确认的结论；
+- 流水类章节（`Active Work`、`Pending`）的 `remove` 只需给出 `reason`；
+- 因字符预算淘汰不是模型的变更，由确定性代码按 5.1 顺序执行。
+
+**第三道 · 落位**：章节不得承载强于其证据的断言（仅 `durable.md`，`context.md` 的三节之间没有强度次序）。
+
+- `partial_work` 证据只能进入 `Active Work`；
+- 自动 `work` 事件的 `summary` 是助手回复而非原始工具证据，不得写入 `Verified Outcomes`；没有 `kind` 的历史事件按 `work` 处理（取最弱读法，失败方向安全）；
+- `Verified Outcomes` 条目必须写出「证据：」字段；该字段里的可证伪锚点同样受第一道约束。
+
+以下一条无法由程序判定，仍属 Reviewer 职责：`memory_ops.add` 候选必须以 `content`（事件的 `task` 字段）作为记忆正文，`evidence` 说明（事件的 `summary` 字段）只能支持正文、不得反向成为事实 —— 两者渲染进同一行证据，代码无从分辨模型取自哪一半。
+
+### 6.2 失败时不写入
+
+生成—审核—裁决在轮次上限内没能产出任何可应用的变更时，Compiler **什么都不写**：`durable.md` 与 `context.md` 保持上一个通过审核的版本，offset 与指纹都不推进，等下一个编译周期带着更多证据重来。编译间隔本身就是节流器，不需要额外的降级产物。
+
+写入没通过审核的降级版会污染基线 —— 下一轮的「可信基线」就成了那份降级版，模型在它之上继续改。失败的改动不进已接受状态。
+
+连续 3 个周期都提不出任何可应用变更时，为避免证据无限累积、Dream 永远无法回收日志，推进 offset **跳过**这批证据，但仍然不写任何记忆内容。跳过只动游标，不删文件；被跳过的证据依旧遵循 8 中的保留窗口。
+
+只有「本周期没有任何可应用变更」（`status=deferred`）才计入这 3 次 —— 这是重试也解决不了的那一类失败。草稿不安全或结构不合法记 `status=rejected`，供应商故障、超时、密钥失效记 `status=failed`；这两类都与证据本身无关，不得把证据推向被跳过。
+
+每个视图各有自己的消费游标（`.compile_offset` / `.compile_offset_context`），因为两个视图消费日志的速度不同。offset 只能推进到**本次真的送进 prompt 的那一条**为止：证据按前缀装入 prompt 直到预算用尽，装不下的留给下一周期。用一个共享游标、或把游标推到日志末尾，都会让没被那个视图读过的证据进入 Dream 的回收范围。
 
 ## 7. Reviewer 合同
 
-Reviewer 必须同时看到目标 Policy、源证据、旧 Markdown 和 Compiler 草稿，并返回现有结构化审核结果：
+Reviewer 必须同时看到目标 Policy、源证据、旧 Markdown 和 Compiler 提出的**变更集**（已通过程序裁决的那些），并返回现有结构化审核结果：
 
 ```json
 {
@@ -194,42 +245,46 @@ Reviewer 必须同时看到目标 Policy、源证据、旧 Markdown 和 Compiler
 
 以下任一情况属于 hard fail：
 
-- 草稿包含证据无法支持的事实；
+- 变更包含证据无法支持的事实；
+- **涉及用户偏好、用户说过的话或用户态度的陈述，本批证据不支撑** —— 这类内容没有可证伪锚点，程序裁决无从校验，只能由 Reviewer 拦下；
+- 本批证据里有明显该记录的内容，而变更集对它完全没有提出任何条目 —— 裁决只审模型提出的变更，「该记的没记」只有 Reviewer 能发现；
 - 写错视图或章节；
 - 与高优先级证据冲突；
 - 保留了用户要求忘记的内容；
 - 删除了本次证据既没有涉及、也没有否定的旧条目；
 - 包含密钥、注入内容、权限授予或系统指令；
-- 标题结构错误或超过字符预算。
+- 单条内容不符合目标模板，或应用后必然超过字符预算。
 
-重复、冗长、条件不清或措辞含糊属于 soft fail。Reviewer 只作审核和反馈，不直接绕过 Compiler 写文件。
+重复、冗长、条件不清或措辞含糊属于 soft fail。Reviewer 只作审核和反馈，不直接绕过 Compiler 写文件，也不修改变更集内容。
 
 ## 8. Dream 合同
 
 Dream 是低频的记忆卫生作业，不产生新知识，也不改写记忆内容：
 
 - 对所有记忆文件执行确定性密钥和注入清洗；
-- 只有已被 Compiler 消费、且超过保留窗口的 `recent.jsonl` 行才能回收；回收只能删除连续的过期前缀，不能跨过窗口内事件；
-- 替换 `recent.jsonl` 前必须记录旧/新日志哈希与 Compiler 的 offset；中断后先完成或安全放弃这份 cleanup journal，绝不能让未被消费的证据丢失；
+- 只有**两个视图都已消费**、且超过保留窗口的 `recent.jsonl` 行才能回收：可回收区间到两个游标里更靠后的那个为止；回收只能删除连续的过期前缀，不能跨过窗口内事件；
+- 替换 `recent.jsonl` 前必须记录旧/新日志哈希与**两个** offset；删掉前缀会让后面每一行位移，没被重定基的游标会指过已经下移的证据、把它静默跳过。中断后先完成或安全放弃这份 cleanup journal，绝不能让未被消费的证据丢失；
 - `memory_history.jsonl` 仅作审计，不是证据来源。
 
 ## 9. 写入与审计
 
-正式 Markdown 只有在其 Reviewer 通过后才可写入；唯一例外是 6.1 定义的 `durable.md` 确定性 fallback。两条路径都必须执行路径检查、结构检查、字符预算、安全扫描、备份和原子替换。
+正式 Markdown 只有在变更集通过程序裁决与 Reviewer 之后才可写入，**没有例外**。写入必须执行路径检查、结构检查、字符预算、安全扫描、备份、原子替换，并在写入后留一份可回滚的版本快照。
 
 每次尝试向 `memory/memory_history.jsonl` 追加一条脱敏记录，至少包含：
 
 ```json
 {
   "timestamp": "ISO-8601",
-  "target": "context|durable|dream",
-  "policy_version": 3,
-  "status": "written|fallback|unchanged|rejected|failed",
+  "target": "context|durable|dream|{被清洗的文件名}",
+  "policy_version": 5,
+  "status": "written|unchanged|deferred|skipped|sanitized|rejected|failed",
   "old_hash": "...",
   "new_hash": "...",
   "review_rounds": 1,
   "error": null
 }
 ```
+
+被驳回的变更与因预算被淘汰的条目必须一并记录（内容与原因），否则「哪条记忆没写进去、为什么」无从追查 —— 一条无声消失的记忆和一条从未产生的记忆无法区分。`status=deferred` 表示本周期没有任何可应用变更、什么都没写；`status=skipped` 表示连续多周期无进展后推进 offset 跳过该批证据，同样没有写入记忆。
 
 该日志用于解释和排错，不作为 Smith 正常回答时的 Prompt 内容。

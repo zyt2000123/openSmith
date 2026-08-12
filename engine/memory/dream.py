@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ._snapshot import snapshot_views
 from .compile import _read_offset
 from ._files import (
     MEMORY_LAYER_FILES,
@@ -68,6 +69,7 @@ class DreamCleanup:
     old_recent_hash: str
     new_recent_hash: str
     compile_offset: int
+    context_offset: int = 0
 
 
 def dream_report_completed(report: DreamReport) -> bool:
@@ -131,9 +133,17 @@ async def run_dream(
 
 
 def _sanitize_all_layers(memory_dir: Path, report: DreamReport) -> None:
-    """Scan all memory files for secrets and instruction-like content."""
+    """Scan all memory files for secrets and instruction-like content.
+
+    Sanitizing is the second writer of the rendered views, and the only one that
+    removes content without evidence -- legitimately so, since a leaked secret
+    must go.  It therefore records the write and snapshots afterwards rather than
+    being gated: without a trace, a false-positive secret match deletes real
+    memory silently and nothing distinguishes it from a compiler deletion.
+    """
     secrets_removed = 0
     injections_removed = 0
+    sanitized_files = 0
     for md_file in _all_memory_files(memory_dir):
         content = md_file.read_text(encoding="utf-8")
         cleaned, file_secrets, file_injections = _sanitize_lines(content)
@@ -153,6 +163,21 @@ def _sanitize_all_layers(memory_dir: Path, report: DreamReport) -> None:
             atomic_write_text(md_file, cleaned)
             secrets_removed += file_secrets
             injections_removed += file_injections
+            sanitized_files += 1
+            append_memory_history(
+                memory_dir,
+                target=md_file.name,
+                policy_version=_MEMORY_POLICY.version,
+                status="sanitized",
+                old_text=content,
+                new_text=cleaned,
+            )
+    if sanitized_files:
+        snapshot_views(
+            memory_dir.parent,
+            f"memory: sanitized ({sanitized_files} file(s), "
+            f"{secrets_removed} secret(s), {injections_removed} injection(s))",
+        )
     report.secrets_removed = secrets_removed
     report.injection_lines_removed = injections_removed
 
@@ -202,6 +227,7 @@ def _write_dream_cleanup(memory_dir: Path, cleanup: DreamCleanup) -> None:
                 "old_recent_hash": cleanup.old_recent_hash,
                 "new_recent_hash": cleanup.new_recent_hash,
                 "compile_offset": cleanup.compile_offset,
+                "context_offset": cleanup.context_offset,
             },
             sort_keys=True,
         ),
@@ -227,6 +253,11 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
     old_recent_hash = payload.get("old_recent_hash")
     new_recent_hash = payload.get("new_recent_hash")
     compile_offset = payload.get("compile_offset")
+    # A journal written before context.md had its own cursor has no
+    # ``context_offset``.  Recovering it as 0 makes context re-read the trimmed
+    # log from the start: redundant work, never lost evidence -- and the journal
+    # only survives at all if a crash landed inside a millisecond-wide window.
+    context_offset = payload.get("context_offset", 0)
     # A journal written before the memory views were merged also carries
     # durable/dream/nudge offsets.  Those lanes no longer exist; ignore the
     # extra keys rather than rejecting a journal that must still be recovered.
@@ -241,6 +272,9 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
         or isinstance(compile_offset, bool)
         or not isinstance(compile_offset, int)
         or compile_offset < 0
+        or isinstance(context_offset, bool)
+        or not isinstance(context_offset, int)
+        or context_offset < 0
     ):
         return None, "Dream cleanup has invalid fields"
     return (
@@ -249,6 +283,7 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
             old_recent_hash=old_recent_hash,
             new_recent_hash=new_recent_hash,
             compile_offset=compile_offset,
+            context_offset=context_offset,
         ),
         None,
     )
@@ -259,8 +294,16 @@ def _clear_dream_cleanup(memory_dir: Path) -> None:
 
 
 def _write_dream_cleanup_offsets(memory_dir: Path, cleanup: DreamCleanup) -> None:
-    """Apply journaled post-cleanup checkpoints idempotently."""
+    """Apply journaled post-cleanup checkpoints idempotently.
+
+    Both cursors are rebased. Trimming lines off the front of the log shifts
+    every position, so a cursor left un-rebased would point past evidence that
+    moved down -- silently skipping it.
+    """
     atomic_write_text(memory_dir / ".compile_offset", str(cleanup.compile_offset))
+    atomic_write_text(
+        memory_dir / ".compile_offset_context", str(cleanup.context_offset)
+    )
 
 
 def _recover_dream_cleanup(memory_dir: Path) -> str | None:
@@ -312,10 +355,12 @@ def _cleanup_log(memory_dir: Path, report: DreamReport) -> int:
     if safe_file_in_dir(memory_dir, memory_dir / "durable.md") is None:
         return 0
 
-    # Compilation is now the only consumer of the event log, so its checkpoint
-    # is the single high-water mark: never delete a line it has not read.
+    # Both views consume the log, at their own pace. The reclaimable region ends
+    # at whichever is further behind: durable's cursor says nothing about what
+    # context has read, so trusting it alone deletes evidence one view never saw.
     compile_offset = _read_offset(memory_dir)
-    offset = compile_offset
+    context_offset = _read_offset(memory_dir, "context")
+    offset = min(compile_offset, context_offset)
 
     if offset <= 0:
         return 0
@@ -359,6 +404,7 @@ def _cleanup_log(memory_dir: Path, report: DreamReport) -> int:
         old_recent_hash=_text_hash(source_text),
         new_recent_hash=_text_hash(remaining_text),
         compile_offset=max(0, compile_offset - safe_offset),
+        context_offset=max(0, context_offset - safe_offset),
     )
     _write_dream_cleanup(memory_dir, cleanup)
     atomic_write_text(recent, remaining_text)

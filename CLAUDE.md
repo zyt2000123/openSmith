@@ -75,6 +75,25 @@ accumulates in `memory/recent.jsonl`; `compile_durable()` merges it
 incrementally against `.compile_offset`, and Dream only sanitizes the rendered
 files and reclaims the expired prefix of the event log.
 
+The compiler emits a **change set**, never a document (`_changeset.py`), and
+every change passes three deterministic guards (`_guards.py`, policy §6.1)
+before the LLM reviewer sees it: traceability (`evidence.ref` real, `quote`
+verbatim, falsifiable anchors inside the cited event), retention (a conclusion
+is only erased by `forget`/`correction`), placement (`work` evidence cannot
+establish a `Verified Outcomes` entry). Rejection is per change, so one bad edit
+does not sink the batch, and the reviewer is shown only what survived. On total
+failure nothing is written — a degraded draft would become the next round's
+trusted baseline. `_snapshot.py` git-commits the two views on every accepted
+write, so recovery is not limited to one `.bak` generation.
+
+Each view owns a log cursor (`.compile_offset` for durable, `.compile_offset_context`
+for context) and advances it only past events that actually fit the 24k prompt
+budget. Dream reclaims up to whichever cursor is further behind and rebases both.
+After three consecutive `deferred` cycles (nothing applicable) the batch is
+skipped — cursor only, still no write. `rejected` (unsafe/malformed draft) and
+`failed` (provider outage) never count towards that, because neither is the
+evidence's fault.
+
 ## 4. Product Language
 
 Use: "Smith", "Agent", "skill", "session", "memory", "tool", "template"
@@ -275,8 +294,8 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline (macOS, measured on this merge): engine 1064 passed, server 243
-passed (5 skipped), shell 303 passed. The engine's ~59 Seatbelt skips appear on
+Current baseline (macOS): engine 1100 passed, server 243 passed (5 skipped),
+shell 303 passed (not re-measured this change). The engine's ~59 Seatbelt skips appear on
 Linux only; every one carries `@pytest.mark.skipif(sys.platform != "darwin")`,
 so on macOS they run instead. A Seatbelt test *failing* rather than skipping on
 Linux means that marker is missing — add it.
