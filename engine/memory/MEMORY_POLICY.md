@@ -1,5 +1,5 @@
 ---
-policy_version: 4
+policy_version: 5
 views:
   context:
     path: context.md
@@ -193,15 +193,30 @@ Compiler 必须：
 
 变更的应用、章节归位与字符预算淘汰由确定性代码执行，Compiler 不负责渲染最终文件，也不负责淘汰。
 
-### 6.1 证据强度与落位规则（全路径生效）
+### 6.1 三道程序裁决
 
-以下规则过去只约束确定性 fallback，也就是**代码写的兜底路径比 LLM 走的主路径管得更严**。现在它们对每一条变更生效，由程序裁决强制，不再依赖模型自觉：
+以下规则过去只约束确定性 fallback，也就是**代码写的兜底路径比 LLM 走的主路径管得更严**。现在它们对每一条变更生效，由程序在 Reviewer 之前裁决，不再依赖模型自觉。裁决按变更逐条进行：一条被驳回不影响旁边合格的变更。
 
-- `partial_work` 证据只能进入 `Active Work`，不得产出 `Verified Outcomes`；
-- 自动 `work` 事件的 `summary` 是助手回复而非原始工具证据，只能标为 `Pending` 待复核，不得写入 `Verified Outcomes`；
-- `memory_ops.add` 候选必须以 `content`（事件的 `task` 字段）作为记忆正文；`evidence` 说明（事件的 `summary` 字段）只能支持正文，不得反向成为事实；
-- `Verified Outcomes` 条目中的「证据：」字段内容，必须能在该变更声明的 `evidence` 里找到出处；
-- 删除既有条目必须有依据：本批存在指向它的 `forget` / `correction` 证据、或 `reason` 说明它已完成且本批有对应 `work` 证据、或它因字符预算按 5.1 顺序被淘汰。三者都不成立即驳回。
+**第一道 · 溯源**：变更声明的证据必须真的存在，内容必须留在证据之内。
+
+- `evidence.ref` 必须是本批证据里真实出现过的事件时间戳；
+- `evidence.quote` 必须是该事件文本中的原文片段（只忽略空白差异）；
+- `content` 里每一个**可证伪锚点**必须能在该事件文本中找到：URL、反引号内容、带扩展名的文件路径（可带 `:行号`）、6 位以上数字。散文式表述无法这样校验，交给 Reviewer；
+- `replace` 可以沿用被改写条目里已有的锚点 —— 那条已经通过过一次审核，只有**新增**的内容需要新证据。
+
+**第二道 · 保留**：条目离开文档必须有依据。
+
+- 结论类章节（`Verified Outcomes`、`Decisions`、`Known Pitfalls`、以及 `context.md` 全部三节）的 `remove` 必须由本批的 `forget` / `correction` 证据支持 —— 又干了一些活不能推翻一条已确认的结论；
+- 流水类章节（`Active Work`、`Pending`）的 `remove` 只需给出 `reason`；
+- 因字符预算淘汰不是模型的变更，由确定性代码按 5.1 顺序执行。
+
+**第三道 · 落位**：章节不得承载强于其证据的断言（仅 `durable.md`，`context.md` 的三节之间没有强度次序）。
+
+- `partial_work` 证据只能进入 `Active Work`；
+- 自动 `work` 事件的 `summary` 是助手回复而非原始工具证据，不得写入 `Verified Outcomes`；没有 `kind` 的历史事件按 `work` 处理（取最弱读法，失败方向安全）；
+- `Verified Outcomes` 条目必须写出「证据：」字段；该字段里的可证伪锚点同样受第一道约束。
+
+以下一条无法由程序判定，仍属 Reviewer 职责：`memory_ops.add` 候选必须以 `content`（事件的 `task` 字段）作为记忆正文，`evidence` 说明（事件的 `summary` 字段）只能支持正文、不得反向成为事实 —— 两者渲染进同一行证据，代码无从分辨模型取自哪一半。
 
 ### 6.2 失败时不写入
 
@@ -209,7 +224,11 @@ Compiler 必须：
 
 写入没通过审核的降级版会污染基线 —— 下一轮的「可信基线」就成了那份降级版，模型在它之上继续改。失败的改动不进已接受状态。
 
-连续多个周期都提不出任何可应用变更时，为避免证据无限累积、Dream 永远无法回收日志，可以推进 offset **跳过**这批证据，但仍然不写任何记忆内容。跳过只动游标，不删文件；被跳过的证据依旧遵循 8 中的保留窗口。
+连续 3 个周期都提不出任何可应用变更时，为避免证据无限累积、Dream 永远无法回收日志，推进 offset **跳过**这批证据，但仍然不写任何记忆内容。跳过只动游标，不删文件；被跳过的证据依旧遵循 8 中的保留窗口。
+
+只有内容被驳回（`status=rejected`）才计入这 3 次。供应商故障、超时、密钥失效记为 `status=failed`，与证据本身无关，不得把证据推向被跳过。
+
+offset 只能推进到**本次真的送进 prompt 的那一条**为止。证据按前缀装入 prompt 直到预算用尽，装不下的留给下一周期；把游标推到日志末尾会让没被任何模型读过的证据进入 Dream 的回收范围。
 
 ## 7. Reviewer 合同
 
@@ -257,7 +276,7 @@ Dream 是低频的记忆卫生作业，不产生新知识，也不改写记忆�
 {
   "timestamp": "ISO-8601",
   "target": "context|durable|dream|{被清洗的文件名}",
-  "policy_version": 4,
+  "policy_version": 5,
   "status": "written|unchanged|deferred|skipped|sanitized|rejected|failed",
   "old_hash": "...",
   "new_hash": "...",

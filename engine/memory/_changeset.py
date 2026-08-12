@@ -15,6 +15,7 @@ an edit that is semantically fine.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Literal
@@ -175,6 +176,43 @@ def _parse_one(
         # the applier would have no way to find it again.
         return None, RejectedChange(change, "content_has_no_topic_key")
     return change, None
+
+
+def render_changeset(
+    changes: list[MemoryChange],
+    *,
+    nothing_to_record: bool = False,
+) -> str:
+    """Re-emit changes in the wire contract, for review.
+
+    The reviewer must be shown what will actually be written, not what the
+    generator proposed.  Handing it a change the guards already refused invites a
+    hard fail on content that was never going to land -- which would sink the
+    surviving changes beside it and undo the whole point of per-change rejection.
+    """
+    payload = {
+        "nothing_to_record": nothing_to_record,
+        "changes": [
+            {
+                key: value
+                for key, value in (
+                    ("op", change.op),
+                    ("view", change.view),
+                    ("section", change.section),
+                    ("content", change.content),
+                    ("target", change.target),
+                    ("reason", change.reason),
+                    (
+                        "evidence",
+                        {"ref": change.evidence_ref, "quote": change.evidence_quote},
+                    ),
+                )
+                if value
+            }
+            for change in changes
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def parse_document(text: str, sections: tuple[str, ...]) -> dict[str, list[str]]:

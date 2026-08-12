@@ -296,11 +296,12 @@ def test_user_preference_learner_does_not_reemit_after_failed_ack(tmp_path: Path
 def test_entries_to_source_keeps_full_normal_event_summary() -> None:
     summary = "decision-" + ("x" * 160)
 
-    source = _entries_to_source([
+    source, consumed = _entries_to_source([
         {"timestamp": "2026-07-10T00:00:00+00:00", "task": "memory repair", "summary": summary},
     ])
 
     assert summary in source
+    assert consumed == 1
 
 
 def test_compile_durable_uses_fingerprint_to_skip_unchanged(tmp_path: Path) -> None:

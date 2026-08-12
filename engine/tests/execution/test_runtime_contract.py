@@ -204,10 +204,14 @@ class ToolCallingMemoryLLM(ToolCallingLLM):
                         "changes": [
                             {
                                 "op": "add",
-                                "section": "Verified Outcomes",
+                                # Active Work, not Verified Outcomes: this turn's
+                                # evidence is a `work` event, and policy 6.1 will
+                                # not let the assistant's own account of what it
+                                # did establish a verified result.
+                                "section": "Active Work",
                                 "content": (
-                                    "- **Runtime memory** — 结果：Tool-assisted turns "
-                                    "enter the memory pipeline；证据：tool_result。"
+                                    "- **Runtime memory** — 状态：Tool-assisted turns "
+                                    "enter the memory pipeline；下一步：keep watching。"
                                 ),
                                 "evidence": {
                                     "ref": _first_evidence_ref(prompt),

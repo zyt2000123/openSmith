@@ -120,8 +120,10 @@ def test_memory_policy_loads_one_canonical_two_view_contract(tmp_path: Path) -> 
 
     # v4 moved the compiler contract from "emit the whole document" to "emit a
     # change set", and lifted the evidence-strength rules out of the fallback
-    # path so they bind every write.
-    assert policy.version == 4
+    # path so they bind every write.  v5 turned those rules into three code
+    # guards that run before the reviewer, so a compiler prompt written against
+    # v4 will now have changes refused it did not expect.
+    assert policy.version == 5
     assert set(policy.views) == {"context", "durable"}
     assert resolve_view_path(policy, tmp_path, "context") == tmp_path / "context.md"
     assert resolve_view_path(policy, tmp_path, "durable") == tmp_path / "memory" / "durable.md"
@@ -259,7 +261,9 @@ def test_compile_context_uses_policy_review_and_audit_history(tmp_path: Path) ->
 
 def test_compile_durable_writes_only_policy_structured_markdown(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
-    _write_event(memory_dir)
+    # verified_fact, because DURABLE_DOC carries a Verified Outcomes bullet and
+    # adjudication will not let a plain `work` event establish one.
+    _write_event(memory_dir, kind="verified_fact")
     generator = DocLLM(DURABLE_DOC)
     reviewer = PassReviewer()
 
@@ -284,6 +288,11 @@ def test_generic_work_events_reach_durable_memory(tmp_path: Path) -> None:
 
     The previous policy rejected `work` and then advanced the compile
     checkpoint past it, so durable.md could never fill up at all.
+
+    It is admissible everywhere except `Verified Outcomes`: a `work` summary is
+    the assistant's own account of what it did, so policy 6.1 refuses to let it
+    establish a verified result. That single bullet is dropped and the rest of
+    the change set still lands -- partial success, not a failed compile.
     """
     memory_dir = tmp_path / "memory"
     _write_event(memory_dir, kind="work", scope="project")
@@ -291,7 +300,19 @@ def test_generic_work_events_reach_durable_memory(tmp_path: Path) -> None:
     assert asyncio.run(
         compile_durable(memory_dir, DocLLM(DURABLE_DOC), PassReviewer())
     ) is True
-    assert (memory_dir / "durable.md").read_text(encoding="utf-8") == DURABLE_DOC
+    written = (memory_dir / "durable.md").read_text(encoding="utf-8")
+    assert "**Memory upgrade**" in written
+    assert "**Free-form summaries**" in written
+    assert "结果：policy parsed" not in written
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ][-1]
+    assert any(
+        "unverified_evidence_in_verified_outcomes" in note
+        for note in history["not_written"]
+    )
 
 
 def test_user_scoped_events_stay_out_of_durable_memory(tmp_path: Path) -> None:

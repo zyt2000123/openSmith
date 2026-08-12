@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -208,17 +209,48 @@ async def _generate_and_review_result(
     system_prompt: str | None = None,
     target_view: str = "memory",
     review_policy: str = "(legacy quality rules)",
+    pre_check: "Callable[[str], tuple[list[str], str]] | None" = None,
 ) -> ReviewOutcome:
-    """Run the review loop and retain review-round metadata for auditing."""
+    """Run the review loop and retain review-round metadata for auditing.
+
+    *pre_check* is the deterministic adjudication of the draft. It returns the
+    blocking reasons when nothing in the draft survives -- empty otherwise -- plus
+    the narrowed draft that the reviewer should actually see.  It runs before the
+    reviewer for two reasons: a mechanically refutable draft costs no reviewer
+    call, and the reviewer must not be shown a change that has already been
+    refused, or it can hard-fail the batch over content that was never going to be
+    written and take the surviving changes down with it.
+    """
     draft = await _llm_summarize(generator, prompt, system_prompt=system_prompt)
     gen_prompt = prompt
     rounds = 0
 
     for attempt in range(_MAX_REVIEW_ROUNDS):
         rounds = attempt + 1
+        blocking, reviewable = (
+            pre_check(draft) if pre_check is not None else ([], draft)
+        )
+        if blocking:
+            if attempt >= _MAX_REVIEW_ROUNDS - 1:
+                raise MemoryCompilationError(
+                    "; ".join(blocking)[:400],
+                    review_rounds=rounds,
+                )
+            gen_prompt = (
+                f"{prompt}\n\nPREVIOUS CHANGE SET REJECTED BY DETERMINISTIC "
+                f"ADJUDICATION: {'; '.join(blocking)[:800]}\n"
+                "Every change must cite an `evidence.ref` present in the evidence "
+                "above and an `evidence.quote` copied verbatim from that entry. "
+                "Fix these and regenerate."
+            )
+            draft = await _llm_summarize(
+                generator, gen_prompt, system_prompt=system_prompt
+            )
+            continue
+
         review = await _review_draft(
             reviewer,
-            draft,
+            reviewable,
             source,
             target_view=target_view,
             review_policy=review_policy,

@@ -120,6 +120,40 @@ def recent_failure_streak(memory_dir: Path) -> tuple[int, str | None]:
     return streak, last_error
 
 
+def rejected_streak(memory_dir: Path, target: str) -> int:
+    """Count the trailing run of content rejections for one view.
+
+    Only ``rejected`` counts. A provider outage is recorded as ``failed`` and
+    breaks the run, because a batch of evidence must never be given up on for a
+    reason that has nothing to do with the evidence.  The ``skipped`` record that
+    follows a give-up breaks the run too, so the count restarts per batch.
+    """
+    path = memory_dir / "memory_history.jsonl"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _FAILURE_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return 0
+    streak = 0
+    for line in reversed(tail.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("target") != target:
+            # Another view's outcome says nothing about this one's streak.
+            continue
+        if record.get("status") != "rejected":
+            break
+        streak += 1
+    return streak
+
+
 def trim_memory_history(
     memory_dir: Path,
     *,

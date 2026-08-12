@@ -34,11 +34,14 @@ from ._files import (
 )
 from ._changeset import (
     EVICTION_ORDER,
+    MemoryChange,
     apply_changes,
     evict_to_budget,
     parse_changeset,
     parse_document,
+    render_changeset,
 )
+from ._guards import adjudicate, build_evidence_index
 from ._review import (
     MemoryCompilationError,
     _generate_and_review_result,
@@ -46,7 +49,7 @@ from ._review import (
     _truncate_source,
 )
 from ._snapshot import snapshot_views
-from .history import append_memory_history
+from .history import append_memory_history, rejected_streak
 from .policy import (
     MemoryPolicy,
     MemoryPolicyError,
@@ -66,6 +69,9 @@ MAX_DURABLE_SOURCE_CHARS = 24_000
 # generator/reviewer calls. Keep a finite bound, but do not make a normal
 # background request fail at the same 30-second budget as a chat turn.
 _DURABLE_REVIEW_TIMEOUT_SECONDS = 300.0
+# Cycles of content rejection after which the batch itself is treated as the
+# problem and the cursor moves past it. See _skip_evidence_batch.
+_MAX_REJECTED_STREAK = 3
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +109,17 @@ def _load_recent(
     if offset is None:
         offset = _read_offset(memory_dir) if from_offset else 0
     entries = []
-    for line in lines[offset:]:
+    for index, line in enumerate(lines[offset:], start=offset):
         try:
             parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
+            # The log position travels with the event so the caller can advance
+            # the compile cursor to what was actually consumed. Selection and
+            # prompt-budget fitting both drop entries, and neither preserves a
+            # count that maps back to lines on its own.
+            parsed["_line"] = index
             entries.append(parsed)
     return entries
 
@@ -146,41 +157,59 @@ def _entries_to_source(
     entries: list[dict],
     summary_limit: int | None = None,
     source_limit: int | None = None,
-) -> str:
-    """Render events without losing normal-sized content.
+) -> tuple[str, int]:
+    """Render events as prompt evidence, and report how many were included.
 
     ``recent.jsonl`` keeps the durable event record. Limits here constrain only
-    LLM input, and include an explicit marker when they need to apply.
-    """
-    lines = []
-    for entry in entries:
-        task, _, _ = sanitize_memory_text(str(entry.get("task", "?")))
-        summary, _, _ = sanitize_memory_text(str(entry.get("summary", "?")))
-        if summary_limit is not None:
-            summary = _truncate_source(summary, summary_limit)
-        metadata_parts = []
-        for key in ("kind", "scope", "evidence", "status", "reason"):
-            value = _safe_source_metadata(entry.get(key))
-            if value:
-                metadata_parts.append(f"{key}={value}")
-        metadata = ", ".join(metadata_parts)
-        signals = entry.get("signals")
-        if isinstance(signals, list):
-            safe_signals = []
-            for signal in signals:
-                cleaned = _safe_source_metadata(signal)
-                if cleaned.strip():
-                    safe_signals.append(cleaned.strip())
-            if safe_signals:
-                metadata = ", ".join(filter(None, (metadata, f"signals={safe_signals}")))
-        metadata_suffix = f" ({metadata})" if metadata else ""
-        timestamp = _safe_source_metadata(entry.get("timestamp", "?"), limit=64) or "?"
-        lines.append(
-            f"- [{timestamp[:16]}]{metadata_suffix} {task}: {summary}"
-        )
+    LLM input.
 
-    source = "\n".join(lines)
-    return _truncate_source(source, source_limit) if source_limit is not None else source
+    The budget selects a *prefix* of the events rather than eliding the middle of
+    the joined text, and the count comes back with it. That is what keeps the
+    compile cursor honest: the caller can only advance past evidence the model
+    actually saw, and the remainder waits for the next cycle instead of being
+    skipped unseen.
+    """
+    rendered: list[str] = []
+    used = 0
+    for entry in entries:
+        line = _render_entry(entry, summary_limit)
+        cost = len(line) + (1 if rendered else 0)
+        if source_limit is not None:
+            if rendered and used + cost > source_limit:
+                break
+            if not rendered and cost > source_limit:
+                # One oversized event still has to be consumable, or the cursor
+                # can never move past it and every later event starves behind it.
+                line = _truncate_source(line, source_limit)
+                cost = len(line)
+        rendered.append(line)
+        used += cost
+    return "\n".join(rendered), len(rendered)
+
+
+def _render_entry(entry: dict, summary_limit: int | None) -> str:
+    task, _, _ = sanitize_memory_text(str(entry.get("task", "?")))
+    summary, _, _ = sanitize_memory_text(str(entry.get("summary", "?")))
+    if summary_limit is not None:
+        summary = _truncate_source(summary, summary_limit)
+    metadata_parts = []
+    for key in ("kind", "scope", "evidence", "status", "reason"):
+        value = _safe_source_metadata(entry.get(key))
+        if value:
+            metadata_parts.append(f"{key}={value}")
+    metadata = ", ".join(metadata_parts)
+    signals = entry.get("signals")
+    if isinstance(signals, list):
+        safe_signals = []
+        for signal in signals:
+            cleaned = _safe_source_metadata(signal)
+            if cleaned.strip():
+                safe_signals.append(cleaned.strip())
+        if safe_signals:
+            metadata = ", ".join(filter(None, (metadata, f"signals={safe_signals}")))
+    metadata_suffix = f" ({metadata})" if metadata else ""
+    timestamp = _safe_source_metadata(entry.get("timestamp", "?"), limit=64) or "?"
+    return f"- [{timestamp[:16]}]{metadata_suffix} {task}: {summary}"
 
 
 def _safe_source_metadata(value: object, *, limit: int = 500) -> str:
@@ -260,7 +289,7 @@ class _ViewDraft:
 
     document: str
     rounds: int
-    applied: int
+    applied: list[MemoryChange]
     notes: list[str]
     nothing_to_record: bool
 
@@ -272,6 +301,7 @@ def _build_draft(
     existing: str,
     raw: str,
     rounds: int,
+    evidence: dict[str, list[str]],
 ) -> _ViewDraft:
     """Turn a model change set into a rendered document, deterministically.
 
@@ -286,6 +316,12 @@ def _build_draft(
     grouped = parse_document(
         existing or _empty_view_document(policy, view), spec.sections
     )
+    # Adjudication before application: the three checks in policy 6.1 decide
+    # whether a change is *entitled* to be applied, which is a question about the
+    # evidence rather than about the document, so it is settled first.
+    changes, unsupported = adjudicate(
+        changes, view=view, evidence=evidence, grouped=grouped
+    )
     updated, applied, rejected = apply_changes(grouped, changes)
     document, evicted = evict_to_budget(
         updated,
@@ -295,7 +331,7 @@ def _build_draft(
         max_chars=spec.max_chars,
     )
 
-    notes = [item.describe() for item in (*structural, *rejected)]
+    notes = [item.describe() for item in (*structural, *unsupported, *rejected)]
     notes.extend(f"evicted_for_budget: {bullet[:120]}" for bullet in evicted)
 
     if not applied and not nothing_to_record:
@@ -309,7 +345,7 @@ def _build_draft(
     return _ViewDraft(
         document=_normalize_markdown(document),
         rounds=rounds,
-        applied=len(applied),
+        applied=applied,
         notes=notes,
         nothing_to_record=nothing_to_record,
     )
@@ -329,6 +365,25 @@ async def _generate_view(
             f"{view} compilation requires a reviewer model"
         )
     prompt = _build_view_prompt(policy, view, existing=existing, source=source)
+    evidence = build_evidence_index(source)
+
+    def pre_check(raw: str) -> tuple[list[str], str]:
+        """Adjudicate a change set: blocking reasons, and what is left to review.
+
+        Running the real pipeline is the check: ``_build_draft`` already raises
+        exactly when no change survives parsing, adjudication and application, so
+        there is one implementation of the rules rather than two that can drift.
+        """
+        try:
+            draft = _build_draft(
+                policy, view, existing=existing, raw=raw, rounds=0, evidence=evidence
+            )
+        except MemoryCompilationError as exc:
+            return [str(exc)], raw
+        return [], render_changeset(
+            draft.applied, nothing_to_record=draft.nothing_to_record
+        )
+
     review_source = (
         f"CURRENT TIME (UTC): {datetime.now(timezone.utc).isoformat()}\n\n"
         "PRIOR ACCEPTED MEMORY (reference state; retain only when the target "
@@ -344,9 +399,15 @@ async def _generate_view(
         source=review_source,
         target_view=f"{view}.md",
         review_policy=policy.instructions_for(view, role="reviewer"),
+        pre_check=pre_check,
     )
     return _build_draft(
-        policy, view, existing=existing, raw=outcome.text, rounds=outcome.rounds
+        policy,
+        view,
+        existing=existing,
+        raw=outcome.text,
+        rounds=outcome.rounds,
+        evidence=evidence,
     )
 
 
@@ -523,7 +584,7 @@ async def compile_context(
     if _read_fp(fp_file) == fp and target.is_file():
         return False
 
-    source = _entries_to_source(entries, source_limit=MAX_DURABLE_SOURCE_CHARS)
+    source, _ = _entries_to_source(entries, source_limit=MAX_DURABLE_SOURCE_CHARS)
     try:
         draft = await asyncio.wait_for(
             _generate_view(
@@ -573,11 +634,14 @@ async def compile_durable(
     fp_file = memory_dir / ".fp_durable"
     ensure_durable_template(memory_dir)
 
-    # No qualifying evidence is a no-op, never a checkpoint advance. The
-    # previous design skipped the log forward here whenever *any* event was
-    # present, which silently discarded every event that did not qualify and
-    # left durable.md permanently empty.
     if not entries:
+        # Nothing in the unconsumed span can ever become durable memory, so the
+        # cursor moves to the end of the log. Leaving it behind would pin those
+        # lines against Dream's reclamation forever, and durable will not learn
+        # anything from them on a later pass either.
+        total = _total_lines(memory_dir)
+        if total > _read_offset(memory_dir):
+            _write_offset(memory_dir, total)
         return False
 
     fp = _fingerprint([f"{e.get('timestamp', '')}:{e.get('task', '')[:50]}" for e in entries])
@@ -589,13 +653,17 @@ async def compile_durable(
     except MemoryViewUnreadableError as exc:
         _record_compile_failure(memory_dir, "durable", policy, "", exc)
         raise
-    source = _entries_to_source(
+    source, consumed = _entries_to_source(
         entries,
         summary_limit=1000,
         source_limit=MAX_DURABLE_SOURCE_CHARS,
     )
     if not source.strip():
         return False
+    # Only the events that fit into the prompt count as consumed. Advancing past
+    # the rest would hand them to Dream for reclamation without any model having
+    # read them.
+    consumed_through = int(entries[consumed - 1].get("_line", 0)) + 1
 
     try:
         draft = await asyncio.wait_for(
@@ -626,10 +694,50 @@ async def compile_durable(
         # and builds on it.  Nothing is written, neither checkpoint moves, and the
         # 10-turn compile interval is the throttle -- see policy 6.2.
         _record_compile_failure(memory_dir, "durable", policy, existing, exc)
+        if rejected_streak(memory_dir, "durable") >= _MAX_REJECTED_STREAK:
+            _skip_evidence_batch(
+                memory_dir, policy, existing=existing, through=consumed_through
+            )
         raise
 
+    _write_offset(memory_dir, consumed_through)
     _write_fp(fp_file, fp)
     return True
+
+
+def _skip_evidence_batch(
+    memory_dir: Path,
+    policy: MemoryPolicy,
+    *,
+    existing: str,
+    through: int,
+) -> None:
+    """Advance the cursor past evidence that keeps failing, writing no memory.
+
+    Policy 6.2: after several cycles produce nothing applicable, the batch is
+    what is stuck, and holding it forever means the log grows without bound and
+    Dream can never reclaim anything.  Skipping moves only the cursor -- the
+    events stay on disk under the normal retention window, and ``durable.md``
+    keeps the last version that passed review.
+
+    Counted from ``rejected`` records only, so a provider outage (recorded as
+    ``failed``) never costs evidence: the streak resets on any other status,
+    including the ``skipped`` record written here.
+    """
+    # The audit record lands before the cursor moves. The reverse order can
+    # abandon a batch of evidence with no record of why, which is the one outcome
+    # here that cannot be reconstructed; a trace of a skip whose cursor write
+    # failed is merely repeated next cycle.
+    append_memory_history(
+        memory_dir,
+        target="durable",
+        policy_version=policy.version,
+        status="skipped",
+        old_text=existing,
+        new_text=existing,
+        notes=[f"skipped_evidence_through_line: {through}"],
+    )
+    _write_offset(memory_dir, through)
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +783,6 @@ async def run_compilation(
     default.
     """
     memory_dir.mkdir(parents=True, exist_ok=True)
-    total = _total_lines(memory_dir)
     results = {"context": False, "durable": False}
     errors: dict[str, str] = {}
     error_causes: dict[str, Exception] = {}
@@ -691,8 +798,11 @@ async def run_compilation(
         logger.warning("durable-memory compilation failed", exc_info=True)
         errors["durable"] = "durable-memory compilation failed"
         error_causes["durable"] = exc
-    if not errors and any(results.values()):
-        _write_offset(memory_dir, total)
+    # The compile cursor belongs to compile_durable: it is the only view that
+    # reads from an offset, and it is the only place that knows how many events
+    # actually fitted into the prompt. Advancing it here from a whole-file line
+    # count was what let unread evidence be reclaimed.
+    #
     # A successful layer is useful progress even when a later layer failed.
     # Only lifecycle callers opt into resetting their retry counter here; the
     # direct API keeps its strict raise-on-error behavior by default.
