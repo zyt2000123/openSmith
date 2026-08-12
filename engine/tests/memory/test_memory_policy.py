@@ -359,7 +359,10 @@ def test_compile_durable_rejects_free_form_output_and_keeps_old_view(tmp_path: P
         if line.strip()
     ][-1]
     assert history["target"] == "durable"
-    assert history["status"] == "rejected"
+    # deferred, not rejected: nothing applicable came out of the cycle, so nothing
+    # was written.  `rejected` is reserved for a draft that was unsafe or malformed
+    # in a way that must never be allowed to give up on the evidence batch.
+    assert history["status"] == "deferred"
 
 
 def test_compile_durable_accepts_complete_view_without_adding_legacy_wrapper(tmp_path: Path) -> None:

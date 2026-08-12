@@ -27,9 +27,20 @@ logger = logging.getLogger(__name__)
 class MemoryCompilationError(RuntimeError):
     """A compilation result was unsafe or unusable and must be retried."""
 
-    def __init__(self, message: str, *, review_rounds: int = 0) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        review_rounds: int = 0,
+        no_applicable_change: bool = False,
+    ) -> None:
         super().__init__(message)
         self.review_rounds = max(0, review_rounds)
+        # Distinguishes "the model proposed nothing this batch supports" -- the one
+        # failure that repeating cannot fix, and therefore the only one that may
+        # eventually give up the batch -- from "the output was unsafe or malformed",
+        # where abandoning the evidence would punish it for someone else's fault.
+        self.no_applicable_change = no_applicable_change
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +246,7 @@ async def _generate_and_review_result(
                 raise MemoryCompilationError(
                     "; ".join(blocking)[:400],
                     review_rounds=rounds,
+                    no_applicable_change=True,
                 )
             gen_prompt = (
                 f"{prompt}\n\nPREVIOUS CHANGE SET REJECTED BY DETERMINISTIC "

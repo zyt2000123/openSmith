@@ -853,7 +853,7 @@ def test_dream_recovers_cleanup_after_log_replacement_without_replaying_evidence
         }) + "\n",
         encoding="utf-8",
     )
-    (memory_dir / ".compile_offset").write_text("1", encoding="utf-8")
+    _mark_consumed(memory_dir, 1)
     original_atomic_write = dream_module.atomic_write_text
 
     def fail_compile_offset(path: Path, content: str) -> None:
@@ -885,6 +885,16 @@ def test_dream_recovers_cleanup_after_log_replacement_without_replaying_evidence
     assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "0"
 
 
+def _mark_consumed(memory_dir: Path, lines: int) -> None:
+    """Record that *both* views have compiled through *lines*.
+
+    Dream reclaims only up to whichever cursor is further behind, so setting one
+    and not the other asserts that nothing is reclaimable at all.
+    """
+    (memory_dir / ".compile_offset").write_text(str(lines), encoding="utf-8")
+    (memory_dir / ".compile_offset_context").write_text(str(lines), encoding="utf-8")
+
+
 def test_dream_cleans_log_with_offset(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
@@ -892,7 +902,7 @@ def test_dream_cleans_log_with_offset(tmp_path: Path) -> None:
     for i in range(10):
         lines.append(json.dumps({"task": f"task {i}", "summary": f"reply {i}", "timestamp": "2026-06-01T00:00:00"}))
     (memory_dir / "recent.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (memory_dir / ".compile_offset").write_text("7", encoding="utf-8")
+    _mark_consumed(memory_dir, 7)
     (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
     (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
 
@@ -901,7 +911,10 @@ def test_dream_cleans_log_with_offset(tmp_path: Path) -> None:
     assert report.log_lines_cleaned == 7
     remaining = (memory_dir / "recent.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(remaining) == 3
+    # Both cursors rebase: trimming the front shifts every position, so a cursor
+    # left alone would point past the evidence that moved down and skip it.
     assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "0"
+    assert (memory_dir / ".compile_offset_context").read_text(encoding="utf-8") == "0"
 
 
 def test_dream_cleans_log_without_recent_view(tmp_path: Path) -> None:
@@ -911,7 +924,7 @@ def test_dream_cleans_log_without_recent_view(tmp_path: Path) -> None:
     for i in range(4):
         lines.append(json.dumps({"task": f"task {i}", "summary": f"reply {i}", "timestamp": "2026-06-01T00:00:00"}))
     (memory_dir / "recent.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (memory_dir / ".compile_offset").write_text("4", encoding="utf-8")
+    _mark_consumed(memory_dir, 4)
     (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
 
     report = asyncio.run(run_dream(memory_dir, StaticLLM()))
@@ -925,7 +938,7 @@ def test_dream_skips_cleanup_without_compiled_files(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
     (memory_dir / "recent.jsonl").write_text('{"task":"t","summary":"s","timestamp":"now"}\n')
-    (memory_dir / ".compile_offset").write_text("1", encoding="utf-8")
+    _mark_consumed(memory_dir, 1)
 
     report = asyncio.run(run_dream(memory_dir, StaticLLM()))
 
@@ -1122,7 +1135,7 @@ def test_dream_cleanup_keeps_current_entries_before_later_stale_entries(
         encoding="utf-8",
     )
     (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
-    (memory_dir / ".compile_offset").write_text("3", encoding="utf-8")
+    _mark_consumed(memory_dir, 3)
 
     report = asyncio.run(run_dream(memory_dir, StaticLLM()))
 

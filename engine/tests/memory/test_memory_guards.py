@@ -466,7 +466,7 @@ def test_three_rejected_cycles_skip_the_batch_without_writing_memory(
     history = memory_dir / "memory_history.jsonl"
     history.write_text(
         "".join(
-            json.dumps({"target": "durable", "status": "rejected"}) + "\n"
+            json.dumps({"target": "durable", "status": "deferred"}) + "\n"
             for _ in range(2)
         ),
         encoding="utf-8",
@@ -489,6 +489,102 @@ def test_three_rejected_cycles_skip_the_batch_without_writing_memory(
     assert "Ghost" not in written
 
 
+def test_a_failed_cycle_leaves_the_fingerprint_alone(tmp_path: Path) -> None:
+    """A written fingerprint means "this batch is done"; a failure must not claim that.
+
+    Writing it on failure would make the next cycle skip the same evidence as
+    already-compiled, so a single bad round would discard the batch silently.
+    """
+    memory_dir = tmp_path / "memory"
+    _write_events(memory_dir, 1)
+
+    with pytest.raises(MemoryCompilationError):
+        asyncio.run(compile_durable(
+            memory_dir, _CountingLLM(UNSUPPORTED),
+            _CountingLLM('{"pass": true, "hard_fail": [], "soft_fail": []}'),
+        ))
+
+    assert not (memory_dir / ".fp_durable").exists()
+
+    # And the retry can still land, because nothing was marked consumed.
+    from _changeset_fixtures import changeset_from_document
+
+    class _Doc(_CountingLLM):
+        async def chat(self, messages: list[dict], **_: object) -> ChatResponse:
+            self.calls.append(messages)
+            return ChatResponse(text=changeset_from_document(
+                "# Durable Project Memory\n\n## Active Work\n"
+                "- **Loader** — 状态：tuned；下一步：measure。\n",
+                messages[-1]["content"],
+            ))
+
+    assert asyncio.run(compile_durable(
+        memory_dir, _Doc(""),
+        _CountingLLM('{"pass": true, "hard_fail": [], "soft_fail": []}'),
+    )) is True
+    assert "**Loader**" in (memory_dir / "durable.md").read_text(encoding="utf-8")
+
+
+def test_nothing_worth_recording_is_a_success_not_a_failure(tmp_path: Path) -> None:
+    """A quiet batch genuinely has nothing to remember.
+
+    Counting an honest blank as failure would make a working pipeline look broken
+    and stall the cursor behind evidence that will never yield a memory.
+    """
+    memory_dir = tmp_path / "memory"
+    _write_events(memory_dir, 2)
+    blank = _CountingLLM(json.dumps({"nothing_to_record": True, "changes": []}))
+
+    assert asyncio.run(compile_durable(
+        memory_dir, blank,
+        _CountingLLM('{"pass": true, "hard_fail": [], "soft_fail": []}'),
+    )) is True
+
+    assert _read_offset(memory_dir) == 2
+    history = [
+        json.loads(line)
+        for line in (memory_dir / "memory_history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ][-1]
+    assert history["status"] == "unchanged"
+
+
+def test_dream_will_not_reclaim_evidence_context_has_not_read(tmp_path: Path) -> None:
+    """Each view owns a cursor; reclamation stops at whichever is further behind.
+
+    One shared cursor let durable's progress speak for context's, so a stretch of
+    continuously failing context compilation ended with user-scope evidence
+    reclaimed before context.md ever absorbed it.
+    """
+    from engine.memory.dream import run_dream
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "recent.jsonl").write_text(
+        "".join(
+            json.dumps({
+                "task": f"task {index}",
+                "summary": "s",
+                "timestamp": "2020-01-01T00:00:00+00:00",
+            }) + "\n"
+            for index in range(4)
+        ),
+        encoding="utf-8",
+    )
+    (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
+    # durable consumed everything; context is still at the start.
+    (memory_dir / ".compile_offset").write_text("4", encoding="utf-8")
+    (memory_dir / ".compile_offset_context").write_text("1", encoding="utf-8")
+
+    report = asyncio.run(run_dream(memory_dir, _CountingLLM("")))
+
+    assert report.log_lines_cleaned == 1
+    remaining = (memory_dir / "recent.jsonl").read_text(encoding="utf-8").strip()
+    assert len(remaining.splitlines()) == 3
+    # durable's cursor rebases down by the one reclaimed line, not to zero.
+    assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "3"
+
+
 def test_a_provider_outage_does_not_burn_the_evidence_batch(tmp_path: Path) -> None:
     """Only content rejections count towards giving up on a batch.
 
@@ -500,7 +596,7 @@ def test_a_provider_outage_does_not_burn_the_evidence_batch(tmp_path: Path) -> N
     ensure_durable_template(memory_dir)
     (memory_dir / "memory_history.jsonl").write_text(
         "".join(
-            json.dumps({"target": "durable", "status": "rejected"}) + "\n"
+            json.dumps({"target": "durable", "status": "deferred"}) + "\n"
             for _ in range(2)
         ),
         encoding="utf-8",

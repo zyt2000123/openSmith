@@ -83,10 +83,16 @@ is only erased by `forget`/`correction`), placement (`work` evidence cannot
 establish a `Verified Outcomes` entry). Rejection is per change, so one bad edit
 does not sink the batch, and the reviewer is shown only what survived. On total
 failure nothing is written — a degraded draft would become the next round's
-trusted baseline. `.compile_offset` advances only past events that actually fit
-the prompt, and after three consecutive content rejections the batch is skipped
-(cursor only, still no write). `_snapshot.py` git-commits the two views on every
-accepted write, so recovery is not limited to one `.bak` generation.
+trusted baseline. `_snapshot.py` git-commits the two views on every accepted
+write, so recovery is not limited to one `.bak` generation.
+
+Each view owns a log cursor (`.compile_offset` for durable, `.compile_offset_context`
+for context) and advances it only past events that actually fit the 24k prompt
+budget. Dream reclaims up to whichever cursor is further behind and rebases both.
+After three consecutive `deferred` cycles (nothing applicable) the batch is
+skipped — cursor only, still no write. `rejected` (unsafe/malformed draft) and
+`failed` (provider outage) never count towards that, because neither is the
+evidence's fault.
 
 ## 4. Product Language
 
@@ -288,7 +294,7 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline (macOS): engine 1097 passed, server 243 passed (5 skipped),
+Current baseline (macOS): engine 1100 passed, server 243 passed (5 skipped),
 shell 303 passed (not re-measured this change). The engine's ~59 Seatbelt skips appear on
 Linux only; every one carries `@pytest.mark.skipif(sys.platform != "darwin")`,
 so on macOS they run instead. A Seatbelt test *failing* rather than skipping on

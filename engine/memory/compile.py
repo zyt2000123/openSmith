@@ -49,7 +49,7 @@ from ._review import (
     _truncate_source,
 )
 from ._snapshot import snapshot_views
-from .history import append_memory_history, rejected_streak
+from .history import append_memory_history, deferred_streak
 from .policy import (
     MemoryPolicy,
     MemoryPolicyError,
@@ -69,9 +69,9 @@ MAX_DURABLE_SOURCE_CHARS = 24_000
 # generator/reviewer calls. Keep a finite bound, but do not make a normal
 # background request fail at the same 30-second budget as a chat turn.
 _DURABLE_REVIEW_TIMEOUT_SECONDS = 300.0
-# Cycles of content rejection after which the batch itself is treated as the
-# problem and the cursor moves past it. See _skip_evidence_batch.
-_MAX_REJECTED_STREAK = 3
+# Cycles with no applicable change after which the batch itself is treated as
+# the problem and the cursor moves past it. See _skip_evidence_batch.
+_MAX_DEFERRED_STREAK = 3
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +124,17 @@ def _load_recent(
     return entries
 
 
-def _read_offset(memory_dir: Path) -> int:
-    offset_file = memory_dir / ".compile_offset"
+# Each view consumes the event log at its own pace, so each owns a cursor. One
+# shared cursor made durable's progress speak for context's: Dream would reclaim
+# a line durable had read and context had not.
+_OFFSET_FILES: dict[str, str] = {
+    "durable": ".compile_offset",
+    "context": ".compile_offset_context",
+}
+
+
+def _read_offset(memory_dir: Path, view: str = "durable") -> int:
+    offset_file = memory_dir / _OFFSET_FILES[view]
     if not offset_file.exists() and not offset_file.is_symlink():
         return 0
     if offset_file.is_symlink():
@@ -142,8 +151,8 @@ def _read_offset(memory_dir: Path) -> int:
     return offset
 
 
-def _write_offset(memory_dir: Path, offset: int) -> None:
-    atomic_write_text(memory_dir / ".compile_offset", str(offset))
+def _write_offset(memory_dir: Path, offset: int, view: str = "durable") -> None:
+    atomic_write_text(memory_dir / _OFFSET_FILES[view], str(offset))
 
 
 def _total_lines(memory_dir: Path) -> int:
@@ -535,11 +544,15 @@ def _record_compile_failure(
     existing: str,
     exc: Exception,
 ) -> None:
-    status = (
-        "rejected"
-        if isinstance(exc, (MemoryCompilationError, MemoryPolicyError))
-        else "failed"
-    )
+    if getattr(exc, "no_applicable_change", False):
+        # Policy 9: nothing was applicable, so nothing was written. Kept distinct
+        # from `rejected` because this is the only failure the skip counter may
+        # act on -- see _skip_evidence_batch.
+        status = "deferred"
+    elif isinstance(exc, (MemoryCompilationError, MemoryPolicyError)):
+        status = "rejected"
+    else:
+        status = "failed"
     append_memory_history(
         memory_dir,
         target=view,
@@ -563,8 +576,20 @@ async def compile_context(
 ) -> bool:
     """Compile user-scoped learning signals into ``agent_dir/context.md``."""
     policy = _MEMORY_POLICY
-    entries = _entries_for_view(_load_recent(memory_dir), "context")
+    # From its own cursor, not from line 0. Reading the whole log every time meant
+    # the 24k prompt budget pinned context to the oldest evidence once the log
+    # outgrew it, so newly stated preferences at the tail were never seen.
+    entries = _entries_for_view(
+        _load_recent(memory_dir, offset=_read_offset(memory_dir, "context")),
+        "context",
+    )
     if not entries:
+        # Nothing unconsumed is user-scoped, so nothing here will ever reach
+        # context.md. Move the cursor to the end of the log, or these lines block
+        # Dream's reclamation forever.
+        total = _total_lines(memory_dir)
+        if total > _read_offset(memory_dir, "context"):
+            _write_offset(memory_dir, total, "context")
         return False
 
     target = resolve_view_path(policy, memory_dir.parent, "context")
@@ -584,7 +609,8 @@ async def compile_context(
     if _read_fp(fp_file) == fp and target.is_file():
         return False
 
-    source, _ = _entries_to_source(entries, source_limit=MAX_DURABLE_SOURCE_CHARS)
+    source, consumed = _entries_to_source(entries, source_limit=MAX_DURABLE_SOURCE_CHARS)
+    consumed_through = int(entries[consumed - 1].get("_line", 0)) + 1
     try:
         draft = await asyncio.wait_for(
             _generate_view(
@@ -610,6 +636,7 @@ async def compile_context(
         _record_compile_failure(memory_dir, "context", policy, existing, exc)
         raise
 
+    _write_offset(memory_dir, consumed_through, "context")
     _write_fp(fp_file, fp)
     return True
 
@@ -694,7 +721,7 @@ async def compile_durable(
         # and builds on it.  Nothing is written, neither checkpoint moves, and the
         # 10-turn compile interval is the throttle -- see policy 6.2.
         _record_compile_failure(memory_dir, "durable", policy, existing, exc)
-        if rejected_streak(memory_dir, "durable") >= _MAX_REJECTED_STREAK:
+        if deferred_streak(memory_dir, "durable") >= _MAX_DEFERRED_STREAK:
             _skip_evidence_batch(
                 memory_dir, policy, existing=existing, through=consumed_through
             )
@@ -720,8 +747,9 @@ def _skip_evidence_batch(
     events stay on disk under the normal retention window, and ``durable.md``
     keeps the last version that passed review.
 
-    Counted from ``rejected`` records only, so a provider outage (recorded as
-    ``failed``) never costs evidence: the streak resets on any other status,
+    Counted from ``deferred`` records only -- cycles where nothing the model
+    proposed was applicable.  An unsafe draft (``rejected``) or a provider outage
+    (``failed``) never costs evidence: the streak resets on any other status,
     including the ``skipped`` record written here.
     """
     # The audit record lands before the cursor moves. The reverse order can

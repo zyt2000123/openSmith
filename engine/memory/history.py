@@ -120,13 +120,15 @@ def recent_failure_streak(memory_dir: Path) -> tuple[int, str | None]:
     return streak, last_error
 
 
-def rejected_streak(memory_dir: Path, target: str) -> int:
-    """Count the trailing run of content rejections for one view.
+def deferred_streak(memory_dir: Path, target: str) -> int:
+    """Count the trailing run of "nothing was applicable" outcomes for one view.
 
-    Only ``rejected`` counts. A provider outage is recorded as ``failed`` and
-    breaks the run, because a batch of evidence must never be given up on for a
-    reason that has nothing to do with the evidence.  The ``skipped`` record that
-    follows a give-up breaks the run too, so the count restarts per batch.
+    Only ``deferred`` counts -- the one failure that repeating cannot fix. Every
+    other status breaks the run: a provider outage (``failed``) and an unsafe or
+    malformed draft (``rejected``) say nothing about whether the evidence is
+    usable, and a batch must never be given up on for someone else's fault. The
+    ``skipped`` record written when a batch is given up breaks the run too, so the
+    count restarts per batch.
     """
     path = memory_dir / "memory_history.jsonl"
     try:
@@ -148,7 +150,7 @@ def rejected_streak(memory_dir: Path, target: str) -> int:
         if not isinstance(record, dict) or record.get("target") != target:
             # Another view's outcome says nothing about this one's streak.
             continue
-        if record.get("status") != "rejected":
+        if record.get("status") != "deferred":
             break
         streak += 1
     return streak
