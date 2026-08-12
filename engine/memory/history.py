@@ -29,6 +29,7 @@ def append_memory_history(
     new_text: str = "",
     review_rounds: int = 0,
     error: str | None = None,
+    notes: list[str] | None = None,
 ) -> bool:
     """Append one sanitized compile/review/write outcome without blocking memory."""
     cleaned_error: str | None = None
@@ -46,6 +47,18 @@ def append_memory_history(
         "review_rounds": max(0, review_rounds),
         "error": cleaned_error,
     }
+    if notes:
+        # What the change set proposed but did not land: rejected edits and
+        # bullets evicted for budget.  Sanitized like everything else, because a
+        # rejected edit can still quote the content that got it rejected.
+        cleaned_notes = []
+        for note in notes[:20]:
+            cleaned, _, _ = sanitize_memory_text(str(note))
+            cleaned = cleaned.strip()[:300]
+            if cleaned:
+                cleaned_notes.append(cleaned)
+        if cleaned_notes:
+            entry["not_written"] = cleaned_notes
     try:
         memory_dir.mkdir(parents=True, exist_ok=True)
         append_private_lines(

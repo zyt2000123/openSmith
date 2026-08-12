@@ -42,6 +42,30 @@ from engine.skill.registry import SkillRegistry
 from engine.tool.interface import ToolCall
 from engine.tool.registry import ToolRegistry
 
+def _first_evidence_line(prompt: str) -> str:
+    marker = "copied verbatim from the same line:\n"
+    if marker not in prompt:
+        return ""
+    block = prompt.split(marker, 1)[1].split("\n\nLegal `section`", 1)[0]
+    return next((line for line in block.splitlines() if line.strip()), "")
+
+
+def _first_evidence_ref(prompt: str) -> str:
+    line = _first_evidence_line(prompt)
+    if line.startswith("- [") and "]" in line:
+        return line[3 : line.index("]")]
+    return ""
+
+
+def _first_evidence_quote(prompt: str) -> str:
+    line = _first_evidence_line(prompt)
+    if "] " in line:
+        line = line.split("] ", 1)[1]
+    if line.startswith("(") and ") " in line:
+        line = line.split(") ", 1)[1]
+    return line.strip()[:80]
+
+
 EMPTY_DURABLE_DOC = (
     "# Durable Project Memory\n\n"
     "## Active Work\n\n"
@@ -173,20 +197,28 @@ class ToolCallingMemoryLLM(ToolCallingLLM):
             return self.responses.pop(0)
         prompt = messages[-1]["content"]
         if "`memory/durable.md`" in prompt:
-            return ChatResponse(text="""# Durable Project Memory
-
-## Active Work
-- **Runtime memory** — 状态：active；下一步：verify；更新：2026-07-13。
-
-## Pending
-
-## Verified Outcomes
-- **Runtime memory** — 结果：Tool-assisted turns enter the memory pipeline；证据：tool_result。
-
-## Decisions
-
-## Known Pitfalls
-""")
+            # The compiler contract is a change set now, not a document.
+            return ChatResponse(
+                text=json.dumps(
+                    {
+                        "changes": [
+                            {
+                                "op": "add",
+                                "section": "Verified Outcomes",
+                                "content": (
+                                    "- **Runtime memory** — 结果：Tool-assisted turns "
+                                    "enter the memory pipeline；证据：tool_result。"
+                                ),
+                                "evidence": {
+                                    "ref": _first_evidence_ref(prompt),
+                                    "quote": _first_evidence_quote(prompt),
+                                },
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            )
         return ChatResponse(text="stable memory summary")
 
 

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ._snapshot import snapshot_views
 from .compile import _read_offset
 from ._files import (
     MEMORY_LAYER_FILES,
@@ -131,9 +132,17 @@ async def run_dream(
 
 
 def _sanitize_all_layers(memory_dir: Path, report: DreamReport) -> None:
-    """Scan all memory files for secrets and instruction-like content."""
+    """Scan all memory files for secrets and instruction-like content.
+
+    Sanitizing is the second writer of the rendered views, and the only one that
+    removes content without evidence -- legitimately so, since a leaked secret
+    must go.  It therefore records the write and snapshots afterwards rather than
+    being gated: without a trace, a false-positive secret match deletes real
+    memory silently and nothing distinguishes it from a compiler deletion.
+    """
     secrets_removed = 0
     injections_removed = 0
+    sanitized_files = 0
     for md_file in _all_memory_files(memory_dir):
         content = md_file.read_text(encoding="utf-8")
         cleaned, file_secrets, file_injections = _sanitize_lines(content)
@@ -153,6 +162,21 @@ def _sanitize_all_layers(memory_dir: Path, report: DreamReport) -> None:
             atomic_write_text(md_file, cleaned)
             secrets_removed += file_secrets
             injections_removed += file_injections
+            sanitized_files += 1
+            append_memory_history(
+                memory_dir,
+                target=md_file.name,
+                policy_version=_MEMORY_POLICY.version,
+                status="sanitized",
+                old_text=content,
+                new_text=cleaned,
+            )
+    if sanitized_files:
+        snapshot_views(
+            memory_dir.parent,
+            f"memory: sanitized ({sanitized_files} file(s), "
+            f"{secrets_removed} secret(s), {injections_removed} injection(s))",
+        )
     report.secrets_removed = secrets_removed
     report.injection_lines_removed = injections_removed
 

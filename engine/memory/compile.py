@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,11 +32,20 @@ from ._files import (
     safe_file_in_dir,
     sanitize_memory_text,
 )
+from ._changeset import (
+    EVICTION_ORDER,
+    apply_changes,
+    evict_to_budget,
+    parse_changeset,
+    parse_document,
+)
 from ._review import (
     MemoryCompilationError,
     _generate_and_review_result,
+    _parse_review_json,
     _truncate_source,
 )
+from ._snapshot import snapshot_views
 from .history import append_memory_history
 from .policy import (
     MemoryPolicy,
@@ -205,7 +215,8 @@ def _entries_for_view(entries: list[dict], view: MemoryViewName) -> list[dict]:
 
 _VIEW_COMPILER_SYSTEM_PROMPT = (
     "You are Smith's memory compiler. Follow the supplied canonical MemoryPolicy exactly. "
-    "Return only the complete Markdown document for the requested target view."
+    "Return only a JSON change set for the requested target view. Never return a Markdown "
+    "document: the document is rendered from your changes by deterministic code."
 )
 
 
@@ -219,21 +230,89 @@ def _build_view_prompt(
     spec = policy.view(view)
     current_time = datetime.now(timezone.utc).isoformat()
     return f"""\
-Generate the complete `{spec.path.as_posix()}` memory view.
+Propose a change set for the `{spec.path.as_posix()}` memory view.
 
 Current time (UTC): {current_time}
 
 Canonical MemoryPolicy:
 {policy.instructions_for(view, role="compiler")}
 
-Current accepted Markdown:
+Current accepted Markdown (the trusted baseline; every bullet you do not name
+survives untouched):
 {existing or "(empty)"}
 
-Selected evidence:
+Selected evidence. Each line starts with its timestamp in square brackets: that
+bracketed value is the `evidence.ref` for any change you base on that line, and
+`evidence.quote` must be copied verbatim from the same line:
 {source}
 
-Output only the complete Markdown document beginning with `# {spec.title}`.
+Legal `section` values for this view: {", ".join(spec.sections)}
+Legal `view` value: {view}
+
+Output only the JSON object described by the policy. If nothing in the evidence
+is worth remembering, output {{"nothing_to_record": true, "changes": []}}.
 """
+
+
+@dataclass(frozen=True)
+class _ViewDraft:
+    """A rendered view plus what the change set actually did to produce it."""
+
+    document: str
+    rounds: int
+    applied: int
+    notes: list[str]
+    nothing_to_record: bool
+
+
+def _build_draft(
+    policy: MemoryPolicy,
+    view: MemoryViewName,
+    *,
+    existing: str,
+    raw: str,
+    rounds: int,
+) -> _ViewDraft:
+    """Turn a model change set into a rendered document, deterministically.
+
+    Rejections are collected rather than raised: one unusable edit must not
+    discard the usable ones beside it, which is the whole reason the compiler
+    emits changes instead of a replacement document.
+    """
+    spec = policy.view(view)
+    changes, structural, nothing_to_record = parse_changeset(
+        _parse_review_json(raw), view=view, sections=spec.sections
+    )
+    grouped = parse_document(
+        existing or _empty_view_document(policy, view), spec.sections
+    )
+    updated, applied, rejected = apply_changes(grouped, changes)
+    document, evicted = evict_to_budget(
+        updated,
+        title=spec.title,
+        sections=spec.sections,
+        order=EVICTION_ORDER[view],
+        max_chars=spec.max_chars,
+    )
+
+    notes = [item.describe() for item in (*structural, *rejected)]
+    notes.extend(f"evicted_for_budget: {bullet[:120]}" for bullet in evicted)
+
+    if not applied and not nothing_to_record:
+        # Nothing to write and no claim that nothing was worth writing: treat it
+        # as a failed round so the caller leaves the accepted view untouched.
+        detail = "; ".join(notes[:5]) or "empty change set"
+        raise MemoryCompilationError(
+            f"{view} change set produced no applicable change: {detail}",
+            review_rounds=rounds,
+        )
+    return _ViewDraft(
+        document=_normalize_markdown(document),
+        rounds=rounds,
+        applied=len(applied),
+        notes=notes,
+        nothing_to_record=nothing_to_record,
+    )
 
 
 async def _generate_view(
@@ -244,7 +323,7 @@ async def _generate_view(
     *,
     existing: str,
     source: str,
-) -> tuple[str, int]:
+) -> _ViewDraft:
     if reviewer is None:
         raise MemoryCompilationError(
             f"{view} compilation requires a reviewer model"
@@ -266,7 +345,9 @@ async def _generate_view(
         target_view=f"{view}.md",
         review_policy=policy.instructions_for(view, role="reviewer"),
     )
-    return _normalize_markdown(outcome.text), outcome.rounds
+    return _build_draft(
+        policy, view, existing=existing, raw=outcome.text, rounds=outcome.rounds
+    )
 
 
 def _normalize_markdown(text: str) -> str:
@@ -316,6 +397,7 @@ def _commit_view(
     review_rounds: int,
     status: str = "written",
     error: str | None = None,
+    notes: list[str] | None = None,
 ) -> None:
     validate_rendered_view(policy, view, draft)
     if contains_secret(draft) or contains_injection(draft):
@@ -331,158 +413,31 @@ def _commit_view(
         if on_disk.strip() and on_disk != draft:
             atomic_write_text(target.with_name(f"{target.name}.bak"), on_disk)
     atomic_write_text(target, draft)
+    recorded_status = (
+        "unchanged" if existing == draft and status == "written" else status
+    )
     append_memory_history(
         memory_dir,
         target=view,
         policy_version=policy.version,
-        status="unchanged" if existing == draft and status == "written" else status,
+        status=recorded_status,
         old_text=existing,
         new_text=draft,
         review_rounds=review_rounds,
         error=error,
+        # Rejected edits and budget evictions are the memories that did *not*
+        # get written.  Without them recorded, a memory that vanished is
+        # indistinguishable from one that was never proposed.
+        notes=notes,
     )
-
-
-def _fallback_inline(value: object, limit: int) -> str:
-    """Render already-sanitized event data as one bounded Markdown line."""
-    cleaned, _, _ = sanitize_memory_text(str(value or ""))
-    cleaned = " ".join(cleaned.split()).replace("#", "＃").replace("`", "'")
-    return cleaned[:limit].rstrip(" .。；;")
-
-
-def _fallback_event_content(value: object, limit: int) -> str:
-    """Recover candidate content from the internal ``[memory]`` envelope."""
-    marker = "[memory] "
-    content = _fallback_inline(value, limit + len(marker))
-    if content.startswith(marker):
-        content = content[len(marker):]
-    return content[:limit].rstrip(" .。；;")
-
-
-def _fallback_date(value: object) -> str:
-    parsed = None
-    try:
-        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        pass
-    return (parsed or datetime.now(timezone.utc)).date().isoformat()
-
-
-_DURABLE_FALLBACK_SECTIONS: tuple[str, ...] = _MEMORY_POLICY.view("durable").sections
-
-
-# Sections that existed before the memory views were merged. The LLM compiler
-# sees `existing` in full and can re-file them itself, but this deterministic
-# extractor matches on heading names — without the mapping it would silently
-# drop every bullet stored under a retired heading.
-_LEGACY_DURABLE_SECTIONS: dict[str, str] = {
-    "Confirmed Facts": "Verified Outcomes",
-    "Reusable Procedures": "Verified Outcomes",
-}
-
-
-def _existing_fallback_bullets(existing: str, section: str) -> list[str]:
-    """Keep only bounded bullets from an accepted durable section."""
-    accepted = {section} | {
-        legacy for legacy, current in _LEGACY_DURABLE_SECTIONS.items() if current == section
-    }
-    in_section = False
-    bullets: list[str] = []
-    for line in existing.splitlines():
-        if line.startswith("## "):
-            in_section = line[3:].strip() in accepted
-            continue
-        if in_section and line.lstrip().startswith("-"):
-            # This text already came from the accepted, sanitized durable view.
-            # Keep the complete bullet; the document-level eviction pass below
-            # enforces the total budget without silently cutting facts in half.
-            item = line.lstrip()[1:].strip()
-            if item:
-                bullets.append(f"- {item}")
-    return bullets
-
-
-def _fallback_durable_document(existing: str, entries: list[dict]) -> str:
-    """Build a safe extractive durable view without inventing facts.
-
-    Existing bullets are carried over first: this fallback runs on an
-    *incremental* merge, so dropping them would silently erase every fact the
-    reviewed pipeline had already accepted.
-    """
-    grouped = {
-        section: _existing_fallback_bullets(existing, section)
-        for section in _DURABLE_FALLBACK_SECTIONS
-    }
-    for entry in entries[-16:]:
-        content = _fallback_event_content(entry.get("task"), 260)
-        topic = content[:80].rstrip(" .。；;") or "未命名工作"
-        summary = _fallback_inline(entry.get("summary"), 260)
-        evidence = _fallback_inline(entry.get("evidence"), 40) or "memory_event"
-        kind = str(entry.get("kind") or "work")
-        if kind == "decision":
-            decision = content or topic
-            lines = [("Decisions", f"- **{topic}**: 决定 {decision}；适用范围：当前项目；证据：{evidence}。")]
-        elif kind in {"correction", "pitfall"}:
-            pitfall = content or topic
-            lines = [("Known Pitfalls", f"- **{topic}**: 记录已确认陷阱：{pitfall}；证据：{evidence}。")]
-        elif kind in {"work", "partial_work"}:
-            date = _fallback_date(entry.get("timestamp"))
-            status = "未完成" if kind == "partial_work" else "待复核"
-            reason = _fallback_inline(entry.get("reason"), 80)
-            reason_suffix = f"；原因：{reason}" if reason else ""
-            lines = [(
-                "Active Work",
-                f"- **{topic}** — 状态：{status}{reason_suffix}；"
-                f"下一步：依据现有证据继续处理；更新：{date}。",
-            )]
-            if kind == "work" and summary:
-                lines.append(
-                    (
-                        "Pending",
-                        f"- **{topic}** — 待处理：待复核本回合摘要“{summary}”；"
-                        f"证据标签：{evidence}。",
-                    )
-                )
-        elif content:
-            # Structured memory candidates put the asserted content in
-            # ``task`` and the supporting evidence description in ``summary``.
-            # The latter must never be promoted into the asserted fact.
-            lines = [("Verified Outcomes", f"- **{topic}** — 结果：{content}；证据：{evidence}。")]
-        else:
-            continue
-        for section, line in lines:
-            if line not in grouped[section]:
-                grouped[section].append(line)
-
-    # The fallback carries `existing` forward, so an almost-full durable view
-    # would render over budget and _commit_view would reject it — the safety net
-    # failing exactly when memory has accumulated enough to need it. Evict in the
-    # order policy §5.1 prescribes until the document fits.
-    document = _render_durable_fallback(grouped)
-    for section in _DURABLE_EVICTION_ORDER:
-        while len(document) > MAX_DURABLE_CHARS and grouped[section]:
-            grouped[section].pop(0)  # oldest bullet in this section
-            document = _render_durable_fallback(grouped)
-    return document
-
-
-# Least valuable first: transient status before verified conclusions, and
-# decisions/pitfalls last because they are the entries worth keeping longest.
-_DURABLE_EVICTION_ORDER: tuple[str, ...] = (
-    "Active Work",
-    "Pending",
-    "Verified Outcomes",
-    "Decisions",
-    "Known Pitfalls",
-)
-
-
-def _render_durable_fallback(grouped: dict[str, list[str]]) -> str:
-    parts = [f"# {_MEMORY_POLICY.view('durable').title}"]
-    for section in _DURABLE_FALLBACK_SECTIONS:
-        parts.extend(["", f"## {section}", *grouped[section]])
-    parts.append("")
-    return "\n".join(parts)
+    # The audit record lands first: it is the durable trace, while the snapshot
+    # is a recovery aid that may legitimately be unavailable.  ``.bak`` holds a
+    # single generation, and history stores digests rather than text, so without
+    # this two consecutive bad writes lose the last good document for good.
+    snapshot_views(
+        memory_dir.parent,
+        f"memory: {view} ({recorded_status}, rounds={review_rounds})",
+    )
 
 
 def _empty_view_document(policy: MemoryPolicy, view: MemoryViewName) -> str:
@@ -510,13 +465,6 @@ def ensure_durable_template(memory_dir: Path) -> bool:
         status="initialized",
     )
     return True
-
-
-def _can_use_compilation_fallback(exc: Exception) -> bool:
-    """Fallback only for transient/review-loop failures, never policy violations."""
-    if isinstance(exc, TimeoutError):
-        return True
-    return isinstance(exc, MemoryCompilationError) and getattr(exc, "review_rounds", 0) > 0
 
 
 def _record_compile_failure(
@@ -577,7 +525,7 @@ async def compile_context(
 
     source = _entries_to_source(entries, source_limit=MAX_DURABLE_SOURCE_CHARS)
     try:
-        draft, rounds = await asyncio.wait_for(
+        draft = await asyncio.wait_for(
             _generate_view(
                 policy,
                 "context",
@@ -593,8 +541,9 @@ async def compile_context(
             "context",
             memory_dir,
             existing=existing,
-            draft=draft,
-            review_rounds=rounds,
+            draft=draft.document,
+            review_rounds=draft.rounds,
+            notes=draft.notes,
         )
     except Exception as exc:
         _record_compile_failure(memory_dir, "context", policy, existing, exc)
@@ -649,7 +598,7 @@ async def compile_durable(
         return False
 
     try:
-        draft, rounds = await asyncio.wait_for(
+        draft = await asyncio.wait_for(
             _generate_view(
                 policy,
                 "durable",
@@ -660,45 +609,24 @@ async def compile_durable(
             ),
             timeout=_DURABLE_REVIEW_TIMEOUT_SECONDS,
         )
-        if not draft:
+        if not draft.document:
             raise MemoryCompilationError("durable compilation output was empty")
         _commit_view(
             policy,
             "durable",
             memory_dir,
             existing=existing,
-            draft=draft,
-            review_rounds=rounds,
+            draft=draft.document,
+            review_rounds=draft.rounds,
+            notes=draft.notes,
         )
     except Exception as exc:
-        requires_reviewed_merge = any(
-            str(entry.get("kind") or "") in {"correction", "forget"}
-            for entry in entries
-        )
-        if (
-            reviewer is None
-            or requires_reviewed_merge
-            or not _can_use_compilation_fallback(exc)
-        ):
-            _record_compile_failure(memory_dir, "durable", policy, existing, exc)
-            raise
-        try:
-            fallback = _fallback_durable_document(existing, entries)
-            _commit_view(
-                policy,
-                "durable",
-                memory_dir,
-                existing=existing,
-                draft=fallback,
-                review_rounds=getattr(exc, "review_rounds", 0),
-                status="fallback",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        except Exception:
-            _record_compile_failure(memory_dir, "durable", policy, existing, exc)
-            raise
-        _write_fp(fp_file, fp)
-        return True
+        # No fallback document. Writing an unreviewed extractive merge poisons the
+        # baseline: the next round reads it back as "the trusted current state"
+        # and builds on it.  Nothing is written, neither checkpoint moves, and the
+        # 10-turn compile interval is the throttle -- see policy 6.2.
+        _record_compile_failure(memory_dir, "durable", policy, existing, exc)
+        raise
 
     _write_fp(fp_file, fp)
     return True
