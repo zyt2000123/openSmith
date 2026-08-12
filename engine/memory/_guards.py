@@ -78,6 +78,12 @@ _ANCHOR_PATTERNS: tuple[re.Pattern[str], ...] = (
 # Chinese but nothing stops a user's project memory from being written in English.
 _EVIDENCE_FIELD_MARKERS: tuple[str, ...] = ("证据", "evidence")
 
+# A citation has to demonstrate that the entry was read. A one-character quote
+# matches almost any entry, which would let the anchor pool resolve to some other
+# event in the batch than the one the claim is attached to -- not fabrication, but
+# misattribution. Short enough that any real fragment clears it.
+_MIN_QUOTE_CHARS = 8
+
 
 def build_evidence_index(source: str) -> dict[str, list[str]]:
     """Index the rendered evidence block by ``ref`` (the bracketed timestamp).
@@ -186,6 +192,10 @@ def _check_traceable(
     """Guard 1: the citation must resolve, and the content must stay inside it."""
     if not change.evidence_ref or not change.evidence_quote:
         return RejectedChange(change, "evidence_missing")
+    if len(_normalize(change.evidence_quote)) < _MIN_QUOTE_CHARS:
+        return RejectedChange(
+            change, "evidence_quote_too_short", change.evidence_quote[:40]
+        )
     if change.evidence_ref not in evidence:
         return RejectedChange(
             change, "evidence_ref_not_in_batch", change.evidence_ref[:40]
@@ -221,13 +231,19 @@ def _check_retention(
     if change.op == "add":
         return None
     kinds = _kinds(cited)
-    if change.op == "remove" and change.section in _CONCLUSION_SECTIONS:
+    if change.section in _CONCLUSION_SECTIONS:
         # A settled conclusion is not undone by more work happening; it takes the
         # user forgetting it or correcting it.
+        #
+        # `replace` counts, not just `remove`.  A replace keeps the topic key but
+        # may rewrite the entire body, so it erases a conclusion just as
+        # thoroughly -- and the new body is prose, which guard 1 cannot check for
+        # anchors it does not contain.  Leaving replace out made it the cheap way
+        # to invert a decision on the strength of routine work evidence.
         if not kinds & _FORGET_KINDS:
             return RejectedChange(
                 change,
-                "conclusion_removed_without_forget_or_correction",
+                "conclusion_changed_without_forget_or_correction",
                 ",".join(sorted(kinds))[:60],
             )
         return None

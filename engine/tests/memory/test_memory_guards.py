@@ -174,7 +174,56 @@ def test_a_settled_decision_needs_forget_or_correction_to_be_removed() -> None:
     ))
 
     assert allowed == []
-    assert refused[0].reason == "conclusion_removed_without_forget_or_correction"
+    assert refused[0].reason == "conclusion_changed_without_forget_or_correction"
+
+
+def test_a_decision_cannot_be_inverted_by_rewriting_it_in_place() -> None:
+    """`replace` must not be the cheap way around the retention guard.
+
+    It keeps the topic key but may rewrite the whole body, so routing an inversion
+    through replace erases the conclusion just as thoroughly as remove does -- and
+    the new body is prose, which the traceability guard cannot check.
+    """
+    allowed, refused = _judge(_change(
+        "replace", "Decisions",
+        target="Cache",
+        content="- **Cache**: 决定 不再使用缓存；适用范围：loader。",
+        reason="the loader work suggests otherwise",
+        evidence_ref=WORK_REF,
+        evidence_quote="tune the loader",
+    ))
+
+    assert allowed == []
+    assert refused[0].reason == "conclusion_changed_without_forget_or_correction"
+
+
+def test_a_correction_may_rewrite_a_decision_in_place() -> None:
+    change = _change(
+        "replace", "Decisions",
+        target="Cache",
+        content="- **Cache**: 决定 drop the cache；适用范围：loader。",
+        reason="user corrected it",
+        evidence_ref=FORGET_REF,
+        evidence_quote="user asked to forget the cache decision",
+    )
+
+    allowed, refused = _judge(change)
+
+    assert refused == []
+    assert allowed == [change]
+
+
+def test_a_quote_too_short_to_show_the_entry_was_read_is_refused() -> None:
+    """A one-character quote matches nearly any entry, so it proves nothing."""
+    allowed, refused = _judge(_change(
+        "add", "Active Work",
+        content="- **Loader** — 状态：tuned；下一步：measure。",
+        evidence_ref=WORK_REF,
+        evidence_quote="the",
+    ))
+
+    assert allowed == []
+    assert refused[0].reason == "evidence_quote_too_short"
 
 
 def test_forget_evidence_authorizes_removing_a_decision() -> None:
