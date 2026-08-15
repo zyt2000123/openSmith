@@ -800,7 +800,207 @@ CTX_PROVISIONAL_OUTPUTS = "_committed_provisional_output"
 
 ---
 
-## 7. 参数速查
+## 7. 编排生命周期
+
+`engine/execution/orchestration/lifecycle.py`（875 行）是把上面所有部件串起来的地方。它的入口有五个：
+
+| 函数 | 用途 |
+|---|---|
+| `run_stream_with_runtime()` | 主入口：一次新请求，产出事件流 |
+| `resume_stream_with_runtime()` | 恢复一个被中断的 run |
+| `reply_with_runtime()` | 非流式，返回 `EngineResult` |
+| `reply_events_with_runtime()` | 非流式但要事件 |
+| `reply_stream_with_runtime()` | 流式文本（不要完整事件） |
+
+### 7.1 `_RunEventBoundary`：事件的分流点
+
+每一个执行事件都要落两个地方：**执行状态**（`RunStateStore`）和**观察者**（可观测适配器）。`_RunEventBoundary` 是这个分流点，它的 docstring 讲了两个非显然的决定：
+
+```python
+"""Fan events into execution state and an optional observer Adapter.
+
+The async methods offload the (deliberately fsynced) persistence I/O to a
+worker thread so a busy disk never stalls the server's event loop.  The
+per-boundary lock serializes the offloads: ``asyncio.to_thread`` alone does
+not guarantee execution order, and the run trace's sequence numbers and the
+byte-offset cursor depend on records being written in stream order.
+"""
+```
+
+**① 持久化是刻意 fsync 的，所以必须离开事件循环。** 运行 trace 是崩溃恢复的依据，不 fsync 就没意义；但 fsync 在忙盘上可能几十毫秒，跑在事件循环里会卡住所有 SSE 流。所以 `asyncio.to_thread`。
+
+**② 但 `to_thread` 不保证顺序，所以还要一把锁。**
+
+```mermaid
+flowchart TD
+    A["事件 1"] --> L["asyncio.Lock<br/>（每个 boundary 一把）"]
+    B["事件 2"] --> L
+    C["事件 3"] --> L
+    L --> T["asyncio.to_thread<br/>串行执行"]
+    T --> S1["project_execution_event → RunState"]
+    T --> S2["observer.record → trace JSONL"]
+    S2 --> N["trace 的序号与字节偏移游标<br/>依赖记录按流顺序写入"]
+```
+
+这是一个很容易漏掉的正确性问题：**并发地把事件卸载到线程，写入顺序就是随机的**，而 trace 的序号和 `observability_trace_cursors.byte_offset` 都建立在"按流顺序写"这个前提上。
+
+**③ 观察者抛异常不能影响执行。** 每一处调用观察者的地方都包着 `try/except` + `logger.warning`。可观测性是旁路，它坏掉不该让 run 失败。
+
+### 7.2 记忆维护的 tick 与钩子键
+
+`_ensure_memory_lifecycle_hooks()` 是一段值得学的**幂等注册**代码：
+
+```python
+hook_key = (
+    id(maintenance_llm),
+    id(services.gate_llm),
+    services.owns_llm_clients,
+    id(services.hooks),
+)
+if (services._memory_lifecycle_hook is not None
+    and services._memory_lifecycle_hook_key == hook_key
+    and services.hooks.is_registered(services._memory_lifecycle_hook)):
+    return
+```
+
+三个条件缺一不可：
+
+1. **钩子存在**
+2. **键没变**——键由维护用的 LLM、门禁 LLM、所有权标志、钩子管理器四者的身份组成。任何一个换了，旧钩子就绑着错误的客户端
+3. **它确实还注册着**——只记住"我注册过"不够，注册表可能被重建过
+
+不满足就先 `unregister` 旧的再注册新的。这段代码防的是**同一个 services 被复用于多个请求时，记忆维护钩子绑到已关闭的客户端上**。
+
+两个 tick：
+
+| Tick | 触发时机 | 干什么 |
+|---|---|---|
+| `memory_idle_tick` | 空闲时 | 增量编译记忆 |
+| `memory_daily_tick` | 每日 | Dream 维护周期 |
+
+两者都通过 `HookType.PARALLEL` 分发，并且 `include_failures=True`——**失败也要收回来**，然后 `all(result is not False for result in results)` 判定整体成败。
+
+`defer_maintenance=not services.owns_llm_clients` 这一行也有讲究：客户端是共享的时候（server 场景），维护要延后，不能在请求路径上同步跑。
+
+### 7.3 `_persist_runtime_learning()`：三种终态三个钩子
+
+```python
+hook_name = {
+    "completed": "memory_after_turn_completed",
+    "incomplete": "memory_after_turn_incomplete",
+    "failed": "memory_after_turn_failed",
+}.get(terminal_status, "memory_after_turn_failed")
+```
+
+注意默认值是 `failed`——**未知状态按失败处理**，又一处 fail-closed。
+
+而且非 `completed` 的分支会多传一个 `terminal_reason`，因为"为什么没完成"对记忆管线是有用信息。
+
+流程：
+
+```mermaid
+flowchart TD
+    A["_persist_runtime_learning"] --> B["UserPreferenceLearner.observe()<br/>抽取偏好信号"]
+    B --> C["_ensure_memory_lifecycle_hooks()"]
+    C --> D["按终态选钩子并并行执行"]
+    D --> E{"全部成功且有信号"}
+    E -->|"是"| F["learner.acknowledge(signals)<br/>确认这批信号已消费"]
+    E -->|"否"| G["不确认：下次还会重新抽到"]
+```
+
+**先 observe，成功后才 acknowledge** 是一个标准的至少一次投递模式：写失败时不确认，信号留着下次再来。
+
+### 7.4 什么才算"工具证据"
+
+`_has_successful_tool_evidence()` 的 docstring 把一个容易搞错的判断说清楚了：
+
+> 工具**开始**只是描述了模型的一个提案。预检挑战、策略阻断、以及 provider/工具失败都**没有产生项目证据**，绝不能让记忆管线把这一轮标成 `tool_result`。
+
+即：只有 `TOOL_CALL_RESULT` 且**没出错**才算证据。这条判断直接决定了记忆系统里那一轮证据的 `kind`，进而决定它能不能建立 `Verified Outcomes` 条目（见 [05 · 记忆系统](./05-记忆系统.md) 的放置守卫）。
+
+---
+
+## 8. 技能子系统
+
+`engine/skill/`（829 行）：注册、加载、执行、启停。
+
+### 8.1 技能的判定标准
+
+一个目录是技能，当且仅当它有**顶层 `SKILL.md`**。`_parse_or_skip()` 解析失败就跳过，不让一个坏文件毁掉整个目录扫描。
+
+两个来源分开加载：
+
+| 方法 | 来源 | 语义 |
+|---|---|---|
+| `load_builtin()` | `~/.agent-smith/builtin/skills/` | Smith 自带 |
+| `load_agent_skills()` | `~/.agent-smith/agent/skills/` | 用户安装 |
+
+`is_builtin()` 让上层能区分两者——比如禁止卸载内建技能。
+
+### 8.2 启停状态：只记 disabled
+
+`engine/skill/settings.py` 存的是 `~/.agent-smith/agent/skills.yaml`：
+
+```yaml
+disabled:
+  - some-skill
+```
+
+**只记禁用的，不记启用的。** 这是个正确的默认方向：新装的技能默认可用，不需要在设置文件里补一条。反过来（只记 enabled）会让"装了技能但没生效"成为常态。
+
+校验也很严：
+
+```python
+unknown = set(settings) - {"disabled"}
+if unknown:
+    raise SkillSettingsError(f"unknown settings: {', '.join(sorted(unknown))}")
+```
+
+**未知键直接报错**，而不是忽略——拼错一个键名不会静默失效。
+
+### 8.3 技能执行的两条路径与两个预算
+
+```python
+WORKFLOW_HANDOFF_TOKEN_BUDGET = 2_000
+WORKFLOW_SKILL_TOKEN_BUDGET = 8_000
+```
+
+| 函数 | 场景 |
+|---|---|
+| `execute_skill_events()` | 有 `SKILL.md`，按技能内容执行 |
+| `execute_react_fallback_events()` | **没有匹配的技能**，退回普通 ReAct |
+
+第二条路径是 `CLAUDE.md` 里那句话的实现：
+
+> A pipeline node falls back to generic ReAct when no matching `SKILL.md` is installed; the gate still runs, so the intermediate contract stays observable.
+
+**技能没装，节点仍然跑，门禁仍然判。** 这意味着一条管线的"契约"由门禁保证，而不是由技能保证——技能只是帮助模型达成契约的方法论。
+
+### 8.4 节点间怎么传递上下文
+
+`_workflow_layers()` 把技能执行的 prompt 也拆成层，其中两层专门做节点间交接：
+
+| 层 | 来源 | 预算 |
+|---|---|---|
+| `_workflow_handoff_layer()` | 上一节点的交接产物 | 2000 token |
+| `_workflow_feedback_layer()` | 门禁给的重试提示（`CTX_RETRY_HINT`） | — |
+
+加上 `_prior_workflow_outputs()`（更早节点的产物）和 `_gate_feedback()`，一个管线节点看到的是：
+
+```mermaid
+flowchart TD
+    A["技能本体 SKILL.md<br/>预算 8000 token"] --> P["节点 prompt"]
+    B["上一节点交接<br/>预算 2000 token"] --> P
+    C["更早节点的产物"] --> P
+    D["门禁反馈 CTX_RETRY_HINT"] --> P
+    P --> R["ReAct 循环"]
+```
+
+`_trim_to_token_budget()` 对这两块做硬裁剪。设 8000/2000 这两个数的意图很清楚：**技能方法论比上游交接重要 4 倍**——交接只需要结论，方法论要完整。
+
+---
+
+## 9. 参数速查
 
 ### ReAct
 
@@ -851,7 +1051,7 @@ CTX_PROVISIONAL_OUTPUTS = "_committed_provisional_output"
 
 ---
 
-## 8. 这一层的设计取舍
+## 10. 这一层的设计取舍
 
 **① 所有边界都是显式常量，不是魔法数字散落各处。** `budget.py` 一个文件放全部 ReAct 预算，改一个值不用翻 1386 行。
 
@@ -865,7 +1065,7 @@ CTX_PROVISIONAL_OUTPUTS = "_committed_provisional_output"
 
 ---
 
-## 9. 接下来
+## 11. 接下来
 
 | 想深入 | 读 |
 |---|---|
