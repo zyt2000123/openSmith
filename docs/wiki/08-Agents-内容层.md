@@ -427,6 +427,240 @@ def execute(...):
 
 ---
 
+### 4.1 19 个工具的安全元数据全表
+
+每个工具的 `TOOL_META` 声明四个安全维度。把 19 个工具排在一起，分层非常清楚：
+
+| 工具 | `permission_level` | `approval_policy` | `side_effect` | `concurrency` |
+|---|---|---|---|---|
+| `read_file` | read | never | none | — |
+| `list_dir` | read | never | none | — |
+| `glob_files` | read | never | none | — |
+| `grep` | read | never | none | — |
+| `read_pdf` | read | never | none | — |
+| `render_pdf_page` | read | never | none | — |
+| `render_ui` | read | never | none | — |
+| `skill_load` | read | never | none | — |
+| `get_current_time` | read | never | none | — |
+| `web_fetch` | read | never | none | — |
+| `web_search` | read | never | none | — |
+| `write_file` | write | policy | write | serial |
+| `edit_file` | write | policy | write | serial |
+| `todo` | write | policy | write | serial |
+| `memory_ops` | write | policy | write | serial |
+| `skill_manage` | write | policy | write | serial |
+| `web_crawl` | write | policy | write | serial |
+| `git_ops` | write | policy | **external** | serial |
+| **`shell`** | **execute** | **always** | **external** | serial |
+
+三条规律：
+
+**① 只读工具一律 `never` + `none`。** 十一个只读工具没有任何审批开销——读文件、搜索、看时间不需要打断用户。这让 Agent 的探索阶段是流畅的。
+
+**② 所有写工具都是 `serial`。** 并发写会产生竞态（两个 `edit_file` 同时改一个文件、两个 `todo` 同时改列表）。串行化的代价是慢，但写操作本来就不该并发。
+
+**③ `shell` 是唯一 `always` 的。** 其余写工具用 `policy`（按配置的风险等级决定），只有 `shell` **每次都要用户批准**——因为它能执行任意命令，风险不可从参数推断。这和 [12 · MCP 集成](./12-MCP-集成.md) §6.3 里远程 MCP 工具一律 `always` 是同一个判断：**能力边界不可知时，一律要人点头**。
+
+`git_ops` 和 `web_crawl` 的 `side_effect` 值得注意：
+
+| 工具 | `side_effect` | 为什么 |
+|---|---|---|
+| `write_file` / `edit_file` | `write` | 只影响本地文件系统 |
+| `git_ops` | **`external`** | push 会影响远端仓库——**进程外、不可撤销** |
+| `web_crawl` | `write` | 抓取结果要落盘，所以是写；但网络请求本身是读 |
+| `shell` | `external` | 什么都可能做 |
+
+`external` 这个标记的含义是"影响到了这个进程之外的世界"，它让可观测性和审批层知道这次调用**不能靠回滚本地状态来撤销**。
+
+三个工具声明了超时：`read_pdf` 120 秒、`web_crawl` 180 秒，其余用默认值。PDF 解析和站点抓取都是可能长时间运行的操作，给它们更宽的预算，同时仍然有限。
+
+### 4.2 `web_fetch` 的七道边界
+
+网络工具是攻击面最大的一类——URL 由模型给出，而模型可能被 prompt 里的内容影响。`agents/tools/web_fetch.py`（353 行）有七道限制：
+
+```python
+MAX_RESPONSE_BYTES = 512 * 1024        # 响应体上限 512 KB
+MAX_OUTPUT_CHARS = 40_000              # 给模型的文本上限
+MAX_TIMEOUT = 60                       # 超时上限
+BLOCKED_SCHEMES = {"file", "ftp", "data"}
+BLOCKED_HOSTS = {"localhost"}
+ALLOWED_PORTS = {80, 443}
+_FETCH_CONCURRENCY = asyncio.Semaphore(2)
+```
+
+| 边界 | 防的是 |
+|---|---|
+| `BLOCKED_SCHEMES` | **`file://` 读本地文件**、`data:` 构造任意内容 |
+| `BLOCKED_HOSTS` + `.localhost` 后缀 | 访问本机服务 |
+| `ALLOWED_PORTS = {80, 443}` | **只允许标准 HTTP(S) 端口**，挡住内网服务扫描 |
+| `ip.is_private` / `not ip.is_global` | 私有网段、回环、链路本地（含云元数据 `169.254.169.254`） |
+| `MAX_RESPONSE_BYTES` | 超大响应撑爆内存 |
+| `MAX_OUTPUT_CHARS` | 一个页面吃光上下文预算 |
+| `Semaphore(2)` | 并发抓取变成对目标站点的压力测试 |
+
+IP 检查和 [07 · LLM 集成](./07-LLM-集成.md) §2.2.1 的 `validate_llm_base_url` 是同一套 SSRF 防护，只是那里保护的是凭据不外泄，这里保护的是**不要拿 Agent 当内网跳板**。
+
+还有一处不属于"边界"但同样重要的处理：
+
+```python
+_UNTRUSTED_FENCE_CLOSE = "[/UNTRUSTED_EXTERNAL_CONTENT]"
+```
+
+抓回来的内容用围栏包起来交给模型，明确标注"这是外部不可信内容"。这和 [04 · Engine 核心执行](./04-Engine-核心执行.md) §2.2 里 `learned_context` 和 `durable_context` 的围栏是同一个手法——**任何非用户授权的文本进入 prompt 时都要标明来源**，否则一个网页里写着"忽略之前的指令"就可能生效。
+
+`ALLOWED_CONTENT_TYPES` 白名单则限制只处理文本类响应，避免把二进制内容塞给模型。
+
+### 4.3 `web_crawl`：遵守 robots.txt 的有限抓取
+
+`agents/tools/web_crawl.py`（801 行）是最大的工具。文件第二行的中文注释就把定位说死了：
+
+```python
+# 只在用户明确给定的站点内、遵守 robots.txt 地有限抓取，避免开放式扫描。
+```
+
+三个限定词都是约束：**用户明确给定的站点内**、**遵守 robots.txt**、**有限**。
+
+```python
+USER_AGENT = "AgentSmithCrawler/1.0"
+MAX_PAGES = 50
+MAX_DEPTH = 4
+MAX_DOCUMENT_BYTES = 512 * 1024
+MAX_ROBOTS_CRAWL_DELAY = 10.0
+TRACKING_PARAMS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+```
+
+| 参数 | 值 | 作用 |
+|---|---|---|
+| `MAX_PAGES` | 50 | 一次抓取的页数上限 |
+| `MAX_DEPTH` | 4 | 链接深度上限，防止无限下钻 |
+| `MAX_DOCUMENT_BYTES` | 512 KB | 单页大小 |
+| `MAX_ROBOTS_CRAWL_DELAY` | 10 秒 | **尊重 robots 的 crawl-delay，但封顶** |
+| `USER_AGENT` | 自报家门 | 站点管理员能识别并在 robots.txt 里针对性配置 |
+| `TRACKING_PARAMS` | 四个 | 归一化 URL 时剥掉，避免同一页面因追踪参数不同被重复抓取 |
+
+`MAX_ROBOTS_CRAWL_DELAY` 的设计很讲究：**尊重站点的意愿，但不允许它把 Agent 挂死**。一个 robots.txt 写 `Crawl-delay: 86400`（一天）的站点，不封顶就会让这次工具调用永远不返回。封顶 10 秒是"我尽量守规矩，但有我自己的时限"。
+
+robots.txt 拿不到时的处理也明确：
+
+```python
+policy = _parse_robots(robots_text) if robots_status == 200 else _RobotsPolicy((), None, ())
+```
+
+**只有 200 才解析**，其余情况（404、5xx）用空策略——即不限制。这是标准做法：没有 robots.txt 意味着站点没有声明限制。但如果**请求本身失败**（网络错误），则直接抛 `ValueError` 拒绝抓取——区分"站点说没有限制"和"我根本没问到"。
+
+`MAX_DOCUMENT_BYTES + 1` 那个细节值得一提：
+
+```python
+data = response.read(MAX_DOCUMENT_BYTES + 1)
+if len(data) > MAX_DOCUMENT_BYTES:
+```
+
+**多读一个字节**才能判断是否超限。只读 `MAX_DOCUMENT_BYTES` 的话，恰好等于上限时无法区分"正好这么大"和"被截断了"。
+
+---
+
+### 4.4 `git_ops`：仓库配置本身就是攻击面
+
+`agents/tools/git_ops.py`（490 行）的文件头注释概括了两条基本措施：
+
+```python
+# Git 参数以 argv 传递而非 shell 拼接，并在暂存前拦截敏感文件。
+```
+
+但真正精彩的是 `_run_git` 里那段注释——它识别出了一个不那么显然的攻击面：
+
+```python
+# A repository's .git/config is trusted input from the workspace and can
+# point git at commands it would then execute in this process.  Neutralize
+# every such knob we know about with command-line overrides (which beat
+# repo config): hooks, the fsmonitor helper, external diffs, credential
+# helpers, and a custom ssh transport.  Filters (clean/smudge via
+# .gitattributes) and remote.<name>.receivepack/uploadpack have no global
+# override and remain a documented residual.
+```
+
+**`.git/config` 能让 git 执行任意命令。** 克隆一个恶意仓库（或在一个被污染的工作区里），它的配置文件可以设置：
+
+| 配置项 | 效果 |
+|---|---|
+| `core.hooksPath` | 指定钩子目录，任何 git 操作触发执行 |
+| `core.fsmonitor` | 文件系统监视器，git 会调用它 |
+| `diff.external` | 外部 diff 程序 |
+| `credential.helper` | 凭据助手，git 会执行它并把凭据交给它 |
+| `core.sshCommand` | 自定义 ssh 传输命令 |
+
+这五个都被**命令行覆盖**中和了——`git -c core.hooksPath=...` 这类参数优先于仓库配置。
+
+最值得称道的是最后一句：
+
+> Filters (clean/smudge via .gitattributes) and `remote.<name>.receivepack/uploadpack` have **no global override** and **remain a documented residual**.
+
+这两个没有命令行覆盖手段，所以**风险仍然存在**——注释把它明确记录下来而不是假装已经解决。这种"记录残留风险"的做法比声称"已全面防护"诚实得多，也让后来的人知道该往哪个方向继续加固。
+
+### 4.5 环境隔离与敏感文件拦截
+
+`_safe_environment()` 的 docstring 说明了为什么 git 子进程要单独构造环境：
+
+> Git may execute **repository-controlled** hooks, filters, and helpers. Those subprocesses **must not inherit provider credentials** or other service secrets owned by the Agent-Smith runtime.
+
+即使前面五道覆盖都做了，仍然可能有 git 执行外部程序的路径（比如那两个残留项）。**纵深防御**：就算它真的执行了什么，那个进程也读不到 API key。
+
+这和 [12 · MCP 集成](./12-MCP-集成.md) §3.1 的 MCP 子进程环境白名单是完全相同的思路——项目里凡是"要跑一个可能不受控的子进程"的地方，都用同一套 credential-free 环境。
+
+`GIT_PAGER` / `GIT_EDITOR` 被钉成 no-op：输出本来就走管道捕获，一个交互式分页器只会让进程挂起等输入。
+
+**暂存前的敏感文件拦截**用一条正则覆盖十一种形态：
+
+```python
+_SENSITIVE_PATTERNS = re.compile(
+    r"(?i)"
+    r"(^|/)\.env($|\.)"        # .env / .env.local
+    r"|(^|/)credentials"
+    r"|(^|/)secrets?"
+    r"|(^|/).*\.pem$"
+    r"|(^|/).*\.key$"
+    r"|(^|/).*_rsa$|(^|/).*_dsa$"
+    r"|(^|/)\.aws/|(^|/)\.ssh/"
+    r"|(^|/)id_rsa|(^|/)id_ed25519"
+)
+```
+
+每个分支都带 `(^|/)` 前缀——**必须是路径段的开头**，避免 `mysecrets_are_safe.txt` 这类文件名被误伤，也避免 `not-a.env-file` 绕过。`.env($|\.)` 同时匹配 `.env` 和 `.env.production`。
+
+这条防线针对的是一个很常见的失误：模型执行 `git add .` 时把 `.env` 一起提交了。它拦不住所有情况（自定义命名的密钥文件不在列表里），但覆盖了绝大多数默认命名。
+
+### 4.6 引用名校验
+
+```python
+_SAFE_REF = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,200}$")
+
+def _validate_ref(name: str) -> str | None:
+    if not name:
+        return "branch name is empty"
+    if not _SAFE_REF.match(name):
+        return f"branch name contains unsafe characters: {name!r}"
+    if ".." in name or name.endswith(".lock"):
+        return f"branch name is invalid: {name!r}"
+    return None
+```
+
+三层检查：
+
+| 检查 | 防的是 |
+|---|---|
+| 正则白名单 | 参数注入（尽管走 argv，但分支名会进入 refs 路径） |
+| **首字符必须是字母数字** | 以 `-` 开头的名字会被 git 当成选项 |
+| `".." not in name` | **路径穿越**——`refs/heads/../../hooks/post-commit` |
+| 不以 `.lock` 结尾 | git 用 `.lock` 后缀做锁文件，同名会破坏锁机制 |
+
+长度封顶 200 也在正则里（`{0,200}`）。
+
+`_validate_ref` 返回**错误消息或 `None`** 而不是布尔——调用方可以直接把消息回给模型，让它知道具体哪里不合法而不是笼统的"失败了"。这个小设计让模型有机会自己修正参数重试。
+
+`_redact_url_credentials()` 则处理输出侧：git 的错误消息里可能包含 `https://user:token@host/repo` 形式的远端地址，脱敏后才能进入会话记录和日志。这和 [12 · MCP 集成](./12-MCP-集成.md) §9.5 的 `_redact_url` 是同一类处理。
+
+---
+
 ## 5. 技能：16 个
 
 ### 5.1 判定标准与来源
@@ -479,6 +713,69 @@ flowchart TD
 ```
 
 **有测试断言这份声明和实际技能保持同步**——因为漏一条的后果是"开发环境能用，wheel 安装后这个技能消失"，而这类 bug 只有真正装一次才能发现。
+
+---
+
+### 5.1 16 个技能全表
+
+按 `SKILL.md` 行数排（行数大致反映了 SOP 的详细程度）：
+
+| 技能 | 行数 | 用途 |
+|---|---|---|
+| `tdd-workflow` | 466 | TDD 开发主流程，`tdd-development` 链的核心节点 |
+| `ecc-plan` | 213 | 把研究结论落成决定好的计划 |
+| `teach` | 140 | 解释与教学 |
+| `diagnosing-bugs` | 134 | 根因定位，条件触发（`coding_bugfix_needs_diagnosis`） |
+| `verification-loop` | 125 | 验证闭环，被两条链复用 |
+| `code-review` | 89 | 评审流程 |
+| `writing-great-skills` | 83 | **写技能的技能** |
+| `coding-architecture` | 33 | 架构判断 |
+| `coding-understanding` / `coding-planning` / `coding-implementation` / `coding-validation` | — | 编码四阶段 |
+| `grilling` / `grill-me` | — | 把模糊需求逼成明确需求 |
+| `research` | — | 需求调研 |
+| `edit-article` | — | 文章编辑 |
+
+`writing-great-skills` 是个有意思的存在——**技能系统用自己描述自己**。它降低了新增技能的门槛，也让技能的写法有一份可引用的标准。
+
+### 5.2 `SKILL.md` 的 frontmatter 契约
+
+```markdown
+---
+name: tdd-workflow
+description: Use this skill when writing new features, fixing bugs, or refactoring code. Enforces test-driven development with 80%+ coverage...
+---
+
+# Test-Driven Development Workflow
+...
+## When to Activate
+- Writing new features or functionality
+...
+```
+
+两个 frontmatter 字段是**注册的全部要求**：
+
+| 字段 | 用途 |
+|---|---|
+| `name` | 唯一标识，也是管线节点引用它的键 |
+| `description` | **进 prompt 第 6 层（Available Skills）**，模型靠它决定要不要加载 |
+
+`description` 的写法有讲究：它以 "Use this skill when..." 开头，直接告诉模型**触发条件**而不是描述内容。因为模型看到的只有这一句——正文要等技能被加载后才进上下文。一句描述不清楚触发条件的技能，等于没人会用它。
+
+正文里的 `## When to Activate` 段是第二道说明，在技能加载后再次确认适用场景。两层描述看似重复，作用不同：前者用于**选择**（在几十个技能里挑一个），后者用于**确认**（选中之后判断是不是真的适用）。
+
+### 5.3 技能与管线节点的关系
+
+管线的节点名和技能名一一对应，但**不是所有节点都必须有技能**。[CLAUDE.md](../../CLAUDE.md) 说明了这个设计：
+
+> A pipeline node falls back to generic ReAct when no matching `SKILL.md` is installed; **the gate still runs**, so the intermediate contract stays observable.
+
+节点缺技能时降级成普通 ReAct，**但门禁照常执行**。这意味着：
+
+- 技能是"怎么做"的建议，门禁是"做成什么样"的验收
+- 删掉一个技能不会让管线断掉，只会让那一步失去 SOP 指导
+- **契约（门禁）比实现（技能）更基础**
+
+这个分离让技能可以独立演进——改一个 `SKILL.md` 不需要动管线定义，也不会影响验收标准。
 
 ---
 
@@ -686,6 +983,85 @@ flowchart TD
 
 ---
 
+### 10.1 测试锁住了什么
+
+工具层的测试在 `engine/tests/tool/` 和 `engine/tests/safety/`，**196 个**：
+
+| 文件 | 数量 | 覆盖 |
+|---|---|---|
+| `test_tool_design_fixes.py` | 76 | 历次设计修复的回归 |
+| `test_tool_guard.py` | 57 | 硬守卫（见 [06 · 安全与安全边界](./06-安全与安全边界.md)） |
+| `test_execution_environment.py` | 21 | 子进程环境隔离 |
+| `test_web_crawl.py` | 10 | 抓取边界与 robots |
+| 其余 8 个文件 | 32 | 账本、PDF、git、快照、白名单 |
+
+### 10.1.1 网络工具：SSRF 的四个角度
+
+| 测试 | 锁住 |
+|---|---|
+| `web_fetch_rejects_local_network_targets` | localhost 与私有网段（§4.2） |
+| `web_fetch_rejects_non_public_addresses_and_non_web_ports` | 非公网地址 **+ 非 80/443 端口** |
+| **`web_fetch_rejects_redirects_to_local_network_targets`** | **重定向到本地网络同样拒绝** |
+| **`web_fetch_validation_does_not_stall_the_engine_event_loop`** | DNS 解析**不能卡住事件循环** |
+
+第三个是 §4.2 那张表没有覆盖的一层：初始 URL 是公网地址，服务端返回 302 指向 `http://169.254.169.254/`。**只在请求前检查一次是不够的**——每一跳重定向后都要重新验证。这是 SSRF 防护最常被漏掉的地方。
+
+第四个是工程约束而非安全约束：`socket.getaddrinfo` 是**阻塞调用**，直接在协程里调会把整个事件循环卡住（一个慢 DNS 就让所有并发请求停摆）。测试名里的 "does not stall the engine event loop" 就是在钉这一点——校验必须走线程池。
+
+### 10.1.2 敏感文件：四条假阳性与真阳性的分界
+
+| 测试 | 锁住 |
+|---|---|
+| `sensitive_system_file_is_classified_before_generic_path_boundary` | 敏感系统文件的分类**先于**通用路径边界判断 |
+| `case_variant_sensitive_file_reads_require_high_risk_approval` | **大小写变体**（`.ENV`、`Id_Rsa`）同样拦 |
+| `env_variant_and_stray_private_key_reads_require_high_risk_approval` | `.env.local` 这类变体、散落的私钥 |
+| **`documented_env_templates_remain_readable`** | **`.env.example` 这类模板必须可读** |
+
+最后一个是假阳性防护，和 [05 · 记忆系统](./05-记忆系统.md) §12.2 的"冠词必需"是同一类考虑：`.env.example` / `.env.template` 是**要提交进仓库、给人看的文档**，把它们也拦下来会让 Agent 连项目的配置说明都读不了。
+
+`sensitive_system_file_is_classified_before_generic_path_boundary` 说的是**判断顺序**：一个文件既可能命中"敏感文件"规则，也可能命中"路径超出工作区"规则。先按敏感文件分类，才能给出正确的风险等级和提示——反过来会把"你在读私钥"报成"你越界了"，用户看到的原因是错的。
+
+### 10.1.3 git：符号链接与凭据委派
+
+| 测试 | 锁住 |
+|---|---|
+| **`symlinked_git_dir_still_requires_high_risk_write_approval`** | `.git` 是符号链接时**仍然**要高风险审批 |
+| `symlinked_git_dir_still_gates_credential_bearing_config_read` | 符号链接的 `.git/config` 读取同样受控 |
+| `read_git_config_and_credentials_require_high_risk_approval` | 读 git 配置和凭据要审批（§4.4 的攻击面） |
+| `other_git_metadata_reads_stay_ordinary` | 其余 git 元数据读取**不要过度拦截** |
+| **`git_operations_do_not_delegate_runtime_secrets`** | git 子进程**拿不到运行时密钥**（§4.5） |
+| `git_worktree_creation_stays_under_the_selected_repository` | worktree 只能建在选定仓库下 |
+
+两个 `symlinked_git_dir` 测试针对的是一种规避手法：把 `.git` 做成指向别处的符号链接，让基于路径前缀的检查失效。这和 [13 · Common 基础设施](./13-Common-基础设施.md) §2.6 的逐段符号链接检查是同一类防护。
+
+`other_git_metadata_reads_stay_ordinary` 又是一条假阳性防线——读 `.git/HEAD` 看当前分支是完全正常的操作，不该弹审批。**只有 `config` 和凭据相关的才升级风险**。
+
+### 10.1.4 脱敏的一致性
+
+| 测试 | 锁住 |
+|---|---|
+| `audit_log_recursively_redacts_sensitive_argument_values` | **递归**脱敏嵌套参数 |
+| `audit_log_redacts_secret_flag_pairs_in_list_arguments` | 列表参数里的 `["--token", "xxx"]` 成对脱敏 |
+| **`sensitive_key_redaction_comes_from_the_shared_approval_source`** | 脱敏键来自**共享的单一来源** |
+| **`guard_and_approval_redact_the_same_argument_keys`** | **守卫和审批脱敏同一套键** |
+
+后两个是同一条约束的两面：脱敏规则**只能有一份**。如果守卫和审批各维护一张敏感键列表，两者迟早会分歧——用户在审批提示里看到 `token: ***`，而审计日志里却记着明文。
+
+`redacts_secret_flag_pairs_in_list_arguments` 处理的是命令行参数的特殊形态：`["git", "clone", "--config", "http.extraheader=Authorization: Bearer xxx"]`。密钥不在某个字段的值里，而在**列表的下一个元素**——按键名脱敏完全看不到，必须识别 flag/value 成对出现的模式。
+
+### 10.1.5 会话白名单不能扩到敏感区
+
+| 测试 | 锁住 |
+|---|---|
+| **`session_whitelist_extends_boundary_but_not_sensitive_blocks`** | 白名单能放宽**路径边界**，但放不宽**敏感文件拦截** |
+| `session_tool_whitelist_does_not_bypass_sensitive_paths` | 同上，从工具白名单角度 |
+
+用户可以在会话里授权 Agent 访问工作区之外的某个目录（放宽边界），但**这个授权不能顺带解除敏感文件保护**。两种限制是正交的：一个管"能去哪"，一个管"什么不能碰"。
+
+把它们混成一个开关是很自然的实现失误——都是"允许访问"嘛。这两个测试确保它们始终分开。
+
+---
+
 ## 11. 设计取舍
 
 **① 人格拆成四个文件，每个文件声明自己的边界。** 代价是要维护四份；收益是改"说话方式"不会误碰"完成标准"，而且预算裁剪能按层进行。
@@ -701,6 +1077,60 @@ flowchart TD
 **⑥ 白名单 fail-closed，代价是三处要同步。** 工具、身份、管线节点三级收窄，漏一处工具就不可见。
 
 **⑦ 上游技能要在 `instructions` 里被改造。** 直接用会得到一个假设了不同运行环境的节点。代价是每条管线的 `instructions` 都不短。
+
+---
+
+### 11.1 这一层的四条写作纪律
+
+`agents/` 是"数据不是代码"，但它的内容质量直接决定 Smith 的行为。四条纪律贯穿人格文件、技能、门禁。
+
+**① 写失败模式，不只写目标。** `role.md` 的六条反目标（§2.2）比六条原则更能约束行为——"不把本应由自己作出的低风险判断退回给用户"是可检验的，"要主动"不是。同理，`style.md` 的空话禁令列了具体黑名单而不是写"请简洁"：**模型能验证自己有没有说"很好的问题"，无法验证自己够不够简洁**。
+
+**② 穷举允许的例外，等于禁止其余。** `workflow.md` 只列三种"可以停下来确认"的情况（§2.4），言下之意是其余时候都要自己往前推。这比写"尽量不要频繁确认"有效得多——后者留下了无限的解释空间。
+
+**③ 声明自己的边界，包括自己会被裁剪。** 四份人格文件每一份第一行都写明"我管什么、不管什么"，其中 `style.md` 和 `toolbox.md` 还声明了"本层在预算紧张时会被裁剪，硬约束不要只写在这里"（§2.1）。**提示词文件写着自己在预算模型里的位置**，这样后来的人往里加内容时知道该不该加。
+
+**④ 同一条约束在多层重复。** "只有拿到成功证据才能报告完成"同时出现在 `toolbox.md`、`code-review.yaml`、`tdd-development.yaml`（§2.5）。这不是冗余——**"没做却说做了"是 Agent 最严重的失效模式**，重复约束是刻意的加固。
+
+这四条的共同点是：**约束要能被检验**。一条无法判断有没有遵守的指令，对模型和对人都等于没写。
+
+### 11.2 往这一层加东西之前先问三个问题
+
+**① 这个东西的判定标准是什么？** 加技能要有顶层 `SKILL.md`，加工具要同时有 `TOOL_META` 和 `execute`——否则它在目录里存在，但消费方根本看不见（§1.1）。加完之后用消费方的判据数一遍，别用 `ls`。
+
+**② 这个工具的安全元数据填对了吗？** 四个字段（§4.1）里最容易填错的是 `side_effect`：只要影响到本进程之外（网络写入、远端仓库、发消息），就是 `external` 而不是 `write`。填错的后果不是报错，而是审批和可观测性对这次调用的风险判断偏低。**不确定时往严格填**——`policy` 比 `never` 安全，`external` 比 `write` 安全。
+
+**③ 新工具的输入有多可信？** 路径参数要过路径校验，URL 参数要过 SSRF 检查，命令参数走 argv 不走 shell 拼接。§4.2–4.6 的每一道边界都对应一类曾经存在或可能存在的攻击面。工具是 Agent 唯一能影响外部世界的通道，**这一层的每个新增函数都是新的攻击面**。
+
+三个问题分别对应 `CLAUDE.md` 的计数纪律、`engine/tool/registry.py` 的注册契约、`engine/tests/tool/` 的 196 个测试。
+
+### 11.3 为什么这一层不被 import
+
+`agents/` 的所有 `.py` 文件都由工具注册表通过 `exec_module` 动态加载，**不走正常的 import**。这带来一条容易踩的约束，`CLAUDE.md` 写明了：
+
+> `agents/` imports nothing from other layers — the tool registry loads its `.py` files via `exec_module`, so the contract is `TOOL_META` + `execute`, **not types**. A path constant cannot be shared into it; **expect duplicated path derivation**.
+
+三个后果：
+
+| 后果 | 说明 |
+|---|---|
+| 契约是**字段**不是**类型** | 工具不继承任何基类，只要有 `TOOL_META` 和 `execute` 就能注册 |
+| **路径常量无法共享** | 不能 `from common.paths import PATHS`，每个工具自己推导路径 |
+| 重复代码是预期的 | 几个工具各有一份相似的路径推导逻辑，这不是待重构的技术债 |
+
+第二条是最反直觉的：明明有 `common/paths.py` 这个单一真相来源，工具却不能用。原因是 `exec_module` 加载的模块不在正常的包结构里，跨层 import 会破坏"`agents/` 不依赖任何层"这条边界——而这条边界正是让 `agents/` 保持"纯内容"的前提。
+
+代价是路径推导重复了几处，收益是这一层可以被整体替换、可以被用户自己的目录覆盖、可以在没有 `engine/` 的环境下单独检视。**为了一个更重要的性质，接受一处局部的重复**，是这套架构里反复出现的取舍方式。
+
+反过来说，如果哪天发现某个工具 `import` 了 `engine/` 的东西，那不是"优化"而是**边界被破坏了**——它会让这个工具无法在纯内容的语境下被理解和替换。
+
+### 11.4 这一层最容易被误解的三件事
+
+**① "人格"不是提示词工程技巧，是四份有边界声明的文档。** 很多项目把系统提示写成一大段文字，改的时候只能整段重读。这里拆成四份并让每份声明自己管什么（§2.1），带来的直接好处是：改说话方式只动 `style.md`，改流程只动 `workflow.md`，两者不会互相污染。**边界声明本身就是给未来的自己看的**。
+
+**② "身份"不是第二个 Agent。** `coding.yaml` 看起来像另一个 agent 的定义，实际上只是 Smith 的一份能力档案——它不拥有独立的运行进程、独立的会话、独立的记忆。这条在 `role.md` 的原则第 5 条、反目标第 2 条、`catalog.py` 的模块 docstring 里各声明了一次（§2.2、§3.1）。**三处重复说明这是个很容易被重新引入的误解**。
+
+**③ "技能"不是必需品。** 管线节点没有对应技能时降级成普通 ReAct，门禁照常跑（§5.3）。这意味着技能是**优化项**而非**依赖项**——加一个技能能让某一步做得更好，删掉它不会让流程断掉。理解这一点之后，写技能的心理负担会小很多：它不需要完美，只需要比没有它更好。
 
 ---
 
