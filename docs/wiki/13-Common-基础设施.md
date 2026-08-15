@@ -440,6 +440,109 @@ flowchart LR
 - `engine/observability/trace_store.py` —— 每次 run 一条链
 - `engine/safety/tool_guard.py` —— 装机级审计日志（`~/.agent-smith/audit.jsonl`）
 
+### 6.1 `append()` 的六个步骤
+
+```mermaid
+flowchart TD
+    A["append(record, sync=False)"] --> L["取 self._lock"]
+    L --> S1["_drop_stale_anchor()<br/>锚点比日志新是不可能的"]
+    S1 --> S2["_reload_if_externally_appended()<br/>文件比记忆中大就重载"]
+    S2 --> S3["_ensure_loaded()<br/>流式扫尾部拿 seq 和 prev_hash"]
+    S3 --> S4["组装 seq / prev_hash / hash"]
+    S4 --> S5["canonical_json 序列化并追加写"]
+    S5 --> S6{"sync"}
+    S6 -->|"是"| F["os.fsync"]
+    S6 -->|"否"| N["只 flush"]
+    F --> S7["更新 _prev_hash / _next_seq / _remember_size"]
+    N --> S7
+```
+
+**两条写路径**：
+
+```python
+handle = self.ensure_handle()
+if handle is not None:
+    handle.write(...); handle.flush()
+    if sync: os.fsync(handle.fileno())
+else:
+    fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, CHAIN_FILE_MODE)
+    ...
+    if created: self.path.chmod(CHAIN_FILE_MODE)
+```
+
+有长驻句柄时走句柄（高频场景，比如 trace），没有时走一次性 `os.open` + `O_APPEND`（低频场景，比如审计日志）。
+
+**新建文件时额外 `chmod`**——`os.open` 的 mode 参数同样会被 umask 削弱，和 `paths.py` 的处理一致。
+
+### 6.2 `legacy_linked` 标记
+
+```python
+if self._legacy_linked and self._next_seq == 1:
+    chained["legacy_linked"] = True
+```
+
+一个**在哈希链机制引入之前就存在的日志**，第一条链式记录会带上这个标记。这样校验时能区分"链从这里开始"和"链断了"。
+
+**兼容旧数据的正确做法是标注而不是假装**——把老日志当成没有前驱的新链，会让校验器无法判断中间是不是被删过。
+
+### 6.3 `seal()` 的顺序：先 fsync 日志，再写锚点
+
+```python
+"""The log is fsynced first so every previously appended record (including
+deferred-sync ones) is durable before the anchor names the head."""
+```
+
+```mermaid
+sequenceDiagram
+    participant S as seal()
+    participant L as audit.jsonl
+    participant A as audit.jsonl.head
+
+    S->>L: flush + fsync（含所有延迟同步的记录）
+    Note over L: 此刻日志里的每条记录都已落盘
+    S->>A: 写临时文件（O_EXCL）+ fsync
+    S->>A: os.replace 原子替换
+    S->>A: chmod 0600
+    S->>A: _fsync_directory(父目录)
+```
+
+**如果先写锚点再 fsync 日志**，一次断电可能留下"锚点说链头是第 100 条，但日志里只有 87 条"——一个**看起来像被回滚**的正常状态，会在下次校验时误报。
+
+而且没有句柄时也要 fsync（用 `O_RDONLY` 打开再 fsync），失败只记 warning 不抛——**封存尽力而为，但不能因为 fsync 失败就不写锚点**。
+
+### 6.4 锚点写入的五重保险
+
+```python
+temp = self.anchor_path.with_name(f".{self.anchor_path.name}.{uuid4().hex}.tmp")
+fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, CHAIN_FILE_MODE)
+... write + flush + fsync ...
+os.replace(temp, self.anchor_path)
+self.anchor_path.chmod(CHAIN_FILE_MODE)
+_fsync_directory(self.anchor_path.parent)
+```
+
+| 措施 | 防什么 |
+|---|---|
+| 临时文件名带 `uuid4()` | 两个进程同时封存时不撞名 |
+| `O_EXCL` | 临时文件必须是新建的，不复用别人的 |
+| 写完 `fsync` | 内容落盘后再替换 |
+| `os.replace` | 原子替换 |
+| **`_fsync_directory(parent)`** | **目录项本身落盘** |
+
+最后一条容易被漏掉：`os.replace` 改的是**目录项**，只 fsync 文件内容不保证这个改名操作本身持久。断电后可能出现"新文件内容在盘上但名字还是临时名"。
+
+### 6.5 `_ensure_loaded()` 的流式尾扫描
+
+docstring 里那条被测试固化的约束：
+
+> `_ensure_loaded` 通过**逐行流式**扫描文件尾部；它**绝不能**调用 `Path.read_text`（`test_trace_store_recovers_sequence_without_reading_the_whole_file` 把它 monkeypatch 成抛异常）。
+
+实现用 `collections.deque(maxlen=...)`——**只保留最后 N 行**，内存占用与文件大小无关。
+
+一个跑了几个月的审计日志可能有几百 MB，`read_text()` 会把它整个读进内存，而恢复链状态只需要最后一条记录。
+
+**有一个测试通过 monkeypatch 让 `read_text` 抛异常来固化这个约束**——这比注释可靠，因为注释不会在 CI 里失败。
+
 ---
 
 ## 7. 参数速查
