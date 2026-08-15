@@ -138,7 +138,9 @@ Dependencies flow one way: `server → engine → common`. The engine never impo
 
 ## Documentation
 
-从 [文档入口](docs/README.md) 开始；写作与图示规范见 [00 · 文档阅读指南与表达规范](docs/00-文档阅读指南与表达规范.md)。当前实现以源码和测试为准，调研及历史方案不代表已支持的功能。
+**设计文档从 [docs/wiki/](docs/wiki/README.md) 开始** —— 14 篇按子系统组织的详细文档（技术选型、架构、参数、取舍），全部以源码为准。
+
+`docs/` 根目录下的 `00`–`11` 是更早的一版，未随重构同步；写作与图示规范见 [00 · 文档阅读指南与表达规范](docs/00-文档阅读指南与表达规范.md)。当前实现以源码和测试为准，调研及历史方案不代表已支持的功能。
 
 ## Development
 
