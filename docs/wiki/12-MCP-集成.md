@@ -196,6 +196,128 @@ _STDIO_DEAD_CONNECTION_MESSAGES = frozenset({
 
 ---
 
+## 4.5 三个 JSON-RPC 方法
+
+Agent-Smith 只用 MCP 协议的一个子集：
+
+| 方法 | 类型 | 用途 |
+|---|---|---|
+| `initialize` | 请求 | 握手，协商协议版本 |
+| `notifications/initialized` | 通知 | 握手完成 |
+| `tools/list` | 请求 | 发现工具，支持游标分页 |
+| `tools/call` | 请求 | 调用工具 |
+
+**没有实现的**：`resources/*`、`prompts/*`、`sampling/*`、以及任何 server → client 的主动请求。
+
+### 4.5.1 握手
+
+```mermaid
+sequenceDiagram
+    participant C as MCPClient
+    participant T as Transport
+    participant S as MCP Server
+
+    C->>T: connect()
+    T->>S: 建立 stdio 子进程或 HTTP 连接
+    C->>S: initialize<br/>protocolVersion 2025-11-25<br/>capabilities {}<br/>clientInfo agent-smith/0.2.0
+    S-->>C: protocolVersion
+    C->>C: 校验：必须是字符串且在 4 个支持版本里
+    alt 版本不支持
+        C->>C: RuntimeError
+        C->>T: close()（并吞掉关闭时的异常）
+        C-->>C: 向上抛出原始错误
+    else 版本 OK
+        C->>S: notifications/initialized
+        C->>C: log.info 连接成功
+    end
+```
+
+两个细节：
+
+**① `capabilities: {}`。** 客户端**不声明任何能力**——因为它不处理 server 发起的请求（sampling、roots 之类）。声明了却不实现比不声明更糟。
+
+**② 握手失败时先关传输再抛。**
+
+```python
+except BaseException:
+    try:
+        await self.close()
+    except BaseException:
+        log.warning("failed to close MCP transport after connect failure", exc_info=True)
+    raise
+```
+
+**关闭时的异常被吞掉并记日志**，因为原始的连接错误才是用户要看的那个。如果 `close()` 抛出，它会替换掉真正的失败原因。
+
+### 4.5.2 `tools/list` 的游标分页
+
+```python
+cursor: str | None = None
+seen_cursors: set[str] = set()
+for _page in range(MAX_MCP_TOOL_LIST_PAGES):
+    result = await self._send("tools/list", {"cursor": cursor} if cursor else {})
+    ...
+    next_cursor = result.get("nextCursor")
+    if not isinstance(next_cursor, str) or not next_cursor:
+        return tools                                     # 正常结束
+    if next_cursor in seen_cursors:
+        raise RuntimeError("MCP tools/list returned a repeated cursor")   # 环
+    seen_cursors.add(next_cursor)
+    cursor = next_cursor
+raise RuntimeError(f"MCP tools/list exceeded maximum page limit ({MAX_MCP_TOOL_LIST_PAGES})")
+```
+
+**两道独立的防线**：
+
+| 防线 | 防什么 |
+|---|---|
+| `seen_cursors` | server 返回一个**重复的游标**——分页环 |
+| 100 页上限 | server 每页返回一个**新**游标，永不结束 |
+
+只有页数上限挡不住环（环会在上限内跑满 100 页才报错，而且报的是错误的原因）；只有 `seen_cursors` 挡不住"每页都给新游标"的无限分页。
+
+### 4.5.3 逐工具的宽容校验
+
+```python
+for t in result.get("tools", []):
+    if not isinstance(t, dict):
+        continue                                    # 静默跳过
+    name = t.get("name")
+    if not isinstance(name, str) or not name:
+        continue                                    # 静默跳过
+    description = t.get("description", "")
+    input_schema = t.get("inputSchema", {})
+    if not isinstance(description, str) or not isinstance(input_schema, dict):
+        log.warning("Skipping MCP tool with invalid metadata: %s", name)
+        continue                                    # 记日志后跳过
+```
+
+**三级处理**：
+
+- **不是对象 / 没有名字** → 静默跳过（连名字都没有，日志也没法写有用的信息）
+- **元数据类型不对** → 记 warning 再跳过（有名字，能写进日志让人排查）
+- **其余** → 收下
+
+**一个坏工具不让整个 server 的工具列表失败。** 这和 §7 的"一个坏 server 不影响其余的"是同一条原则的不同粒度。
+
+### 4.5.4 `tools/call` 的错误约定
+
+```python
+result = await self._send("tools/call", {"name": name, "arguments": arguments})
+content = _content_to_text(result.get("content", []))
+if result.get("isError") is True:
+    raise MCPToolError(content or f"MCP tool failed: {name}")
+return content
+```
+
+MCP 的工具错误**不是 JSON-RPC 错误**，而是一个成功响应里 `isError: true`。所以要显式检查这个字段，否则一个失败的工具调用会被当成成功并把错误信息返回给模型当结果。
+
+`isError` 的判定用 `is True` 而不是真值判断——一个 `"false"` 字符串不该被当成错误。
+
+`_content_to_text()` 把 MCP 的 content 块数组（可能含 text、image、resource 等类型）压成一段文本。
+
+---
+
 ## 5. 工具名归一化
 
 MCP server 的工具名可以是任意字符串，但 provider 的函数名有格式和长度限制（实测踩过 **113 字符的工具名超出 provider 限制**）。
@@ -381,6 +503,75 @@ def _parse_json_object(payload: str, *, label: str) -> dict[str, Any]:
 | 撞名后缀 | sha1(原名) 前 8 位 |
 | 子进程环境变量白名单 | 6 个 |
 | 传输实现 | stdio、Streamable HTTP |
+
+---
+
+## 10.5 两种传输的对比
+
+| 维度 | stdio | Streamable HTTP |
+|---|---|---|
+| 连接形态 | 子进程（`asyncio.create_subprocess_exec`） | `httpx` 客户端 |
+| 消息帧 | **逐行 JSON**（无长度前缀） | HTTP body 或 SSE 事件 |
+| 会话标识 | 进程本身 | `Mcp-Session-Id` 响应头 |
+| 超限后果 | **整条传输永久报废** | 单次请求失败，连接可复用 |
+| 死连接信号 | stdout EOF | HTTP 错误 / 会话过期 |
+| 环境隔离 | 6 个环境变量白名单 | 不适用 |
+| stderr 处理 | `_drain_stderr()` 单独排空 | 不适用 |
+| 杀进程后的收尾 | `_drain_stdout_after_kill()` | 不适用 |
+| 典型部署 | 本机 npm/pip 包 | 远端服务 |
+
+### 10.5.1 stdio 特有的两个排空函数
+
+```python
+@staticmethod
+async def _drain_stderr(stream: asyncio.StreamReader) -> None: ...
+
+@staticmethod
+async def _drain_stdout_after_kill(process: asyncio.subprocess.Process) -> None: ...
+```
+
+**`_drain_stderr`**：MCP server 的 stderr 是日志通道。不排空它，管道缓冲区满了之后**子进程会在写日志时阻塞**——一个只是话多的 server 会变成一个挂住的 server。
+
+**`_drain_stdout_after_kill`**：杀进程后要把 stdout 里剩下的数据读完再关，否则子进程可能在 `write()` 上收到 SIGPIPE 而不是干净退出。
+
+这两个函数是"和子进程打交道"的标准税，和 Shell 侧处理 `uv run uvicorn` 的进程组信号属于同一类。
+
+### 10.5.2 HTTP 的会话粘连
+
+```python
+def _capture_session(self, headers: Any) -> None: ...
+def _request_headers(self, *, accept: str, include_protocol: bool) -> dict[str, str]: ...
+```
+
+Streamable HTTP 的 server 可以在响应里给一个 `Mcp-Session-Id`，之后的请求都要带上它。`_capture_session()` 抓这个头，`_request_headers()` 在后续请求里回填。
+
+`include_protocol` 参数控制要不要带协议版本头——**握手请求本身不能带**（那时还没协商出版本），之后的请求要带。
+
+`MCPSessionExpiredError` 对应 server 让会话失效的情况：这时要**重新初始化**而不是当成普通错误重试。
+
+---
+
+## 10.6 接一个 MCP server 的实操
+
+```mermaid
+flowchart TD
+    A["1. 在 ~/.agent-smith/agent/config.yaml<br/>的 mcp_servers 里加一条"] --> B["2. 重开会话（连接是会话级的）"]
+    B --> C["3. /mcp 查看是否连上、注册了哪些工具"]
+    C --> D{"连上了吗"}
+    D -->|"否"| E["看 server 日志<br/>连接错误会被 logger.exception 记下"]
+    D -->|"是"| F{"工具名对吗"}
+    F -->|"被改名了"| G["清洗规则：非 [A-Za-z0-9_] 变 _<br/>超 64 字符截断加哈希<br/>撞名加哈希后缀"]
+    F -->|"对"| H["模型现在能调它们了"]
+```
+
+四个常见问题：
+
+| 症状 | 原因 |
+|---|---|
+| server 连上了但工具名很怪 | 名字被清洗/截断/去重了，见 §5 |
+| 某个工具完全没出现 | 名字清洗后变成空字符串（比如全是中文或符号） |
+| 改了配置没生效 | 连接是**会话级**的，要开新会话或让池驱逐 |
+| server 挂住不返回 | 600 秒墙钟会终结它，但那之后传输报废需重连 |
 
 ---
 
