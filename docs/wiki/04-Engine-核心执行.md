@@ -920,6 +920,159 @@ flowchart TD
 
 ---
 
+### 7.1 运行状态机：`run_state.py`
+
+`engine/execution/orchestration/run_state.py`（790 行）持久化一次运行的生命周期。它是崩溃恢复、续跑、审批暂停三件事共同的基础。
+
+### 7.1.1 七个状态与转移表
+
+```python
+class RunStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+```
+
+转移**不是随意的**，`_ALLOWED_TRANSITIONS` 把合法路径写死：
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> running
+    queued --> failed
+    queued --> cancelled
+    running --> running
+    running --> waiting_approval
+    running --> completed
+    running --> incomplete
+    running --> failed
+    running --> cancelled
+    waiting_approval --> running
+    waiting_approval --> failed
+    waiting_approval --> cancelled
+    incomplete --> running
+    failed --> running
+    cancelled --> running
+    completed --> completed
+```
+
+几条关键规则：
+
+| 规则 | 含义 |
+|---|---|
+| **`COMPLETED` 只能转到自己** | 唯一的真终态。**完成的运行不能续跑**——否则会产生第二份回复 |
+| `INCOMPLETE` / `FAILED` / `CANCELLED` **可以回到 `RUNNING`** | 这就是续跑的实现。对应 [09 · Server API 层](./09-Server-API层.md) §4.7 第 3 条校验 |
+| `RUNNING → RUNNING` 允许 | 幂等更新，同一状态重复写入不报错 |
+| `WAITING_APPROVAL` **不能直接到 `COMPLETED`** | 必须先回 `RUNNING`。审批通过后还要真的执行工具，不能跳过 |
+| `QUEUED` **不能直接到 `COMPLETED`** | 没跑过就不可能完成 |
+| 每个终态都能转到自己 | 重复写入终态是幂等的，崩溃恢复时可以安全重放 |
+
+用**显式的转移表**而不是在每个方法里写 `if` 判断，好处是所有合法路径在一处可见，且非法转移抛的是有类型的 `RunStateTransitionError` 而不是某个业务方法内部的断言失败。
+
+三个异常也有层次：
+
+```python
+class RunStateError(RuntimeError): ...             # 基类：状态无效或读不出来
+class RunStateTransitionError(RunStateError): ...  # 试图跳过或离开非法状态
+class RunScopeMismatchError(RunStateError): ...    # 续跑请求不属于这个 run
+```
+
+调用方可以只 `except RunStateError` 一次接住全部，也可以分开处理——续跑时区分"状态不对"（可能可以等）和"根本不是你的 run"（永远不行）很有价值。
+
+### 7.1.2 `RunScope`：续跑必须证明身份
+
+```python
+class RunScope:
+    @classmethod
+    def from_state(cls, state: RunState) -> "RunScope": ...
+    def mismatched_fields(self, state: RunState) -> list[str]: ...
+```
+
+续跑请求带一个 `RunScope`，`resume()` 会用它和持久化的状态比对。不匹配就抛 `RunScopeMismatchError`。
+
+`mismatched_fields()` 返回的是**列表而不是布尔**——错误消息里能说清到底哪几个字段对不上（agent_id？session_id？identity_id？）。这个设计和 [13 · Common 基础设施](./13-Common-基础设施.md) §6.6 里 `verify_chain` 返回具体失败原因是同一种考虑：**校验失败时，"哪里不对"比"不对"有用得多**。
+
+### 7.1.3 损坏的状态文件留给操作员
+
+```python
+# A torn or edited state file must not abort startup recovery
+# of every other run.  Leave it untouched for the operator
+# rather than silently writing a second copy over it.
+```
+
+启动恢复要遍历所有 run 的状态文件。其中一个损坏了（写到一半崩溃、或被手工编辑过），三种处理方式：
+
+| 做法 | 后果 |
+|---|---|
+| 抛异常中止 | **一个坏文件让所有 run 都恢复不了** |
+| 静默覆盖成默认值 | 证据被销毁，操作员再也查不清发生了什么 |
+| **跳过并留着不动** ✓ | 其余 run 正常恢复，坏文件保留供人工检查 |
+
+第三种是这里的选择。它和 [10 · 可观测性与诊断](./10-可观测性与诊断.md) §10.1 分支①"隔离损坏的 trace"是同一条原则：**坏数据要被隔离，不能被清理掉**——清理等于销毁现场。
+
+### 7.1.4 高频事件不落盘
+
+```python
+_HIGH_FREQUENCY_STREAM_EVENTS = frozenset({
+    EventType.RAW_RESPONSE_EVENT,
+    EventType.PROVISIONAL_TEXT_DELTA,
+})
+```
+
+运行状态每记录一个事件就要写一次文件。但这两种事件在流式响应里**每秒可能来几十上百个**——逐个同步会让磁盘成为瓶颈，而它们对"这个 run 处于什么状态"没有任何贡献。
+
+它们被排除在同步写之外。这和 [13 · Common 基础设施](./13-Common-基础设施.md) §6.11 里 `sync=False` 的延迟同步是配套的取舍：**高频、低价值的记录走宽松路径，状态转移走严格路径**。
+
+### 7.1.5 两个有界化函数
+
+```python
+def _bounded_text(value: object | None, *, limit: int = 200) -> str | None: ...
+def _bounded_error_details(value: object) -> dict[str, object] | None: ...
+```
+
+状态文件里的文本字段（reason、错误详情）**限长 200 字符**。理由和 [11 · Shell 终端 UI](./11-Shell-终端UI.md) §5.8.3 的 2 000 字符上限一样：错误详情可能包含模型的长输出或一整个异常栈，不限长会让一个状态文件涨到几 MB，而它每次状态转移都要重写一遍。
+
+`_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")` 则是路径安全——run_id 直接参与构造文件路径，不校验就可能出现 `../../etc/passwd` 这样的 id。字符集只允许字母数字和两个符号，长度封顶 128。
+
+### 7.1.6 审批恢复只增一次序号
+
+```python
+# resolve_approval_if_waiting records the event and clears the
+# pending approval atomically, so returning here keeps one source
+# TOOL_CALL_RESULT at exactly one event_seq increment.  No
+# clear_tool is needed on this path: request_approval already
+# cleared current_tool when the approval was raised, and no
+# TOOL_CALL_START is re-emitted for the resumed call.
+```
+
+这段注释描述的是一个容易写重的地方。审批通过之后：
+
+1. 要记录 `TOOL_CALL_RESULT` 事件
+2. 要清掉挂起的审批
+3. 要更新 `event_seq`
+
+三件事必须**原子完成且只让序号加一次**。如果分开做，一次 `TOOL_CALL_RESULT` 会让序号加两次——而序号是事件流的排序依据，加错了会让恢复时的事件顺序错乱。
+
+注释后半段解释了为什么这条路径**不需要** `clear_tool`：`request_approval` 在挂起审批时已经清过 `current_tool`，而恢复的调用不会重新发 `TOOL_CALL_START`。写一个多余的 `clear_tool` 不会报错，但会再动一次状态——在一个要求"恰好一次"的路径上，多余的操作就是 bug 的温床。
+
+### 7.1.7 状态控制失败不能拖垮执行
+
+```python
+# Run control state must not take down an otherwise valid execution.
+```
+
+这条和 [10 · 可观测性与诊断](./10-可观测性与诊断.md) §10.5 的"可观测性失败不能让运行失败"是同一个方向，但对象不同：这里是**运行控制状态**。
+
+状态文件写不进去（磁盘满、权限问题），运行本身仍然是有效的——模型在正常工作、工具在正常执行、用户在正常收到回复。此时因为记不下状态就中止执行，是把一个"事后无法恢复"的问题升级成了"当下就用不了"。
+
+代价是崩溃后这个 run 可能恢复不了。但这个取舍方向很明确：**已经在跑的任务，让它跑完。**
+
+---
+
 ## 8. 技能子系统
 
 `engine/skill/`（829 行）：注册、加载、执行、启停。
@@ -1000,6 +1153,83 @@ flowchart TD
 
 ---
 
+### 8.5 Hook 的动态加载
+
+`engine/execution/hooks/tool/loader.py`（314 行）把 `hooks.yaml` 里的声明变成活的 hook 实例。它是"引擎提供框架、agents 提供实现"这条边界的实际执行者。
+
+### 8.5.1 一条 hook 声明
+
+```yaml
+pre_hooks:
+  - id: config-protection
+    module: agents/smith/hooks/config_protection.py
+    class: ConfigProtectionHook
+    enabled: true
+    priority: 10
+```
+
+四个字段各有用处：`module` + `class` 定位实现，`enabled` 控制开关，`priority` 决定 Pre hook 的执行顺序（数字越小越先跑）。
+
+### 8.5.2 三级路径解析
+
+```python
+# 如果是相对路径，尝试相对于配置文件目录解析
+#   先尝试相对于项目根目录（本文件位于
+#   engine/execution/hooks/tool/loader.py，向上 5 级到达仓库根）
+#   再尝试相对于配置文件目录
+```
+
+`module` 写的是相对路径时，按三个基准依次尝试：
+
+| 顺序 | 基准 | 适用 |
+|---|---|---|
+| 1 | 绝对路径 | 用户写了完整路径 |
+| 2 | **项目根**（从 loader.py 上溯 5 级） | 内建 hook：`agents/smith/hooks/xxx.py` |
+| 3 | **配置文件所在目录** | 用户 hook：放在 `~/.agent-smith/` 旁边 |
+
+第二条那个"向上 5 级"是硬编码的相对深度，注释特意把推导写出来了——`engine/execution/hooks/tool/loader.py` 上溯 5 层正好是仓库根。这类基于文件位置的路径推导很脆弱（移动文件就会坏），所以注释必须说明它数的是什么，否则下一个人重构目录结构时不会意识到这里有依赖。
+
+### 8.5.3 类型校验在实例化之前
+
+```python
+hook_class = self._load_hook_class(module_path, class_name, config_dir)
+if not hook_class:
+    return None
+if not issubclass(hook_class, PreToolHook):
+    logger.error("Class %s is not a PreToolHook subclass", class_name)
+    return None
+hook_instance = hook_class()
+```
+
+顺序是**加载类 → 校验基类 → 才实例化**。三个 `_load_*_hook` 方法结构完全相同，只是校验的基类不同（`PreToolHook` / `PostToolHook` / `StopHook`）。
+
+先校验后实例化很重要：一个不符合协议的类被实例化时可能有副作用（构造函数里连数据库、起线程），而它最终还是会被拒绝。先看类型，不合格就根本不构造。
+
+这里用的是 `issubclass` 而非 `Protocol`——和 [07 · LLM 集成](./07-LLM-集成.md) §2.4 的选择相反。原因是场景不同：hook 是**用户提供的扩展**，明确继承一个基类能让用户从 IDE 得到方法签名提示，也让"你漏实现了某个方法"在加载时就报错；而 LLM 客户端的包装器需要的是"不继承也能顶替"的灵活性。
+
+### 8.5.4 每一步失败都只跳过这一个 hook
+
+三个加载方法里，任何一步失败（缺 `module`、缺 `class`、类加载不出来、基类不对）都是 `logger.error` + `return None`，**不抛异常**。
+
+这意味着：一个写错的 hook 配置不会让整个引擎起不来，其余 hook 照常加载。这和 [12 · MCP 集成](./12-MCP-集成.md) §9 的"一个坏 server 不影响其余"是同一条隔离原则。
+
+代价是配置写错时只有日志里有线索——所以每条错误消息都带上了 `hook_def.get("id")` 或 `class_name`，让人能直接定位到 yaml 里的哪一条。
+
+加载结束后调 `registry.list_registered_hooks()` 汇总日志，这是确认"我配的 hook 到底生效了没有"的唯一途径。
+
+### 8.5.5 两层配置来源
+
+`preparation.py` 先加载 `agents/smith/hooks.yaml`（内建），再加载 `~/.agent-smith/hooks.yaml`（用户）。**用户配置后加载**，所以：
+
+- 用户可以新增 hook
+- 用户的 hook 排在内建 hook 之后注册
+
+但 Pre hook 的实际执行顺序由 `priority` 决定而非注册顺序——所以用户 hook 可以通过设一个小的 `priority` 插到内建 hook 前面。这个设计让用户能在配置保护、事实门这些内建检查**之前**插入自己的逻辑，是有意留的扩展点。
+
+需要注意的是它**不能覆盖非 hook 的安全边界**：`tool_guard.py` 是不可绕过的硬守卫，不在 hook 体系里（见 [06 · 安全与安全边界](./06-安全与安全边界.md)）。hook 能做的只是在守卫**之外**再加一层拦截，不能拆掉守卫本身。
+
+---
+
 ## 9. 参数速查
 
 ### ReAct
@@ -1062,6 +1292,20 @@ flowchart TD
 **④ 确定性优先。** 假最终回答用正则不用模型，门禁先跑启发式再跑 LLM，路由纯词法。模型只在确定性方法真的做不了的地方出现。
 
 **⑤ 该省的地方省。** 懒加载工具 schema、稳定前缀缓存、门禁走便宜模型路由、工具输出截断落盘——四个不同的省钱手段，都不牺牲正确性。
+
+---
+
+### 10.1 改这一层之前先问三个问题
+
+**① 这个改动会不会改变 prompt 的稳定前缀？** §2.4 的前缀缓存按**字节前缀**匹配，第一个易变层就终结了前缀。在第 1–10 层里插入任何内容、或给某个前置层加上易变的 `source`/`load_reason`，都会让缓存边界前移——命中率下降是静默的，只会表现为账单变高和首字延迟变长。加层时优先往第 11 层之后放。
+
+**② 这个改动会不会让某个状态转移变成非法？** §7.1.1 的转移表是全局约束。新增一条"直接标记完成"的快捷路径听起来无害，但 `QUEUED → COMPLETED` 是被明确禁止的——它会让一次从未真正执行的运行看起来成功了。改转移表要连带检查续跑（三个可回 `RUNNING` 的状态）和审批（`WAITING_APPROVAL` 必须先回 `RUNNING`）两条路径。
+
+**③ 这个改动在硬守卫之前还是之后？** 工具执行路径上有明确的次序：`tool_guard`（不可绕过）→ `fact_gate`（只挑战）→ `PreToolHook`（可拦截）。新增的检查放在哪一层决定了它能不能被配置关掉。**安全边界必须进守卫，不能做成 hook**——hook 是可配置的，而可配置就意味着可以被关掉。项目里有一个测试专门锁住"守卫先于挑战"这个次序。
+
+三个问题分别对应 `engine/tests/context/`、`engine/tests/execution/` 与 `engine/tests/safety/` 三组测试。这一层的改动几乎总会牵动其中至少一组——它是四个子系统的交汇点，也是整个引擎里最不适合"顺手改一下"的地方。
+
+最后一条经验：**这一层的很多常量看起来可以调，实际上都编码了某个具体的失败**。60 次迭代上限、40/28/2 的对话裁剪档位、200 字符的状态文本上限、16 层的顺序——每一个背后都有一次"不这样会怎样"的判断，大多写在了紧邻的注释里。调整之前先把那段注释读完，它通常已经回答了你正准备提出的问题。
 
 ---
 
