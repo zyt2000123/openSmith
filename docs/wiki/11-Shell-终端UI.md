@@ -296,11 +296,239 @@ export function closeLatestTurn(entries: TranscriptEntry[]): TranscriptEntry[]
 
 ---
 
-## 6. 后端进程生命周期
+## 6. 输入路由：19 个处理器的责任链
+
+`input.ts`（475 行）把按键处理拆成 19 个独立函数，`routeInput()` 按顺序调用，**每个返回 `boolean` 表示"我处理了，别再往下传"**。
+
+```mermaid
+flowchart TD
+    K["一次按键"] --> R["routeInput(input, key, options)"]
+    R --> H1["handleCtrlC<br/>中断当前运行"]
+    H1 -->|"未处理"| H2["handleViewToggle<br/>Ctrl+O 切紧凑/全文"]
+    H2 -->|"未处理"| H3["handleApprovalInput<br/>审批面板按键"]
+    H3 -->|"未处理"| H4["handleModelPickerInput"]
+    H4 -->|"未处理"| H5["handleSlashNavigation<br/>命令面板上下选"]
+    H5 -->|"未处理"| H6["handleSkillMention*<br/>@技能 补全"]
+    H6 -->|"未处理"| H7["handleSkills* / handleSkillActions*<br/>handleSkillToggle"]
+    H7 -->|"未处理"| H8["handleHooks*"]
+    H8 -->|"未处理"| H9["handleEscape"]
+    H9 -->|"未处理"| H10["handleQueuedEdit<br/>编辑排队中的消息"]
+    H10 -->|"未处理"| H11["handleHistoryNavigation<br/>↑↓ 翻输入历史"]
+    H11 -->|"未处理"| T["落到文本输入"]
+
+    style R fill:#e3f2fd
+```
+
+**责任链而不是一个大 switch** 的收益是可测性：`input.test.ts` 有 570 行，每个 handler 都能被单独喂一个按键断言返回值。
+
+### 6.1 面板导航是一套重复的模式
+
+`handleSlashNavigation` / `handleSkillsNavigation` / `handleHooksNavigation` / `handleSkillMentionNavigation` 结构几乎一样——上下移动一个索引。对应 `store.ts` 里四个独立的索引字段：
+
+```typescript
+slashIndex: number;
+skillsIndex: number;
+skillActionIndex: number;
+hooksIndex: number;
+skillMentionIndex: number;
+```
+
+**每个面板一个索引**而不是共享一个"当前选中项"，因为面板可以嵌套（技能列表 → 技能操作），共享索引会在返回时丢掉位置。
+
+`list-navigation.ts`（64 行）抽出了共同的"上下 + 环绕"逻辑。
+
+### 6.2 输入历史的三个字段
+
+```typescript
+inputValue: string;
+inputHistory: string[];
+historyIndex: number;
+historyDraft: string;      // ← 关键
+```
+
+`historyDraft` 存的是**开始翻历史之前用户正在写的那一行**。没有它，用户按 ↑ 看了一眼历史再按 ↓ 回来，自己写了一半的内容就没了。
+
+`exitHistoryBrowsing(state)` 是显式的退出函数——任何非导航按键都要调它，把 `historyIndex` 复位。
+
+历史持久化在 `~/.agent-smith/shell_history.json`。
+
+### 6.3 一条注释里的坑
+
+```typescript
+// The data-backed panels load through the bridge; setting `panel` alone would
+// strand them on their loading placeholder with no request behind it.
+```
+
+`tokens` / `runs` 这类面板需要先发请求。**只改 `panel` 状态会让它永远停在"加载中"**——因为没有任何东西去发那个请求。所以打开这类面板必须走 bridge 的方法而不是直接 `set({panel: "tokens"})`。
+
+---
+
+## 7. 状态容器：一个扁平的 `AppState`
+
+`store.ts` 的 `AppState` 有 **45 个字段**，全部扁平。没有嵌套的 `ui.panels.skills.index` 这种结构。
+
+按用途分组：
+
+| 组 | 字段 |
+|---|---|
+| 模式与面板 | `mode`、`panel`、`viewMode` |
+| 连接与配置 | `baseUrl`、`config`、`agent` |
+| 数据缓存 | `sessions`、`skills`、`mcpServers`、`tokenStats`、`observability*` |
+| 会话记录 | `transcript`、`transcriptEpoch`、`turnCount` |
+| 用量 | `turnTokenUsage`、`tokenUsage`、`contextUsage`、`tokenTab` |
+| 运行态 | `busy`、`compressing`、`inputLocked`、`runStartedAt`、`recoverableRunId` |
+| 审批 | `pendingApproval`、`approvalIndex`、`approvalResolving`、`lastToolCallId` |
+| 输入 | `inputValue`、`inputHistory`、`historyIndex`、`historyDraft`、`statusLine` |
+| 面板索引 | 五个 `*Index` |
+| 配置向导 | `setupDraft`、`setupFlow`、`setupIndex` |
+| 其它 | `pendingSkill`、`queuedMessages`、`modelPicker`、`selectedModelProfile`、`welcomeNotice` |
+
+四个字段带着解释性注释，都是"不写下来就会被删掉"的那种：
+
+| 字段 | 注释 |
+|---|---|
+| `transcriptEpoch` | 会话记录被整体替换时递增——**重挂 `<Static>`** |
+| `turnTokenUsage` | 当前这条用户消息**及其 Agent 工作**累积的用量 |
+| `recoverableRunId` | 最后一个未完成的运行，**留着让断开的 Shell 能恢复它** |
+| `lastToolCallId` | 其结果**可能落定挂起审批**的那次工具调用 |
+
+最后一个尤其微妙：审批面板要知道"我等的那个工具调用回来了没有"，而工具结果事件和审批解析是两条独立的路径。
+
+### 7.1 十个 action
+
+```typescript
+set · pushSystemLine · pushHistory · pushTurn · applyEvent
+closeTurn · interruptTurn · resetChat · clearChat · startFreshSession · hydrate
+```
+
+`resetChat` / `clearChat` / `startFreshSession` **三个都是"开新的"，但语义不同**：
+
+| action | 服务端 | 本地历史 |
+|---|---|---|
+| `startFreshSession`（`/new`） | 建新会话 | 保留（进 scrollback） |
+| `clearChat`（`/clear`） | **删掉**当前会话 | 清空 |
+| `resetChat` | — | 清空（内部用） |
+
+---
+
+## 8. 配置向导
+
+`setup.ts`（412 行）驱动首次配置和 `/config`。
+
+### 8.1 两套字段集
+
+```typescript
+export const INITIAL_SETUP_FIELDS = [...]   // 首次配置：最小必需
+export const SETUP_FIELDS = [...]           // /config advanced：全部
+export type SetupField = (typeof INITIAL_SETUP_FIELDS)[number] | (typeof SETUP_FIELDS)[number];
+```
+
+`setupFields(flow)` 按 `flow`（`"initial"` / `"advanced"`）返回对应的字段列表。
+
+**首次配置只问最少的问题**——一个上来就要填 13 个字段的向导会把人劝退。
+
+### 8.2 API Key 的三态显示
+
+```typescript
+export function isApiKeySetupField(field: SetupField): boolean
+export function hasStoredApiKey(config: LlmConfig | null, field: SetupField): boolean
+
+const ROUTE_SECRET_FIELDS = ["interactive_api_key", "gate_api_key", "background_api_key"]
+```
+
+因为 `api_key` 是**只写不读**的（见 [07 · LLM 集成](./07-LLM-集成.md) §2.2），配置读回来时这个字段永远是空的。于是向导要区分三种状态：
+
+```mermaid
+flowchart LR
+    A["读配置"] --> B{"hasStoredApiKey"}
+    B -->|"是，且用户没输入"| C["显示：已保存，留空则不变"]
+    B -->|"是，用户输入了新值"| D["提交新值"]
+    B -->|"否"| E["显示：未设置"]
+```
+
+不做这个区分，用户每次进 `/config` 都会看到一个空的 API Key 框，以为自己没配过。
+
+### 8.3 `PROVIDER_PRESETS` 与 `setProvider`
+
+```typescript
+export const PROVIDER_PRESETS = {...}
+export function setProvider(draft: SetupDraft, value: string): SetupDraft | null
+```
+
+选 provider 时自动填 `base_url` 等预设值。返回 `null` 表示这个 provider 名不认识——**由调用方决定是拒绝还是当自定义值接受**。
+
+### 8.4 三条路由 × 五个超时字段
+
+```typescript
+const LLM_USAGES = ["interactive", "gate", "background"] as const satisfies readonly LlmUsage[];
+const TIMEOUT_FIELDS = ["connect", "read", "stream_read", "write", "pool"] as const;
+```
+
+`as const satisfies readonly LlmUsage[]` 这个写法让 TypeScript **同时**做两件事：保留字面量类型（`"interactive" | "gate" | "background"`）**并且**校验它们确实都是合法的 `LlmUsage`。写错一个名字会在编译期报错。
+
+`buildLlmConfigInput()` 把向导草稿转成 `POST /api/config/llm` 的载荷。
+
+---
+
+## 9. HUD：终端宽度是自己算的
+
+`hud.tsx`（476 行）里有一半是**字符宽度计算**，因为终端没有布局引擎。
+
+```typescript
+const GRAPHEME_SEGMENTER = ...              // Intl.Segmenter
+function segmentGraphemes(text: string): string[]
+function isFullWidthCodePoint(codePoint: number): boolean
+function graphemeWidth(grapheme: string): number
+function textWidth(text: string): number
+function partWidth(part: HudPart): number
+function lineWidth(parts: HudPart[]): number
+function takeTextByWidth(text: string, maxWidth: number): string
+function truncatePart(part: HudPart, maxWidth: number): HudPart
+function wrapParts(parts: HudPart[], maxWidth: number): HudPart[][]
+```
+
+**十个函数只为回答"这段文本在终端里占几列"**。三层难点：
+
+```mermaid
+flowchart TD
+    A["一段文本"] --> B["Intl.Segmenter 切成字素簇<br/>因为 emoji 和组合字符<br/>不等于一个 code point"]
+    B --> C["逐字素判断是否全角<br/>CJK 占 2 列，ASCII 占 1 列"]
+    C --> D["按宽度而不是按字符数截断<br/>takeTextByWidth"]
+    D --> E["按宽度折行<br/>wrapParts"]
+```
+
+**用 `.length` 会全错**：一个 emoji 可能是 2–7 个 code point 但占 2 列；一个 CJK 字符是 1 个 code point 但占 2 列。
+
+`SEP_WIDTH = 3` 是分隔符 `" │ "` 的宽度——连它都要显式算进去。
+
+### 9.1 HUD 里的两个后台轮询
+
+```typescript
+export const MEMORY_POLL_INTERVAL_MS = 10_000;
+export const MEMORY_FAILURE_STREAK_THRESHOLD = 3;
+
+function useGitBranch(cwd: string): string | null
+function useMemoryMaintenance(baseUrl: string): MemoryMaintenance | null
+export function memoryMaintenanceStalled(maintenance): boolean
+export function memoryMaintenanceLabel(maintenance): string | null
+```
+
+| 轮询 | 间隔 | 显示 |
+|---|---|---|
+| git 分支（`execGit`） | 随 cwd 变化 | 当前分支名 |
+| 记忆维护状态 | 10 秒 | 编译停滞时的提示 |
+
+**连续 3 次失败才算"停滞"**（`MEMORY_FAILURE_STREAK_THRESHOLD`）——一次瞬时失败不该在状态栏亮红灯。这和记忆系统本身"`rejected` / `failed` 不计入跳过计数"（见 [05 · 记忆系统](./05-记忆系统.md) §9.1）是同一条判断：**区分"这次没成"和"一直不成"**。
+
+`memoryMaintenanceStalled()` 和 `memoryMaintenanceLabel()` 被导出，所以它们有独立的单元测试（`hud.test.ts`）。
+
+---
+
+## 10. 后端进程生命周期
 
 `dev-server.ts`（473 行）的完整决策流见 [02 · 快速上手](./02-快速上手.md) §6.1。这里补三个实现要点。
 
-### 6.1 26 条 API 契约
+### 10.1 26 条 API 契约
 
 ```typescript
 export const REQUIRED_API_OPERATIONS = [
@@ -314,7 +542,7 @@ export function findMissingApiOperations(paths: Record<string, unknown>): string
 
 启动时拿 `/openapi.json` 逐条比对。**把运行时的怪异故障提前成启动期的明确报错。**
 
-### 6.2 `stale` 缺失等同于 `stale=true`
+### 10.2 `stale` 缺失等同于 `stale=true`
 
 ```typescript
 if (typeof payload.stale !== "boolean") return "it is too old to report whether its code is current";
@@ -324,7 +552,7 @@ if (typeof payload.stale !== "boolean") return "it is too old to report whether 
 
 这是一个可复用的判断模式：**当一个自检字段是后加的，缺失它就等于最坏情况**。
 
-### 6.3 进程组信号
+### 10.3 进程组信号
 
 ```typescript
 // `uv run uvicorn ...` spawns uvicorn as a grandchild; signalling only the `uv`
@@ -350,7 +578,7 @@ if (typeof payload.stale !== "boolean") return "it is too old to report whether 
 
 ---
 
-## 7. 命令与技能的分离
+## 11. 命令与技能的分离
 
 `commands.ts` 里有一句注释是产品决策：
 
@@ -373,7 +601,7 @@ flowchart LR
 
 ---
 
-## 8. 渲染子系统
+## 12. 渲染子系统
 
 | 模块 | 处理 |
 |---|---|
@@ -386,7 +614,7 @@ flowchart LR
 | `smith-ui-schema.ts` | 结构化 UI 的 schema 校验（391 行） |
 | `sanitize.ts` | 输入清洗 |
 
-### 8.1 流式 Markdown 的难点
+### 12.1 流式 Markdown 的难点
 
 普通 Markdown 渲染器假设输入是完整的。流式场景下：
 
@@ -397,7 +625,7 @@ flowchart LR
 
 **代码围栏误判**是踩过的坑——一个未闭合的围栏会让后面所有内容都被当成代码。`streaming-markdown.ts` 要在"内容不完整"的前提下做出可撤销的渲染决定。
 
-### 8.2 `smith-ui-schema.ts`：结构化 UI 要校验
+### 12.2 `smith-ui-schema.ts`：结构化 UI 要校验
 
 `render_ui` 工具让模型能产出结构化 UI（表单、列表、卡片）。但模型的输出**是不可信的**——一个不符合 schema 的载荷会让渲染器崩溃，进而崩掉整个终端。
 
@@ -405,7 +633,7 @@ flowchart LR
 
 ---
 
-## 9. 测试
+## 13. 测试
 
 `shell/src` 里测试文件占 5.7k 行（16.4k 总量的 35%）：
 
@@ -426,7 +654,7 @@ flowchart LR
 
 **`ink-static-cache.test.tsx` 单独存在**，说明 `Static` 的重印问题被认真对待——它有专门的回归测试。
 
-### 9.1 12 个依赖鉴权的测试
+### 13.1 12 个依赖鉴权的测试
 
 在没有 `~/.agent-smith/auth_token` 的容器里会失败，因为它们调用真实的 `localAuthHeaders()`。造一个就绿：
 
@@ -438,7 +666,7 @@ mkdir -p ~/.agent-smith && printf token > ~/.agent-smith/auth_token && chmod 600
 
 ---
 
-## 10. 参数速查
+## 14. 参数速查
 
 | 参数 | 值 | 位置 |
 |---|---|---|
@@ -457,7 +685,7 @@ mkdir -p ~/.agent-smith && printf token > ~/.agent-smith/auth_token && chmod 600
 
 ---
 
-## 11. 设计取舍
+## 15. 设计取舍
 
 **① 状态机做成纯函数。** `applyStreamEvent(entries, event) → entries` 没有副作用，所以 512 行测试能覆盖全部分支。代价是每次事件都要重建数组。
 
@@ -475,7 +703,7 @@ mkdir -p ~/.agent-smith && printf token > ~/.agent-smith/auth_token && chmod 600
 
 ---
 
-## 12. 接下来
+## 16. 接下来
 
 | 想深入 | 读 |
 |---|---|
