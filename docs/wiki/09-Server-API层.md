@@ -409,6 +409,130 @@ flowchart LR
 
 ---
 
+## 7.4 `config_service`：一半代码在拒绝非法输入
+
+555 行里有 **18 个 `_validate_*` / `_apply_*` 方法**。为什么一个"改配置"的端点要这么多？
+
+```mermaid
+flowchart TD
+    P["POST /api/config/llm 的 patch"] --> V1["_validate_string_fields<br/>字段名必须在派生集合里"]
+    V1 --> V2["_validate_provider<br/>必须能被 normalize"]
+    V2 --> V3["_validate_base_url"]
+    V3 --> V4["_validate_bool_fields<br/>stream / thinking"]
+    V4 --> V5["_validate_max_output_tokens<br/>_validate_context_window<br/>正整数"]
+    V5 --> V6["_validate_route<br/>每条路由的字段"]
+    V6 --> V7["_validate_timeout_profile<br/>五个字段"]
+    V7 --> V8["_validate_usage<br/>必须是 interactive/gate/background"]
+    V8 --> A["_apply_*_patch 系列<br/>逐段合并"]
+    A --> AL["_align_interactive_model"]
+    AL --> W["_validate_stored_llm<br/>写盘前再全量校验一次"]
+    W --> S["save_yaml 原子写"]
+
+    style W fill:#e8f5e9
+```
+
+### 7.4.1 字段集合全部派生
+
+```python
+_USAGES = frozenset(usage.value for usage in LLMUsage)
+_BASE_STRING_FIELDS = ROUTE_STRING_FIELDS
+_ROUTE_STRING_FIELDS = ROUTE_STRING_FIELDS
+_ROUTE_FIELDS = frozenset(ROUTE_FIELDS)
+_PUBLIC_ROUTE_FIELDS = PUBLIC_ROUTE_FIELDS
+_TIMEOUT_FIELDS = frozenset(("connect", "read", "stream_read", "write", "pool"))
+```
+
+**五个集合里有四个直接来自 `engine/llm/config_fields.py`**，只有超时字段是本地的。这就是那份"声明一次、四处派生"的设计在服务端的落点（见 [07 · LLM 集成](./07-LLM-集成.md) §2.2）。
+
+`_PUBLIC_ROUTE_FIELDS` 用在读路径上——`_public_routes()` / `_public_models()` 按它投影，**`api_key` 自动被排除**，不需要调用方记得过滤。
+
+### 7.4.2 写盘前再校验一次
+
+`_validate_stored_llm()` 在 patch 应用完之后、写盘之前跑一遍**全量**校验。
+
+为什么要两遍：patch 校验只看**这次改了什么**，但一次合法的 patch 可能和既有配置组合出一个非法状态（比如 patch 给某条路由设了一个 `timeout_profile`，而那个 profile 已经被删了）。
+
+**"每个改动都合法"不等于"结果合法"。**
+
+### 7.4.3 `list_relay_models` 的响应体上限
+
+```python
+_MAX_RELAY_BODY_BYTES = 5 * 1024 * 1024
+```
+
+`/api/config/llm/models` 会去打中转站的 `/v1/models`。**5 MB 上限**防的是一个返回巨大响应的中转站把服务端内存吃光。
+
+实测提醒：**中转站列出的模型不等于能用**（见 [07 · LLM 集成](./07-LLM-集成.md) §12）。这个端点只做发现，不做可用性验证。
+
+### 7.4.4 `_align_interactive_model`
+
+改基线 `model` 时，`interactive` 路由如果显式写了一个旧值就会覆盖掉新基线——用户会觉得"我改了模型但没生效"。这个方法处理这类对齐。
+
+---
+
+## 7.5 `token_stats_service`：684 行做什么
+
+```mermaid
+flowchart TD
+    subgraph 入库["三条入库路径"]
+        A["record_usage()<br/>执行事件里的 TOKEN_USAGE"] --> T1[("token_usage_events")]
+        B["record_generation()<br/>每次模型调用"] --> T2[("llm_generations")]
+        C["sync_from_traces()<br/>启动时从 trace 增量导入"] --> T1
+        C -.->|"byte_offset"| T3[("observability_trace_cursors")]
+        D["_sync_message_estimates()<br/>没有用量数据时按消息估算"] --> T1
+    end
+    subgraph 出库["两个查询"]
+        T1 --> E["get_stats(agent_id, year)"]
+        T2 --> F["get_generation_stats(year)"]
+    end
+    E --> API["/api/agent/token-stats"]
+    F --> API
+```
+
+### 7.5.1 `local-estimate`：没有用量数据时的兜底
+
+```python
+_NON_MODEL_STAT_KEYS = frozenset({"unknown", "local-estimate"})
+```
+
+不是所有 provider 都返回用量。`_sync_message_estimates()` 用 `tiktoken` 对消息内容做本地估算，记在 `model="local-estimate"` 下。
+
+**这两个键在按模型分组统计时被排除**——否则"local-estimate"会作为一个虚构的模型出现在成本报表里。
+
+这又是"区分数据来源"的一个实例：估算值有用（总量还能看），但不能和真实计量混在一起。
+
+### 7.5.2 成本计算
+
+```python
+@staticmethod
+def _load_price_table() -> dict[str, dict[str, float]]: ...
+def _generation_cost(...) -> ...
+```
+
+按模型的价格表算成本。价格表是本地的——**没有联网查价格**，因为价格表联网就意味着终端要在启动时打外网。
+
+### 7.5.3 连续活跃天数
+
+```python
+@staticmethod
+def _streaks(active_dates: list[date]) -> tuple[int, int]:
+```
+
+返回（当前连续天数，历史最长连续天数）。这是 `/token` 面板的一个展示项——它不是成本指标，是**使用习惯指标**。
+
+### 7.5.4 幂等导入
+
+`sync_from_traces()` 用两个机制保证重复运行不翻倍：
+
+| 机制 | 作用 |
+|---|---|
+| `observability_trace_cursors.byte_offset` | 只读新增的字节 |
+| `token_usage_events.source_key` 唯一索引 | 同一条记录插两次会被拒 |
+
+**游标是性能优化，唯一索引是正确性保证。** 只有游标的话，一次游标写失败就会导致重复计数。
+
+---
+
 ## 8. 仓库层
 
 只有 3 个：
@@ -422,6 +546,56 @@ flowchart LR
 其余三张表（`token_usage_events`、`observability_trace_cursors`、`llm_generations`）由 `token_stats_service` 直接操作——因为它们只有一个消费方，加一层仓库是纯开销。
 
 **不为只有一个消费方的表建仓库**，这是一个务实的取舍。
+
+### 8.1 `session_repo`：19 个方法里的两组
+
+`SessionRepo` 有 19 个方法，其中两组值得看：
+
+**① 所有权在方法名里。**
+
+```python
+async def exists(self, session_id: str, agent_id: str) -> bool
+async def get_owned(self, session_id: str, agent_id: str) -> dict | None
+async def delete_owned(self, session_id: str, agent_id: str) -> bool
+async def exists_by_id(self, session_id: str) -> bool          # ← 不带 agent_id
+```
+
+**`_owned` 后缀表示"这个查询带 `agent_id` 条件"**。这不是命名洁癖——把所有权检查编码进方法名，让"忘了校验归属"变成一个能在 review 里被看见的错误（调用了不带 `_owned` 的版本）。
+
+`exists_by_id` 是唯一不带所有权的，用在确实不需要归属的场景。
+
+**② 六个消息查询方法。**
+
+```python
+async def get_recent_messages(session_id, limit)      # 给引擎的短期上下文
+async def get_messages(session_id, ...)               # 分页列表
+async def count_messages(session_id, ...)
+async def get_message(session_id, message_id)
+async def get_messages_since(session_id, ...)
+async def get_messages_before(session_id, ...)
+```
+
+`since` / `before` 两个方向都有，因为**压缩要向前取**（`_COMPRESS_BYTE_CAP` 边取边算字节），**恢复要向后取**。
+
+**③ `discard_assistant_messages_after_user`。**
+
+用在中断恢复：一次运行被打断后，那条用户消息之后的助手消息是半成品，重跑前要丢掉。**否则重跑会在一段残缺回复的基础上继续写。**
+
+### 8.2 `auto_task_repo`：租约的三个方法
+
+```python
+async def claim_running(self, task_id: str) -> str | None      # 认领，返回 lease_token
+async def renew_lease(self, task_id: str, lease_token: str) -> bool
+async def finish_task(self, ...)
+```
+
+`claim_running()` 返回 `str | None`——**`None` 表示没抢到**（别的进程先认领了）。这个返回值就是分布式锁的获取结果。
+
+`renew_lease(task_id, lease_token)` 要求带上 token：**只有持有当前租约的那个进程才能续期**。一个已经被抢走的任务续期会返回 `False`，执行方据此知道自己该退出了。
+
+`list_due_tasks()` 是调度器每 60 秒调的那个查询。
+
+`_row_to_dict` 是唯一的静态方法——把 `aiosqlite.Row` 转成普通 dict，避免 Row 对象泄漏到 service 层。
 
 ---
 
