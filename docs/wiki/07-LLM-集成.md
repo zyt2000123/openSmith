@@ -388,7 +388,157 @@ flowchart TD
 
 ---
 
-## 7. 用量记账
+## 7. `HTTPAdapterMixin`：六道流式边界
+
+`engine/llm/adapters/_http.py`（239 行）的 docstring：
+
+> 为 provider 适配器提供共享的 HTTP 管道：重试/退避循环、非流式 JSON 请求周期、**有界的响应读取**、以及每个基于 HTTP 的适配器都需要的错误体提取。适配器在实现 `ProviderAdapter` 协议的同时继承 `HTTPAdapterMixin`。
+
+**六个上限**：
+
+| 常量 | 值 | 防什么 |
+|---|---|---|
+| `MAX_RESPONSE_BYTES` | 20 MiB | 非流式响应过大 |
+| `MAX_STREAM_TOTAL_BYTES` | 20 MiB | 整个流的总量 |
+| `MAX_STREAM_EVENT_BYTES` | 1 MiB | 单个 SSE 事件过大 |
+| `MAX_STREAM_EVENTS` | 10 000 | 事件条数 |
+| `MAX_STREAM_DURATION_SECONDS` | 900（15 分钟） | 流的墙钟 |
+| `MAX_ERROR_BODY_BYTES` | 64 KiB | 错误体读取上限 |
+
+```mermaid
+flowchart TD
+    S["一次流式响应"] --> L["SSEStreamLimiter"]
+    L --> C1{"单事件 > 1 MiB"}
+    L --> C2{"总字节 > 20 MiB"}
+    L --> C3{"事件数 > 10000"}
+    L --> C4{"耗时 > 900 秒"}
+    C1 -->|"是"| E["中止"]
+    C2 -->|"是"| E
+    C3 -->|"是"| E
+    C4 -->|"是"| E
+
+    style E fill:#ffcdd2
+```
+
+这套上限和 MCP 的四道边界（见 [12 · MCP 集成](./12-MCP-集成.md) §4）**是同一个设计模式的两次应用**：一个外部服务的响应流必须同时被字节、条数和时间三个维度约束，因为任何单一维度都有绕过方式。
+
+**`MAX_ERROR_BODY_BYTES = 64 KiB`** 单独存在，是因为错误体也要读——一个返回 500 并附带 100 MB HTML 错误页的中转站，不该在读错误信息时把内存吃光。
+
+### 7.1 上下文超限的文本识别
+
+```python
+_CONTEXT_LIMIT_MARKERS = (...)
+```
+
+provider 报告"上下文超了"的方式五花八门：HTTP 状态码可能是 400 也可能是 413，错误码字段可能叫 `code` / `type` / `error.code`，而有些中转站只在消息文本里说。
+
+所以要**按文本标记识别**，然后抛 `LLMContextLengthError`——ReAct 循环的 `_is_context_limit_error()` 靠这个类型决定要不要触发一次上下文恢复重试（见 [04 · Engine 核心执行](./04-Engine-核心执行.md) §4.1）。
+
+**把一个模糊的外部信号收敛成一个精确的内部类型**，是适配器层的核心价值。
+
+---
+
+## 8. Anthropic 适配器的四个翻译难点
+
+`adapters/anthropic.py` 654 行，比 OpenAI 的 482 行大 35%。差额几乎全在**消息格式翻译**上——引擎内部用 OpenAI 风格的消息数组，Anthropic 的 Messages API 结构不同。
+
+```mermaid
+flowchart TD
+    A["引擎的 OpenAI 风格消息"] --> B["_translate_messages()"]
+    B --> C["_assistant_content()<br/>助手消息可能是 str 或 block 数组"]
+    B --> D["_order_user_blocks()<br/>user 块必须按特定顺序"]
+    B --> E["_merge_content() / _content_blocks()<br/>相邻同角色消息要合并"]
+    B --> F["_append_message()"]
+    A --> G["_translate_tools()<br/>function schema 转 tool schema"]
+    B --> H["_with_cache_breakpoint()<br/>插入缓存断点"]
+    H --> I["_request_body()"]
+```
+
+| 难点 | 处理 |
+|---|---|
+| **system 消息位置不同** | OpenAI 放在消息数组里，Anthropic 是顶层 `system` 字段 |
+| **相邻同角色消息** | Anthropic 要求 user/assistant 交替，相邻同角色必须合并（`_merge_content`） |
+| **内容可以是字符串或块数组** | `_content_blocks()` / `_copy_content()` / `_text_content()` 三个函数处理这个多态 |
+| **user 块顺序有要求** | `_order_user_blocks()` 保证 tool_result 块排在文本块前面 |
+
+### 8.1 缓存断点
+
+```python
+def _with_cache_breakpoint(...)
+```
+
+Anthropic 的 prompt 缓存需要在消息里插一个显式的 `cache_control` 标记。**断点位置就是 `prefix_cache_key` 对应的那个稳定前缀边界**（见 [04 · Engine 核心执行](./04-Engine-核心执行.md) §2.4）。
+
+这解释了为什么 `ProviderCapabilities.prefix_cache_key` 默认是 `False`：OpenAI 的缓存是自动的（按前缀匹配），Anthropic 需要显式断点。**同一个概念在两个 provider 上的实现完全不同**，所以能力必须显式声明。
+
+### 8.2 流式错误的可重试子集
+
+```python
+_RETRYABLE_STREAM_ERROR_TYPES = frozenset({...})
+
+class _AnthropicStreamError(LLMResponseError):
+    def __init__(self, message: str, *, retryable: bool) -> None: ...
+
+class _AnthropicStreamTruncatedError(LLMResponseError): ...
+```
+
+Anthropic 的 SSE 流里可以携带 `error` 事件。**只有一部分错误类型值得重试**（比如 `overloaded_error`），其余（比如 `invalid_request_error`）重试只会得到同样的结果。
+
+`_AnthropicStreamTruncatedError` 单独一个类型：流在没有收到结束事件的情况下断了。这和"收到了一个错误事件"是两回事——前者可能是网络问题，后者是 provider 明确的拒绝。
+
+### 8.3 `_ANTHROPIC_VERSION = "2023-06-01"`
+
+API 版本头。Anthropic 用日期做版本，写死一个已知可用的值比跟随最新更稳——**新版本可能改变响应结构**。
+
+---
+
+## 9. `ProviderClient`：适配器与 `LLMPort` 之间
+
+`engine/llm/client.py`（261 行）做四件事，每件都有一处非显然的细节。
+
+### 9.1 能力校验
+
+```python
+def _validate_requested_capabilities(self, ...) -> ...
+```
+
+调用方传了 `prefix_cache_key` 但适配器不支持时，**在这里被拦下**而不是传给适配器。
+
+这是 [04 · Engine 核心执行](./04-Engine-核心执行.md) §4.1 里那段 `getattr(getattr(llm, "capabilities", None), "prefix_cache_key", False)` 的另一半——调用方先问，客户端再验，**两层都不信任对方**。
+
+### 9.2 非流式伪装成事件流
+
+```python
+async def _complete_as_events(self, request: LLMRequest) -> AsyncIterator[ProviderEvent]:
+```
+
+`stream=False` 时 `chat_events()` 仍然要产出事件——它调 `complete()` 拿完整响应，再**合成**一串事件（`RESPONSE_CREATED` → 一个大的 `OUTPUT_TEXT_DELTA` → `USAGE` → `RESPONSE_COMPLETED`）。
+
+**调用方不需要写两套代码。** ReAct 循环里的流式/非流式分支处理的是"provider 能不能流"，而不是"事件流存不存在"。
+
+### 9.3 首 token 延迟怎么测
+
+```python
+_CONTENT_EVENT_TYPES = (...)
+
+async def _observed_stream(self, request: LLMRequest) -> AsyncIterator[ProviderEvent]:
+```
+
+`ttft_ms` 的定义是"第一个**内容**事件的时间"，不是"第一个事件的时间"。`RESPONSE_CREATED` 立刻就到，用它测 TTFT 会得到一个恒定的小数字。
+
+所以有 `_CONTENT_EVENT_TYPES` 这个集合——只有文本 delta、推理 delta、函数参数 delta 三种算内容。
+
+### 9.4 记账在 finally 里
+
+```python
+async def _emit_generation(self, ...) -> None: ...
+```
+
+无论流正常结束、抛异常、还是被取消，**都要产出一条 `GenerationRecord`**（`ok` 字段区分）。一个只在成功路径记账的系统，会让"失败的调用"在成本报表里完全消失——而失败的调用**同样花钱**（provider 通常按输入 token 计费）。
+
+---
+
+## 10. 用量记账
 
 `engine/llm/usage.py` 的 docstring 描述了一个现实问题：
 
@@ -428,7 +578,7 @@ docstring 最后一句是原则：
 
 ---
 
-## 8. Generation 级可观测
+## 11. Generation 级可观测
 
 `engine/llm/observability.py`：**每一次模型调用都产生一条 `GenerationRecord`**——主循环和旁路一视同仁。
 
@@ -480,7 +630,7 @@ set_default_generation_sink(TokenStatsService().record_generation)
 
 ---
 
-## 9. 录制与回放
+## 12. 录制与回放
 
 `engine/llm/replay.py`（337 行）。`engine_runtime.py` 的 `_maybe_record()` 是入口：
 
@@ -512,7 +662,7 @@ flowchart LR
 
 ---
 
-## 10. `ProviderClient`
+## 13. 客户端缓存
 
 `engine/llm/client.py`（261 行）是 adapter 和 `LLMPort` 之间的那一层。它做四件事：
 
@@ -525,7 +675,7 @@ flowchart LR
 
 `chat_stream()` 是一个只产出文本的简化接口，给不需要完整事件的调用方用。
 
-### 10.1 客户端缓存
+### 13.1 指纹
 
 `server/app/services/engine_runtime.py` 的 `LLMClientManager`：
 
@@ -550,7 +700,7 @@ clients = list({id(client): client for client in self._clients.values()}.values(
 
 ---
 
-## 11. 接一个新 Provider 要做什么
+## 14. 接一个新 Provider 要做什么
 
 ```mermaid
 flowchart TD
@@ -582,7 +732,7 @@ async def close(self) -> None
 
 ---
 
-## 12. 中转站的现实问题
+## 15. 中转站的现实问题
 
 用中转站（relay）而不是官方端点时，有三条实测教训：
 
@@ -607,7 +757,7 @@ async def close(self) -> None
 
 ---
 
-## 13. 参数速查
+## 16. 参数速查
 
 | 参数 | 值 | 位置 |
 |---|---|---|
@@ -629,7 +779,7 @@ async def close(self) -> None
 
 ---
 
-## 14. 设计取舍
+## 17. 设计取舍
 
 **① 两个 Protocol 而不是一个。** `LLMPort` 给执行层，`ProviderAdapter` 给 provider 实现。多一层，但换来"加录制/回放/测试替身"和"加 provider"是两件互不干扰的事。
 
@@ -645,7 +795,7 @@ async def close(self) -> None
 
 ---
 
-## 15. 接下来
+## 18. 接下来
 
 | 想深入 | 读 |
 |---|---|
