@@ -22,26 +22,19 @@ def reset_paths(paths: AppPaths | None = None) -> None:
     _paths_instance = paths
 
 
-# Legacy module-level constants for backward compatibility
-# These resolve lazily through module attribute lookup.
+# Legacy module-level constants for backward compatibility.
+# These resolve lazily through module attribute lookup; only names with live
+# consumers are kept — everything else reads a property off ``config.PATHS``.
 def __getattr__(name: str):
     """Resolve legacy path exports lazily from the current ``AppPaths`` instance."""
     paths = _get_paths()
     mapping = {
         "DATA_DIR": paths.data_dir,
         "AGENT_DIR": paths.agent_dir,
-        "SQLITE_PATH": paths.sqlite_path,
         "SMITH_PROFILE_DIR": paths.smith_profile_dir,
         "BUILTIN_SKILLS_DIR": paths.builtin_skills_dir,
-        "BUILTIN_TOOLS_DIR": paths.builtin_tools_dir,
-        "BUILTIN_IDENTITIES_DIR": paths.builtin_identities_dir,
-        "SAFETY_RULES_PATH": paths.safety_rules_path,
         "PATHS": paths,
     }
     if name in mapping:
         return mapping[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def ensure_dirs() -> None:
-    _get_paths().ensure_base_dirs()

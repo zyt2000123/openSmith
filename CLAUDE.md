@@ -124,7 +124,7 @@ Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 
 | Layer | Directory | Source lines (non-test) | Responsibility |
 |---|---|---|---|
-| Infrastructure | `common/` | 1.4k | Paths, SQLite connection, YAML read/write, hash chain. Zero business logic. |
+| Infrastructure | `common/` | 1.1k | Paths, SQLite connection, YAML read/write, hash chain. Zero business logic. |
 | Execution | `engine/` | 25.3k | Agent framework: LLM, pipeline + ReAct, memory, skills, tools, safety, observability. Zero platform knowledge. |
 | Content | `agents/` | 9.9k | Smith identity seed, pipelines, gates, conditions, tools, skills, hooks. Pure content. |
 | Platform | `server/` | 6.1k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints (34 router + `/api/health`). |
@@ -133,16 +133,20 @@ Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 Rules:
 
 - `engine/` must not know FastAPI, HTTP, or agent instance management
-- `agents/` imports nothing from other layers — the tool registry loads its `.py`
-  files via `exec_module`, so the contract is `TOOL_META` + `execute`, not types.
-  A path constant cannot be shared into it; expect duplicated path derivation.
+- `agents/` gates, conditions, and tools import nothing from other layers — the
+  tool registry loads its `.py` files via `exec_module`, so the contract is
+  `TOOL_META` + `execute`, not types, and a path constant cannot be shared into
+  them. The one sanctioned exception is `agents/smith/hooks/`: hooks implement
+  the `engine.execution.hooks` ABCs and may read `common` for the data root.
+  Both boundaries are test-enforced (`engine/tests/skill/test_skill_chain.py`).
 - `server/app/routers/` stays thin — extract params, call service, return result
 - `server/app/` is the FastAPI application package; keep this conventional layout
 - `agents/smith/` is where Smith's built-in identity seed lives
 - New capabilities → add skills, not new agents
 
 `common/paths.py` is the single source of truth for the runtime data root
-(`~/.agent-smith`, enforced `0o700`/`0o600`). `engine/safety/tool_guard.py`
+(`~/.agent-smith`, created `0o700`/`0o600`; a pre-existing directory keeps the
+mode the user gave it — deliberate, test-locked behavior). `engine/safety/tool_guard.py`
 anchors its non-bypassable platform-write protection on it.
 
 ## 6. Files That Matter

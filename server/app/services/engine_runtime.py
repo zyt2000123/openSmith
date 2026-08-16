@@ -117,7 +117,7 @@ def load_runtime_identity_catalog(*, force: bool = False) -> IdentityCatalog:
     paths.ensure_base_dirs()
     skill_registry.load_builtin(paths.builtin_skills_dir)
     skill_registry.load_agent_skills(paths.agent_dir / "skills")
-    tool_registry.load_builtin_providers(paths.project_root / "agents" / "tools")
+    tool_registry.load_builtin_providers(paths.builtin_tools_dir)
     validate_execution_assets(
         catalog,
         agents_dir=paths.project_root / "agents",
