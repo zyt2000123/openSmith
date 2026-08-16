@@ -33,6 +33,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platform
+    fcntl = None  # type: ignore[assignment]
+
 CHAIN_VERSION = 1
 CHAIN_FILE_MODE = 0o600
 _PRIVATE_DIR_MODE = 0o700
@@ -75,6 +80,9 @@ class ChainVerification:
     failure: str | None = None
     anchored: bool = False
     anchor_matches: bool | None = None
+    # A trailing fragment without its newline: a crash tear, tolerated rather
+    # than reported as tampering, and surfaced here so it is never silent.
+    torn_tail: bool = False
 
 
 class HashChainLog:
@@ -137,25 +145,28 @@ class HashChainLog:
         return self._handle
 
     def append(self, record: dict, *, sync: bool = False) -> dict:
-        """Chain and persist one record; returns the record as written."""
+        """Chain and persist one record; returns the record as written.
+
+        The whole read-state-then-write sequence runs under an ``flock`` on the
+        log file: two *processes* whose in-memory ``seq``/``prev_hash`` were
+        loaded from the same head would otherwise both extend it, forking the
+        chain into a false "sequence gap" report.  The in-process ``threading``
+        lock cannot see the other process; the size check in
+        ``_reload_if_externally_appended`` narrows that window but a
+        stat-then-write race remains without a file lock.
+
+        A short write (``ENOSPC``) is rolled back by truncating the partial
+        bytes and raised — returning normally would acknowledge a record the
+        file does not hold, and leaving the bytes would fuse them with the next
+        record into a line no verifier can parse.
+        """
         with self._lock:
             self._drop_stale_anchor()
-            self._reload_if_externally_appended()
-            self._ensure_loaded()
-            chained = dict(record)
-            chained["seq"] = self._next_seq
-            chained["prev_hash"] = self._prev_hash
-            if self._legacy_linked and self._next_seq == 1:
-                chained["legacy_linked"] = True
-            chained["hash"] = record_hash(chained)
-            payload = (canonical_json(chained) + "\n").encode("utf-8")
-
             handle = self.ensure_handle()
             if handle is not None:
-                handle.write(payload.decode("utf-8"))
-                handle.flush()
-                if sync:
-                    os.fsync(handle.fileno())
+                created = False
+                lock_fd = handle.fileno()
+                fd = None
             else:
                 created = not self.path.exists()
                 fd = os.open(
@@ -163,14 +174,56 @@ class HashChainLog:
                     os.O_WRONLY | os.O_CREAT | os.O_APPEND,
                     CHAIN_FILE_MODE,
                 )
+                lock_fd = fd
+            try:
+                self._lock_log_file(lock_fd)
+                self._repair_torn_tail()
+                self._reload_if_externally_appended()
+                self._ensure_loaded()
+                chained = dict(record)
+                chained["seq"] = self._next_seq
+                chained["prev_hash"] = self._prev_hash
+                if self._legacy_linked and self._next_seq == 1:
+                    chained["legacy_linked"] = True
+                chained["hash"] = record_hash(chained)
+                payload = (canonical_json(chained) + "\n").encode("utf-8")
+
                 try:
-                    os.write(fd, payload)
-                    if sync:
-                        os.fsync(fd)
-                finally:
+                    if handle is not None:
+                        handle.write(payload.decode("utf-8"))
+                        handle.flush()
+                        if sync:
+                            os.fsync(handle.fileno())
+                    else:
+                        assert fd is not None
+                        written = os.write(fd, payload)
+                        if written != len(payload):
+                            try:
+                                os.ftruncate(fd, os.fstat(fd).st_size - written)
+                            except OSError:
+                                logger.warning(
+                                    "failed to roll back a short write: %s",
+                                    self.path,
+                                    exc_info=True,
+                                )
+                            raise OSError(
+                                f"short write to {self.path}: "
+                                f"{written}/{len(payload)} bytes"
+                            )
+                        if sync:
+                            os.fsync(fd)
+                except BaseException:
+                    # The file may now hold bytes our cached state does not
+                    # know about; force the next append to rescan and repair.
+                    self._loaded = False
+                    self._observed_size = None
+                    raise
+            finally:
+                self._unlock_log_file(lock_fd)
+                if fd is not None:
                     os.close(fd)
-                if created:
-                    self.path.chmod(CHAIN_FILE_MODE)
+            if created:
+                self.path.chmod(CHAIN_FILE_MODE)
 
             self._prev_hash = chained["hash"]
             self._next_seq += 1
@@ -267,6 +320,87 @@ class HashChainLog:
                 self._handle_path = None
 
     # ── internal state ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _lock_log_file(fd: int) -> None:
+        if fcntl is None:  # pragma: no cover - non-POSIX platform
+            return
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    @staticmethod
+    def _unlock_log_file(fd: int) -> None:
+        if fcntl is None:  # pragma: no cover - non-POSIX platform
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - close() releases it anyway
+            pass
+
+    def _repair_torn_tail(self) -> None:
+        """Truncate a crash-torn trailing fragment before the chain is extended.
+
+        ``_ensure_loaded`` already treats an unparseable final line as a crash
+        tear and links the chain from the previous valid record — but that is
+        only the read side.  Left in place, the fragment fuses with the next
+        ``O_APPEND`` write into one line no parser can read: ``verify_chain``
+        reports tamper forever, the fused record is unreadable even though
+        ``append`` acknowledged it, and the next load re-assigns its ``seq``.
+
+        Only a fragment *without* its trailing newline is repaired — a
+        canonical record never contains a raw newline, so a complete line that
+        fails to parse is still treated as tampering by ``verify_chain``.  The
+        removed bytes are preserved in a ``.torn`` sidecar first: repair of an
+        audit log must not silently destroy bytes.  Runs under the append
+        flock, so a concurrent writer cannot be mid-record here.
+        """
+        try:
+            size = os.stat(self.path).st_size
+        except OSError:
+            return
+        if size == 0:
+            return
+        with open(self.path, "rb") as source:
+            source.seek(-1, os.SEEK_END)
+            if source.read(1) == b"\n":
+                return
+            # Scan backwards for the last newline; the torn tail is small (at
+            # most one record), so this touches a block or two.
+            position = size
+            last_newline = -1
+            while position > 0 and last_newline < 0:
+                step = min(4096, position)
+                position -= step
+                source.seek(position)
+                chunk = source.read(step)
+                index = chunk.rfind(b"\n")
+                if index >= 0:
+                    last_newline = position + index
+            keep = last_newline + 1
+            source.seek(keep)
+            torn = source.read()
+
+        sidecar = self.path.with_name(self.path.name + ".torn")
+        try:
+            sidecar_fd = os.open(
+                sidecar,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                CHAIN_FILE_MODE,
+            )
+            try:
+                os.write(sidecar_fd, torn + b"\n")
+            finally:
+                os.close(sidecar_fd)
+        except OSError:
+            logger.warning(
+                "failed to preserve torn tail bytes: %s", sidecar, exc_info=True
+            )
+        os.truncate(self.path, keep)
+        logger.warning(
+            "repaired torn tail of %s: %d byte(s) preserved in %s",
+            self.path,
+            len(torn),
+            sidecar.name,
+        )
 
     def _read_anchor(self) -> dict | None:
         if not self.anchor_path.is_file():
@@ -420,13 +554,24 @@ def verify_chain(
     last_legacy: dict | None = None
     chain_started = False
     record_count = 0
-    with path.open(encoding="utf-8") as handle:
+    torn_tail = False
+    with path.open(encoding="utf-8", newline="") as handle:
         for line in handle:
             if not line.strip():
                 continue
             try:
                 value = json.loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError):
+                if not line.endswith("\n"):
+                    # A fragment missing its newline can only be the file's
+                    # final line: a crash tear, not tampering.  The writer
+                    # truncates it on its next append (_repair_torn_tail); the
+                    # chain ends at the previous record either way.  A
+                    # *complete* unparseable line stays a failure — canonical
+                    # records never contain a raw newline, so a tear cannot
+                    # produce one.
+                    torn_tail = True
+                    break
                 return ChainVerification(
                     ok=False,
                     records=record_count,
@@ -533,10 +678,12 @@ def verify_chain(
                 ),
                 anchored=True,
                 anchor_matches=False,
+                torn_tail=torn_tail,
             )
     return ChainVerification(
         ok=True,
         records=record_count,
         anchored=anchored,
         anchor_matches=anchor_matches,
+        torn_tail=torn_tail,
     )

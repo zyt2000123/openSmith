@@ -190,6 +190,35 @@ def test_shipped_gate_and_condition_content_do_not_import_engine_or_common() -> 
         assert "import common" not in source
 
 
+def test_shipped_hooks_import_only_the_hook_interface_and_common() -> None:
+    """Hooks are the sanctioned exception to the no-cross-layer rule.
+
+    They exist to implement the engine's hook ABCs (CLAUDE.md §6a: engine
+    provides framework, agents provide implementations), and cost_tracker reads
+    the data root from ``common.config``.  That is the whole allowance: any
+    other ``engine`` internals or anything from ``server`` would silently
+    widen the content layer's dependency surface, which is exactly what the
+    gate/condition/tool test above exists to prevent.
+    """
+    import re
+
+    hook_files = sorted((ROOT / "agents" / "smith" / "hooks").glob("*.py"))
+    assert hook_files, "no shipped hooks were discovered"
+
+    for path in hook_files:
+        source = path.read_text(encoding="utf-8")
+        imports = re.findall(
+            r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.]*)", source, re.MULTILINE
+        )
+        for module in imports:
+            assert not module.startswith("server"), f"{path.name} imports {module}"
+            if module == "engine" or module.startswith("engine."):
+                assert module.startswith("engine.execution.hooks"), (
+                    f"{path.name} imports {module}; hooks may only import the "
+                    "hook interface from the engine"
+                )
+
+
 def test_malformed_pipeline_step_fails_loudly(tmp_path: Path) -> None:
     path = _write(
         tmp_path,

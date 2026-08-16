@@ -233,3 +233,146 @@ def test_trace_store_chain_continues_across_instances(tmp_path: Path) -> None:
     records = _lines(tmp_path / "traces" / "run-resume.jsonl")
     assert [r["seq"] for r in records] == [1, 2]
     assert records[1]["prev_hash"] == records[0]["hash"]
+
+
+# ── crash-torn tails ─────────────────────────────────────────────────────────
+# A tear (power loss, SIGKILL, ENOSPC) removes a suffix of the final line,
+# including its newline.  The chain must survive this as a *crash*, not report
+# it as tampering forever: before this fix the next O_APPEND write fused with
+# the fragment into a line no parser could read, verify_chain failed
+# permanently, and the fused record was unreadable despite append() having
+# acknowledged it.
+
+
+def _tear_final_line(path: Path, keep_all_but: int = 25) -> bytes:
+    raw = path.read_bytes()
+    path.write_bytes(raw[:-keep_all_but])
+    torn = path.read_bytes()
+    assert not torn.endswith(b"\n"), "tear must remove the trailing newline"
+    return torn
+
+
+def test_append_after_a_torn_tail_repairs_and_stays_verifiable(tmp_path: Path) -> None:
+    path, _ = _chain(tmp_path, records=[{"a": 1}, {"a": 2}])
+    _tear_final_line(path)
+
+    # A fresh instance, as after a process crash.
+    recovered = HashChainLog(path, namespace="test-ns")
+    recovered.append({"a": 3})
+
+    result = verify_chain(path, namespace="test-ns")
+    assert result.ok, result.failure
+    assert not result.torn_tail
+    stored = _lines(path)  # every line parses again — nothing fused
+    assert [r["seq"] for r in stored] == [1, 2]
+    assert stored[-1]["a"] == 3
+    assert stored[-1]["prev_hash"] == stored[0]["hash"]
+
+
+def test_torn_tail_bytes_are_preserved_in_a_sidecar(tmp_path: Path) -> None:
+    """Repair of an audit log must not silently destroy bytes."""
+    path, _ = _chain(tmp_path, records=[{"a": 1}, {"a": 2}])
+    _tear_final_line(path)
+    fragment = path.read_bytes().rsplit(b"\n", 1)[-1]
+
+    HashChainLog(path, namespace="test-ns").append({"a": 3})
+
+    sidecar = path.with_name(path.name + ".torn")
+    assert fragment in sidecar.read_bytes()
+
+
+def test_verify_tolerates_a_torn_tail_before_any_repair(tmp_path: Path) -> None:
+    """A crash must not read as tampering even before the writer returns."""
+    path, _ = _chain(tmp_path, records=[{"a": 1}, {"a": 2}])
+    _tear_final_line(path)
+
+    result = verify_chain(path, namespace="test-ns")
+
+    assert result.ok, result.failure
+    assert result.torn_tail
+    assert result.records == 1
+
+
+def test_verify_still_fails_on_a_complete_unparseable_line(tmp_path: Path) -> None:
+    """Torn-tail tolerance must not weaken tamper detection: a canonical record
+    never contains a raw newline, so a tear cannot produce a complete line."""
+    path, _ = _chain(tmp_path, records=[{"a": 1}, {"a": 2}])
+    path.write_bytes(path.read_bytes() + b"garbage\n")
+
+    result = verify_chain(path, namespace="test-ns")
+
+    assert not result.ok
+    assert "unparseable" in (result.failure or "")
+
+
+def test_torn_tail_repair_works_with_a_persistent_handle(tmp_path: Path) -> None:
+    path = tmp_path / "log.jsonl"
+    first = HashChainLog(path, namespace="test-ns", keep_handle=True)
+    first.append({"a": 1})
+    first.append({"a": 2})
+    first.close()
+    _tear_final_line(path)
+
+    recovered = HashChainLog(path, namespace="test-ns", keep_handle=True)
+    recovered.append({"a": 3})
+    recovered.close()
+
+    result = verify_chain(path, namespace="test-ns")
+    assert result.ok, result.failure
+    assert [r["seq"] for r in _lines(path)] == [1, 2]
+
+
+def test_a_short_write_is_rolled_back_and_raised(tmp_path: Path, monkeypatch) -> None:
+    """Returning normally would acknowledge a record the file does not hold;
+    leaving the partial bytes would fuse them with the next record."""
+    from common import hash_chain as hash_chain_module
+
+    path, chain = _chain(tmp_path, records=[{"a": 1}])
+    real_write = os.write
+    fail_once = {"armed": True}
+
+    def short_write(fd: int, payload: bytes) -> int:
+        if fail_once["armed"] and len(payload) > 10:
+            fail_once["armed"] = False
+            return real_write(fd, payload[:10])
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(hash_chain_module.os, "write", short_write)
+
+    with pytest.raises(OSError, match="short write"):
+        chain.append({"a": 2})
+
+    assert verify_chain(path, namespace="test-ns").ok
+    assert [r["seq"] for r in _lines(path)] == [1]
+
+    chain.append({"a": 3})  # the writer recovers on the next append
+    assert verify_chain(path, namespace="test-ns").ok
+    assert [r["seq"] for r in _lines(path)] == [1, 2]
+
+
+def test_append_waits_for_a_foreign_flock_holder(tmp_path: Path) -> None:
+    """Two processes extending the same head fork the chain into a false
+    "sequence gap"; the file lock serializes them."""
+    fcntl = pytest.importorskip("fcntl")
+    import threading
+    import time
+
+    path, _ = _chain(tmp_path, records=[{"a": 1}])
+    holder = os.open(path, os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+
+    thread = threading.Thread(
+        target=lambda: HashChainLog(path, namespace="test-ns").append({"a": 2})
+    )
+    thread.start()
+    time.sleep(0.3)
+    try:
+        assert thread.is_alive(), "append must block while a foreign lock is held"
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert verify_chain(path, namespace="test-ns").ok
+    assert [r["seq"] for r in _lines(path)] == [1, 2]
