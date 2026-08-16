@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { renderToString } from "ink";
+import { Box, renderToString } from "ink";
 import stringWidth from "string-width";
 
 import { skillPresentation } from "./skill-presentation.js";
@@ -266,6 +266,72 @@ test("transcript does not truncate a narrow fenced code block", () => {
 
   assert.ok(output.split("\n").every((line) => stringWidth(line) <= 40));
   assert.match(compact, new RegExp(token));
+});
+
+// The mount in index.tsx wraps every entry in `<Box paddingX={2}>`. Rendering the
+// entry bare — as the assertions above do — hides four columns of indent, so a grid
+// budgeted against the raw terminal width still looked correct in tests while Ink
+// wrapped the trailing border cell of every row in the real shell.
+function renderInTranscriptContainer(node: React.ReactNode, columns: number): string {
+  return stripAnsi(
+    renderToString(
+      <Box flexDirection="column" paddingX={2}>
+        {node}
+      </Box>,
+      { columns },
+    ),
+  );
+}
+
+test("tables keep their grid intact inside the padded transcript container", () => {
+  const columns = 80;
+  const entry = {
+    ...completedTurn("film facts"),
+    // The cell has to be long enough to claim the whole content budget: a narrow
+    // grid fits either way and would assert nothing.
+    assistantText: [
+      "| 项目 | 内容 |",
+      "| --- | --- |",
+      "| 导演/编剧 | 克里斯托弗·诺兰 |",
+      `| 主演 | ${"麦特·戴蒙、汤姆·霍兰德、安·海瑟薇、罗伯·派汀森、".repeat(4)} |`,
+    ].join("\n"),
+  };
+
+  const lines = renderInTranscriptContainer(
+    <TranscriptEntryView entry={entry} viewMode="compact" terminalColumns={columns} />,
+    columns,
+  ).split("\n");
+
+  const top = lines.find((line) => line.includes("┌"));
+  const bottom = lines.find((line) => line.includes("└"));
+
+  assert.ok(top, "expected a table top border");
+  assert.ok(bottom, "expected a table bottom border");
+  // A wrapped grid line leaves its closing corner alone on the next row.
+  assert.ok(top.includes("┐"), `top border wrapped: ${JSON.stringify(top)}`);
+  assert.ok(bottom.includes("┘"), `bottom border wrapped: ${JSON.stringify(bottom)}`);
+  assert.ok(lines.every((line) => stringWidth(line) <= columns));
+});
+
+test("system entries keep their body inside the padded transcript container", () => {
+  const columns = 80;
+  const entry = {
+    id: "system-1",
+    kind: "system" as const,
+    text: ["| 键 | 值 |", "| --- | --- |", `| 模型 | ${"claude-opus-latest ".repeat(6)}|`].join("\n"),
+    tone: "info" as const,
+  };
+
+  const lines = renderInTranscriptContainer(
+    <TranscriptEntryView entry={entry} viewMode="compact" terminalColumns={columns} />,
+    columns,
+  ).split("\n");
+
+  const top = lines.find((line) => line.includes("┌"));
+
+  assert.ok(top, "expected a table top border");
+  assert.ok(top.includes("┐"), `top border wrapped: ${JSON.stringify(top)}`);
+  assert.ok(lines.every((line) => stringWidth(line) <= columns));
 });
 
 test("transcript renders fenced diffs with structured line gutters", () => {

@@ -20,3 +20,4 @@ __pycache__/
 *.sqlite-shm
 tmp/
 .workbuddy/
+.codebuddy/

@@ -48,7 +48,7 @@ from ._review import (
     _parse_review_json,
     _truncate_source,
 )
-from ._snapshot import snapshot_views
+from ._snapshot import snapshot_baseline, snapshot_views
 from .history import append_memory_history, deferred_streak
 from .policy import (
     MemoryPolicy,
@@ -474,6 +474,12 @@ def _commit_view(
         raise MemoryCompilationError(f"{view} compilation output contains unsafe content")
 
     target = resolve_view_path(policy, memory_dir.parent, view)
+    # Capture the pre-existing document once, before the first write on this
+    # install creates the repository -- otherwise the state that preceded all
+    # memory compilation is in no commit and cannot be restored.  Later writes
+    # skip this: the previous post-write commit holds the same bytes, so it
+    # would cost two git processes per accepted draft to commit nothing.
+    snapshot_baseline(memory_dir.parent, f"memory: baseline before {view}")
     # Back up what is on disk rather than the caller's ``existing``.  The two
     # differ whenever the accepted view could not be read back in full, and
     # that is exactly when the overwrite is least recoverable -- an empty

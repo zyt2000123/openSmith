@@ -65,6 +65,19 @@ export function processingScanSegments(frame: number): ProcessingScanSegment[] {
   return [...PROCESSING_LABEL].map((text, index) => ({ id: String(index), text, active: index === activeIndex }));
 }
 
+/**
+ * Columns unavailable to an assistant body, counted from the raw terminal width:
+ * the transcript mounts every entry inside `<Box paddingX={2}>` (index.tsx), and
+ * the body itself adds `paddingLeft={2}` plus the two-cell `"● "` marker.
+ * Budgeting only the outer padding left hard-geometry renderers four cells too
+ * wide, and Ink wrapped the trailing border cell of every table row onto its own
+ * line — the grid looked shattered while its own layout was correct.
+ */
+const ASSISTANT_BODY_INDENT = 8;
+
+/** Same accounting for a system entry: the outer `paddingX={2}` plus its own `paddingLeft={1}`. */
+const SYSTEM_BODY_INDENT = 5;
+
 export function userMessageBoxProps(columns: number) {
   return {
     width: Math.max(1, columns - 4),
@@ -558,7 +571,7 @@ function TurnView({
   terminalColumns: number;
 }) {
   const columns = terminalColumns;
-  const markdownWidth = Math.max(1, columns - 4);
+  const markdownWidth = Math.max(1, columns - ASSISTANT_BODY_INDENT);
   const hasAssistantBody = entry.assistantText.trim().length > 0;
   const assistantBody = hasAssistantBody ? stripEmojiIcons(entry.assistantText).trimEnd() : "";
   const assistantStartsWithHeading = startsWithMarkdownHeading(assistantBody);
@@ -648,7 +661,7 @@ export function TranscriptEntryView({
   const { columns: windowColumns } = useWindowSize();
   const columns = terminalColumns ?? windowColumns;
   if (entry.kind === "system") {
-    return <SystemMessage entry={entry} highlighter={highlighter} width={Math.max(1, columns - 1)} />;
+    return <SystemMessage entry={entry} highlighter={highlighter} width={Math.max(1, columns - SYSTEM_BODY_INDENT)} />;
   }
 
   return (

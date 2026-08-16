@@ -1,6 +1,6 @@
-# Agent-Smith
+# openSmith
 
-> Local-first, terminal-native AI agent workbench.
+> A local-first, terminal-native agent workbench.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
@@ -9,47 +9,54 @@
 ![React](https://img.shields.io/badge/React-61DAFB?style=for-the-badge&logo=react&logoColor=black)
 ![Anthropic](https://img.shields.io/badge/Claude-191919?style=for-the-badge&logo=anthropic&logoColor=white)
 ![OpenAI](https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
-Smith is a single, always-on agent that runs locally. It keeps conversation context, accumulates memory across sessions, and switches workflows via skills. One agent, no orchestration overhead.
+Smith is a single, always-on agent that runs on your machine. It keeps
+conversation context, accumulates memory across sessions, and switches workflows
+through skills. One agent, one conversation — no sub-agents, no routing layer to
+reason about.
 
-## 结论
+Everything runs locally: the shell, the API server, the execution engine, and
+the SQLite database. The only outbound traffic goes to the LLM provider you
+configure.
 
-Smith 是一个本地运行的常驻 Agent：它保留会话上下文、跨会话积累记忆，并通过 skill 切换任务工作流。产品只运行一个 Agent，不包含子 Agent 或多 Agent 编排。
+---
 
-## 架构总览
+## Why One Agent
 
-```mermaid
-graph LR
-    U[User] --> S[Shell: Ink / React]
-    S -->|HTTP / SSE| V[Server: FastAPI]
-    V --> E[Engine: 执行运行时]
-    E --> A[Agents: 身份 / Skill / Tool]
-    E --> C[Common: 路径 / YAML / SQLite]
-    E --> L[LLM Provider]
-    E --> M[MCP Server]
-    L --> R[Execution Event]
-    M --> R
-    R --> V
-    V --> S
-    S --> O[Response]
-```
+Multi-agent frameworks spend their complexity budget on orchestration —
+delegation, hand-off protocols, shared scratchpads, and the failure modes each of
+those introduces. openSmith spends it on the single agent instead:
 
-依赖方向为 `server → engine → common`。`agents/` 由 Engine 在运行时加载；`shell/` 仅通过本地 HTTP/SSE 与 Server 通信。
+| Concern | How openSmith handles it |
+|---|---|
+| Different task types | **Skills** — a task-specific workflow loaded into the prompt, not a separate agent |
+| Multi-step work | **Skill chains** — declared pipelines with gates between stages |
+| Long-lived context | **Memory** — compiled from evidence, not appended transcripts |
+| Dangerous operations | **Tool guard + fact gate** — a non-bypassable boundary plus a challenge layer |
+| Correctness of intermediate steps | **Gates** — a stage must produce its contract before the next one runs |
+
+---
 
 ## What It Does
 
-- **Interactive terminal** — a single rich Ink shell
-- **Skill-based workflows** — debug, plan, review, or direct reply, chosen per task
-- **Skill chains** — requirements research, TDD development, and code review are routed by intent and run as gated skill chains
-- **Real tools** — file I/O, shell, Git, web search, MCP, all sandboxed with permission levels
+- **Interactive terminal** — a single rich Ink shell, launched with `smith` from any project directory
+- **Skill-based workflows** — debug, plan, review, or reply directly, chosen per task
+- **Skill chains** — requirements research, TDD development, and code review run as gated pipelines
+- **Real tools** — file I/O, shell, Git, web search, and MCP servers, each behind permission levels
 - **Persistent memory** — sessions, agent memory, and project context survive restarts
-- **Multi-provider LLM** — OpenAI-compatible and Anthropic; routed by use case (interactive / gate / background)
+- **Multi-provider LLM** — OpenAI-compatible and Anthropic, routed by use case (interactive / gate / background)
+- **Auditable by construction** — a tamper-evident hash chain over the audit log, plus structured execution events
+
+---
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/)
+- Node.js 22+
 
 ### Install
 
@@ -70,8 +77,8 @@ uv tool uninstall agent-smith-server
 
 `npm link` symlinks the global `smith` to this working copy rather than copying
 it, so `smith` works from any directory and finds `server/` through its own
-install path — but it breaks if the repository moves, and picks up source edits
-only after `npm run build`. Verify with:
+install path. The trade-off: it breaks if the repository moves, and it picks up
+source edits only after `npm run build`. Verify with:
 
 ```bash
 ls -l "$(which smith)"   # → .../lib/node_modules/smith-shell/bin/smith.js
@@ -79,7 +86,7 @@ ls -l "$(which smith)"   # → .../lib/node_modules/smith-shell/bin/smith.js
 
 ### Configure
 
-Set your LLM provider via environment variables:
+Set your LLM provider through environment variables:
 
 ```bash
 export AGENTSMITH_LLM_PROVIDER=openai          # openai / anthropic
@@ -101,54 +108,175 @@ llm:
 ### Run
 
 ```bash
-# Run it from any project directory — it auto-starts the backend
+# From any project directory — the backend starts automatically
 smith
 ```
 
-### Context files
+### Context Files
 
-`~/.agent-smith/SMITH.md` is your user-wide instruction file: it applies to every Smith run. Use a repository's `.smith/SMITH.md` only for rules that belong to that project. Both files are read when Smith builds a run, so edits apply to the next request without restarting the backend.
+`~/.agent-smith/SMITH.md` is your user-wide instruction file: it applies to every
+run. A repository's own `.smith/SMITH.md` holds rules that belong to that project
+only. Both are read while a run is assembled, so edits take effect on the next
+request without restarting the backend.
 
-In the terminal, run `/reload` after editing context files to start a fresh session while keeping the prior session in history. The next task then starts with the current context.
+Inside the shell, `/reload` starts a fresh session while keeping the previous one
+in history, so the next task begins with the current context.
+
+---
 
 ## Architecture
 
-```
-shell (Ink / React)
-      │ HTTP
-      ▼
-server (FastAPI)
-      │
-      ▼
-engine (execution) ◄── agents (identity, skills, tools, safety)
-      │
-      ▼
-common (paths, YAML, SQLite, filesystem, audit hash chain)
+```mermaid
+graph LR
+    U[User] --> S[Shell · Ink / React]
+    S -->|HTTP + SSE| V[Server · FastAPI]
+    V --> E[Engine · execution runtime]
+    E --> A[Agents · identity / skills / tools]
+    E --> C[Common · paths / YAML / SQLite]
+    E --> L[LLM provider]
+    E --> M[MCP servers]
+    L --> R[Execution events]
+    M --> R
+    R --> V
+    V --> S
+    S --> O[Response]
 ```
 
-| Layer | What It Does |
-|---|---|
-| `common/` | Paths, YAML configuration, SQLite connection, filesystem resources, tamper-evident audit log hash chain (`common/hash_chain.py`, consumed by the engine's trace store and tool guard) — no orchestration logic |
-| `engine/` | Task routing, skill chains, ReAct loop, LLM adapters, memory, tools, safety, sandbox (`engine/sandbox/`), observability (`engine/observability/`) |
-| `agents/` | Smith identity, pipelines, built-in skills, tool providers, safety rules |
-| `server/` | FastAPI app, service orchestration, agent/session lifecycle |
-| `shell/` | Ink/React terminal UI, auto-starts backend, SSE streaming |
+Dependencies flow one way — `server → engine → common`. The engine never imports
+FastAPI, and `agents/` imports nothing from the other layers: it is loaded at
+runtime, so its contract is file shape, not Python types.
 
-Dependencies flow one way: `server → engine → common`. The engine never imports FastAPI.
+| Layer | Directory | Responsibility |
+|---|---|---|
+| Infrastructure | `common/` | Paths, YAML config, SQLite connection, audit hash chain. No business logic. |
+| Execution | `engine/` | Agent framework: LLM, ReAct loop, pipelines, memory, skills, tools, safety, observability. No platform knowledge. |
+| Content | `agents/` | Smith's identity seed, pipelines, gates, conditions, tools, skills, hooks. Pure content. |
+| Platform | `server/` | FastAPI app: orchestration, session and agent lifecycle, HTTP endpoints. |
+| Terminal UI | `shell/` | Ink shell. Talks to the server over local HTTP, auto-starts the backend. |
+
+---
+
+## Repository Layout
+
+```
+openSmith/
+├── agents/                     # Content layer — loaded at runtime, never imported
+│   ├── conditions/             #   Predicates deciding whether a pipeline node runs
+│   ├── gates/                  #   Stage contracts: what a node must produce to advance
+│   ├── identities/             #   Identity and route declarations (smith.yaml, coding.yaml)
+│   ├── pipelines/              #   Skill-chain definitions
+│   ├── safety/                 #   Declarative safety rules
+│   ├── skills/                 #   Built-in skills, one directory per SKILL.md
+│   ├── smith/                  #   Smith's identity seed: role, style, workflow, hooks
+│   ├── tools/                  #   Tool providers (TOOL_META + execute)
+│   ├── output_style.md         #   Response style layer injected into the prompt
+│   └── README.md
+│
+├── common/                     # Infrastructure layer — zero business logic
+│   ├── config.py               #   Configuration loading
+│   ├── database.py             #   SQLite connection management
+│   ├── hash_chain.py           #   Tamper-evident audit log chain
+│   ├── paths.py                #   Single source of truth for the data root (~/.agent-smith)
+│   ├── yaml_utils.py           #   Safe YAML read/write
+│   └── pyproject.toml
+│
+├── engine/                     # Execution layer — the agent framework
+│   ├── context/                #   Prompt assembly (trust-tagged layers)
+│   ├── execution/              #   Run lifecycle and control flow
+│   │   ├── hooks/              #     Pre/Post/Stop tool-lifecycle hook framework
+│   │   ├── orchestration/      #     Run lifecycle, agent dispatch
+│   │   ├── pipeline/           #     Pipeline and skill-chain execution
+│   │   ├── react/              #     ReAct loop
+│   │   └── routing/            #     Lexical intent routing
+│   ├── identity/               #   Identity catalog and route resolution
+│   ├── llm/                    #   Provider adapters, model configuration
+│   ├── mcp/                    #   MCP client: external tool protocol
+│   ├── memory/                 #   Evidence log, compiler, guards, policy
+│   ├── observability/          #   Structured events, traces, metrics
+│   ├── safety/                 #   Tool guard (non-bypassable) and fact gate
+│   ├── sandbox/                #   Host execution isolation (Seatbelt on macOS)
+│   ├── skill/                  #   Skill discovery and loading
+│   ├── tool/                   #   Tool registry and dispatch
+│   ├── tests/                  #   Engine test suite
+│   └── pyproject.toml
+│
+├── server/                     # Platform layer — FastAPI
+│   ├── app/
+│   │   ├── infrastructure/     #     App wiring, startup, dependencies
+│   │   ├── routers/            #     HTTP endpoints (thin: extract, call, return)
+│   │   ├── schemas/            #     Request and response models
+│   │   ├── services/           #     Orchestration: engine runtime, sessions, profiles
+│   │   ├── utils/
+│   │   └── main.py             #     ASGI entry point
+│   ├── docs/
+│   ├── tests/
+│   └── pyproject.toml
+│
+├── shell/                      # Terminal UI — Ink / React
+│   ├── bin/smith.js            #   CLI entry point
+│   ├── src/                    #   Components, transcript rendering, API bridge
+│   ├── scripts/                #   Test runner
+│   ├── biome.json              #   Lint and format configuration
+│   └── package.json
+│
+├── docs/                       # Documentation
+│   ├── wiki/                   #   Primary design docs — 14 chapters, start here
+│   ├── adr/                    #   Architecture decision records
+│   ├── analysis/               #   Analyses and investigations
+│   ├── capabilities/           #   Capability notes
+│   ├── reference/              #   Reference material
+│   ├── research/               #   Research notes
+│   ├── superpowers/            #   Agent technique notes
+│   └── 00–11 *.md              #   Earlier documentation set (not kept in sync)
+│
+├── .githooks/                  # Repository git hooks
+├── AGENTS.md                   # Brief for coding agents working in this repo
+├── CLAUDE.md                   # Working brief: architecture, boundaries, verification
+└── CONTEXT.md                  # Short project context
+```
+
+---
 
 ## Documentation
 
-**设计文档从 [docs/wiki/](docs/wiki/README.md) 开始** —— 14 篇按子系统组织的详细文档（技术选型、架构、参数、取舍），全部以源码为准。
+**Start with [`docs/wiki/`](docs/wiki/README.md)** — 14 chapters organised by
+subsystem, covering technology choices, architecture, parameters, and the
+trade-offs behind them. All of it is written against the source.
 
-`docs/` 根目录下的 `00`–`11` 是更早的一版，未随重构同步；写作与图示规范见 [00 · 文档阅读指南与表达规范](docs/00-文档阅读指南与表达规范.md)。当前实现以源码和测试为准，调研及历史方案不代表已支持的功能。
+The `00`–`11` files in the `docs/` root are an earlier set that was not kept in
+sync with later refactors; writing and diagram conventions are described in
+[`docs/00`](docs/00-文档阅读指南与表达规范.md). When documentation and code
+disagree, the code wins.
+
+---
 
 ## Development
 
 ```bash
 cd engine && uv run --extra test pytest tests   # Engine tests
-cd server && uv run --extra dev pytest tests     # Server tests
-cd shell  && npm test && npm run check           # Shell tests + typecheck
+cd server && uv run --extra dev  pytest tests   # Server tests
+cd shell  && npm test && npm run check          # Shell tests + typecheck
 ```
+
+Run the backend in the foreground when you need it directly:
+
+```bash
+cd server && uv run uvicorn app.main:app --port 8000
+```
+
+Note for non-macOS contributors: a number of engine tests exercise the macOS
+Seatbelt sandbox and are skipped elsewhere. A Seatbelt test that *fails* rather
+than skips on Linux is missing its platform marker.
+
+---
+
+## Contributing
+
+New capability? Add a **skill**, not an agent. The architecture boundaries in
+[`CLAUDE.md`](CLAUDE.md) are enforced by the import graph and by tests — keep
+`engine/` free of HTTP concepts, and keep `agents/` importing nothing.
+
+---
 
 ## License
 

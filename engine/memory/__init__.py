@@ -25,6 +25,7 @@ __all__ = [
     "sanitize_memory_text",
 ]
 
+from ._snapshot import MemorySnapshot, list_snapshots, restore_snapshot
 from .dream import run_dream, DreamReport, dream_report_completed
 from .compile import run_compilation, assemble_memory
 from .maintenance import (
@@ -34,6 +35,9 @@ from .maintenance import (
 )
 
 __all__ += [
+    "MemorySnapshot",
+    "list_snapshots",
+    "restore_snapshot",
     "run_dream",
     "DreamReport",
     "dream_report_completed",

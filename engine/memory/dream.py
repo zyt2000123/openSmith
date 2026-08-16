@@ -144,6 +144,12 @@ def _sanitize_all_layers(memory_dir: Path, report: DreamReport) -> None:
     secrets_removed = 0
     injections_removed = 0
     sanitized_files = 0
+    # Deliberately no pre-write snapshot here, unlike every other writer: the
+    # text being replaced is the text that contains the leaked secret, and
+    # committing it would park that secret in git history permanently -- the one
+    # outcome sanitizing exists to prevent. Recovering from a false-positive
+    # match uses the compiler's snapshots instead, which are clean by
+    # construction because _commit_view refuses a draft containing secrets.
     for md_file in _all_memory_files(memory_dir):
         content = md_file.read_text(encoding="utf-8")
         cleaned, file_secrets, file_injections = _sanitize_lines(content)
@@ -407,8 +413,14 @@ def _cleanup_log(memory_dir: Path, report: DreamReport) -> int:
         context_offset=max(0, context_offset - safe_offset),
     )
     _write_dream_cleanup(memory_dir, cleanup)
+    # The cleanup journal below makes the truncation *atomic* -- it replays a
+    # half-finished reclaim after a crash. It does not make it *undoable*: the
+    # reclaimed prefix is gone once it is written out. Snapshot first so an
+    # over-eager reclaim can be rolled back with the views that cite it.
+    snapshot_views(memory_dir.parent, f"memory: before reclaiming {safe_offset} event(s)")
     atomic_write_text(recent, remaining_text)
     _write_dream_cleanup_offsets(memory_dir, cleanup)
     _clear_dream_cleanup(memory_dir)
+    snapshot_views(memory_dir.parent, f"memory: reclaimed {safe_offset} event(s)")
     report.log_lines_cleaned = safe_offset
     return safe_offset

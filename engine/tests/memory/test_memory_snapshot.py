@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
 
-from engine.memory._snapshot import TRACKED_VIEWS, snapshot_views
+from engine.memory._snapshot import (
+    TRACKED_VIEWS,
+    list_snapshots,
+    restore_snapshot,
+    snapshot_baseline,
+    snapshot_views,
+)
 
 
 def _agent_root(tmp_path):
@@ -15,9 +22,15 @@ def _agent_root(tmp_path):
     return root
 
 
-def _write_views(root, *, context: str, durable: str) -> None:
+def _write_views(root, *, context: str, durable: str, recent: str | None = None) -> None:
     (root / "context.md").write_text(context, encoding="utf-8")
     (root / "memory" / "durable.md").write_text(durable, encoding="utf-8")
+    # The evidence log is tracked alongside the rendered views, so a helper that
+    # left it out would make every "all tracked views" assertion vacuous for it.
+    # It derives from *durable* so a changed document implies changed evidence,
+    # which is what the real pipeline produces.
+    line = recent if recent is not None else json.dumps({"note": durable.strip()}) + "\n"
+    (root / "memory" / "recent.jsonl").write_text(line, encoding="utf-8")
 
 
 def _show(root, ref: str, path: str) -> str:
@@ -55,7 +68,7 @@ def test_unchanged_views_are_a_noop_not_a_failure(tmp_path):
     assert snapshot_views(root, "second") is False
 
 
-def test_only_the_two_views_ever_enter_the_repository(tmp_path):
+def test_only_whitelisted_views_ever_enter_the_repository(tmp_path):
     """A whitelist, never `git add -A`: the agent root also holds secrets."""
     root = _agent_root(tmp_path)
     _write_views(root, context="# Smith Context\n", durable="# durable\n")
@@ -145,6 +158,126 @@ def test_dream_sanitize_leaves_a_trace_and_a_snapshot(tmp_path):
     # Recovering from a false-positive match relies on the *compiler's* snapshot
     # instead: _commit_view refuses a draft containing secrets, so whatever
     # compilation committed is clean by construction and still restorable.
+
+
+def test_baseline_captures_the_state_before_the_first_write_only(tmp_path):
+    """The pre-compilation document is in no post-write commit: the repository
+    does not exist until after that write."""
+    root = _agent_root(tmp_path)
+    _write_views(root, context="# ctx original\n", durable="# dur original\n")
+
+    assert snapshot_baseline(root, "memory: baseline") is True
+
+    _write_views(root, context="# ctx compiled\n", durable="# dur compiled\n")
+    snapshot_views(root, "memory: durable (written)")
+
+    assert "original" in _show(root, "HEAD~1", "memory/durable.md")
+    # Later writes must not pay for a baseline that could only ever commit the
+    # bytes the previous post-write snapshot already holds.
+    assert snapshot_baseline(root, "memory: baseline again") is False
+    assert len(list_snapshots(root)) == 2
+
+
+def test_baseline_never_shells_out_once_the_repository_exists(tmp_path, monkeypatch):
+    """Guards the cost, not just the outcome: this runs on every accepted draft."""
+    root = _agent_root(tmp_path)
+    _write_views(root, context="# ctx\n", durable="# dur\n")
+    snapshot_views(root, "first")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("baseline must not spawn git once the repo exists")
+
+    monkeypatch.setattr(subprocess, "run", _forbidden)
+    assert snapshot_baseline(root, "memory: baseline") is False
+
+
+def test_list_snapshots_returns_history_newest_first(tmp_path):
+    root = _agent_root(tmp_path)
+    _write_views(root, context="# ctx v1\n", durable="# dur v1\n")
+    snapshot_views(root, "memory: durable (v1)")
+    _write_views(root, context="# ctx v2\n", durable="# dur v2\n")
+    snapshot_views(root, "memory: durable (v2)")
+
+    snapshots = list_snapshots(root)
+
+    assert [s.message for s in snapshots] == ["memory: durable (v2)", "memory: durable (v1)"]
+    assert all(s.timestamp for s in snapshots)
+    assert len({s.ref for s in snapshots}) == 2
+
+
+def test_list_snapshots_is_empty_without_a_repository(tmp_path):
+    """Listing is a read of a recovery aid, not part of the memory contract."""
+    assert list_snapshots(_agent_root(tmp_path)) == []
+
+
+def test_restore_rolls_back_and_stays_undoable(tmp_path):
+    """Undoing a bad write must not destroy the only copy of what it replaced."""
+    root = _agent_root(tmp_path)
+    _write_views(root, context="# ctx good\n", durable="# dur good\n")
+    snapshot_views(root, "good")
+    _write_views(root, context="# ctx ruined\n", durable="# dur ruined\n")
+    snapshot_views(root, "ruined")
+
+    good = list_snapshots(root)[-1]
+    assert restore_snapshot(root, good.ref) is True
+
+    assert (root / "memory" / "durable.md").read_text(encoding="utf-8") == "# dur good\n"
+    assert (root / "context.md").read_text(encoding="utf-8") == "# ctx good\n"
+    # The ruined document is still reachable: the restore snapshotted it first,
+    # so a restore aimed at the wrong commit is itself recoverable.
+    assert any("ruined" in _show(root, s.ref, "memory/durable.md") for s in list_snapshots(root))
+
+
+def test_restore_rejects_a_ref_that_could_be_read_as_an_option(tmp_path):
+    """`--` guards the pathspec position, never the <tree-ish> one."""
+    root = _agent_root(tmp_path)
+    _write_views(root, context="# ctx\n", durable="# dur\n")
+    snapshot_views(root, "only")
+
+    for ref in ("--upload-pack=touch /tmp/pwned", "HEAD", "main", "", "../etc", "zzzzzzz"):
+        assert restore_snapshot(root, ref) is False
+
+    assert (root / "memory" / "durable.md").read_text(encoding="utf-8") == "# dur\n"
+
+
+def test_restore_without_a_repository_is_false_not_an_exception(tmp_path):
+    assert restore_snapshot(_agent_root(tmp_path), "0" * 40) is False
+
+
+def test_reclaimed_evidence_is_recoverable(tmp_path):
+    """Dream's reclaim is atomic but not undoable on its own: the cleanup journal
+    replays a half-finished truncation, it does not bring the prefix back."""
+    from engine.memory.dream import DreamReport, _cleanup_log
+
+    root = _agent_root(tmp_path)
+    memory_dir = root / "memory"
+    old = "2024-01-01T00:00:00+00:00"
+    events = [
+        json.dumps({"timestamp": old, "type": "work", "task": f"event {i}"}) for i in range(2)
+    ]
+    _write_views(
+        root,
+        context="# ctx\n",
+        durable="# dur\n",
+        recent="\n".join(events) + "\n",
+    )
+    (memory_dir / ".compile_offset").write_text("2", encoding="utf-8")
+    (memory_dir / ".compile_offset_context").write_text("2", encoding="utf-8")
+
+    report = DreamReport()
+    assert _cleanup_log(memory_dir, report) == 2
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == ""
+
+    # The evidence is gone from disk but reachable in history, together with the
+    # views that cite it — restoring one without the other is what makes a
+    # rollback leave memory inconsistent.
+    restorable = [
+        s for s in list_snapshots(root) if "event 0" in _show(root, s.ref, "memory/recent.jsonl")
+    ]
+    assert restorable, "the reclaimed prefix left no recoverable snapshot"
+
+    assert restore_snapshot(root, restorable[0].ref) is True
+    assert "event 0" in (memory_dir / "recent.jsonl").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("view", TRACKED_VIEWS)
