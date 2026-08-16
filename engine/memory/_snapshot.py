@@ -14,19 +14,31 @@ held.  Every failure path here logs and returns False.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Only these two paths ever enter the index, and they are named explicitly on
-# every call.  The agent root also holds config.yaml, toolbox.md and the rest of
-# the profile; `git add -A` there would enrol whatever lands in that directory
-# next.  A whitelist fails closed -- a new sensitive file stays out even if
-# nobody remembers to write an ignore rule for it.
-TRACKED_VIEWS: tuple[str, ...] = ("context.md", "memory/durable.md")
+# Only these paths ever enter the index, and they are named explicitly on every
+# call.  The agent root also holds config.yaml, toolbox.md and the rest of the
+# profile; `git add -A` there would enrol whatever lands in that directory next.
+# A whitelist fails closed -- a new sensitive file stays out even if nobody
+# remembers to write an ignore rule for it.
+#
+# recent.jsonl joins the two rendered views because Dream's reclaim truncates
+# it: restoring a conclusion without the evidence it was drawn from leaves the
+# two out of step, and the next compile would reread a log that no longer holds
+# what the restored document cites.
+TRACKED_VIEWS: tuple[str, ...] = ("context.md", "memory/durable.md", "memory/recent.jsonl")
 
 _TIMEOUT_SECONDS = 15.0
+
+# A restore target is handed straight to git.  Anything that is not a plain
+# object name could be read as an option (`--upload-pack=...`), and `--` guards
+# the pathspec position, not the <tree-ish> one.
+_REF_PATTERN = re.compile(r"\A[0-9a-fA-F]{7,40}\Z")
 
 # A fresh machine may have no committer identity, and a configured GPG key would
 # block on a passphrase prompt.  Both are supplied per invocation so the
@@ -98,4 +110,98 @@ def snapshot_views(agent_root: Path, message: str) -> bool:
         # FileNotFoundError covers "git is not installed", TimeoutExpired covers
         # a hung index lock.  Neither may interrupt a memory write.
         logger.warning("memory snapshot unavailable: %s", exc)
+        return False
+
+
+def snapshot_baseline(agent_root: Path, message: str) -> bool:
+    """Commit the views as they stand, but only before the repository exists.
+
+    A post-write snapshot can never reach the state that preceded the *first*
+    write: the repository is created after that write, so the original document
+    lands in no commit at all.  One baseline closes that gap.
+
+    Every later write is deliberately not preceded by a snapshot.  The previous
+    post-write commit already holds exactly those bytes, so a pre-write snapshot
+    would be a guaranteed nothing-to-commit -- while still forking two git
+    processes on a path that runs on every accepted draft.  The existence check
+    here is a stat, not a subprocess.
+    """
+    if (agent_root / ".git").exists():
+        return False
+    return snapshot_views(agent_root, message)
+
+
+@dataclass(frozen=True)
+class MemorySnapshot:
+    """One recoverable point in the memory history."""
+
+    ref: str
+    timestamp: str
+    message: str
+
+
+def list_snapshots(agent_root: Path, limit: int = 20) -> list[MemorySnapshot]:
+    """Most recent snapshots first; empty when git or the repository is absent."""
+    if limit <= 0:
+        return []
+    try:
+        log = _git(
+            agent_root,
+            "log",
+            f"-{limit}",
+            # A unit separator, because a commit subject may contain anything a
+            # view name does -- splitting on a printable delimiter would cut the
+            # message in two.
+            "--format=%H%x1f%cI%x1f%s",
+            "--",
+            *TRACKED_VIEWS,
+        )
+        if log.returncode != 0:
+            logger.warning("memory snapshot: git log failed: %s", log.stderr.strip()[:200])
+            return []
+        snapshots = []
+        for line in log.stdout.splitlines():
+            parts = line.split("\x1f", 2)
+            if len(parts) == 3:
+                snapshots.append(
+                    MemorySnapshot(ref=parts[0], timestamp=parts[1], message=parts[2])
+                )
+        return snapshots
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("memory snapshot unavailable: %s", exc)
+        return []
+
+
+def restore_snapshot(agent_root: Path, ref: str) -> bool:
+    """Roll the tracked views back to *ref*; return whether anything was restored.
+
+    The current state is snapshotted first, so undoing a bad Dream is itself
+    undoable.  A restore that destroyed the only copy of what it replaced would
+    move the data loss one step along instead of preventing it.
+    """
+    if not _REF_PATTERN.match(ref):
+        logger.warning("memory snapshot: refusing to restore malformed ref %r", ref)
+        return False
+    try:
+        if not (agent_root / ".git").exists():
+            logger.warning("memory snapshot: no repository under %s", agent_root)
+            return False
+
+        snapshot_views(agent_root, f"memory: state before restoring {ref[:12]}")
+
+        restored = []
+        for name in TRACKED_VIEWS:
+            # A file the commit never had is left alone rather than deleted:
+            # `git checkout <ref> -- <path>` fails for it, and removing live
+            # evidence to complete a rollback trades one loss for another.
+            if _git(agent_root, "checkout", ref, "--", name).returncode == 0:
+                restored.append(name)
+        if not restored:
+            logger.warning("memory snapshot: nothing restored from %s", ref)
+            return False
+
+        snapshot_views(agent_root, f"memory: restored {ref[:12]} ({len(restored)} file(s))")
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("memory snapshot restore unavailable: %s", exc)
         return False

@@ -83,8 +83,18 @@ is only erased by `forget`/`correction`), placement (`work` evidence cannot
 establish a `Verified Outcomes` entry). Rejection is per change, so one bad edit
 does not sink the batch, and the reviewer is shown only what survived. On total
 failure nothing is written — a degraded draft would become the next round's
-trusted baseline. `_snapshot.py` git-commits the two views on every accepted
-write, so recovery is not limited to one `.bak` generation.
+trusted baseline. `_snapshot.py` makes `~/.agent-smith/` a git repository and
+commits `context.md`, `memory/durable.md` and `memory/recent.jsonl` after every
+accepted write, so recovery is not limited to one `.bak` generation. The
+evidence log is tracked with the views because restoring a conclusion without
+the evidence it cites leaves the two out of step. `snapshot_baseline()` captures
+the pre-compilation state once — the repository is created *after* the first
+write, so nothing else can reach it — and costs a stat, not a git call, on every
+later write. Dream snapshots on both sides of a reclaim; sanitize deliberately
+snapshots only afterwards, because committing the pre-sanitize text would park
+the leaked secret in git history permanently. `list_snapshots()` /
+`restore_snapshot()` are the undo path, and a restore snapshots the current
+state first, so aiming one at the wrong commit is itself recoverable.
 
 Each view owns a log cursor (`.compile_offset` for durable, `.compile_offset_context`
 for context) and advances it only past events that actually fit the 24k prompt
