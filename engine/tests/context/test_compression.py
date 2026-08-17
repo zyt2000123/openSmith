@@ -25,6 +25,19 @@ VALID_SUMMARY = """<context_summary>
   <current_plan>plan</current_plan>
 </context_summary>"""
 
+# A summary of a conversation about code, which is most of what compaction sees.
+# The prose carries a bare ``&``, a bare ``<`` and a comment marker because the
+# conversation did.  The compaction prompt never asks the model to escape XML
+# entities, so a faithful summary of code talk is not well-formed XML.
+CODE_HEAVY_SUMMARY = """<context_summary>
+  <conversation_overview>依赖是 server/ -> engine/ -> common/，用户问 A && B 时 if (a < b) 会怎样。</conversation_overview>
+  <key_knowledge>List<String> 那段用了 <!-- placeholder -->，U+4E00-U+9FFF 判定要改。</key_knowledge>
+  <file_system_state>budget.py 已改：estimate_tokens() 按 3 token/字符 计 CJK & 假名。</file_system_state>
+  <recent_actions>跑了 pytest && 全绿。</recent_actions>
+  <current_plan>[DONE] 修 estimate_tokens()
+    [TODO] 若 a < b 仍失败则补测试</current_plan>
+</context_summary>"""
+
 
 def test_needs_compaction_uses_actual_conversation_size() -> None:
     conversation = [{"role": "system", "content": "x" * 300_000}]
@@ -246,6 +259,49 @@ def test_session_summary_rejects_a_malformed_completed_response() -> None:
     result = asyncio.run(summarize_session(
         [{"role": "user", "content": "goal"}],
         InvalidSummaryLLM(),
+    ))
+
+    assert result.status is SessionSummaryStatus.INVALID
+    assert not result.usable
+
+
+def test_session_summary_accepts_unescaped_markup_inside_the_sections() -> None:
+    """Structure lives in the tags; section prose is opaque text.
+
+    Summarizing a conversation about code yields prose full of ``&&``, ``<`` and
+    generics.  Requiring the whole envelope to parse as XML failed every such
+    summary even though the model returned all five sections.
+    """
+    class MarkupHeavyLLM:
+        async def chat(self, messages, tools=None):
+            return SimpleNamespace(text=CODE_HEAVY_SUMMARY, finish_reason="stop")
+
+    result = asyncio.run(summarize_session(
+        [{"role": "user", "content": "goal"}],
+        MarkupHeavyLLM(),
+    ))
+
+    assert result.status is SessionSummaryStatus.COMPLETE
+    assert result.usable
+    assert result.summary == CODE_HEAVY_SUMMARY
+
+
+def test_session_summary_rejects_a_summary_missing_one_section() -> None:
+    """Tag presence is the contract, so a dropped section must still fail."""
+    partial = CODE_HEAVY_SUMMARY.replace(
+        "<current_plan>[DONE] 修 estimate_tokens()\n"
+        "    [TODO] 若 a < b 仍失败则补测试</current_plan>\n",
+        "",
+    )
+    assert "<current_plan>" not in partial
+
+    class PartialSummaryLLM:
+        async def chat(self, messages, tools=None):
+            return SimpleNamespace(text=partial, finish_reason="stop")
+
+    result = asyncio.run(summarize_session(
+        [{"role": "user", "content": "goal"}],
+        PartialSummaryLLM(),
     ))
 
     assert result.status is SessionSummaryStatus.INVALID

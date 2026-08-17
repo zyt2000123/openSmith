@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import logging
+import re
 from typing import Any
-from xml.etree import ElementTree
 
 from engine.llm.observability import llm_purpose
 
@@ -133,20 +133,33 @@ async def summarize_session(
 
 
 def _has_required_summary_structure(summary: str) -> bool:
-    """Accept only the summary envelope the compaction prompt requires."""
+    """Accept the summary envelope by tag presence, not XML well-formedness.
+
+    The sections hold prose about whatever the conversation covered, so a
+    faithful summary of code talk carries a bare ``&`` (``A && B``), a bare
+    ``<`` (``if (a < b)``, ``List<String>``) or a comment marker.  Parsing the
+    whole envelope as XML rejected those complete summaries over characters the
+    model was right to reproduce, and since the prompt asks for the tags but
+    never for escaped entities, *every* summary of a conversation about code
+    failed -- the one case compaction exists to serve.  Telling the model to
+    escape instead would trade a certain failure for an intermittent one.
+
+    So structure lives in the tags and the text between them stays opaque.  A
+    section may be self-closing: the model emits ``<key_knowledge/>`` when it
+    has nothing to record there, and that still satisfies the contract.
+    """
     if "<!DOCTYPE" in summary or "<!ENTITY" in summary:
-        # ElementTree expands internally declared entities, so a document
-        # carrying a DTD is a memory bomb rather than a summary: four levels of
-        # nesting already turn ten characters into ten thousand.  The compaction
-        # prompt never asks for one, so refusing costs nothing.
+        # No parser expands entities here anymore, so a DTD is inert text rather
+        # than a memory bomb.  Still refused: the compaction prompt never asks
+        # for one, nothing downstream should start parsing this, and defence in
+        # depth costs one substring check.
         return False
-    try:
-        root = ElementTree.fromstring(summary)
-    except (ElementTree.ParseError, ValueError):
+    if "<context_summary>" not in summary or "</context_summary>" not in summary:
         return False
-    return (
-        root.tag == "context_summary"
-        and all(root.find(section) is not None for section in _REQUIRED_SUMMARY_SECTIONS)
+    return all(
+        re.search(rf"<{section}\s*(?:/>|>.*?</{section}>)", summary, re.DOTALL)
+        is not None
+        for section in _REQUIRED_SUMMARY_SECTIONS
     )
 
 
