@@ -34,6 +34,17 @@ graph LR
 | 修改本地 API 或终端 UI | [07 · Server](07-Server-平台后端.md)、[08 · Shell](08-Shell-终端前端.md) | `server/app/routers/`、`shell/src/` |
 | 开发、验证和下一阶段工作 | [10 · 开发规范](10-开发规范与约定.md)、[11 · 路线图](11-开发路线图与待办.md) | 包脚本、测试、Issue/ADR |
 
+## 系统机制说明（20–23）
+
+这四篇是 2026-08-23 按代码重新通读后写的现行机制说明，用于对外讲解四个核心子系统。与 `04a`–`04k` 旧稿冲突时以这四篇和代码为准。
+
+| 文档 | 讲什么 | 事实来源 |
+| --- | --- | --- |
+| [20 · Agent Loop 运行机制](20-Agent-Loop-运行机制.md) | 三条执行路径、ReAct 单轮形状、三套预算、终态与原因、草稿生命周期、崩溃恢复、管线门禁 | `engine/execution/` |
+| [21 · 记忆系统](21-记忆系统.md) | 两个视图、证据日志、变更集编译、三道程序裁决、失败不写入、双游标与 Dream、git 快照 | `engine/memory/`、`engine/memory/MEMORY_POLICY.md` |
+| [22 · 上下文治理](22-上下文治理.md) | 16 层提示词与信任标签、预算推导、CJK token 估算、`fit_request` 五步阶梯、三种压缩、缓存前缀 | `engine/context/` |
+| [23 · 工具与安全体系](23-工具与安全体系.md) | 19 个工具的能力矩阵、八道关卡、ToolGuard 与 31 条危险规则、风险分级与审批、Seatbelt profile、哈希链审计 | `agents/tools/`、`engine/{tool,safety,sandbox}/` |
+
 ## 文档分层
 
 ### 当前实现（规范性）
