@@ -855,7 +855,13 @@ class ScopedToolRegistry:
         # ``list_tool_names`` already applies the parent identity/profile
         # allowlist.  Intersecting here prevents a scoped view from widening
         # that outer boundary through ``get_schemas(enabled=...)``.
-        return self._allowed.intersection(self._registry.list_tool_names())
+        #
+        # ``set(...)`` is load-bearing: ``self._allowed`` is a frozenset, and
+        # ``frozenset.intersection`` returns another frozenset, which
+        # ``get_schemas`` then tried to ``intersection_update`` — an
+        # AttributeError on the one path that narrows a scoped view by name
+        # (the lazy-schema loader's per-tool lookup).
+        return set(self._allowed.intersection(self._registry.list_tool_names()))
 
     @property
     def working_directory(self) -> Path | None:
