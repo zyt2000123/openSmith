@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 # stub cheap -- the paired assistant tool_call still carries name and
 # arguments, so repeating them here would only burn tokens.
 _PRUNED_PREFIX = "[pruned"
-_PRUNED_MARKER = "[pruned]"
 
 
 def _pruned_stub(char_count: int) -> str:
@@ -123,9 +122,9 @@ def prune_tool_outputs(
         msg = conversation[i]
         if msg.get("role") == "tool":
             content = msg.get("content", "")
-            # Exact match, not substring: a real tool output that merely
-            # mentions the marker (grepping this repo does) would otherwise
-            # stop pruning early.
+            # Prefix, not substring: a real tool output that merely mentions
+            # the marker (grepping this repo does) would otherwise stop pruning
+            # early.  A stub is always the whole payload, so it always leads.
             if isinstance(content, str) and content.startswith(_PRUNED_PREFIX):
                 break
             char_count = len(content) if isinstance(content, str) else 0

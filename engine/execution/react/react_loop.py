@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
@@ -44,10 +45,10 @@ from .budget import (
     INCOMPLETE_FINAL_AFTER_TOOL_HINT,
     MAX_FAILED_TOOL_RECOVERY_ITERS,
     MAX_IDENTICAL_TOOL_ERRORS,
-    REPEATED_SUCCESS_WARN_THRESHOLD,
     MAX_INCOMPLETE_FINAL_REPAIRS,
     MAX_LENGTH_CONTINUATIONS,
     MAX_PREFLIGHT_CHALLENGE_ITERS,
+    REPEATED_SUCCESS_WARN_THRESHOLD,
     PREFLIGHT_BUDGET_MESSAGE,
     TOOL_CALL_BUDGET_MESSAGE,
     TOOL_FAILURE_BUDGET_MESSAGE,
@@ -417,13 +418,18 @@ def _elision_note(dropped: list[dict]) -> list[dict]:
 
 
 def _repeat_key(tool_name: str, arguments: object) -> str:
-    """Identify a call by name plus arguments, bounded so a huge payload
-    cannot make the dedup key itself expensive."""
+    """Identify a call by name plus arguments.
+
+    Hashed rather than truncated: two different calls that share a long common
+    prefix -- the same directory, the same file with a different line range --
+    would collide under a slice and warn about a repeat that never happened.
+    """
     try:
         rendered = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         rendered = repr(arguments)
-    return f"{tool_name}:{rendered[:200]}"
+    digest = hashlib.sha256(rendered.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{tool_name}:{digest}"
 
 
 def _assistant_turn(text: str, reasoning: str = "") -> dict[str, object]:

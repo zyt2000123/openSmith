@@ -1686,12 +1686,28 @@ def test_identical_successful_calls_are_warned_about_once():
     assert any(e.type is EventType.TEXT_DELTA for e in events)
 
 
+def _echo_registry() -> ToolRegistry:
+    """A registry whose tool accepts arguments.
+
+    _registry()'s ok() takes none, so a parameterised call raises TypeError and
+    lands on the *error* path -- which silently makes any test about repeated
+    *successful* calls pass for the wrong reason.
+    """
+    registry = ToolRegistry()
+
+    async def echo(**kwargs) -> str:
+        return f"echoed {kwargs}"
+
+    registry.register("echo", "Echoes its arguments", {}, echo)
+    return registry
+
+
 def test_distinct_successful_calls_are_not_warned_about():
     """Different arguments are different work, not a repeat."""
     async def run():
         calls = [
             ChatResponse(tool_calls=[
-                ToolCallData(id=f"c{i}", name="ok", arguments={"n": i})
+                ToolCallData(id=f"c{i}", name="echo", arguments={"n": i})
             ])
             for i in range(REPEATED_SUCCESS_WARN_THRESHOLD + 2)
         ]
@@ -1699,7 +1715,7 @@ def test_distinct_successful_calls_are_not_warned_about():
         async for _ in _react_event_loop(
             llm,
             [{"role": "user", "content": "go"}],
-            _registry(),
+            _echo_registry(),
             max_iters=REPEATED_SUCCESS_WARN_THRESHOLD + 6,
         ):
             pass
@@ -1808,3 +1824,40 @@ def test_a_continued_answer_can_still_be_repaired_without_duplication():
     )
     assert "最终答案" in text
     assert text.count(preamble) <= 1, "the user must not see the fragment twice"
+
+
+def test_long_arguments_sharing_a_prefix_are_not_treated_as_repeats():
+    """A sliced key collided; two distinct calls must stay distinct.
+
+    Reading the same long directory path with different line ranges shares far
+    more than 200 leading characters, and a truncated dedup key would report a
+    repeat that never happened.
+    """
+    # One long value whose *tail* is what differs -- sort_keys would otherwise
+    # float a short discriminating field to the front and hide the collision.
+    shared = "src/" + "very_long_directory_name/" * 12
+
+    async def run():
+        calls = [
+            ChatResponse(tool_calls=[ToolCallData(
+                id=f"c{i}", name="echo", arguments={"path": f"{shared}module_{i}.py"},
+            )])
+            for i in range(REPEATED_SUCCESS_WARN_THRESHOLD + 2)
+        ]
+        llm = FakeLLM([*calls, ChatResponse(text="done")])
+        async for _ in _react_event_loop(
+            llm,
+            [{"role": "user", "content": "go"}],
+            _echo_registry(),
+            max_iters=REPEATED_SUCCESS_WARN_THRESHOLD + 6,
+        ):
+            pass
+        return llm
+
+    llm = asyncio.run(run())
+    assert len(json.dumps({"path": shared})) > 200, "the fixture must exceed the old slice"
+    assert not any(
+        m.get("role") == "system" and "identical arguments" in str(m.get("content", ""))
+        for call in llm.chat_calls
+        for m in call["messages"]
+    )
