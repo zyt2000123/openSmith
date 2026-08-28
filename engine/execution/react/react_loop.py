@@ -15,7 +15,7 @@ from engine.context.compression import (
 )
 from engine.execution.evidence import tool_result_hash
 from engine.execution.events import EventType, ExecutionEvent
-from engine.execution.runtime_control import tool_blocked_prompt
+from engine.execution.runtime_control import repeated_success_prompt, tool_blocked_prompt
 from engine.llm.contracts import (
     ChatResponse,
     LLMContextLengthError,
@@ -44,6 +44,7 @@ from .budget import (
     INCOMPLETE_FINAL_AFTER_TOOL_HINT,
     MAX_FAILED_TOOL_RECOVERY_ITERS,
     MAX_IDENTICAL_TOOL_ERRORS,
+    REPEATED_SUCCESS_WARN_THRESHOLD,
     MAX_INCOMPLETE_FINAL_REPAIRS,
     MAX_LENGTH_CONTINUATIONS,
     MAX_PREFLIGHT_CHALLENGE_ITERS,
@@ -391,6 +392,16 @@ def _should_repair_incomplete_final(
     )
 
 
+def _repeat_key(tool_name: str, arguments: object) -> str:
+    """Identify a call by name plus arguments, bounded so a huge payload
+    cannot make the dedup key itself expensive."""
+    try:
+        rendered = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = repr(arguments)
+    return f"{tool_name}:{rendered[:200]}"
+
+
 def _assistant_turn(text: str, reasoning: str = "") -> dict[str, object]:
     """构造一条 assistant 消息，按需带上 reasoning。
 
@@ -478,6 +489,8 @@ async def react_event_loop(
     active_provision_ids: list[str] = []
     last_error_key: str | None = None
     identical_error_count = 0
+    repeat_counts: dict[str, int] = {}
+    repeat_warned: set[str] = set()
     context_recoveries = 0
     model_compaction_enabled = True
 
@@ -1351,6 +1364,21 @@ async def react_event_loop(
                 consecutive_errors = 0
                 last_error_key = None
                 identical_error_count = 0
+                repeat_key = _repeat_key(tc.name, call.arguments)
+                repeat_counts[repeat_key] = repeat_counts.get(repeat_key, 0) + 1
+                if (
+                    repeat_counts[repeat_key] >= REPEATED_SUCCESS_WARN_THRESHOLD
+                    and repeat_key not in repeat_warned
+                ):
+                    # Warn once per call shape: re-appending every round would
+                    # itself flood the context this guard exists to protect.
+                    repeat_warned.add(repeat_key)
+                    conversation.append({
+                        "role": "system",
+                        "content": repeated_success_prompt(
+                            tc.name, repeat_counts[repeat_key]
+                        ),
+                    })
 
         if round_had_preflight:
             preflight_iters += 1

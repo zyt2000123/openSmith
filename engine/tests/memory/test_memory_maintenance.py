@@ -761,3 +761,54 @@ def test_dream_maintenance_trims_stale_audit_history(tmp_path: Path) -> None:
     ).splitlines()
     assert remaining
     assert all("2020-01-01" not in line for line in remaining)
+
+
+def test_record_turn_does_not_queue_behind_a_running_compile(tmp_path: Path) -> None:
+    """A turn's evidence write must not wait out a multi-minute compile.
+
+    Regression: record_turn took the same _operation_lock a background compile
+    holds for the length of its LLM review rounds.  The turn then blew the 30s
+    lifecycle/hook timeout and the user was told "本轮记忆保存失败" for a write
+    that was never actually attempted.
+    """
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
+    async def run() -> bool:
+        service = MemoryMaintenanceService(StaticLLM(), defer_maintenance=True)
+        # Stand in for a compile that is mid-flight and holding the lock.
+        async with MemoryMaintenanceService._operation_lock(memory_dir):
+            return await asyncio.wait_for(
+                service.record_turn(
+                    tmp_path,
+                    "what changed",
+                    "verified reply",
+                    had_tools=True,
+                ),
+                timeout=5,
+            )
+
+    assert asyncio.run(run()) is True
+    assert (memory_dir / "recent.jsonl").is_file(), "evidence must reach the log"
+
+
+def test_dream_and_evidence_writes_stay_mutually_exclusive(tmp_path: Path) -> None:
+    """Splitting the lock must not let an append race Dream's log rewrite."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
+    async def run() -> None:
+        service = MemoryMaintenanceService(StaticLLM(), defer_maintenance=True)
+        async with MemoryMaintenanceService._evidence_lock(memory_dir):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    service.record_turn(
+                        tmp_path,
+                        "what changed",
+                        "verified reply",
+                        had_tools=True,
+                    ),
+                    timeout=1,
+                )
+
+    asyncio.run(run())

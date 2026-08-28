@@ -21,6 +21,7 @@ from engine.execution.react.budget import (
     MAX_FAILED_TOOL_RECOVERY_ITERS,
     MAX_IDENTICAL_TOOL_ERRORS,
     MAX_PREFLIGHT_CHALLENGE_ITERS,
+    REPEATED_SUCCESS_WARN_THRESHOLD,
 )
 from engine.safety.fact_gate import FactGate, FactGateContext
 from engine.skill.executor import execute_skill_events
@@ -1638,3 +1639,72 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {e}")
     raise SystemExit(1 if failures else 0)
+
+
+def test_identical_successful_calls_are_warned_about_once():
+    """Repeating a *successful* call had no ceiling at all.
+
+    identical_error_count only counts failures and every success resets it, so
+    the same call could run with identical arguments until max_iters ran out --
+    especially once its earlier result had been pruned to a stub.  The guard
+    warns instead of blocking: a file may legitimately have changed.
+    """
+    warn_marker = "identical arguments"
+
+    def _warnings(messages: list[dict]) -> int:
+        return sum(
+            1
+            for m in messages
+            if m.get("role") == "system" and warn_marker in str(m.get("content", ""))
+        )
+
+    async def run():
+        repeats = [
+            ChatResponse(tool_calls=[ToolCallData(id=f"c{i}", name="ok", arguments={})])
+            for i in range(REPEATED_SUCCESS_WARN_THRESHOLD + 2)
+        ]
+        llm = FakeLLM([*repeats, ChatResponse(text="done")])
+        events = [
+            event
+            async for event in _react_event_loop(
+                llm,
+                [{"role": "user", "content": "go"}],
+                _registry(),
+                max_iters=REPEATED_SUCCESS_WARN_THRESHOLD + 6,
+            )
+        ]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    final = llm.chat_calls[-1]["messages"]
+    assert _warnings(final) == 1, "warn exactly once per repeated call shape"
+    # The guard must not abort the run -- it only nudges.
+    assert any(e.type is EventType.TEXT_DELTA for e in events)
+
+
+def test_distinct_successful_calls_are_not_warned_about():
+    """Different arguments are different work, not a repeat."""
+    async def run():
+        calls = [
+            ChatResponse(tool_calls=[
+                ToolCallData(id=f"c{i}", name="ok", arguments={"n": i})
+            ])
+            for i in range(REPEATED_SUCCESS_WARN_THRESHOLD + 2)
+        ]
+        llm = FakeLLM([*calls, ChatResponse(text="done")])
+        async for _ in _react_event_loop(
+            llm,
+            [{"role": "user", "content": "go"}],
+            _registry(),
+            max_iters=REPEATED_SUCCESS_WARN_THRESHOLD + 6,
+        ):
+            pass
+        return llm
+
+    llm = asyncio.run(run())
+    assert not any(
+        m.get("role") == "system" and "identical arguments" in str(m.get("content", ""))
+        for call in llm.chat_calls
+        for m in call["messages"]
+    )

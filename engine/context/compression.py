@@ -25,7 +25,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A pruned result must still prove the call happened and hint at its size:
+# replacing it with a bare token erased the model's only evidence that it had
+# already run the tool, and re-running was then the rational move.  Keep the
+# stub cheap -- the paired assistant tool_call still carries name and
+# arguments, so repeating them here would only burn tokens.
+_PRUNED_PREFIX = "[pruned"
 _PRUNED_MARKER = "[pruned]"
+
+
+def _pruned_stub(char_count: int) -> str:
+    return f"[pruned: {char_count} chars of earlier output]"
 # react_loop appends the live clock as a *user* turn (see
 # ``react_loop._tool_result_messages``) so a volatile value never enters the
 # stable system-prompt prefix.  It is engine-injected framing, not the request
@@ -107,7 +117,7 @@ def prune_tool_outputs(
     """
     total_chars = 0
     pruned_chars = 0
-    to_prune: list[dict] = []
+    to_prune: list[tuple[dict, int]] = []
 
     for i in range(len(conversation) - 1, -1, -1):
         msg = conversation[i]
@@ -116,7 +126,7 @@ def prune_tool_outputs(
             # Exact match, not substring: a real tool output that merely
             # mentions the marker (grepping this repo does) would otherwise
             # stop pruning early.
-            if content == _PRUNED_MARKER:
+            if isinstance(content, str) and content.startswith(_PRUNED_PREFIX):
                 break
             char_count = len(content) if isinstance(content, str) else 0
             # Compare before accumulating: the threshold is how much recent
@@ -124,15 +134,15 @@ def prune_tool_outputs(
             # messages already filled that budget.  Accumulating first would
             # prune the newest result whenever it alone exceeds the threshold.
             if total_chars > protect_threshold:
-                to_prune.append(msg)
+                to_prune.append((msg, char_count))
                 pruned_chars += char_count
             total_chars += char_count
 
     if pruned_chars < min_prune:
         return 0
 
-    for msg in to_prune:
-        msg["content"] = _PRUNED_MARKER
+    for msg, char_count in to_prune:
+        msg["content"] = _pruned_stub(char_count)
 
     return pruned_chars
 

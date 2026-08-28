@@ -17,6 +17,11 @@ CONVERSATION_HARD_LIMIT = 40
 CONVERSATION_KEEP_RECENT = 28
 CONVERSATION_KEEP_HEAD = 2
 MAX_IDENTICAL_TOOL_ERRORS = 6
+# Identical *successful* calls had no ceiling at all: identical_error_count only
+# counts failures and is reset by every success, so a tool could be re-run with
+# the same arguments until max_iters ran out.  Warn rather than block -- a file
+# may legitimately have changed between two reads.
+REPEATED_SUCCESS_WARN_THRESHOLD = 3
 TOOL_FAILURE_HINT = tool_failure_recovery_prompt()
 INCOMPLETE_FINAL_AFTER_TOOL_HINT = incomplete_final_repair_prompt()
 CONTINUE_AFTER_LENGTH_HINT = continue_after_length_prompt()
