@@ -95,3 +95,26 @@ def test_tool_heavy_turn_no_longer_fails_to_fit() -> None:
     assert result.status is not ContextFitStatus.UNFIT_REQUEST, (
         f"a tool-heavy turn still cannot be fitted: {result.actions}"
     )
+
+
+def test_a_pruned_result_still_proves_the_call_happened() -> None:
+    """The stub must not erase the evidence that the tool already ran.
+
+    Regression: pruning replaced the payload with a bare "[pruned]", leaving the
+    model no sign of what that call produced -- or that it succeeded at all.
+    Re-running the tool was then the rational move, which burned the iteration
+    budget and produced the duplicate-call behaviour this guards against.
+    """
+    conversation: list[dict] = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "tool", "content": "A" * 9000},
+        {"role": "tool", "content": "B" * 9000},
+    ]
+
+    assert prune_tool_outputs(conversation) > 0
+
+    stub = conversation[2]["content"]
+    assert stub != "[pruned]", "a bare marker carries no evidence"
+    assert "9000" in stub, "the stub must say how much output was dropped"
+    assert conversation[3]["content"] == "B" * 9000, "the newest result stays intact"

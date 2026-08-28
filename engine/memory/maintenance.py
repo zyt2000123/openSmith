@@ -68,6 +68,7 @@ class MemoryMaintenanceService:
     defer_maintenance: bool = False
 
     _locks: ClassVar[dict[Path, asyncio.Lock]] = {}
+    _evidence_locks: ClassVar[dict[Path, asyncio.Lock]] = {}
     _background_tasks: ClassVar[dict[tuple[Path, str], asyncio.Task[None]]] = {}
 
     async def record_turn(
@@ -83,7 +84,17 @@ class MemoryMaintenanceService:
     ) -> bool:
         """Persist turn evidence and run threshold-based maintenance."""
         memory_dir = agent_dir / "memory"
-        async with self._operation_lock(memory_dir):
+        # Deferred maintenance only *schedules* background tasks, and those take
+        # _operation_lock themselves.  Holding it here made every turn queue
+        # behind a running compile -- minutes of LLM review -- which blew the
+        # 30s lifecycle/hook timeout and reported a perfectly good evidence
+        # write to the user as "本轮记忆保存失败".
+        guard = (
+            self._evidence_lock(memory_dir)
+            if self.defer_maintenance
+            else self._operation_lock(memory_dir)
+        )
+        async with guard:
             try:
                 from engine.memory.store import save_conversation_memory
 
@@ -259,10 +270,13 @@ class MemoryMaintenanceService:
         try:
             from engine.memory.dream import dream_report_completed, run_dream
 
-            report = await asyncio.wait_for(
-                run_dream(memory_dir, self.llm, reviewer=self.reviewer),
-                timeout=_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
-            )
+            # Dream reclaims an expired prefix by rewriting recent.jsonl, which
+            # is the one maintenance step an evidence append can actually race.
+            async with self._evidence_lock(memory_dir):
+                report = await asyncio.wait_for(
+                    run_dream(memory_dir, self.llm, reviewer=self.reviewer),
+                    timeout=_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
+                )
             # Dream runs on a low-frequency cadence: apply audit-log retention here.
             try:
                 from engine.memory.history import trim_memory_history
@@ -302,10 +316,33 @@ class MemoryMaintenanceService:
         return lock
 
     @classmethod
+    def _evidence_lock_for(cls, memory_dir: Path) -> asyncio.Lock:
+        key = memory_dir.resolve()
+        lock = cls._evidence_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            cls._evidence_locks[key] = lock
+        return lock
+
+    @classmethod
     @asynccontextmanager
     async def _operation_lock(cls, memory_dir: Path) -> AsyncIterator[None]:
         async with cls._lock_for(memory_dir):
             async with async_interprocess_file_lock(memory_dir / ".maintenance"):
+                yield
+
+    @classmethod
+    @asynccontextmanager
+    async def _evidence_lock(cls, memory_dir: Path) -> AsyncIterator[None]:
+        """Serialise recent.jsonl writers, and only those.
+
+        Compilation reads the log by offset and never writes it, so an append
+        is safe next to a compile.  Dream is the sole rewriter.  Guarding the
+        append with the full maintenance lock therefore bought no safety and
+        cost the turn a multi-minute wait.
+        """
+        async with cls._evidence_lock_for(memory_dir):
+            async with async_interprocess_file_lock(memory_dir / ".evidence"):
                 yield
 
     @staticmethod

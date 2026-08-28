@@ -137,7 +137,7 @@ def test_rules_file_entries_must_be_objects(tmp_path: Path) -> None:
 
 
 def test_prune_does_not_stop_on_tool_output_containing_the_marker() -> None:
-    """Only an exact replaced payload marks an already-pruned message."""
+    """Only a payload that *starts* with the marker is an already-pruned message."""
     conversation: list[dict] = [
         {"role": "system", "content": "s"},
         {"role": "user", "content": "u1"},
@@ -151,7 +151,11 @@ def test_prune_does_not_stop_on_tool_output_containing_the_marker() -> None:
     pruned = prune_tool_outputs(conversation)
 
     assert pruned > 0
-    assert conversation[2]["content"] == "[pruned]"
+    # Assert the behaviour (the oldest result was replaced by a stub that still
+    # records the call), not the stub's exact wording.
+    assert conversation[2]["content"].startswith("[pruned")
+    assert conversation[2]["content"] != "A" * 9000
+    assert "9000" in conversation[2]["content"], "the stub must report the lost size"
 
 
 def test_prune_still_stops_at_an_already_pruned_message() -> None:
@@ -159,7 +163,7 @@ def test_prune_still_stops_at_an_already_pruned_message() -> None:
         {"role": "system", "content": "s"},
         {"role": "user", "content": "u1"},
         {"role": "tool", "content": "A" * 9000},
-        {"role": "tool", "content": "[pruned]"},
+        {"role": "tool", "content": "[pruned: 4321 chars of earlier output]"},
         {"role": "tool", "content": "B" * 9000},
         {"role": "user", "content": "u2"},
         {"role": "user", "content": "u3"},
