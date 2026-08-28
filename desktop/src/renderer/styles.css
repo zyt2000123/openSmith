@@ -537,24 +537,35 @@ button.chip:hover { background: var(--raised); color: var(--fg); }
 .sui-h3 { font-weight: 600; color: var(--dim); }
 .sui-h4 { color: var(--dim); }
 
+/* 线—标题—线 一行排开, 而不是把标题浮在线上。
+   之前用 translateY(-50%) + 背景色抠出一块底 —— 那块底必须和**周围的**表面同色,
+   但 Divider 可能在 Card(--raised) 里也可能裸放(--panel), 组件自己无从得知,
+   于是在 Card 里就露出一块偏深的方块。两侧各一条线就没有这个问题。
+   无标题时没有中间元素, 两条线自然连成一条。 */
 .sui-divider {
   display: flex;
   align-items: center;
-  justify-content: center;
-  min-height: 1px;
+  margin: 2px 0;
+}
+.sui-divider::before,
+.sui-divider::after {
+  content: "";
+  flex: 1;
   border-top: 1px solid var(--line);
-  margin: 4px 0;
 }
 .sui-divider-title {
-  transform: translateY(-50%);
-  padding: 0 8px;
-  background: var(--panel);
+  padding: 0 10px;
   color: var(--dim);
   font-size: 12px;
+  white-space: nowrap;
 }
 
 .sui-badge {
   display: inline-flex;
+  /* 父级 .sui-card-body 是 flex column, 默认 align-items:stretch 会把
+     inline-flex 也撑满整行 —— 徽章必须自己退回内容宽度。 */
+  align-self: flex-start;
+  width: fit-content;
   align-items: center;
   padding: 1px 7px;
   border: 1px solid currentColor;
@@ -563,14 +574,41 @@ button.chip:hover { background: var(--raised); color: var(--fg); }
   line-height: 17px;
 }
 
-/* ProgressBar / BarChart 共用"标签 + 轨道 + 数值"三列骨架。
-   轨道用 minmax(0,1fr) 而不是固定宽: 终端按字符数定宽, DOM 里该跟着容器走。 */
-.sui-progress, .sui-chart-row {
-  display: grid;
-  grid-template-columns: minmax(0, auto) minmax(60px, 1fr) minmax(0, auto);
+/* ProgressBar 与 BarChart 都是"标签 + 轨道 + 数值"三列, 但对齐方式必须不同。
+
+   BarChart 的各行在同一个容器里 —— 让容器当 grid、行用 display:contents 把子元素
+   提上去参与父 grid, 列宽就按最长标签自动对齐, 且随内容自适应。
+
+   ProgressBar 不行: 多个 ProgressBar 是 Card 里任意位置的兄弟节点, 中间可能夹着
+   别的组件, **没有共同的 grid 父级**。grid 的列宽只在同一个容器内共享, 所以
+   只能给标签一个固定基准宽, 否则每条的起点由自己的标签长度决定, 并排看就是参差
+   不齐(实测: 同一张卡里两条进度条起点差了 24px)。 */
+.sui-progress {
+  display: flex;
   align-items: center;
   gap: 10px;
 }
+.sui-progress-label {
+  flex: 0 0 116px;
+}
+.sui-progress-track { flex: 1; }
+.sui-progress-pct {
+  flex: none;
+  min-width: 38px;
+  text-align: right;
+}
+
+.sui-chart {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(60px, 1fr) minmax(0, auto);
+  align-items: center;
+  gap: 7px 10px;
+}
+.sui-chart-title { grid-column: 1 / -1; }
+/* display:contents 让这一行的三个子元素直接成为 .sui-chart 的 grid 项,
+   于是所有行共享同一组列宽。 */
+.sui-chart-row { display: contents; }
+
 .sui-progress-label, .sui-chart-label {
   color: var(--dim);
   font-size: 13px;
@@ -597,12 +635,11 @@ button.chip:hover { background: var(--raised); color: var(--fg); }
   white-space: nowrap;
 }
 
-.sui-chart { display: flex; flex-direction: column; gap: 6px; }
 .sui-chart-title { color: var(--dim); font-size: 13px; }
 
-.sui-sparkline { display: flex; align-items: flex-end; gap: 8px; }
-.sui-spark-bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 24px; }
-.sui-spark-bar { width: 4px; border-radius: 2px; background: currentColor; }
+.sui-sparkline { display: flex; align-items: center; gap: 10px; }
+.sui-spark-bars { display: inline-flex; align-items: flex-end; gap: 3px; height: 24px; }
+.sui-spark-bar { width: 5px; border-radius: 2px; background: currentColor; }
 
 .sui-table-wrap { overflow-x: auto; }
 .sui-table { border-collapse: collapse; font-size: 13.5px; }
