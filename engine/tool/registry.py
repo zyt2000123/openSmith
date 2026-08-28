@@ -55,6 +55,7 @@ _BUILTIN_PROVIDER_FILENAMES = frozenset(
         "shell.py",
         "skill_load.py",
         "skill_manage.py",
+        "sub_agent.py",
         "todo.py",
         "web_crawl.py",
         "web_fetch.py",

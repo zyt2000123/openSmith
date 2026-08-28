@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import logging
+from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 
 from .runtime import RuntimeServices
+
+logger = logging.getLogger(__name__)
 
 
 def bind_memory_ops_tool(services: RuntimeServices, state_dir: Path) -> None:
@@ -142,11 +146,96 @@ def bind_todo_tool(
     services.tool_registry.wrap_tool("todo", wrapper)
 
 
+
+def bind_sub_agent_tool(services: RuntimeServices, agents_dir: Path) -> None:
+    """Give the generic sub-agent provider the engine's spawn capability.
+
+    A catalog that is empty or malformed leaves the tool registered but hidden:
+    the model never sees a capability whose types could not be loaded, and the
+    reason is in the log rather than in a runtime error on every turn.
+    """
+    from engine.execution.subagent import (
+        SubAgentCatalog,
+        SubAgentCatalogError,
+        SubAgentTask,
+        run_sub_agents,
+    )
+
+    definition = services.tool_registry.get("sub_agent")
+    if definition is None:
+        return
+    try:
+        catalog = SubAgentCatalog.load(agents_dir / "subagents")
+    except SubAgentCatalogError:
+        logger.exception(
+            "sub-agent catalog rejected; the sub_agent tool is unavailable this run"
+        )
+        definition.hidden = True
+        return
+    if not catalog:
+        definition.hidden = True
+        return
+
+    agent_ids = list(catalog.ids())
+    # Idempotent: appending unconditionally duplicates the whole type listing
+    # on every extra bind. Today each turn builds a fresh registry so it never
+    # fires, but a binding that corrupts its own tool contract when called
+    # twice is a trap for whoever caches services next.
+    catalogue_section = f"\n\nAvailable sub-agent types:\n{catalog.describe()}"
+    base, marker, _ = definition.description.partition("\n\nAvailable sub-agent types:\n")
+    definition.description = (base if marker else definition.description) + catalogue_section
+    # The enum keeps an unknown type out of the provider round-trip entirely,
+    # rather than spending a sub-agent launch to discover the typo.
+    item_properties = (
+        definition.parameters.get("properties", {})
+        .get("tasks", {})
+        .get("items", {})
+        .get("properties", {})
+    )
+    if "agent_type" in item_properties:
+        item_properties["agent_type"]["enum"] = agent_ids
+
+    async def spawn(tasks: list[dict], max_parallel: int) -> list[dict]:
+        outcomes = await run_sub_agents(
+            [
+                SubAgentTask(
+                    agent_type=task["agent_type"],
+                    prompt=task["prompt"],
+                    label=task.get("label", ""),
+                )
+                for task in tasks
+            ],
+            catalog=catalog,
+            llm=services.llm,
+            tool_registry=services.tool_registry,
+            tool_guard=services.tool_guard,
+            # Read at call time, not bind time: preparation finishes wiring the
+            # guard, the hooks, and the ports after this binding is installed.
+            hook_registry=services.hook_registry,
+            background_llm=services.background_llm,
+            max_parallel=max_parallel,
+        )
+        return [asdict(outcome) for outcome in outcomes]
+
+    def wrapper(func):
+        async def execute_with_spawn(**kwargs):
+            # Injected last so a model-supplied "_spawn" cannot displace the
+            # real capability with one of its own.
+            kwargs["_spawn"] = spawn
+            kwargs["_agent_types"] = tuple(agent_ids)
+            return await func(**kwargs)
+
+        return execute_with_spawn
+
+    services.tool_registry.wrap_tool("sub_agent", wrapper)
+
+
 __all__ = (
     "MemoryToolApi",
     "bind_memory_ops_tool",
     "bind_skill_load_tool",
     "bind_skill_manage_tool",
     "bind_snapshot_tools",
+    "bind_sub_agent_tool",
     "bind_todo_tool",
 )

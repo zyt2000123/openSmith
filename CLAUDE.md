@@ -14,7 +14,10 @@ Agent-Smith is a local-first personal assistant Agent workbench that runs in the
 
 - Smith is the single, always-on Agent
 - Smith uses the skill system to switch workflows per task type
-- No sub-agents, no multi-agent routing — one Agent, one conversation, accumulating memory over time
+- No multi-agent routing — one Agent, one conversation, accumulating memory over time
+- Smith can delegate scoped work to **ephemeral sub-agents** (§6b) that run in
+  isolation and return only a summary. They are a context-budget tool, not a
+  second resident agent: they hold no memory, no session, and no profile record.
 
 One-line:
 
@@ -106,9 +109,10 @@ evidence's fault.
 
 ## 4. Product Language
 
-Use: "Smith", "Agent", "skill", "session", "memory", "tool", "template"
+Use: "Smith", "Agent", "skill", "session", "memory", "tool", "template",
+"sub-agent" (an ephemeral, memoryless delegate — never a second resident Agent)
 
-Avoid: "sub-agent", "employee", "digital employee", "hire"
+Avoid: "employee", "digital employee", "hire"
 
 ## 5. Architecture Boundaries
 
@@ -166,6 +170,7 @@ anchors its non-bypassable platform-write protection on it.
 | Prompt assembly | `engine/context/assembler.py` |
 | Tool policy | `engine/safety/tool_policy.py` (hard guard before soft challenge) |
 | **Hook system** | `engine/execution/hooks/` (framework), `agents/smith/hooks/` (built-in implementations) |
+| **Sub-agents** | `engine/execution/subagent/` (framework), `agents/subagents/*.yaml` (types), `agents/tools/sub_agent.py` (provider) |
 | Data root | `common/paths.py` |
 | Smith profile seed | `agents/smith/` |
 | **End-to-end map** | `docs/04e-Engine-全链路白盒地图.md` — one turn from input to output, node by node, and what each node records |
@@ -246,6 +251,124 @@ Users can add custom hooks:
 2. Add entry to `~/.agent-smith/hooks.yaml` (loaded after built-in hooks)
 
 Hook system is **pluggable** — engine provides framework, agents provide implementations.
+
+## 6b. Sub-Agent System
+
+Smith can hand a scoped task to a **sub-agent**: one isolated ReAct
+conversation that runs to completion and returns only its final report. The
+parent pays the tokens of a summary, not of a transcript. A sub-agent has no
+memory, no session, no profile record, and cannot ask the user anything.
+
+```
+Smith ──sub_agent(tasks=[…])──▶ run_sub_agents()
+                                    │  asyncio.gather, Semaphore(max_parallel)
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+              fresh ReAct     fresh ReAct     fresh ReAct
+              ScopedToolRegistry per declared type, shared ToolGuard
+                    └───────────────┼───────────────┘
+                                    ▼
+                        one rendered report ──▶ Smith's conversation
+```
+
+### Where each piece lives
+
+| Concern | File |
+|---|---|
+| Type definitions (prompt, tools, model role, iteration + token caps) | `agents/subagents/*.yaml` |
+| Type parsing + validation | `engine/execution/subagent/catalog.py` |
+| Fan-out, isolation, failure containment | `engine/execution/subagent/runner.py` |
+| Tool schema + report rendering | `agents/tools/sub_agent.py` |
+| Capability injection | `bind_sub_agent_tool` in `.../orchestration/builtin_tools.py` |
+
+The content layer keeps its zero-import boundary: `agents/tools/sub_agent.py`
+imports nothing from `engine`, and the engine injects `_spawn` through
+`wrap_tool` — the same pattern `memory_ops` and `skill_load` already use.
+Injection happens *after* the model's arguments, so a model-supplied `_spawn`
+cannot displace the real capability.
+
+### Shipped types
+
+| Type | Writes? | Purpose |
+|---|---|---|
+| `explorer` | no | Search and read the local tree; report with `path:line` |
+| `reviewer` | no | Adversarial defect review; must construct a concrete failure |
+| `implementer` | yes | One scoped change, verified by running something |
+
+`reviewer` deliberately has **no** `git_ops`: scoping is per tool *name*, not
+per action, and `git_ops` carries commit/push/branch alongside diff. The
+parent — which knows which diff matters — puts it in the brief. `implementer`
+deliberately has **no** `todo`: it is session-scoped and index-addressed, so
+parallel siblings would overwrite each other's entries, and it is the user's
+visible task list rather than scratch space.
+
+All three ship on the default (`interactive`) port. A type may declare
+`model: background` to run on the cheaper port instead — content names a
+**role**, never a provider or model string, so credentials and model selection
+stay in the operator's config. An absent port falls back to `interactive`
+rather than failing the task.
+
+### Invariants
+
+- **No recursion.** `sub_agent` is stripped from every declared tool list at
+  catalog load *and* excluded again when the `ScopedToolRegistry` is built. A
+  sub-agent that tries to spawn one gets a `tool_disabled` result.
+- **No privilege escalation.** `ScopedToolRegistry._active_names()` intersects
+  with the parent registry, so a type cannot name a tool the identity or the
+  profile config has disabled. The same `ToolGuard` covers every inner call.
+- **Failure is contained.** One task raising, timing out, or naming an unknown
+  type produces a failed *outcome*; siblings still complete. Only parent
+  cancellation propagates.
+- **A summary is the product.** A sub-agent that returns empty text is a
+  failure, whatever the loop reported.
+- **Ceilings are the engine's, not the content's.** 10 tasks per call, 8
+  concurrent, 40 iterations, 400k tokens per agent, 600 k per batch, 600 s per
+  task — a YAML author cannot raise them.
+- **Spend is bounded twice.** `max_iters` bounds *turns*; `token_budget` bounds
+  *tokens*, which is what a runaway with large tool results actually burns. A
+  provider that omits `total_tokens` is charged input+output, so missing
+  accounting cannot read as free. Both stop the loop between turns and report
+  the partial state as a failure — the tokens are already spent, so the only
+  useful response is to stop compounding them.
+- **An uninstallable capability stays out of the prompt.** An absent or
+  malformed `agents/subagents/` marks the tool `hidden` (logged at ERROR)
+  rather than failing every turn.
+- **No human in the loop.** Each sub-agent runs under
+  `without_approval_context()`. Inheriting the parent's broker made the loop
+  `await broker.wait()` on a prompt the user never sees — the runner discards
+  sub-agent events — so it hung until the task timeout. Detached, the call is
+  refused and the agent can adapt or report.
+- **The fact gate is per sub-agent.** `FactGate` carries mutable per-turn
+  state that `begin_round()` rewrites; sharing the parent's instance across a
+  fan-out let one agent's round boundary satisfy a sibling's outstanding
+  challenge. Each sub-agent gets its own gate, scoped to its own tool set.
+- **Hooks apply to delegated work.** `hook_registry` is passed through, so
+  `config-protection` and the other `PreToolHook`s cover a sub-agent's calls.
+  Without it a sub-agent could edit files the parent is blocked from touching.
+- **The report fits in a tool result.** The runtime truncates past 50 KB and
+  spills the rest to a file, which would drop the *tail* — the last agents'
+  findings. `agents/tools/sub_agent.py` budgets ~40 KB across however many
+  agents ran, measured in **bytes**: a CJK report is ~3x its character count,
+  and a character cap sailed past the ceiling.
+- **The prompt names the tools.** A sub-agent's prompt is not built by
+  `PromptAssembler`, so it has no "Available Tools" layer; under the runtime's
+  lazy-schema mode the model sees only a schema *loader* and would otherwise
+  have to guess names to load.
+- **A read-only type holds no write-capable tool.** Enforced against
+  `ToolDefinition.is_write_tool` / `permission_level`, not against the type's
+  own prose — a description saying "read-only" proves nothing.
+- **No type reaches session-shared or durable state.** `todo`, `memory_ops`,
+  and `skill_manage` are barred from every shipped type.
+- **The tool list is validated after the recursion strip.** Checking the
+  declared list let `tools: [sub_agent]` pass as "at least one tool" and then
+  yield a type with none.
+- **Binding is idempotent.** Appending the catalogue unconditionally
+  duplicated it in the tool's public description on every extra bind.
+- **Parallel tasks must not overlap on files.** Concurrent edits are
+  last-write-wins and nothing detects the clash; the tool description tells
+  the parent to give each task a disjoint scope.
+
+Tests: `engine/tests/execution/test_sub_agent.py`.
 
 ## 7. Smith Profile System
 
@@ -340,5 +463,6 @@ If a choice is unclear, prefer the option that:
 
 - makes the single-Agent terminal experience more usable
 - reuses existing skill infrastructure
-- avoids introducing multi-agent complexity
+- avoids introducing multi-agent *routing* complexity (delegation via §6b
+  sub-agents is fine; a second resident Agent is not)
 - keeps changes minimal and reversible
