@@ -8,7 +8,8 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify:smith-ui": "esbuild scripts/verify-smith-ui.tsx --bundle --platform=node --format=cjs --jsx=automatic --external:react --external:react-dom --outfile=node_modules/.cache/verify-smith-ui.cjs --log-level=error && node node_modules/.cache/verify-smith-ui.cjs"
   },
   "dependencies": {
     "marked": "^18.0.11",

@@ -8,6 +8,7 @@ import { filterSkillMentions, isSkillMentionQuery } from "../../../shell/src/ski
 import type { AppStore } from "../../../shell/src/store.js";
 import type { TranscriptEntry, TurnBlock } from "../../../shell/src/transcript-state.js";
 import { Markdown } from "./Markdown.tsx";
+import { SmithUiBlock } from "./SmithUi.tsx";
 import { Sidebar, when } from "./Sidebar.tsx";
 
 type Props = { store: StoreApi<AppStore>; bridge: NodeBridge };
@@ -439,6 +440,10 @@ function Block({ block }: { block: TurnBlock }) {
           ))}
         </div>
       );
+    case "smith_ui":
+      // 这个分支此前不存在, 于是结构化载荷掉进下面的 default 被 JSON.stringify
+      // 整坨倒出来 —— 终端那侧一直是渲染成组件的。
+      return <SmithUiBlock payload={block.payload} />;
     case "smith_ui_fallback":
       return <div className="block">[smith-ui 无法渲染: {block.reason}]</div>;
     default:
