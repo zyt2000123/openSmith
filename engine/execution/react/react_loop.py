@@ -392,6 +392,30 @@ def _should_repair_incomplete_final(
     )
 
 
+def _elision_note(dropped: list[dict]) -> list[dict]:
+    """Leave a marker where trimmed messages used to be.
+
+    Dropping the middle of the conversation outright removed every trace that
+    those calls ever happened -- strictly worse than a pruned result, which at
+    least keeps the call itself visible.  The model then re-ran work it had
+    already completed, which is the same failure mode `[pruned: ...]` stubs
+    exist to prevent.  One system line is far cheaper than the re-run.
+    """
+    if not dropped:
+        return []
+    tool_results = sum(1 for message in dropped if message.get("role") == "tool")
+    detail = f", including {tool_results} tool result(s)" if tool_results else ""
+    return [{
+        "role": "system",
+        "content": (
+            f"[{len(dropped)} earlier messages were elided to fit the context "
+            f"window{detail}. That work still happened: rely on what you already "
+            "established rather than repeating it, and say so if you genuinely "
+            "need a result again.]"
+        ),
+    }]
+
+
 def _repeat_key(tool_name: str, arguments: object) -> str:
     """Identify a call by name plus arguments, bounded so a huge payload
     cannot make the dedup key itself expensive."""
@@ -520,7 +544,8 @@ async def react_event_loop(
             tail = conversation[cut:]
             while head and head[-1].get("role") == "assistant" and head[-1].get("tool_calls"):
                 head.pop()
-            conversation = head + tail
+            dropped = conversation[len(head):cut]
+            conversation = head + _elision_note(dropped) + tail
 
         pre_fit_receipt = measure_request(conversation, tools, llm)
         compression_started = (
@@ -845,8 +870,9 @@ async def react_event_loop(
                 incomplete_final_repairs += 1
                 # 只追加本轮分片：更早的分片已由 _append_length_continuation
                 # 写进 conversation，重复追加会让同一段文本在修复提示里出现
-                # 两次。（当前 looks_like_incomplete_final_after_tool 有 240
-                # 字上限，续写过的文本够不到，所以这是补一个陷阱而非在燃 bug。）
+                # 两次。这条路径现在真的够得到 —— INCOMPLETE_FINAL_MAX_CHARS
+                # 放宽后，一段续写过的文本可以同时是假结尾，交互由
+                # test_a_continued_answer_can_still_be_repaired_without_duplication 锁住。
                 _append_incomplete_final_repair(
                     conversation, response.text, response.reasoning
                 )

@@ -12,6 +12,13 @@ DEFAULT_MAX_REACT_ITERS = 60
 MAX_FAILED_TOOL_RECOVERY_ITERS = 20
 MAX_PREFLIGHT_CHALLENGE_ITERS = 20
 MAX_INCOMPLETE_FINAL_REPAIRS = 2
+# How much text may still count as "only a promise".  The cap stands in for
+# "delivered nothing", so it has to be generous enough to cover a promise that
+# comes with a paragraph of preamble -- 240 chars is barely two sentences of
+# English.  It cannot go much higher without catching real answers that close
+# with a suggestion ("接下来你可以自己跑一下测试"), and that misfire costs one
+# extra repair round, where a miss costs the user an unanswered question.
+INCOMPLETE_FINAL_MAX_CHARS = 400
 MAX_LENGTH_CONTINUATIONS = 2
 CONVERSATION_HARD_LIMIT = 40
 CONVERSATION_KEEP_RECENT = 28
@@ -65,7 +72,7 @@ _INCOMPLETE_FINAL_PATTERNS = (
 def looks_like_incomplete_final_after_tool(text: str) -> bool:
     """Return true when a supposed final answer is only a promise to keep acting."""
     normalized = " ".join(text.strip().split()).lower()
-    if not normalized or len(normalized) > 240:
+    if not normalized or len(normalized) > INCOMPLETE_FINAL_MAX_CHARS:
         return False
     return any(pattern.search(normalized) for pattern in _INCOMPLETE_FINAL_PATTERNS)
 

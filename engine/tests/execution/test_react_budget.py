@@ -1408,7 +1408,10 @@ def test_react_event_loop_conversation_pruning_keeps_head():
     messages = asyncio.run(run())
     assert messages[0] == {"role": "system", "content": "system prompt"}
     assert messages[1] == {"role": "user", "content": "important initial question"}
-    assert len(messages) == CONVERSATION_KEEP_HEAD + CONVERSATION_KEEP_RECENT
+    # head + one elision marker + recent tail: the marker is what tells the model
+    # the dropped turns ever happened.
+    assert len(messages) == CONVERSATION_KEEP_HEAD + 1 + CONVERSATION_KEEP_RECENT
+    assert "elided" in messages[CONVERSATION_KEEP_HEAD]["content"]
 
 
 def test_react_event_loop_stream_fallback_on_early_error():
@@ -1708,3 +1711,100 @@ def test_distinct_successful_calls_are_not_warned_about():
         for call in llm.chat_calls
         for m in call["messages"]
     )
+
+
+def test_trimmed_tool_rounds_leave_a_trace():
+    """Dropping the middle of the conversation must not erase the tool calls.
+
+    Regression: the hard limit removed whole assistant/tool rounds outright, so
+    the model lost every sign that it had already run those tools -- worse than
+    a pruned payload, which at least keeps the call visible.  Re-running the
+    work was the rational response, and 20 tool calls is enough to hit the
+    40-message limit.
+    """
+    async def run():
+        conversation = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "question"},
+        ]
+        for i in range(CONVERSATION_HARD_LIMIT):
+            conversation.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [_tool_call_entry(f"call-{i}")],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": f"call-{i}",
+                "content": f"result-{i}",
+            })
+        llm = FakeLLM([ChatResponse(text="final")])
+        async for _ in _react_event_loop(llm, conversation, _registry(), max_iters=1):
+            pass
+        return llm.chat_calls[0]["messages"]
+
+    messages = asyncio.run(run())
+
+    notes = [
+        m for m in messages
+        if m.get("role") == "system" and "elided" in str(m.get("content", ""))
+    ]
+    assert len(notes) == 1, "exactly one marker replaces the dropped span"
+    assert "tool result" in notes[0]["content"], "the marker must name the lost tool work"
+    # And the trim still has to leave a request the provider will accept.
+    ids = {m["tool_call_id"] for m in messages if m.get("role") == "tool"}
+    called = {
+        c["id"]
+        for m in messages
+        if m.get("role") == "assistant"
+        for c in (m.get("tool_calls") or [])
+    }
+    assert ids <= called, "every tool result must keep its assistant call"
+
+
+def test_a_continued_answer_can_still_be_repaired_without_duplication():
+    """A length-continued answer that ends in a promise must be repaired once.
+
+    Two things are locked here.  First, widening INCOMPLETE_FINAL_MAX_CHARS
+    past 240 is what lets a continued answer reach this check at all -- at 240
+    the text below is simply too long and the user keeps the promise as their
+    answer.  Second, the repair must not re-append the earlier fragment: that
+    fragment already went into the conversation via the length continuation,
+    and appending it again would show the same paragraph twice.
+    """
+    preamble = "A" * 250
+    promise = "接下来我需要再查一下配置文件"
+
+    async def run():
+        llm = FakeLLM([
+            ChatResponse(tool_calls=[ToolCallData(id="c1", name="ok", arguments={})]),
+            ChatResponse(text=preamble, finish_reason="length"),
+            ChatResponse(text=promise, finish_reason="stop"),
+            ChatResponse(text="最终答案", finish_reason="stop"),
+        ])
+        events = [
+            event
+            async for event in _react_event_loop(
+                llm,
+                [{"role": "user", "content": "answer completely"}],
+                _registry(),
+                max_iters=4,
+            )
+        ]
+        return llm, events
+
+    llm, events = asyncio.run(run())
+
+    assert len(llm.chat_calls) == 4, "the promise must trigger one repair round"
+
+    final_messages = llm.chat_calls[-1]["messages"]
+    carried = [m for m in final_messages if preamble in str(m.get("content", ""))]
+    assert len(carried) == 1, "the continued fragment must appear exactly once"
+
+    text = "".join(
+        event.data.get("text", "")
+        for event in events
+        if event.type == EventType.TEXT_DELTA
+    )
+    assert "最终答案" in text
+    assert text.count(preamble) <= 1, "the user must not see the fragment twice"
