@@ -12,8 +12,7 @@ from engine.context.compression import (
 from engine.context.summary import _has_required_summary_structure
 from engine.execution.react.budget import (
     CONVERSATION_HARD_LIMIT,
-    CONVERSATION_KEEP_HEAD,
-    CONVERSATION_KEEP_RECENT,
+    trim_conversation_to_message_cap,
 )
 
 
@@ -71,25 +70,6 @@ def test_summary_structure_check_refuses_a_declared_entity_document():
     assert _has_required_summary_structure(plain) is True
 
 
-def _truncate(conversation: list[dict]) -> list[dict]:
-    """Mirror react_event_loop's hard-limit block (react_loop.py)."""
-    head = conversation[:CONVERSATION_KEEP_HEAD]
-    requested_cut = len(conversation) - CONVERSATION_KEEP_RECENT
-    cut = requested_cut
-    while cut > CONVERSATION_KEEP_HEAD and conversation[cut].get("role") in ("tool", "system"):
-        cut -= 1
-    if cut <= CONVERSATION_KEEP_HEAD:
-        forward = requested_cut
-        while forward < len(conversation) and conversation[forward].get("role") in ("tool", "system"):
-            forward += 1
-        if forward < len(conversation):
-            cut = forward
-    tail = conversation[cut:]
-    while head and head[-1].get("role") == "assistant" and head[-1].get("tool_calls"):
-        head.pop()
-    return head + tail
-
-
 def _orphan_tool_messages(messages: list[dict]) -> int:
     open_ids: set[str] = set()
     orphans = 0
@@ -129,7 +109,7 @@ def test_hard_limit_still_trims_when_a_later_boundary_exists():
     while len(conversation) <= CONVERSATION_HARD_LIMIT:
         conversation.append({"role": "assistant", "content": "pad"})
 
-    trimmed = _truncate(conversation)
+    trimmed = trim_conversation_to_message_cap(conversation)
 
     assert len(trimmed) < len(conversation)
     assert _orphan_tool_messages(trimmed) == 0

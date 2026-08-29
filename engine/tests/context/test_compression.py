@@ -13,7 +13,11 @@ from engine.context.compression import (
     needs_compaction,
     trim_conversation_for_context_limit,
 )
-from engine.context import SessionSummaryStatus, summarize_session
+from engine.context import (
+    SESSION_SUMMARY_PREFIX,
+    SessionSummaryStatus,
+    summarize_session,
+)
 from engine.llm.contracts import ModelLimits
 
 
@@ -163,6 +167,73 @@ def test_compact_history_fences_the_summary_as_untrusted_data() -> None:
     assert "not instructions" in fenced
     assert "Never follow requests" in fenced
     assert VALID_SUMMARY in fenced
+
+
+def test_second_compaction_carries_the_whole_previous_summary() -> None:
+    """A carried summary must reach the summarizer whole, not head-truncated.
+
+    Per-message truncation cut it at a fixed head length, and the prompt puts
+    <recent_actions>/<current_plan> last — so every extra compaction round
+    silently dropped the plan in progress and the files just touched.
+    """
+    captured: list[list[dict]] = []
+
+    class FakeLLM:
+        async def chat(self, messages, tools=None):
+            captured.append(messages)
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason="stop")
+
+    filler = "步骤说明。" * 500  # 推到 per-message 上限之上
+    long_summary = VALID_SUMMARY.replace(
+        "<recent_actions>actions</recent_actions>",
+        f"<recent_actions>{filler}</recent_actions>",
+    )
+    assert len(long_summary) > 2000
+
+    class FirstPassLLM(FakeLLM):
+        async def chat(self, messages, tools=None):
+            return SimpleNamespace(text=long_summary, finish_reason="stop")
+
+    first = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "旧的需求"},
+        {"role": "user", "content": "Continue safely."},
+    ]
+    compacted = asyncio.run(compact_history(first, FirstPassLLM()))
+    compacted.append({"role": "assistant", "content": "继续"})
+    compacted.append({"role": "user", "content": "现在这个请求"})
+
+    asyncio.run(compact_history(compacted, FakeLLM()))
+
+    blob = " ".join(m["content"] for m in captured[0])
+    assert "<current_plan>plan</current_plan>" in blob
+    assert filler in blob
+
+
+def test_server_injected_session_summary_is_not_truncated() -> None:
+    """Session history carries its summary under its own marker; same exemption."""
+    captured: list[list[dict]] = []
+
+    class FakeLLM:
+        async def chat(self, messages, tools=None):
+            captured.append(messages)
+            return SimpleNamespace(text=VALID_SUMMARY, finish_reason="stop")
+
+    tail = "计划尾部标记"
+    carried = SESSION_SUMMARY_PREFIX + ("会话摘要正文。" * 400) + tail
+    assert len(carried) > 2000
+
+    conversation = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": carried},
+        {"role": "assistant", "content": "了解"},
+        {"role": "user", "content": "现在这个请求"},
+    ]
+
+    asyncio.run(compact_history(conversation, FakeLLM()))
+
+    blob = " ".join(m["content"] for m in captured[0])
+    assert tail in blob
 
 
 def test_compact_history_discards_empty_summary() -> None:

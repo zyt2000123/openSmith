@@ -37,11 +37,9 @@ from engine.tool.interface import ToolCall
 
 from .budget import (
     CONTINUE_AFTER_LENGTH_HINT,
-    CONVERSATION_HARD_LIMIT,
-    CONVERSATION_KEEP_HEAD,
-    CONVERSATION_KEEP_RECENT,
     DEFAULT_MAX_REACT_ITERS,
     INCOMPLETE_FINAL_AFTER_TOOL_HINT,
+    MAX_COMPACTION_FAILURES,
     MAX_FAILED_TOOL_RECOVERY_ITERS,
     MAX_IDENTICAL_TOOL_ERRORS,
     MAX_INCOMPLETE_FINAL_REPAIRS,
@@ -53,6 +51,7 @@ from .budget import (
     TOOL_FAILURE_HINT,
     budget_exhausted_message,
     looks_like_incomplete_final_after_tool,
+    trim_conversation_to_message_cap,
 )
 from .smith_ui import smith_ui_fallback, validate_smith_ui_call
 
@@ -480,34 +479,10 @@ async def react_event_loop(
     identical_error_count = 0
     context_recoveries = 0
     model_compaction_enabled = True
+    compaction_failures = 0
 
     while productive_iters < max_iters:
-        if len(conversation) > CONVERSATION_HARD_LIMIT:
-            # ponytail: keep head (system + initial user) and recent tail
-            head = conversation[:CONVERSATION_KEEP_HEAD]
-            # 切点落在 tool 结果串中会拆散 assistant(tool_calls)/tool 配对
-            # （provider 400）。向前回退到 assistant/user 边界：同一轮的 tool
-            # 结果之间可能夹着 system 提示（TOOL_FAILURE_HINT 在 tool_calls
-            # 循环内 append），只认 role=="tool" 会在提示处停下留下孤儿。
-            requested_cut = len(conversation) - CONVERSATION_KEEP_RECENT
-            cut = requested_cut
-            while cut > CONVERSATION_KEEP_HEAD and conversation[cut].get("role") in ("tool", "system"):
-                cut -= 1
-            if cut <= CONVERSATION_KEEP_HEAD:
-                # 回退撞到 head 边界时 head+tail 就是整条对话，这道上限静默
-                # 失效：一轮 8 个并行工具调用即可（实测 41 条裁剪后仍是 41
-                # 条，30 个调用时 63 条原样返回）。改为向后找下一个边界 ——
-                # 丢弃的更多，但配对完整且一定有进展。整条尾巴都是
-                # tool/system 时没有安全切点，保持原样交给 fit_request 兜底。
-                forward = requested_cut
-                while forward < len(conversation) and conversation[forward].get("role") in ("tool", "system"):
-                    forward += 1
-                if forward < len(conversation):
-                    cut = forward
-            tail = conversation[cut:]
-            while head and head[-1].get("role") == "assistant" and head[-1].get("tool_calls"):
-                head.pop()
-            conversation = head + tail
+        conversation = trim_conversation_to_message_cap(conversation)
 
         pre_fit_receipt = measure_request(conversation, tools, llm)
         compression_started = (
@@ -527,7 +502,11 @@ async def react_event_loop(
             action in {"compaction_failed", "compaction_rejected"}
             for action in fit.actions
         ):
-            model_compaction_enabled = False
+            # 闩锁而不是每轮重试：真正压不动的对话（history 为空）重试无用。
+            # 但一次超时/限流/被截断的摘要也会走到这里，单次即永久关停会让整
+            # 个 run 只剩删除式裁剪 —— 瞬时故障给一次重试再闩锁。
+            compaction_failures += 1
+            model_compaction_enabled = compaction_failures < MAX_COMPACTION_FAILURES
         fit_changed = list(fit.messages) != conversation
         if fit_changed and not compression_started:
             yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)

@@ -16,7 +16,6 @@ from engine.llm.contracts import ModelLimits, ProviderCapabilities
 from engine.llm.events import ProviderEvent, ProviderEventType
 from engine.execution.react.budget import (
     CONVERSATION_HARD_LIMIT,
-    CONVERSATION_KEEP_HEAD,
     CONVERSATION_KEEP_RECENT,
     MAX_FAILED_TOOL_RECOVERY_ITERS,
     MAX_IDENTICAL_TOOL_ERRORS,
@@ -1382,8 +1381,14 @@ def test_react_event_loop_identical_tool_error_short_circuits():
     assert incomplete[0].data["reason"] == "identical_tool_error_loop"
 
 
-def test_react_event_loop_conversation_pruning_keeps_head():
-    """Pruning must keep system + first user message, not just conversation[0]."""
+def test_react_event_loop_conversation_pruning_keeps_contract_and_request():
+    """Pruning keeps the system contract and the turn being executed.
+
+    It used to keep ``conversation[:2]`` — right only when the run opens with
+    [system, request].  In a continuing session index 1 is the *oldest* history
+    message, so pinning it wasted the head slot on stale context; what must
+    survive is the newest user turn.
+    """
     async def run():
         base = [
             {"role": "system", "content": "system prompt"},
@@ -1405,9 +1410,106 @@ def test_react_event_loop_conversation_pruning_keeps_head():
         return llm.chat_calls[0]["messages"]
 
     messages = asyncio.run(run())
+    newest_request = {
+        "role": "user",
+        "content": f"follow-up-{CONVERSATION_HARD_LIMIT - 1}",
+    }
     assert messages[0] == {"role": "system", "content": "system prompt"}
-    assert messages[1] == {"role": "user", "content": "important initial question"}
-    assert len(messages) == CONVERSATION_KEEP_HEAD + CONVERSATION_KEEP_RECENT
+    assert newest_request in messages
+    assert len(messages) == 1 + CONVERSATION_KEEP_RECENT
+
+
+def test_react_event_loop_keeps_the_request_behind_session_history():
+    """The live request must survive a tool marathon, history in front of it.
+
+    Production layout is [system, *session history, request] (agent_loop), and
+    the cap ran every iteration: as tool traffic pushed the request left out of
+    the tail window it was silently deleted, leaving the model to call tools
+    against a days-old user turn for the rest of the run.
+    """
+    request = "current request: 把 A 改成 B"
+
+    async def run():
+        history = [
+            {"role": "user" if i % 2 else "assistant", "content": f"old-{i}"}
+            for i in range(30)
+        ]
+        conversation = [
+            {"role": "system", "content": "system prompt"},
+            *history,
+            {"role": "user", "content": request},
+        ]
+        # 每轮迭代 +2 条消息，裁剪后回到 30 条：要跑到第三次裁剪
+        # （旧实现正是在那一次把请求切掉的）需要约 16 轮工具调用。
+        turns = [
+            ChatResponse(text="", tool_calls=[_tool_call("ok", f"call-{i}")])
+            for i in range(20)
+        ]
+        turns.append(ChatResponse(text="done"))
+        llm = FakeLLM(turns)
+        async for _event in _react_event_loop(
+            llm,
+            conversation,
+            _registry(),
+            max_iters=25,
+        ):
+            pass
+        return llm.chat_calls
+
+    calls = asyncio.run(run())
+    assert len(calls) > 16, "test must run long enough to trim three times"
+    for index, call in enumerate(calls):
+        contents = [message.get("content") for message in call["messages"]]
+        assert request in contents, f"request lost from provider call #{index}"
+
+
+def test_one_failed_compaction_does_not_disable_it_for_the_whole_run():
+    """A transient compaction failure must not latch the run into hard trimming.
+
+    Compaction runs its own LLM call; one timeout or one truncated summary used
+    to set model_compaction_enabled=False with no way back, so the rest of a
+    60-iteration run could only delete history instead of summarizing it.
+    """
+    class FlakyCompactionLLM(FakeLLM):
+        limits = ModelLimits(
+            context_window=8_192,
+            context_window_declared=True,
+            max_output_tokens=1_024,
+            max_output_tokens_declared=True,
+        )
+
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.compaction_attempts = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            summarizing = any(
+                "summarizing a conversation" in (m.get("content") or "")
+                for m in messages
+                if m.get("role") == "system"
+            )
+            if summarizing:
+                self.compaction_attempts += 1
+                raise LLMResponseError("compaction provider timeout")
+            return await super().chat(messages, tools, prefix_cache_key)
+
+    async def run():
+        conversation = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "证" * 4_000},
+            {"role": "assistant", "content": "earlier work"},
+            {"role": "user", "content": "current request"},
+        ]
+        llm = FlakyCompactionLLM([
+            ChatResponse(text="", tool_calls=[_tool_call("ok", "call-1")]),
+            ChatResponse(text="done"),
+        ])
+        async for _event in _react_event_loop(llm, conversation, _registry(), max_iters=5):
+            pass
+        return llm.compaction_attempts
+
+    attempts = asyncio.run(run())
+    assert attempts >= 2, "compaction must be retried after one transient failure"
 
 
 def test_react_event_loop_stream_fallback_on_early_error():
@@ -1548,7 +1650,8 @@ def test_hard_limit_cut_inside_tool_round_keeps_pairing():
     messages = asyncio.run(run())
     _assert_tool_pairing_intact(messages)
     assert messages[0]["content"] == "system prompt"
-    assert messages[1]["content"] == "question"
+    # 存活的必须是正在执行的请求（最新真实 user 轮），不是最老那条历史。
+    assert {"role": "user", "content": "tail-26"} in messages
     assert len(messages) < CONVERSATION_HARD_LIMIT
 
 
