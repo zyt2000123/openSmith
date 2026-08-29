@@ -258,6 +258,19 @@ class RunSummaryStore:
             try:
                 self._path(run_id).unlink(missing_ok=True)
                 (self.trace_root / f"{run_id}.jsonl").unlink(missing_ok=True)
+                # Everything belonging to the run goes, not just the two files
+                # this store writes.  Leaving the lifecycle state behind made
+                # "terminal state, no summary" ambiguous, and startup
+                # reconciliation reads that as a crash window: it re-finalized
+                # every pruned run into an empty zombie summary stamped with the
+                # current time, which sorted ahead of real runs and evicted
+                # them -- the evicted ones then came back as zombies on the next
+                # start, so the index converged on holding nothing but zombies.
+                # The orphaned seal anchor is also what made the rebuilt trace
+                # verify as tampered.
+                (self.root / f"{run_id}.json").unlink(missing_ok=True)
+                (self.trace_root / f"{run_id}.jsonl.head").unlink(missing_ok=True)
+                (self.trace_root / f"{run_id}.jsonl.torn").unlink(missing_ok=True)
                 self._index.remove(run_id)
             except (OSError, sqlite3.Error, ValueError):
                 logger.warning(

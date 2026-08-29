@@ -608,6 +608,18 @@ async def _run_events_with_runtime(
     memory_persist_failed = False
     execution_stage = "runtime_prepare"
 
+    def _terminal_event() -> ExecutionEvent:
+        terminal_data: dict[str, object] = {"run_id": run_id, "status": terminal_status}
+        if terminal_reason:
+            terminal_data["reason"] = terminal_reason
+        if terminal_error:
+            terminal_data["error"] = terminal_error
+        if memory_persist_failed:
+            # 记忆写入失败对用户默认不可见；在终态事件上打标，
+            # 让前端有机会提示"本轮未写入长期记忆"。
+            terminal_data["memory_persist_failed"] = True
+        return ExecutionEvent(EventType.RUN_FINISHED, terminal_data)
+
     if ledger is not None:
         services.tool_registry.bind_execution_ledger(ledger)
 
@@ -781,19 +793,27 @@ async def _run_events_with_runtime(
                 services.tool_registry.bind_execution_ledger(None)
             APPROVAL_BROKER.cancel_run(run_id)
         if cancellation is not None:
+            if drained:
+                # 终态记录排在记忆收尾之后，而记忆收尾会自己发 LLM 调用、最长
+                # 30 秒。取消落在这个窗口里（按 Esc、关终端、断网）时这里直接
+                # 重抛，下面的 RUN_FINISHED 整个被跳过 —— run 永久停在 running，
+                # 只有重启才回收。它还会连累暂停中的 pipeline：下一条消息看到
+                # owner 仍存活，于是从节点 0 重跑并覆盖原 checkpoint。
+                # 消费者已经走了，所以只记录不 yield；写入是有界的（一次
+                # fsync），shield 让它在取消传播中仍能落盘。
+                try:
+                    await asyncio.shield(boundary.record(_terminal_event()))
+                except Exception:
+                    logger.warning(
+                        "failed to record terminal run event after cancellation "
+                        "(run=%s)",
+                        run_id,
+                        exc_info=True,
+                    )
             raise cancellation
 
     if drained:
-        terminal_data: dict[str, object] = {"run_id": run_id, "status": terminal_status}
-        if terminal_reason:
-            terminal_data["reason"] = terminal_reason
-        if terminal_error:
-            terminal_data["error"] = terminal_error
-        if memory_persist_failed:
-            # 记忆写入失败对用户默认不可见；在终态事件上打标，
-            # 让前端有机会提示"本轮未写入长期记忆"。
-            terminal_data["memory_persist_failed"] = True
-        finished_event = ExecutionEvent(EventType.RUN_FINISHED, terminal_data)
+        finished_event = _terminal_event()
         await boundary.record(finished_event)
         yield finished_event
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from engine.execution.events import EventType, ExecutionEvent, RunObservationContext
+from engine.execution.orchestration.run_state import RunStateStore
 from engine.observability import (
     HealthCalculator,
     IncidentDetector,
@@ -329,6 +330,40 @@ def test_observability_retention_removes_oldest_completed_run_files(
         record.metadata.run_id
         for record in store.list("smith", limit=10)
     ] == ["run-3", "run-2"]
+
+
+def test_observability_retention_removes_the_whole_run_not_just_its_summary(
+    tmp_path,
+) -> None:
+    """A pruned run must leave nothing behind that reads as a crash window.
+
+    Retention deleted the summary and the trace but kept the lifecycle state
+    and the seal anchor, so startup reconciliation could not tell a pruned run
+    from one whose summary write was interrupted.  It re-finalized every pruned
+    run into an empty summary stamped with the current time, which sorted ahead
+    of real runs and evicted them -- and those came back as zombies on the next
+    start, until the index held nothing else.
+    """
+    policy = ObservabilityRetentionPolicy(
+        max_completed_runs=2,
+        max_age_days=None,
+        max_bytes=None,
+    )
+    store = RunSummaryStore(tmp_path, retention=policy)
+    states = RunStateStore(tmp_path)
+    traces = TraceStore(tmp_path)
+    for run_id in ("run-1", "run-2", "run-3"):
+        states.create(run_id, agent_id="smith")
+        traces.append(run_id, ExecutionEvent(EventType.RUN_FINISHED, {"status": "completed"}))
+        traces.seal(run_id)
+        _save_completed_summary(store, run_id)
+
+    assert store.get("run-1") is None
+    assert not (tmp_path / "runs" / "run-1.json").exists()
+    assert not (tmp_path / "traces" / "run-1.jsonl.head").exists()
+    # 留下来的 run 一件不少。
+    assert (tmp_path / "runs" / "run-3.json").exists()
+    assert (tmp_path / "traces" / "run-3.jsonl.head").exists()
 
 
 def test_observability_retention_keeps_the_newest_oversized_run(

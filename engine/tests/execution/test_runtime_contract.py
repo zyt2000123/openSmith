@@ -1852,9 +1852,49 @@ def test_run_stream_bounds_post_run_learning_finalization(
         stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
         return [event async for event in stream.stream_events()]
 
-    events = asyncio.run(asyncio.wait_for(collect_events(), timeout=0.2))
+    # 预算证明的是"学习步骤被上限截断"，不是磁盘有多快：一次 run 本身要为
+    # 每个事件做几次 fsync，0.2s 会在忙盘上量到磁盘而不是这个上限。真正的
+    # 对照是未打补丁时的 30s。
+    events = asyncio.run(asyncio.wait_for(collect_events(), timeout=5))
 
     assert events[-1].type is EventType.RUN_FINISHED
+
+
+def test_cancelled_learning_still_records_a_terminal_run_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """取消落在记忆收尾窗口里，run 也必须落到终态。
+
+    终态记录排在记忆收尾之后，而收尾自己发 LLM 调用、最长 30 秒。窗口内断连
+    时 CancelledError 被重抛，RUN_FINISHED 整个跳过 —— run 永久停在 running，
+    只有重启才回收；暂停中的 pipeline 还会因为"owner 仍存活"被从头重跑并覆盖
+    原 checkpoint。
+    """
+    async def cancelled_persist(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_persist_runtime_learning",
+        cancelled_persist,
+    )
+
+    async def run() -> tuple[Path, str]:
+        runtime, services, _ = _runtime(tmp_path)
+        stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
+        try:
+            _ = [event async for event in stream.stream_events()]
+        except asyncio.CancelledError:
+            pass
+        return runtime.profile_dir, stream.run_id
+
+    profile_dir, run_id = asyncio.run(run())
+
+    state = RunStateStore(profile_dir).get(run_id)
+    assert state is not None
+    assert state.status is not RunStatus.RUNNING, "run stranded at running"
+    assert state.status is RunStatus.COMPLETED
 
 
 def test_run_stream_closes_services_when_learning_is_cancelled(
