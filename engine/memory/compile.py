@@ -43,6 +43,7 @@ from ._changeset import (
 )
 from ._guards import adjudicate, build_evidence_index
 from ._review import (
+    _MAX_REVIEW_SOURCE_CHARS,
     MemoryCompilationError,
     _generate_and_review_result,
     _parse_review_json,
@@ -393,13 +394,27 @@ async def _generate_view(
             draft.applied, nothing_to_record=draft.nothing_to_record
         )
 
-    review_source = (
+    # The evidence block is the reviewer's ground truth: it is what every
+    # ``evidence.quote`` is checked against, and the review prompt treats a quote
+    # it cannot find as a fabrication and hard-fails the draft.  Assembled
+    # naively, prior memory (10k) plus evidence (24k) overran the reviewer's own
+    # 32k window, and its head/tail truncation dropped a slice that -- by
+    # construction, since prior memory comes first -- always landed inside the
+    # evidence.  Legitimate changes were then rejected as fabricated, forever:
+    # a rejected cycle neither backs off nor skips the batch.  So prior memory
+    # absorbs the shortfall and the evidence goes in whole.
+    header = (
         f"CURRENT TIME (UTC): {datetime.now(timezone.utc).isoformat()}\n\n"
         "PRIOR ACCEPTED MEMORY (reference state; retain only when the target "
         "policy permits it, and never use it alone to prove that recent work "
-        f"is still current):\n{existing or '(empty)'}\n\n"
-        f"SELECTED NEW EVIDENCE (ground truth):\n{source}"
+        "is still current):\n"
     )
+    evidence_block = f"\n\nSELECTED NEW EVIDENCE (ground truth):\n{source}"
+    prior_budget = _MAX_REVIEW_SOURCE_CHARS - len(header) - len(evidence_block)
+    prior = existing or "(empty)"
+    if prior_budget > 0 and len(prior) > prior_budget:
+        prior = _truncate_source(prior, prior_budget)
+    review_source = f"{header}{prior}{evidence_block}"
     outcome = await _generate_and_review_result(
         llm,
         reviewer,
@@ -640,6 +655,19 @@ async def compile_context(
         )
     except Exception as exc:
         _record_compile_failure(memory_dir, "context", policy, existing, exc)
+        # Policy 6.2 applies per view, not just to durable.  Without this escape
+        # a batch that can never yield an applicable change pins
+        # .compile_offset_context forever: Dream reclaims to min(both cursors),
+        # so the event log then grows without bound while every compile cycle
+        # re-sends the same stuck evidence to the model.
+        if deferred_streak(memory_dir, "context") >= _MAX_DEFERRED_STREAK:
+            _skip_evidence_batch(
+                memory_dir,
+                policy,
+                existing=existing,
+                through=consumed_through,
+                view="context",
+            )
         raise
 
     _write_offset(memory_dir, consumed_through, "context")
@@ -744,6 +772,7 @@ def _skip_evidence_batch(
     *,
     existing: str,
     through: int,
+    view: str = "durable",
 ) -> None:
     """Advance the cursor past evidence that keeps failing, writing no memory.
 
@@ -764,14 +793,14 @@ def _skip_evidence_batch(
     # failed is merely repeated next cycle.
     append_memory_history(
         memory_dir,
-        target="durable",
+        target=view,
         policy_version=policy.version,
         status="skipped",
         old_text=existing,
         new_text=existing,
         notes=[f"skipped_evidence_through_line: {through}"],
     )
-    _write_offset(memory_dir, through)
+    _write_offset(memory_dir, through, view)
 
 
 # ---------------------------------------------------------------------------

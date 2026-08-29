@@ -39,6 +39,21 @@ _CONCLUSION_SECTIONS: frozenset[str] = frozenset((
 
 _FORGET_KINDS: frozenset[str] = frozenset(("forget", "correction"))
 
+# Evidence the user stated themselves, as opposed to the assistant's account of
+# its own work.  A settled conclusion may be *updated* by a later statement of
+# the same standing -- policy 1.4 requires the existing entry be rewritten
+# rather than duplicated, so demanding a forget/correction for that left a new
+# decision no way in at all: replace was refused here, a same-topic add was
+# refused as a duplicate, and a differently-keyed add left two contradictory
+# bullets.  Erasing a conclusion outright still takes an explicit retraction.
+_USER_EXPLICIT_KINDS: frozenset[str] = frozenset((
+    "forget",
+    "correction",
+    "decision",
+    "preference",
+    "remember",
+))
+
 # An automatic ``work`` event's summary is the assistant's own account of what it
 # did, not a tool or test result; ``partial_work`` says so in its name.  Neither
 # can establish a *verified* outcome.
@@ -239,8 +254,11 @@ def _check_retention(
         # may rewrite the entire body, so it erases a conclusion just as
         # thoroughly -- and the new body is prose, which guard 1 cannot check for
         # anchors it does not contain.  Leaving replace out made it the cheap way
-        # to invert a decision on the strength of routine work evidence.
-        if not kinds & _FORGET_KINDS:
+        # to invert a decision on the strength of routine work evidence.  It
+        # still cannot be routine work evidence, but it may be the user saying
+        # something new: that is an update, not an erasure.
+        allowed = _FORGET_KINDS if change.op == "remove" else _USER_EXPLICIT_KINDS
+        if not kinds & allowed:
             return RejectedChange(
                 change,
                 "conclusion_changed_without_forget_or_correction",
