@@ -440,6 +440,12 @@ class TokenStatsService:
             return await self._sync_message_estimates(await self._db_provider())
 
         db = await self._db_provider()
+        # Duplicates the definition in infrastructure/schema.py, which owns the
+        # shared-connection migration; this copy exists for direct callers that
+        # bring a minimal database.  On the lifespan path ``ensure_schema`` has
+        # already created the table, and SQLite takes no write lock for an
+        # IF-NOT-EXISTS no-op, so running it on the backfill's private
+        # connection does not contend.  Changing one copy means changing both.
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS observability_trace_cursors (

@@ -1541,13 +1541,22 @@ async def test_startup_backfill_never_locks_out_a_concurrent_request_write() -> 
 
         # 3. No single request write was queued behind the whole backfill.
         #    Deliberately a ratio and not a deadline: a deadline is satisfied by
-        #    widening it, while both sides of this scale together, so a slower
-        #    machine (or a bigger transcript) does not move it.  Serialising the
-        #    request path behind the backfill puts one write at ~1.0; batching
-        #    that actually bounds the hold keeps every write far below it.
-        #    This is what still fails on a machine fast enough to drain the
-        #    backfill inside the 5s ``busy_timeout``, where assertion 1 would
-        #    pass by luck rather than by the invariant holding.
+        #    widening it, while machine speed moves both sides of this together.
+        #    Serialising the request path behind the backfill puts one write at
+        #    ~1.0; bounding the hold keeps every write far below it.  This is
+        #    what still fails on a machine fast enough to drain the backfill
+        #    inside the 5s ``busy_timeout``, where assertion 1 would pass by
+        #    luck rather than by the invariant holding.
+        #
+        #    The green IS fixture-shaped, though.  A waiting writer never wins
+        #    the sub-millisecond gap between one COMMIT and the next INSERT —
+        #    SQLite's busy handler backs off to 100ms polls — so it queues
+        #    behind the whole INSERT phase, and this passes because 2KB turns
+        #    make the lock-free tokenising phase ~6x that.  Re-shaping towards
+        #    many small messages (measured: 60k x 80B put one write at 2.7s of
+        #    a 3.2s backfill) fails this on current code — that residual is the
+        #    audit's P2-1.  Changing the fixture means re-measuring the two
+        #    phases, not widening the 2x.
         assert max(waits) * 2 < backfill_seconds, (
             f"a request write waited {max(waits):.2f}s of a {backfill_seconds:.2f}s "
             f"backfill ({sent} sent); the request path was queued behind it"

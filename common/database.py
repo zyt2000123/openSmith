@@ -107,7 +107,9 @@ async def dedicated_connection() -> AsyncIterator[aiosqlite.Connection]:
     the two writers interleave under ``busy_timeout``.
 
     The schema is *not* created here: this is for a second writer against a
-    database ``get_app_db`` has already migrated.
+    database ``get_app_db`` has already migrated.  (A caller may still run its
+    own ``CREATE TABLE IF NOT EXISTS`` — the token backfill does — which is a
+    no-op taking no write lock once the migration has run.)
     """
     paths = config.PATHS
     await asyncio.to_thread(paths.ensure_base_dirs)
