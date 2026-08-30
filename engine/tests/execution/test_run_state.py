@@ -241,6 +241,45 @@ def test_progress_events_do_not_fsync_the_state_file_one_by_one(
     assert waiting.event_seq == 32
 
 
+def test_tool_call_start_is_projected_and_durable_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``current_tool`` is read *while* the tool is still running.
+
+    TOOL_CALL_START is as frequent as the deferred progress events and was an
+    obvious candidate to join them, but it is the one that answers "what is
+    this run doing right now" -- the question a status poll asks precisely
+    while a slow tool has not returned.  Buffering it would leave the field
+    empty for exactly that window and lose it entirely if the process died
+    there, so it has to be both projected and fsynced on arrival.
+    """
+    fsync_calls: list[int] = []
+    original_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        original_fsync(fd)
+
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith")
+    project_execution_event(
+        store, "run-1", ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-1"})
+    )
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+
+    project_execution_event(
+        store, "run-1", ExecutionEvent(EventType.TOOL_CALL_START, {"name": "shell"})
+    )
+
+    assert fsync_calls, "the running tool must survive a crash mid-call"
+    # Read through a second store instance: an in-process defer buffer must not
+    # be what makes current_tool visible.
+    reloaded = RunStateStore(tmp_path).get("run-1")
+    assert reloaded is not None
+    assert reloaded.current_tool == "shell"
+    assert reloaded.last_event_type == "tool_call_start"
+
+
 def test_run_state_store_rejects_path_traversal(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path)
 

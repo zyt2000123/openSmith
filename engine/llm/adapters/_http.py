@@ -63,10 +63,16 @@ def stream_event_budget(max_output_tokens: int | None) -> int:
 
 @dataclass
 class SSEStreamLimiter:
-    """Bound an untrusted provider SSE stream across every adapter."""
+    """Bound an untrusted provider SSE stream across every adapter.
+
+    The duration ceiling is deliberately *not* a per-instance knob.  Relaxing
+    it for the background route was considered, but an adapter is constructed
+    from :class:`LLMProviderConfig` alone, which names no route -- so the knob
+    could only ever have been set to its own default, and a caller reading the
+    field would have believed the route was accounted for when it was not.
+    """
 
     max_events: int = MAX_STREAM_EVENTS
-    max_duration_seconds: float = MAX_STREAM_DURATION_SECONDS
     total_bytes: int = 0
     event_bytes: int = 0
     events: int = 0
@@ -80,7 +86,7 @@ class SSEStreamLimiter:
             raise LLMResponseError("Provider stream exceeds the total byte limit.")
         if self.event_bytes > MAX_STREAM_EVENT_BYTES:
             raise LLMResponseError("Provider stream event exceeds the byte limit.")
-        if time.monotonic() - self.started_at > self.max_duration_seconds:
+        if time.monotonic() - self.started_at > MAX_STREAM_DURATION_SECONDS:
             raise LLMResponseError("Provider stream exceeds the duration limit.")
 
     def finish_event(self) -> None:

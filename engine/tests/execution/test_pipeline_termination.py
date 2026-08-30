@@ -843,3 +843,83 @@ def test_gate_llm_outage_ends_the_round_without_re_running_the_node(
     checkpoint = SessionStateManager(tmp_path).restore("sess-gate-down")
     assert checkpoint is not None, "the passed node's checkpoint was deleted"
     assert checkpoint.skill_chain_index == 0
+
+
+def test_base_gate_llm_outage_ends_the_round_without_re_running_the_node(
+    tmp_path: Path,
+) -> None:
+    """The chain-level base gate needs its own outage exit, not the node one.
+
+    run_pipeline carries two independent infra_failure branches -- one for the
+    YAML-declared base gates, one for the node's own gate -- and only the
+    second was covered.  On the uncovered path a provider outage reads as
+    "content rejected": the node is re-run through ReAct with a retry hint,
+    the retry fails the same way, and the round ends BLOCKED with the whole
+    chain's checkpoint deleted, so already-passed nodes have to be redone.
+    """
+
+    class FlakyGateLLM:
+        """Judges the first node, then goes down before the second."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResponse(text="PASS")
+            raise RuntimeError("gate provider down")
+
+    class CountingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls += 1
+            return ChatResponse(text=_RUBRIC_PASSING_TEXT)
+
+    class PassingGate:
+        async def check(self, output, context):
+            return GateResult("pass", "heuristic ok")
+
+    # The node gates are heuristic, so the only consumer of gate_llm is the
+    # base gate -- one gate LLM call per node, and the second one is the outage.
+    chain = SkillChain(
+        [SkillNode("planning", PassingGate()), SkillNode("testing", PassingGate())],
+        base_gates=[LLMGate(PassingGate(), "check {output}")],
+    )
+
+    async def run():
+        llm = CountingLLM()
+        events = []
+        async for event in run_agent_stream(
+            llm, "system prompt", "build a feature",
+            FakeToolRegistry(), FakeSkillRegistry(),
+            FEATURE_ROUTE, chain, FailureLoopGuard(),
+            execution_context={
+                "agent_id": "a",
+                "session_id": "sess-base-gate-down",
+                "_state_dir": str(tmp_path),
+                "_working_dir": str(tmp_path.resolve()),
+                "_run_id": "run-base-gate-down",
+            },
+            gate_llm=FlakyGateLLM(),
+        ):
+            events.append(event)
+        return llm, events
+
+    llm, events = asyncio.run(asyncio.wait_for(run(), timeout=10))
+    types = [event.type for event in events]
+
+    assert llm.calls == 2, "a base-gate outage must not re-run the node it could not judge"
+    assert [
+        event.data["reason"] for event in events if event.type is EventType.FAILED
+    ] == ["gate_unavailable"]
+    assert EventType.BLOCKED not in types, "an outage is not a rejected output"
+    assert types[-1] == EventType.DONE
+
+    from engine.execution.pipeline.checkpoint import SessionStateManager
+
+    checkpoint = SessionStateManager(tmp_path).restore("sess-base-gate-down")
+    assert checkpoint is not None, "the passed node's checkpoint was deleted"
+    assert checkpoint.skill_chain_index == 0
