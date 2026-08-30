@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
+from engine.execution.orchestration.run_state import RunStateStore
 
 from .index import (
     IndexedRun,
@@ -153,8 +154,20 @@ class RunSummaryStore:
             logger.warning("failed to initialize observability index", exc_info=True)
             self._index = None
 
-    def save(self, metadata: RunMetadata, summary: RunSummary) -> RunSummaryRecord:
-        """Atomically persist a terminal summary, merging earlier resumptions."""
+    def save(
+        self,
+        metadata: RunMetadata,
+        summary: RunSummary,
+        *,
+        finished_at: str | None = None,
+    ) -> RunSummaryRecord:
+        """Atomically persist a terminal summary, merging earlier resumptions.
+
+        ``finished_at`` defaults to now, which is right for a run finishing
+        now.  Crash recovery must pass the run's own last-known time instead:
+        retention orders by this field, so stamping a months-old run with the
+        current time sorts it ahead of every real run and evicts them.
+        """
         self._validate_metadata(metadata, summary)
         self._ensure_index()
         previous = self.get(metadata.run_id)
@@ -166,7 +179,7 @@ class RunSummaryStore:
                 if previous is not None
                 else metadata
             ),
-            finished_at=_now(),
+            finished_at=finished_at or _now(),
             summary=merged,
         )
         self._write(record)
@@ -254,7 +267,11 @@ class RunSummaryStore:
     def _apply_retention(self) -> None:
         if self._index is None:
             return
-        for run_id in self._index.retention_candidates(self._retention):
+        candidates = self._index.retention_candidates(self._retention)
+        if not candidates:
+            return
+        state_store = RunStateStore(self.profile_dir)
+        for run_id in candidates:
             try:
                 self._path(run_id).unlink(missing_ok=True)
                 (self.trace_root / f"{run_id}.jsonl").unlink(missing_ok=True)
@@ -268,7 +285,12 @@ class RunSummaryStore:
                 # start, so the index converged on holding nothing but zombies.
                 # The orphaned seal anchor is also what made the rebuilt trace
                 # verify as tampered.
-                (self.root / f"{run_id}.json").unlink(missing_ok=True)
+                #
+                # The state file is deleted through its owner, which refuses
+                # while the run is live: a resumed run still carries its
+                # previous attempt's finished_at here, so it can be selected
+                # as a candidate mid-execution.
+                state_store.prune(run_id)
                 (self.trace_root / f"{run_id}.jsonl.head").unlink(missing_ok=True)
                 (self.trace_root / f"{run_id}.jsonl.torn").unlink(missing_ok=True)
                 self._index.remove(run_id)

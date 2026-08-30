@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -158,6 +159,62 @@ def test_server_lifespan_recovers_interrupted_runs_before_serving_requests(
 
     with TestClient(main.app):
         assert calls == ["store", "recover"]
+
+
+def test_startup_reconciliation_does_not_resurrect_pruned_runs(
+    tmp_path: Path,
+) -> None:
+    """被保留策略修剪掉的 run 不得在重启对账里复活成僵尸摘要。
+
+    这是 #10 真正的危害，而不是"删了哪几个文件"。旧行为下修剪只删 summary
+    和 trace、留下 state，于是"有终态 state、无 summary"对对账不可区分于崩溃
+    窗口：每个被修剪的 run 被重新 finalize 成 finished_at=now 的空事件摘要，
+    按 finished_at DESC 排到所有真实 run 前面，在同一轮循环里把它们挤出保留
+    窗；被挤掉的下次启动又复活，索引最终只剩僵尸。
+    """
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=tmp_path / "project")
+    main.common_config.reset_paths(paths)
+    previous_limit = os.environ.get("AGENT_SMITH_OBSERVABILITY_MAX_RUNS")
+    os.environ["AGENT_SMITH_OBSERVABILITY_MAX_RUNS"] = "2"
+    try:
+        store = RunStateStore(paths.agent_dir)
+        for run_id in ("run-1", "run-2", "run-3"):
+            store.create(run_id, agent_id="smith", session_id="session-1")
+            store.transition(run_id, "running")
+            observation = RunObservation.start(RunObservationContext(
+                run_id=run_id,
+                agent_id="smith",
+                session_id="session-1",
+                profile_dir=paths.agent_dir,
+            ))
+            observation.record(ExecutionEvent(EventType.RUN_STARTED, {"run_id": run_id}))
+            observation.record(ExecutionEvent(EventType.RUN_FINISHED, {
+                "run_id": run_id, "status": "completed",
+            }))
+            # 终态状态文件正是"被修剪 vs 崩溃窗口"歧义的载体：对账只看终态 run。
+            store.transition(run_id, "completed")
+
+        survivors = {
+            record.metadata.run_id: record.summary.event_count
+            for record in RunSummaryStore(paths.agent_dir).list("smith", limit=10)
+        }
+        assert set(survivors) == {"run-2", "run-3"}, survivors
+
+        main._reconcile_startup_observability(store, recovered_run_ids=[])
+
+        after = {
+            record.metadata.run_id: record.summary.event_count
+            for record in RunSummaryStore(paths.agent_dir).list("smith", limit=10)
+        }
+        assert set(after) == set(survivors), f"resurrected: {set(after) - set(survivors)}"
+        # 幸存者的事件数没有被重新 finalize 出来的空摘要覆盖。
+        assert after == survivors
+    finally:
+        if previous_limit is None:
+            os.environ.pop("AGENT_SMITH_OBSERVABILITY_MAX_RUNS", None)
+        else:
+            os.environ["AGENT_SMITH_OBSERVABILITY_MAX_RUNS"] = previous_limit
+        main.common_config.reset_paths()
 
 
 def test_startup_reconciliation_closes_a_recovered_run_in_trace_and_summary(

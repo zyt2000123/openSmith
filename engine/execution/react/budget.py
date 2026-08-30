@@ -87,6 +87,26 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
 
     leading_system_count, active_start = active_turn_bounds(conversation)
 
+    def aligned(cut: int) -> int:
+        """Move *cut* forward so the tail opens on a user turn when it must.
+
+        Anthropic refuses a conversation whose first non-system message is not
+        ``user`` (adapters/anthropic.py), and that refusal is not a
+        context-limit error, so it fails the whole run instead of triggering a
+        retry.  The old fixed ``conversation[:2]`` head satisfied this by
+        accident -- index 1 of [system, *history, request] is a history *user*
+        turn.  Selecting the head by role removed that accident: the boundary
+        scan below stops on ``assistant`` quite happily, so a session sitting at
+        the 40-message history limit produced [system, assistant, ...] and every
+        turn of that session failed on its first provider call.
+        """
+        if active_start is None or active_start < cut:
+            # 请求会被钉进 head（见 kept），首条非 system 就是它。
+            return cut
+        while cut < active_start and conversation[cut].get("role") != "user":
+            cut += 1
+        return cut
+
     def kept(cut: int) -> list[dict]:
         head = conversation[:leading_system_count]
         if active_start is not None and active_start < cut:
@@ -103,7 +123,7 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
     cut = requested_cut
     while cut > leading_system_count and conversation[cut].get("role") in ("tool", "system"):
         cut -= 1
-    trimmed = kept(cut)
+    trimmed = kept(aligned(cut))
     if len(trimmed) < len(conversation):
         return trimmed
 
@@ -116,7 +136,7 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
     while forward < len(conversation) and conversation[forward].get("role") in ("tool", "system"):
         forward += 1
     if forward < len(conversation):
-        forward_trimmed = kept(forward)
+        forward_trimmed = kept(aligned(forward))
         if len(forward_trimmed) < len(conversation):
             return forward_trimmed
     # 整条尾巴都是 tool/system 时没有安全切点，保持原样交给 fit_request 兜底。

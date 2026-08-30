@@ -131,6 +131,46 @@ def snapshot_baseline(agent_root: Path, message: str) -> bool:
     return snapshot_views(agent_root, message)
 
 
+# Nothing else here ever packs.  Git's own auto-gc rides on fetch/merge/rebase/
+# receive-pack; this repository only ever commits, so a snapshot's objects stay
+# loose for the life of the install -- and loose objects carry no delta, so every
+# snapshot keeps a *full* zlib copy of recent.jsonl (1-5 MB inside the 7-day
+# retention window) forever.
+#
+# `git gc --auto` is the obvious trigger and does not fire here: it estimates the
+# loose count from one 1/256 shard (`objects/17/`), so it stays dormant until
+# roughly 500 objects have piled up whatever `gc.auto` says -- measured at 48
+# loose objects with `-c gc.auto=1`: nothing packed.  Counting the shards here
+# instead costs 256 opendir calls on a path that runs every ~50 memory turns.
+_GC_LOOSE_OBJECT_LIMIT = 50
+
+
+def compact_snapshots(agent_root: Path) -> bool:
+    """Repack the snapshot repository once loose objects have accumulated.
+
+    Packing never costs a snapshot: `gc` prunes only *unreachable* objects, and
+    every commit here is reachable from HEAD, so everything ``list_snapshots``
+    can name stays restorable -- including the evidence prefix Dream reclaimed.
+    """
+    objects = agent_root / ".git" / "objects"
+    if not objects.is_dir():
+        return False
+    try:
+        if sum(1 for _ in objects.glob("??/*")) <= _GC_LOOSE_OBJECT_LIMIT:
+            return False
+        # No _RUN_CONFIG: gc writes no commit, so it needs no identity.
+        gc = _git(agent_root, "gc", "--quiet")
+        if gc.returncode != 0:
+            logger.warning("memory snapshot: git gc failed: %s", gc.stderr.strip()[:200])
+            return False
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Same discipline as every other call here: a repo that cannot be packed
+        # is a growing repo, never a failed memory write.
+        logger.warning("memory snapshot compaction unavailable: %s", exc)
+        return False
+
+
 @dataclass(frozen=True)
 class MemorySnapshot:
     """One recoverable point in the memory history."""

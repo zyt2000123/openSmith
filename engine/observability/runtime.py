@@ -111,6 +111,7 @@ def finalize_interrupted_run(
     *,
     status: str,
     reason: str | None,
+    finished_at: str | None = None,
 ) -> RunSummary:
     """Close an interrupted run without losing its already-persisted attempt.
 
@@ -151,6 +152,7 @@ def finalize_interrupted_run(
             summary_store,
             context,
             _summary_for(context.run_id, [terminal]),
+            finished_at,
         )
 
     try:
@@ -165,6 +167,7 @@ def finalize_interrupted_run(
             summary_store,
             context,
             _summary_for(context.run_id, [terminal]),
+            finished_at,
         )
 
     last_terminal = max(
@@ -178,6 +181,7 @@ def finalize_interrupted_run(
             summary_store,
             context,
             _summary_for(context.run_id, events),
+            finished_at,
         )
 
     try:
@@ -201,6 +205,7 @@ def finalize_interrupted_run(
         summary_store,
         context,
         _summary_for(context.run_id, summary_events),
+        finished_at,
     )
 
 
@@ -232,11 +237,14 @@ def _save_recovery_summary(
     summary_store: RunSummaryStore | None,
     context: RunObservationContext,
     summary: RunSummary,
+    finished_at: str | None = None,
 ) -> RunSummary:
     if summary_store is None:
         return summary
     try:
-        return summary_store.save(_metadata_for(context), summary).summary
+        return summary_store.save(
+            _metadata_for(context), summary, finished_at=finished_at
+        ).summary
     except (OSError, ValueError):
         logger.warning(
             "failed to persist recovered run summary (run=%s)",

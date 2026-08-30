@@ -106,6 +106,13 @@ _HIGH_FREQUENCY_STREAM_EVENTS = frozenset({
 # as frequent: RESULT carries the approval transition, and START sets the "what
 # is this run doing right now" field a status poll needs *while* a slow tool is
 # still running — exactly when someone polls.
+# A run in one of these is either executing now or waiting on a person; its
+# state file is load-bearing and must outlive any retention sweep.
+_LIVE_RUN_STATUSES = frozenset({
+    RunStatus.QUEUED,
+    RunStatus.RUNNING,
+    RunStatus.WAITING_APPROVAL,
+})
 _DEFERRED_STATE_EVENTS = frozenset({
     EventType.THINKING,
     EventType.TOKEN_USAGE,
@@ -633,6 +640,33 @@ class RunStateStore:
             raise RunStateError(f"Run state id mismatch for {run_id!r}")
         self._apply_deferred(state)
         return state
+
+    def prune(self, run_id: str) -> bool:
+        """Delete a finished run's state file; refuse while it is still live.
+
+        Observability retention decides *when* a run leaves the window, but the
+        filename and "is this run still executing?" belong here -- the two
+        stores share ``profile_dir/runs`` and nothing but a matching string
+        literal kept them in step.
+
+        The refusal is not theoretical: a resumed run keeps the ``finished_at``
+        of its previous attempt in the summary index, so it can be picked as a
+        retention candidate *while it runs*.  Deleting its state then strands
+        it -- every later transition raises (best-effort, so silently), it never
+        reaches a terminal status, and an approval it raises never becomes
+        visible to the server, leaving the tool to sit out its timeout.
+        """
+        run_id = self._validate_run_id(run_id)
+        with self._lock:
+            try:
+                state = self.get(run_id)
+            except (RunStateError, OSError, ValueError):
+                state = None
+            if state is not None and state.status in _LIVE_RUN_STATUSES:
+                return False
+            self._path(run_id).unlink(missing_ok=True)
+            self._deferred.pop(run_id, None)
+            return True
 
     def defer_event(self, run_id: str, event_type: str) -> None:
         """Buffer a progress-only event instead of rewriting the state file.

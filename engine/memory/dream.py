@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ._snapshot import snapshot_views
+from ._snapshot import compact_snapshots, snapshot_views
 from .compile import _read_offset
 from ._files import (
     MEMORY_LAYER_FILES,
@@ -121,6 +121,13 @@ async def run_dream(
         report.errors.append(error)
         _record_dream_failure(memory_dir, error)
         logger.warning("dream evidence cleanup failed", exc_info=True)
+
+    # Snapshots are taken on every accepted compile, every sanitize and both
+    # sides of a reclaim -- several a day, none of which ever packs.  Dream is
+    # the one low-frequency pass that can absorb a repack, and it runs whether
+    # or not the cleanup above succeeded, because the objects are there either
+    # way.
+    compact_snapshots(memory_dir.parent)
 
     if not report.errors:
         append_memory_history(

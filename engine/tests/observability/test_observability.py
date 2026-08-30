@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from engine.execution.events import EventType, ExecutionEvent, RunObservationContext
-from engine.execution.orchestration.run_state import RunStateStore
+from engine.execution.orchestration.run_state import RunStateStore, RunStatus
 from engine.observability import (
     HealthCalculator,
     IncidentDetector,
@@ -354,6 +354,8 @@ def test_observability_retention_removes_the_whole_run_not_just_its_summary(
     traces = TraceStore(tmp_path)
     for run_id in ("run-1", "run-2", "run-3"):
         states.create(run_id, agent_id="smith")
+        states.transition(run_id, RunStatus.RUNNING)
+        states.transition(run_id, RunStatus.COMPLETED)
         traces.append(run_id, ExecutionEvent(EventType.RUN_FINISHED, {"status": "completed"}))
         traces.seal(run_id)
         _save_completed_summary(store, run_id)
@@ -364,6 +366,45 @@ def test_observability_retention_removes_the_whole_run_not_just_its_summary(
     # 留下来的 run 一件不少。
     assert (tmp_path / "runs" / "run-3.json").exists()
     assert (tmp_path / "traces" / "run-3.jsonl.head").exists()
+
+
+def test_observability_retention_keeps_the_state_of_a_run_that_is_live_again(
+    tmp_path,
+) -> None:
+    """正在恢复执行的 run，其状态文件不能被观测保留策略删掉。
+
+    resume 后的 run 在摘要索引里仍带着上一次尝试的 finished_at，所以它可能在
+    执行途中被选为修剪候选。删掉状态文件会让它彻底搁浅：之后每次 transition
+    都抛异常（best-effort 吞掉），它永远到不了终态；期间若触发审批，服务端
+    看不到 WAITING_APPROVAL，用户无从批准，工具只能干等到超时。
+    """
+    policy = ObservabilityRetentionPolicy(
+        max_completed_runs=2,
+        max_age_days=None,
+        max_bytes=None,
+    )
+    store = RunSummaryStore(tmp_path, retention=policy)
+    states = RunStateStore(tmp_path)
+    for run_id in ("run-old", "run-new"):
+        states.create(run_id, agent_id="smith")
+        states.transition(run_id, RunStatus.RUNNING)
+        # incomplete 才是可恢复的终态 —— 它同样进摘要索引、同样是修剪候选。
+        states.transition(run_id, RunStatus.INCOMPLETE)
+        _save_completed_summary(store, run_id)
+
+    # run-old 被 resume 了；它的摘要还带着上一次尝试的 finished_at。
+    states.resume("run-old")
+
+    # 第三个 run 结束，保留策略把 run-old 选为修剪对象。
+    states.create("run-newest", agent_id="smith")
+    states.transition("run-newest", RunStatus.RUNNING)
+    states.transition("run-newest", RunStatus.COMPLETED)
+    _save_completed_summary(store, "run-newest")
+
+    assert store.get("run-old") is None, "摘要该被修剪 —— 前提没成立测试就没意义"
+    assert (tmp_path / "runs" / "run-old.json").exists()
+    state = states.get("run-old")
+    assert state is not None and state.status is RunStatus.RUNNING
 
 
 def test_observability_retention_keeps_the_newest_oversized_run(

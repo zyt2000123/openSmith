@@ -1906,12 +1906,14 @@ def test_run_stream_bounds_post_run_learning_finalization(
         stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
         return [event async for event in stream.stream_events()]
 
-    # 预算证明的是"学习步骤被上限截断"，不是磁盘有多快：一次 run 本身要为
-    # 每个事件做几次 fsync，0.2s 会在忙盘上量到磁盘而不是这个上限。真正的
-    # 对照是未打补丁时的 30s。
-    events = asyncio.run(asyncio.wait_for(collect_events(), timeout=5))
+    # 墙钟不是判据：stub 睡 1 秒，任何宽到能容下忙盘的超时值，都同样容得下
+    # "上限被整个去掉"的情形（实测去掉后仍 1 秒内跑完、照过）。上限真正生效
+    # 时会置 memory_persist_failed 并打在终态事件上 —— 断言它，wait_for 只
+    # 留作防挂死的外层保险。
+    events = asyncio.run(asyncio.wait_for(collect_events(), timeout=10))
 
     assert events[-1].type is EventType.RUN_FINISHED
+    assert events[-1].data.get("memory_persist_failed") is True
 
 
 def test_cancelled_learning_still_records_a_terminal_run_state(

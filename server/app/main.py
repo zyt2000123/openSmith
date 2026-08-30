@@ -73,6 +73,11 @@ def _reconcile_startup_observability(
                 ),
                 status=status,
                 reason=state.reason,
+                # 用 run 自己最后已知的时间，别盖成"刚刚"：保留策略按
+                # finished_at 排序，把一个几个月前的 run 标成最新会让它排在
+                # 所有真实 run 前面并把它们挤出保留窗 —— 升级后的第一次启动
+                # 就能把用户全部观测历史抹成空壳。
+                finished_at=state.updated_at,
             )
         except Exception:
             logger.warning(
