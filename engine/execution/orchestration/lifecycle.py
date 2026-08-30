@@ -258,6 +258,24 @@ def _execution_error_details(
     return details
 
 
+def _stop_session_stats(
+    token_usage: dict[str, int],
+    llm: object,
+) -> dict[str, object]:
+    """Build the session statistics a StopHook bills the finished run against.
+
+    This was hardcoded to ``{}`` and cost-tracker's first statement is
+    ``if not session_stats: return`` — so every response short-circuited and
+    ``metrics/costs.jsonl`` never received a line, while ``hooks.yaml`` kept
+    advertising the hook as enabled.  Still empty when the run reported no
+    usage at all (a setup failure never reaches the provider): the hook must
+    skip that, not bill a zero-token call that never happened.
+    """
+    if not token_usage:
+        return {}
+    return {**token_usage, "model": getattr(llm, "model", "") or "unknown"}
+
+
 def _fact_gate_for_request(
     request: EngineRequest,
     runtime: RuntimeContext,
@@ -600,6 +618,7 @@ async def _run_events_with_runtime(
     boundary = event_boundary or _RunEventBoundary(state_store, run_id)
     full_text: list[str] = []
     had_tools = False
+    run_token_usage: dict[str, int] = {}
     terminal_status = "completed"
     terminal_reason: str | None = None
     terminal_error: dict[str, object] | None = None
@@ -679,6 +698,12 @@ async def _run_events_with_runtime(
                     # for the next message to resume the same chain node.
                     terminal_status = "incomplete"
                     terminal_reason = "awaiting_user_input"
+                elif event.type == EventType.TOKEN_USAGE:
+                    # 每轮 ReAct 迭代发一条；累计后交给 StopHook 记账。
+                    for key in ("input_tokens", "output_tokens"):
+                        value = event.data.get(key)
+                        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                            run_token_usage[key] = run_token_usage.get(key, 0) + value
                 elif _has_successful_tool_evidence(event):
                     had_tools = True
                 await boundary.record(event)
@@ -775,7 +800,10 @@ async def _run_events_with_runtime(
                     {
                         "session_id": runtime.session_id or "",
                         "run_id": run_id,
-                        "session_stats": {},
+                        "session_stats": _stop_session_stats(
+                            run_token_usage,
+                            services.llm,
+                        ),
                     },
                 )
             except asyncio.CancelledError as exc:

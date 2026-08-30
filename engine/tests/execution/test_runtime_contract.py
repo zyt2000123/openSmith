@@ -1270,6 +1270,60 @@ def test_runtime_carries_assembled_prefix_key_to_capable_llm(tmp_path: Path) -> 
     )
 
 
+def test_finished_run_bills_its_token_usage_to_the_cost_tracker_hook(
+    tmp_path: Path,
+    isolate_runtime_data_dir: Path,
+) -> None:
+    """cost-tracker was a dead path: session_stats was hardcoded to ``{}``.
+
+    The hook opens with ``if not session_stats: return``, so every response
+    short-circuited and ``metrics/costs.jsonl`` never got a line, while
+    ``hooks.yaml`` and CLAUDE.md both listed the hook as enabled.  The existing
+    unit tests only fed the hook a synthetic non-empty dict, which is exactly
+    the input production never produced — so drive a real run with the real
+    hook loaded and assert the file.
+    """
+    cost_tracker = (
+        Path(__file__).resolve().parents[3]
+        / "agents" / "smith" / "hooks" / "cost_tracker.py"
+    )
+
+    async def run() -> None:
+        runtime, services, _ = _runtime(tmp_path)
+        smith_dir = runtime.agents_dir / "smith"
+        smith_dir.mkdir(parents=True, exist_ok=True)
+        (smith_dir / "hooks.yaml").write_text(
+            "hooks:\n"
+            "  stop:\n"
+            "    - id: cost-tracker\n"
+            "      enabled: true\n"
+            f'      module: "{cost_tracker}"\n'
+            '      class: "CostTrackerHook"\n',
+            encoding="utf-8",
+        )
+        stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
+        async for _event in stream.stream_events():
+            pass
+
+    asyncio.run(run())
+
+    cost_file = isolate_runtime_data_dir / "metrics" / "costs.jsonl"
+    assert cost_file.is_file()
+    records = [
+        json.loads(line)
+        for line in cost_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert records[0]["session_id"] == "sess-1"
+    assert records[0]["input_tokens"] > 0
+    assert records[0]["output_tokens"] > 0
+    assert (
+        records[0]["total_tokens"]
+        == records[0]["input_tokens"] + records[0]["output_tokens"]
+    )
+
+
 def test_run_stream_persists_queued_and_terminal_run_state(tmp_path: Path) -> None:
     async def run() -> tuple[str, RunStatus, int]:
         runtime, services, _ = _runtime(tmp_path)

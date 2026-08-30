@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from engine.execution.events import EventType, ExecutionEvent
 from engine.execution.orchestration.run_state import (
     RunStateStore,
     RunStateTransitionError,
     RunStatus,
+    project_execution_event,
 )
 
 
@@ -171,6 +173,72 @@ def test_run_state_store_uses_private_atomic_files(tmp_path: Path) -> None:
     assert os.stat(runs_dir).st_mode & 0o777 == 0o700
     assert os.stat(state_path).st_mode & 0o777 == 0o600
     assert not list(runs_dir.glob("*.tmp"))
+
+
+def test_progress_events_do_not_fsync_the_state_file_one_by_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Thinking/token/context events must not each cost a state-file fsync.
+
+    Projecting one event is a read-modify-write of the JSON state and every
+    save fsyncs twice (file, then parent directory).  That ran per event,
+    inline on the SSE delivery path, and a tool-heavy ReAct turn emits hundreds
+    of these progress events — enough to stall token delivery on a busy disk.
+    Deferring them must not cost accuracy: the counter still has to be exact
+    once flushed, and an approval decision must still reach the disk at once.
+    """
+    fsync_calls: list[int] = []
+    original_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        original_fsync(fd)
+
+    store = RunStateStore(tmp_path)
+    store.create("run-1", agent_id="smith")
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+
+    project_execution_event(
+        store, "run-1", ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-1"})
+    )
+    after_start = len(fsync_calls)
+    assert after_start > 0
+
+    for _ in range(10):
+        project_execution_event(store, "run-1", ExecutionEvent(EventType.THINKING, {}))
+        project_execution_event(
+            store, "run-1", ExecutionEvent(EventType.TOKEN_USAGE, {"total_tokens": 7})
+        )
+        project_execution_event(
+            store, "run-1", ExecutionEvent(EventType.CONTEXT_USAGE, {"used_tokens": 1})
+        )
+
+    assert len(fsync_calls) == after_start
+
+    # An approval is resume-critical: it must still be durable immediately, and
+    # it flushes the buffered counters with it.
+    project_execution_event(
+        store,
+        "run-1",
+        ExecutionEvent(
+            EventType.TOOL_CALL_RESULT,
+            {
+                "approval_required": True,
+                "approval_id": "ap-1",
+                "tool": "shell",
+                "level": "execute",
+                "reason": "needs approval",
+            },
+        ),
+    )
+
+    assert len(fsync_calls) > after_start
+    waiting = store.get("run-1")
+    assert waiting is not None
+    assert waiting.status is RunStatus.WAITING_APPROVAL
+    assert waiting.approval_id == "ap-1"
+    # run_started + 30 buffered progress events + approval_required
+    assert waiting.event_seq == 32
 
 
 def test_run_state_store_rejects_path_traversal(tmp_path: Path) -> None:
