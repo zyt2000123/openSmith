@@ -8,6 +8,7 @@ from engine.tests.execution.react_text_adapters import (
     react_loop as _react_loop,
     react_stream_loop as _react_stream_loop,
 )
+from engine.context.compression import RUNTIME_USER_NOTE_PREFIX, is_request_turn
 from engine.execution.events import EventType
 from engine.execution.react.react_loop import FailedAgentRunError, IncompleteAgentRunError
 from engine.llm.client import ChatResponse, ToolCallData
@@ -1521,6 +1522,53 @@ def test_react_event_loop_conversation_pruning_keeps_contract_and_request():
     assert CONVERSATION_KEEP_RECENT - 2 <= len(messages) <= 1 + CONVERSATION_KEEP_RECENT
 
 
+def test_hard_limit_does_not_cut_on_the_injected_clock_note():
+    """[Current time] 注记不是轮次边界，切在它上面会留下孤儿 tool 结果。
+
+    get_current_time 的结果是两条消息（tool ack + 一条 role=user 的运行时
+    注记），而它们是在 tool_calls 循环里 extend 进去的 —— 一次
+    [get_current_time, grep] 的并行调用产生
+    assistant(tool_calls) / tool / [Current time] / tool。回退扫描原本只把
+    tool 和 system 当作不安全落点，撞上这条 user 注记就停，后面那条 tool
+    结果失去它的 assistant：OpenAI 兼容端报 "tool must be a response to a
+    preceding message with tool_calls"，Anthropic 则发出一个找不到 tool_use
+    的 tool_result —— 两边都是 400，且不是 context-limit 错误，整个 run 失败。
+    """
+    conversation: list[dict] = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "帮我把这个 bug 查清楚"},
+    ]
+    for round_index in range(22):
+        if round_index == 8:
+            conversation.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t8a", "function": {"name": "get_current_time"}},
+                    {"id": "t8b", "function": {"name": "grep"}},
+                ],
+            })
+            conversation.append({"role": "tool", "tool_call_id": "t8a", "content": "ack"})
+            conversation.append({
+                "role": "user",
+                "content": f"{RUNTIME_USER_NOTE_PREFIX}2026-08-30T10:00:00+08:00",
+            })
+            conversation.append({"role": "tool", "tool_call_id": "t8b", "content": "grep result"})
+            continue
+        conversation.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": f"t{round_index}", "function": {"name": "grep"}}],
+        })
+        conversation.append({
+            "role": "tool", "tool_call_id": f"t{round_index}", "content": "r",
+        })
+
+    trimmed = trim_conversation_to_message_cap(conversation)
+
+    _assert_tool_pairing_intact(trimmed)
+
+
 def test_trimmed_conversation_always_opens_on_a_user_turn():
     """裁剪后首条非 system 消息必须是 user 轮。
 
@@ -1735,7 +1783,11 @@ def _assert_tool_pairing_intact(messages: list[dict]) -> None:
             assert not open_ids, f"unanswered tool calls before assistant: {open_ids}"
             for tc in msg.get("tool_calls") or []:
                 open_ids.add(tc["id"])
-        elif role == "user":
+        elif role == "user" and is_request_turn(msg):
+            # 只有**真实**请求轮才必须关闭未决调用。get_current_time 的结果是
+            # tool ack + 一条 [Current time] user 注记，两条都在 tool_calls
+            # 循环里 extend 进去，所以那条注记合法地坐在轮次中间 —— 把它当作
+            # 违规会让这个 helper 拒绝一条生产上完全正常的对话。
             assert not open_ids, f"user turn with pending tool calls: {open_ids}"
         elif role == "tool":
             call_id = msg.get("tool_call_id")

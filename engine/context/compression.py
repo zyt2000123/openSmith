@@ -40,6 +40,25 @@ DEFAULT_CONTEXT_LIMIT = DEFAULT_CONTEXT_WINDOW
 CONTEXT_DISPLAY_WINDOW = DEFAULT_CONTEXT_LIMIT
 
 
+def is_request_turn(message: dict) -> bool:
+    """Whether *message* is a user turn carrying an actual request.
+
+    ``react_loop`` appends the live clock as a ``user`` message
+    (:data:`RUNTIME_USER_NOTE_PREFIX`) from inside the tool-call loop, so one
+    round can read ``assistant(tool_calls) / tool / [Current time] / tool``.
+    Anything deciding "is this a safe place to cut, or the turn to protect?"
+    must ask this rather than ``role == "user"``: treating the note as a real
+    turn both displaces the request and makes the note look like a round
+    boundary, orphaning the tool result that follows it.
+    """
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    return not (
+        isinstance(content, str) and content.startswith(RUNTIME_USER_NOTE_PREFIX)
+    )
+
+
 def active_turn_bounds(conversation: list[dict]) -> tuple[int, int | None]:
     """Return the leading system count and the index of the newest user turn.
 
@@ -57,13 +76,8 @@ def active_turn_bounds(conversation: list[dict]) -> tuple[int, int | None]:
         leading_system_count += 1
 
     for index in range(len(conversation) - 1, leading_system_count - 1, -1):
-        message = conversation[index]
-        if message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if isinstance(content, str) and content.startswith(RUNTIME_USER_NOTE_PREFIX):
-            continue
-        return leading_system_count, index
+        if is_request_turn(conversation[index]):
+            return leading_system_count, index
     return leading_system_count, None
 
 

@@ -371,12 +371,14 @@ def test_observability_retention_removes_the_whole_run_not_just_its_summary(
 def test_observability_retention_keeps_the_state_of_a_run_that_is_live_again(
     tmp_path,
 ) -> None:
-    """正在恢复执行的 run，其状态文件不能被观测保留策略删掉。
+    """正在恢复执行的 run，保留策略一件产物都不能动。
 
     resume 后的 run 在摘要索引里仍带着上一次尝试的 finished_at，所以它可能在
-    执行途中被选为修剪候选。删掉状态文件会让它彻底搁浅：之后每次 transition
-    都抛异常（best-effort 吞掉），它永远到不了终态；期间若触发审批，服务端
-    看不到 WAITING_APPROVAL，用户无从批准，工具只能干等到超时。
+    执行途中被选为修剪候选。删状态文件会让它彻底搁浅（之后每次 transition 都
+    抛异常且被 best-effort 吞掉，永远到不了终态；期间若触发审批，服务端看不到
+    WAITING_APPROVAL）；删 trace 更隐蔽 —— 下一次 append 用 O_CREAT 重建文件，
+    torn-tail 检查看到文件变短就把链重置回 genesis，该 run 自己的历史静默消失
+    而 verify() 仍然答 ok。
     """
     policy = ObservabilityRetentionPolicy(
         max_completed_runs=2,
@@ -385,26 +387,37 @@ def test_observability_retention_keeps_the_state_of_a_run_that_is_live_again(
     )
     store = RunSummaryStore(tmp_path, retention=policy)
     states = RunStateStore(tmp_path)
+    traces = TraceStore(tmp_path)
     for run_id in ("run-old", "run-new"):
         states.create(run_id, agent_id="smith")
         states.transition(run_id, RunStatus.RUNNING)
         # incomplete 才是可恢复的终态 —— 它同样进摘要索引、同样是修剪候选。
         states.transition(run_id, RunStatus.INCOMPLETE)
+        traces.append(run_id, ExecutionEvent(EventType.TOOL_CALL_START, {"name": "shell"}))
         _save_completed_summary(store, run_id)
 
     # run-old 被 resume 了；它的摘要还带着上一次尝试的 finished_at。
     states.resume("run-old")
 
-    # 第三个 run 结束，保留策略把 run-old 选为修剪对象。
-    states.create("run-newest", agent_id="smith")
-    states.transition("run-newest", RunStatus.RUNNING)
-    states.transition("run-newest", RunStatus.COMPLETED)
-    _save_completed_summary(store, "run-newest")
+    # 再结束两个 run，保留窗只剩 2 个位置 —— 候选是最老的两个：run-old 与
+    # run-new。前者活着必须整条跳过，后者该照常清掉。
+    for run_id in ("run-newest", "run-newest-2"):
+        states.create(run_id, agent_id="smith")
+        states.transition(run_id, RunStatus.RUNNING)
+        states.transition(run_id, RunStatus.COMPLETED)
+        _save_completed_summary(store, run_id)
 
-    assert store.get("run-old") is None, "摘要该被修剪 —— 前提没成立测试就没意义"
+    # 活跃 run 的四样产物一件都不能少 —— 只保状态文件是半修：trace 被删后
+    # TraceStore 下一次 append 用 O_CREAT 重建，torn-tail 检查看到文件变短就
+    # 把链重置回 genesis，该 run 自己的历史静默消失而 verify() 仍答 ok；
+    # summary 被删则让 save() 承诺的"合并上一次尝试"无从合并，旧计数一起丢。
     assert (tmp_path / "runs" / "run-old.json").exists()
+    assert (tmp_path / "traces" / "run-old.jsonl").exists()
+    assert store.get("run-old") is not None
     state = states.get("run-old")
     assert state is not None and state.status is RunStatus.RUNNING
+    # 而真正过期的那个照常被清掉。
+    assert store.get("run-new") is None
 
 
 def test_observability_retention_keeps_the_newest_oversized_run(

@@ -273,8 +273,19 @@ class RunSummaryStore:
         state_store = RunStateStore(self.profile_dir)
         for run_id in candidates:
             try:
-                self._path(run_id).unlink(missing_ok=True)
-                (self.trace_root / f"{run_id}.jsonl").unlink(missing_ok=True)
+                # Liveness first, and it gates *everything*.  A resumed run
+                # still carries its previous attempt's finished_at here, so it
+                # can be selected as a candidate mid-execution; deleting its
+                # trace out from under it is worse than losing the state file.
+                # TraceStore reopens the path with O_CREAT on the next append
+                # and its torn-tail check sees a shorter file, so the chain
+                # silently restarts from genesis -- the run's own history is
+                # gone and verify() still answers ok.  The summary going first
+                # also breaks the resumption merge save() promises: with no
+                # previous record there is nothing to merge, and the earlier
+                # attempt's counts vanish.
+                if not state_store.prune(run_id):
+                    continue
                 # Everything belonging to the run goes, not just the two files
                 # this store writes.  Leaving the lifecycle state behind made
                 # "terminal state, no summary" ambiguous, and startup
@@ -285,12 +296,8 @@ class RunSummaryStore:
                 # start, so the index converged on holding nothing but zombies.
                 # The orphaned seal anchor is also what made the rebuilt trace
                 # verify as tampered.
-                #
-                # The state file is deleted through its owner, which refuses
-                # while the run is live: a resumed run still carries its
-                # previous attempt's finished_at here, so it can be selected
-                # as a candidate mid-execution.
-                state_store.prune(run_id)
+                self._path(run_id).unlink(missing_ok=True)
+                (self.trace_root / f"{run_id}.jsonl").unlink(missing_ok=True)
                 (self.trace_root / f"{run_id}.jsonl.head").unlink(missing_ok=True)
                 (self.trace_root / f"{run_id}.jsonl.torn").unlink(missing_ok=True)
                 self._index.remove(run_id)

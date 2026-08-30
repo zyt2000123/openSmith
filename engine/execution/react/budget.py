@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from engine.context.compression import active_turn_bounds
+from engine.context.compression import active_turn_bounds, is_request_turn
 from engine.execution.runtime_control import (
     continue_after_length_prompt,
     incomplete_final_repair_prompt,
@@ -66,6 +66,18 @@ def looks_like_incomplete_final_after_tool(text: str) -> bool:
     return any(pattern.search(normalized) for pattern in _INCOMPLETE_FINAL_PATTERNS)
 
 
+def _is_round_boundary(message: dict) -> bool:
+    """Whether the conversation can be cut *before* this message.
+
+    A round is ``assistant(tool_calls)`` followed by its results, and only the
+    assistant that opened it, or a real request turn, starts a new one.  The
+    engine interleaves two other things into that span — a ``system`` recovery
+    hint, and the ``[Current time]`` user note — and cutting on either strands
+    the tool results that follow.
+    """
+    return message.get("role") == "assistant" or is_request_turn(message)
+
+
 def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
     """Bound the conversation by message count without losing the request.
 
@@ -103,7 +115,7 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
         if active_start is None or active_start < cut:
             # 请求会被钉进 head（见 kept），首条非 system 就是它。
             return cut
-        while cut < active_start and conversation[cut].get("role") != "user":
+        while cut < active_start and not is_request_turn(conversation[cut]):
             cut += 1
         return cut
 
@@ -116,12 +128,16 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
         return head + conversation[cut:]
 
     # 切点落在 tool 结果串中会拆散 assistant(tool_calls)/tool 配对
-    # （provider 400）。向前回退到 assistant/user 边界：同一轮的 tool
-    # 结果之间可能夹着 system 提示（TOOL_FAILURE_HINT 在 tool_calls
-    # 循环内 append），只认 role=="tool" 会在提示处停下留下孤儿。
+    # （provider 400）。向前回退到 assistant 或**真实**请求轮的边界：同一轮的
+    # tool 结果之间可能夹着 system 提示（TOOL_FAILURE_HINT 在 tool_calls 循环
+    # 内 append），也可能夹着 get_current_time 注入的那条 [Current time] user
+    # 注记（_tool_result_messages 一次返回 tool + user 两条）。只认
+    # role=="tool"，或者把那条注记当成 user 边界，都会在轮次中间停下、把它后面
+    # 的 tool 结果切成孤儿 —— provider 400，且不是 context-limit 错误，整个 run
+    # 直接失败。
     requested_cut = len(conversation) - CONVERSATION_KEEP_RECENT
     cut = requested_cut
-    while cut > leading_system_count and conversation[cut].get("role") in ("tool", "system"):
+    while cut > leading_system_count and not _is_round_boundary(conversation[cut]):
         cut -= 1
     trimmed = kept(aligned(cut))
     if len(trimmed) < len(conversation):
@@ -133,7 +149,7 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
     # 一定有进展。判据用"结果是否真的变短"而不是切点下标：head 的长度随
     # 请求是否被钉入而变，下标比较会漏判。
     forward = requested_cut
-    while forward < len(conversation) and conversation[forward].get("role") in ("tool", "system"):
+    while forward < len(conversation) and not _is_round_boundary(conversation[forward]):
         forward += 1
     if forward < len(conversation):
         forward_trimmed = kept(aligned(forward))
