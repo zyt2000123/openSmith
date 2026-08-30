@@ -70,6 +70,11 @@ class DreamCleanup:
     new_recent_hash: str
     compile_offset: int
     context_offset: int = 0
+    # 记账时刻两个状态各自的 UTF-8 字节长度：有了长度，上面两个哈希就能当
+    # *前缀* 哈希用，恢复才容忍崩溃后追加的新证据。旧格式 journal 没有这两个
+    # 值，留 None 表示"只能整文件比对"。
+    old_recent_len: int | None = None
+    new_recent_len: int | None = None
 
 
 def dream_report_completed(report: DreamReport) -> bool:
@@ -223,6 +228,31 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _valid_optional_len(value: object) -> bool:
+    """A journaled prefix length is either absent (old format) or a real size."""
+    return value is None or (
+        not isinstance(value, bool) and isinstance(value, int) and value >= 0
+    )
+
+
+def _matches_journaled_state(text: str, prefix_len: int | None, digest: str) -> bool:
+    """Match *text* against a journaled checkpoint, tolerating later appends.
+
+    整文件哈希曾是这里的判据，代价是：崩溃窗口之后只要有任何一轮入账往
+    recent.jsonl 追加一行，old/new 两个哈希就都对不上，`_recover_dream_cleanup`
+    永久返回错误 —— 此后每次 Dream 都在 `run_dream` 开头提前返回，sanitize 和
+    证据回收一起停摆，只能人工删 journal 才能自愈。recent.jsonl 除了 Dream 自己
+    的修剪之外只会被追加，所以只校验记账那一刻的前缀，追加落在其后不影响判定。
+    """
+    if prefix_len is None:
+        # 旧格式 journal 没有长度可切前缀，只能退回整文件比对。
+        return _text_hash(text) == digest
+    raw = text.encode("utf-8")
+    if len(raw) < prefix_len:
+        return False
+    return hashlib.sha256(raw[:prefix_len]).hexdigest() == digest
+
+
 def _write_dream_cleanup(memory_dir: Path, cleanup: DreamCleanup) -> None:
     """Journal a source-log replacement before changing any checkpoint."""
     atomic_write_text(
@@ -234,6 +264,8 @@ def _write_dream_cleanup(memory_dir: Path, cleanup: DreamCleanup) -> None:
                 "new_recent_hash": cleanup.new_recent_hash,
                 "compile_offset": cleanup.compile_offset,
                 "context_offset": cleanup.context_offset,
+                "old_recent_len": cleanup.old_recent_len,
+                "new_recent_len": cleanup.new_recent_len,
             },
             sort_keys=True,
         ),
@@ -264,6 +296,11 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
     # log from the start: redundant work, never lost evidence -- and the journal
     # only survives at all if a crash landed inside a millisecond-wide window.
     context_offset = payload.get("context_offset", 0)
+    # 旧格式 journal（只有整文件哈希）在磁盘上可能仍然存在，而它恰恰是本次
+    # 修复要救的那类残留。缺键解析成 None，让恢复退回原来的整文件判定，而不
+    # 是把它判成损坏 —— 判损坏就等于把还能救的 journal 变成永久停摆。
+    old_recent_len = payload.get("old_recent_len")
+    new_recent_len = payload.get("new_recent_len")
     # A journal written before the memory views were merged also carries
     # durable/dream/nudge offsets.  Those lanes no longer exist; ignore the
     # extra keys rather than rejecting a journal that must still be recovered.
@@ -281,6 +318,8 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
         or isinstance(context_offset, bool)
         or not isinstance(context_offset, int)
         or context_offset < 0
+        or not _valid_optional_len(old_recent_len)
+        or not _valid_optional_len(new_recent_len)
     ):
         return None, "Dream cleanup has invalid fields"
     return (
@@ -290,6 +329,8 @@ def _load_dream_cleanup(memory_dir: Path) -> tuple[DreamCleanup | None, str | No
             new_recent_hash=new_recent_hash,
             compile_offset=compile_offset,
             context_offset=context_offset,
+            old_recent_len=old_recent_len,
+            new_recent_len=new_recent_len,
         ),
         None,
     )
@@ -322,18 +363,20 @@ def _recover_dream_cleanup(memory_dir: Path) -> str | None:
     if recent is None:
         return "recent evidence is unavailable during Dream cleanup recovery"
     try:
-        current_hash = _text_hash(recent.read_text(encoding="utf-8"))
+        current = recent.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return "recent evidence could not be read during Dream cleanup recovery"
 
-    if current_hash == cleanup.old_recent_hash:
+    if _matches_journaled_state(current, cleanup.old_recent_len, cleanup.old_recent_hash):
         # The journal reached disk but the source-log replacement did not.
         try:
             _clear_dream_cleanup(memory_dir)
         except OSError:
             return "stale Dream cleanup could not be cleared"
         return None
-    if current_hash != cleanup.new_recent_hash:
+    if not _matches_journaled_state(
+        current, cleanup.new_recent_len, cleanup.new_recent_hash
+    ):
         return "recent evidence changed during Dream cleanup recovery"
 
     try:
@@ -411,6 +454,8 @@ def _cleanup_log(memory_dir: Path, report: DreamReport) -> int:
         new_recent_hash=_text_hash(remaining_text),
         compile_offset=max(0, compile_offset - safe_offset),
         context_offset=max(0, context_offset - safe_offset),
+        old_recent_len=len(source_text.encode("utf-8")),
+        new_recent_len=len(remaining_text.encode("utf-8")),
     )
     _write_dream_cleanup(memory_dir, cleanup)
     # The cleanup journal below makes the truncation *atomic* -- it replays a
