@@ -406,6 +406,13 @@ async def test_record_usage_clears_message_estimates_for_the_session() -> None:
     await db.executescript(
         """
         CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE token_usage_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -420,6 +427,10 @@ async def test_record_usage_clears_message_estimates_for_the_session() -> None:
             occurred_at TEXT NOT NULL
         );
         INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1'), ('s2', 'agent-1');
+        INSERT INTO messages (id, session_id, role, content, created_at) VALUES
+            ('m1', 's1', 'user', 'ask', '2026-07-14T10:00:00+00:00'),
+            ('m2', 's1', 'assistant', 'answer', '2026-07-14T10:00:01+00:00'),
+            ('m3', 's2', 'user', 'other', '2026-07-14T10:00:02+00:00');
         INSERT INTO token_usage_events
             (session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at)
         VALUES
@@ -465,6 +476,13 @@ async def test_sync_from_traces_skips_live_recorded_runs(tmp_path: Path) -> None
     await db.executescript(
         """
         CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE token_usage_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -553,6 +571,13 @@ async def test_record_usage_files_an_engine_estimate_as_a_local_estimate(
     await db.executescript(
         """
         CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE token_usage_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -793,6 +818,13 @@ async def test_record_usage_clears_own_trace_imported_rows(tmp_path: Path) -> No
     await db.executescript(
         """
         CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE token_usage_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -836,4 +868,147 @@ async def test_record_usage_clears_own_trace_imported_rows(tmp_path: Path) -> No
 
     stats = await service.get_stats("agent-1", year=2026)
     assert stats["total_tokens"] == 125
+
+
+_TWO_HISTORICAL_TURNS_AND_A_LIVE_ONE = """
+CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+CREATE TABLE messages (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE token_usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    run_id TEXT,
+    source_key TEXT UNIQUE,
+    project_name TEXT NOT NULL DEFAULT '',
+    project_path TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    occurred_at TEXT NOT NULL
+);
+INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1');
+INSERT INTO messages (id, session_id, role, content, created_at) VALUES
+    ('u1', 's1', 'user',      'first question ................', '2026-07-14T10:00:00+00:00'),
+    ('a1', 's1', 'assistant', 'first answer ..................', '2026-07-14T10:00:01+00:00'),
+    ('u2', 's1', 'user',      'second question ...............', '2026-07-14T10:10:00+00:00'),
+    ('a2', 's1', 'assistant', 'second answer .................', '2026-07-14T10:10:01+00:00'),
+    ('u3', 's1', 'user',      'third question ................', '2026-07-14T11:00:00+00:00');
+"""
+
+# The engine's own guess, emitted when the provider reported nothing at all.
+_ENGINE_ESTIMATE = {
+    "input_tokens": 900,
+    "output_tokens": 60,
+    "total_tokens": 960,
+    "usage_reported": 0,
+    "estimated": True,
+}
+
+
+@pytest.mark.asyncio
+async def test_record_usage_keeps_estimates_of_turns_it_did_not_price(
+    tmp_path: Path,
+) -> None:
+    """One engine estimate must not erase a whole conversation's transcript
+    estimates.  Turns 1 and 2 were never priced (the relay reported no usage and
+    predates the engine's fallback), so their 'message:' rows are the only
+    record the panel has of them; only turn 3 — the one this event belongs to —
+    is superseded."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        _TWO_HISTORICAL_TURNS_AND_A_LIVE_ONE
+        + """
+        INSERT INTO token_usage_events
+            (session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at)
+        VALUES
+            ('s1', NULL, 'message:u1', 'local-estimate', 100, 0, 100, '2026-07-14T10:00:00+00:00'),
+            ('s1', NULL, 'message:a1', 'local-estimate', 0, 100, 100, '2026-07-14T10:00:01+00:00'),
+            ('s1', NULL, 'message:u2', 'local-estimate', 100, 0, 100, '2026-07-14T10:10:00+00:00'),
+            ('s1', NULL, 'message:a2', 'local-estimate', 0, 100, 100, '2026-07-14T10:10:01+00:00'),
+            -- Left over from a sync that ran while this turn was already
+            -- pending (server restarted mid-approval, run resumed afterwards).
+            ('s1', NULL, 'message:u3', 'local-estimate', 100, 0, 100, '2026-07-14T11:00:00+00:00');
+        """
+    )
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    service = TokenStatsService(db_provider, trace_root=tmp_path)
+    await service.record_usage(
+        session_id="s1",
+        run_id="run-3",
+        project_name="demo-project",
+        project_path="/tmp/demo-project",
+        model="gpt-test",
+        usage=_ENGINE_ESTIMATE,
+        occurred_at=datetime.fromisoformat("2026-07-14T11:00:03+00:00"),
+    )
+
+    rows = await db.execute_fetchall(
+        "SELECT source_key FROM token_usage_events ORDER BY occurred_at"
+    )
+    keys = [row["source_key"] for row in rows]
+    assert keys[:4] == ["message:u1", "message:a1", "message:u2", "message:a2"]
+    # Turn 3 is priced now, so its transcript estimate is gone and not counted
+    # a second time alongside the event that replaced it.
+    assert "message:u3" not in keys
+    assert len(keys) == 5 and str(keys[4]).startswith("estimate:live:")
+
+    stats = await service.get_stats("agent-1", year=2026)
+    assert stats["total_tokens"] == 400 + 960
+
+    # The next startup's sync must not undo any of that: neither by deleting the
+    # unpriced turns' estimates nor by rebuilding turn 3's.
+    assert await service.sync_from_traces() == 0
+    stats = await service.get_stats("agent-1", year=2026)
+    assert stats["total_tokens"] == 400 + 960
+
+
+@pytest.mark.asyncio
+async def test_sync_rebuilds_estimates_only_for_turns_without_usage(
+    tmp_path: Path,
+) -> None:
+    """Databases damaged by the session-wide delete are healed on the next sync,
+    and the priced turn is still not double-counted while healing them."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        _TWO_HISTORICAL_TURNS_AND_A_LIVE_ONE
+        + """
+        INSERT INTO messages (id, session_id, role, content, created_at) VALUES
+            ('a3', 's1', 'assistant', 'third answer ..................', '2026-07-14T11:00:10+00:00');
+        -- The turn-3 event survived; the four transcript estimates did not.
+        INSERT INTO token_usage_events
+            (session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at)
+        VALUES
+            ('s1', 'run-3', 'estimate:live:deadbeef', 'gpt-test', 900, 60, 960, '2026-07-14T11:00:03+00:00');
+        """
+    )
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    service = TokenStatsService(db_provider, trace_root=tmp_path)
+    assert await service.sync_from_traces() == 4
+
+    rows = await db.execute_fetchall(
+        "SELECT source_key FROM token_usage_events ORDER BY occurred_at"
+    )
+    assert [row["source_key"] for row in rows] == [
+        "message:u1",
+        "message:a1",
+        "message:u2",
+        "message:a2",
+        "estimate:live:deadbeef",
+    ]
+    # u3/a3 are turn 3's messages; the live estimate already prices that turn.
+    assert await service.sync_from_traces() == 0
 

@@ -34,6 +34,60 @@ _NON_MODEL_STAT_KEYS = frozenset({"unknown", "local-estimate"})
 _LIVE_ESTIMATE_PREFIX = "estimate:live:"
 _TRACE_ESTIMATE_PREFIX = "estimate:trace:"
 _ESTIMATE_PREFIXES = ("message:", "estimate:")
+
+# A usage event supersedes a transcript estimate only when the two describe the
+# *same turn*.  Turn boundaries are the user messages, so an event and a message
+# share a turn exactly when no user message falls between them.
+#
+# Scoping this per session instead — "this session now has a real usage event,
+# drop all of its 'message:' estimates" — also erased every earlier turn the
+# engine never priced (a relay that reported no usage, or turns older than the
+# feature).  The rows never came back either: the regeneration guard read the
+# session as exact and skipped it.  One event could therefore drop a 40-turn
+# conversation to whatever that single event was worth.
+#
+# Both timestamps are UTC ISO-8601 strings, which is what makes these string
+# comparisons time comparisons; the rest of this module already relies on that.
+_SAME_TURN_USAGE_EXISTS = """
+EXISTS (
+    SELECT 1 FROM token_usage_events e
+    WHERE e.session_id = m.session_id
+      AND (e.source_key IS NULL OR e.source_key NOT LIKE 'message:%')
+      AND NOT EXISTS (
+          SELECT 1 FROM messages b
+          WHERE b.session_id = m.session_id AND b.role = 'user'
+            AND b.created_at > min(m.created_at, e.occurred_at)
+            AND b.created_at <= max(m.created_at, e.occurred_at)
+      )
+)
+"""
+
+# A NULL :session_id means "every session".  The live path binds one because it
+# runs once per LLM turn and must not walk the whole table to clean up at most
+# its own turn's rows.
+_SUPERSEDED_ESTIMATES_DELETE = f"""
+DELETE FROM token_usage_events
+WHERE source_key LIKE 'message:%'
+  AND (:session_id IS NULL OR session_id = :session_id)
+  AND EXISTS (
+      SELECT 1 FROM messages m
+      WHERE 'message:' || m.id = token_usage_events.source_key
+        AND {_SAME_TURN_USAGE_EXISTS}
+  )
+"""
+
+_UNPRICED_TRANSCRIPT_MESSAGES = f"""
+SELECT m.id, m.session_id, m.role, m.content, m.created_at
+FROM messages m
+JOIN sessions s ON s.id = m.session_id
+WHERE NOT {_SAME_TURN_USAGE_EXISTS}
+  AND NOT EXISTS (
+      SELECT 1 FROM token_usage_events prior
+      WHERE prior.source_key = 'message:' || m.id
+  )
+ORDER BY m.created_at ASC
+"""
+
 logger = logging.getLogger(__name__)
 
 
@@ -114,17 +168,14 @@ class TokenStatsService:
                 (occurred_at or datetime.now(timezone.utc)).isoformat(),
             ),
         )
-        # A per-turn usage event supersedes the local text-token estimates for
-        # the same session (they carry source_key LIKE 'message:%'); clear them
-        # in the same transaction so get_stats never double-counts between this
+        # A per-turn usage event supersedes the local text-token estimates of
+        # *its own turn* (they carry source_key LIKE 'message:%'); clear them in
+        # the same transaction so get_stats never double-counts between this
         # call and the next sync_from_traces.  This holds for an engine estimate
-        # too: it covers the same turns from the prompt side, so keeping both
-        # would count one turn twice.
-        await db.execute(
-            "DELETE FROM token_usage_events "
-            "WHERE source_key LIKE 'message:%' AND session_id=?",
-            (session_id,),
-        )
+        # too: it prices the same turn from the prompt side, so keeping both
+        # would count that turn twice.  Earlier turns are a different matter —
+        # see _SUPERSEDED_ESTIMATES_DELETE for why they must survive.
+        await db.execute(_SUPERSEDED_ESTIMATES_DELETE, {"session_id": session_id})
         # A resumed run (server restarted after the trace was imported) would
         # otherwise keep both its live rows and the trace-imported rows for the
         # whole process lifetime: sync_from_traces only heals at the next startup.
@@ -496,44 +547,14 @@ class TokenStatsService:
         """Fill the first dashboard from local transcripts when exact usage is absent.
 
         This is intentionally marked by a ``message:`` source key. It is a local
-        text-token estimate, not provider billing usage, and is replaced for a
-        session as soon as an exact usage event exists for that session.
+        text-token estimate, not provider billing usage, and is replaced turn by
+        turn as soon as a usage event prices that turn. Turns the engine never
+        priced keep their estimate however many other turns did get one, so a
+        session is never reduced to its priced tail.
         """
         try:
-            exact_sessions = await db.execute_fetchall(
-                """
-                SELECT DISTINCT session_id
-                FROM token_usage_events
-                WHERE source_key IS NULL OR source_key NOT LIKE 'message:%'
-                """
-            )
-            if exact_sessions:
-                placeholders = ",".join("?" for _ in exact_sessions)
-                await db.execute(
-                    "DELETE FROM token_usage_events "
-                    "WHERE source_key LIKE 'message:%' AND session_id IN (" + placeholders + ")",
-                    [row["session_id"] for row in exact_sessions],
-                )
-
-            rows = await db.execute_fetchall(
-                """
-                SELECT m.id, m.session_id, m.role, m.content, m.created_at
-                FROM messages m
-                JOIN sessions s ON s.id=m.session_id
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM token_usage_events e
-                    WHERE e.session_id=m.session_id
-                      AND (e.source_key IS NULL OR e.source_key NOT LIKE 'message:%')
-                )
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM token_usage_events e
-                    WHERE e.source_key = 'message:' || m.id
-                )
-                ORDER BY m.created_at ASC
-                """
-            )
+            await db.execute(_SUPERSEDED_ESTIMATES_DELETE, {"session_id": None})
+            rows = await db.execute_fetchall(_UNPRICED_TRANSCRIPT_MESSAGES)
         except aiosqlite.OperationalError:
             # Keep the service usable with a minimal/custom database in tests or
             # during a partially completed schema migration.
