@@ -1019,21 +1019,33 @@ async def test_sync_rebuilds_estimates_only_for_turns_without_usage(
 
 # ``messages`` never loses rows outside a resume, and a resident Smith keeps one
 # transcript store across every session, so tens of thousands of rows is the
-# normal steady state rather than an extreme.  These two shapes are the ones the
-# cleanup cost is quadratic in: rows in the table, and rows per session.
-_SCALE_SESSIONS = 20
-_SCALE_MESSAGES_PER_SESSION = 600
+# normal steady state rather than an extreme.  Both shapes matter and they fail
+# differently: many sessions grow the table the startup pass walks, while one
+# long session grows the *per-turn* term.  20x600 was the shape the previous
+# version of this test used, and it is exactly the size at which the quadratic
+# term is still invisible (22ms per turn on disk); a single session of a few
+# thousand messages is where it shows (1.27s per LLM call at 4800).
+_SCALE_SHAPES = ((20, 600), (1, 4800))
 
-# Wall clock is the weaker of the two checks below — it is here to catch an
-# order-of-magnitude regression, not to measure anything.  Both bounds sit ~10x
-# above the observed cost on this fixture (0.41-0.42s startup, ~0.021s per
-# turn over repeated runs) and comfortably below the pre-fix cost (13.5s and
-# 0.60s), so neither is tight enough to trip on a loaded machine.
+# Wall clock is the weaker of the checks below — it is here to catch an
+# order-of-magnitude regression, not to measure anything, and an in-memory
+# database is not the on-disk cost either way.  Measured here on 1x4800:
+# 0.023s startup / 0.017s per turn now, against 2.34s / 2.30s before, so each
+# bound has better than 10x headroom above the current cost and stays an order
+# of magnitude below the cost it is guarding against.
 _STARTUP_BUDGET_SECONDS = 5.0
 _TURN_BUDGET_SECONDS = 0.25
 
 # Every alias the transcript table is reachable under in these statements.
 _TRANSCRIPT_SCAN = re.compile(r"^SCAN (?:m|b|messages)\b")
+
+# The quadratic term never was a scan of ``messages``: it is the event lookup,
+# a *SEARCH* on token_usage_events that only constrained ``session_id`` and so
+# walked every one of that session's rows — almost all of which are the
+# per-message estimates this statement is trying to clean up.  A check that only
+# looks for scans of the transcript is structurally blind to it, so the event
+# side is asserted directly: the seek must be bounded on both ends.
+_EVENT_LOOKUP = re.compile(r"^(?:SCAN|SEARCH) e\b")
 
 
 async def _plan(db: aiosqlite.Connection, sql: str, params: tuple = ()) -> list[str]:
@@ -1069,7 +1081,19 @@ async def _transcript_rescans(
     ]
 
 
-async def _large_transcript_db() -> aiosqlite.Connection:
+async def _event_lookups(
+    db: aiosqlite.Connection, sql: str, params: tuple = ()
+) -> list[str]:
+    return [
+        detail
+        for detail in await _plan(db, sql, params)
+        if _EVENT_LOOKUP.match(detail)
+    ]
+
+
+async def _large_transcript_db(
+    session_count: int, per_session: int
+) -> aiosqlite.Connection:
     """A real-schema database holding a normal amount of accumulated history."""
     db = await aiosqlite.connect(":memory:")
     db.row_factory = aiosqlite.Row
@@ -1078,10 +1102,10 @@ async def _large_transcript_db() -> aiosqlite.Connection:
         "INSERT INTO agent_profiles (id, name, role) VALUES ('agent-1', 'Smith', 'assistant')"
     )
     sessions, messages, estimates, events = [], [], [], []
-    for session_index in range(_SCALE_SESSIONS):
+    for session_index in range(session_count):
         session_id = f"s{session_index}"
         sessions.append((session_id, "agent-1"))
-        for index in range(_SCALE_MESSAGES_PER_SESSION):
+        for index in range(per_session):
             message_id = f"{session_id}-m{index}"
             role = "user" if index % 2 == 0 else "assistant"
             occurred_at = (
@@ -1115,20 +1139,24 @@ async def _large_transcript_db() -> aiosqlite.Connection:
     return db
 
 
+@pytest.mark.parametrize(("session_count", "per_session"), _SCALE_SHAPES)
 @pytest.mark.asyncio
 async def test_turn_scoped_cleanup_stays_index_bound_on_an_accumulated_transcript(
     tmp_path: Path,
+    session_count: int,
+    per_session: int,
 ) -> None:
-    """P1 regression: the turn-scoped cleanup must not cost O(messages^2).
+    """P1 regression: the turn-scoped cleanup must not cost O(messages-per-session^2).
 
-    Matching an estimate to its message through ``'message:' || m.id`` is an
-    expression no index can serve, and ``(:session_id IS NULL OR session_id =
-    :session_id)`` is not sargable either, so both the startup backfill and the
-    per-LLM-turn cleanup degraded into full scans of the transcript.  At 20k
-    accumulated messages startup took over 30s — past the shell's 30s backend
-    timeout — and every LLM turn added seconds inside the SSE stream.
+    The cleanup asks, per candidate estimate, "does this session hold a usage
+    event of the same turn?".  Phrased as "no user message lies between them",
+    the only thing bounding the event side is ``e.session_id``, so it walked
+    every event of the session — and a session's events are one per message.
+    Doubling a session's transcript therefore quadrupled the cost of *every*
+    LLM call, which runs inside the SSE stream: 20x2400 measured 324ms per
+    call, one session of 9600 measured 5.3s per call, on disk.
     """
-    db = await _large_transcript_db()
+    db = await _large_transcript_db(session_count, per_session)
 
     async def db_provider() -> aiosqlite.Connection:
         return db
@@ -1156,6 +1184,24 @@ async def test_turn_scoped_cleanup_stays_index_bound_on_an_accumulated_transcrip
     ):
         plan = await _plan(db, sql)
         assert any("idx_messages_session_role_time" in line for line in plan), plan
+
+    # The event lookup is the quadratic term, so it is asserted where it lives:
+    # every statement that runs it must bound ``occurred_at`` on both sides, not
+    # just pin the session.
+    for label, sql, params in (
+        ("startup delete", token_stats_module._SUPERSEDED_ESTIMATES_DELETE, ()),
+        (
+            "per-turn delete",
+            token_stats_module._SUPERSEDED_ESTIMATES_DELETE_FOR_SESSION,
+            ("s0",),
+        ),
+        ("startup select", token_stats_module._UNPRICED_TRANSCRIPT_MESSAGES, ()),
+    ):
+        lookups = await _event_lookups(db, sql, params)
+        assert lookups, (label, await _plan(db, sql, params))
+        for detail in lookups:
+            assert "idx_token_usage_session_time" in detail, (label, detail)
+            assert "occurred_at>" in detail and "occurred_at<" in detail, (label, detail)
 
     # The hot path binds a session and must actually narrow by it.
     plan = await _plan(
@@ -1255,6 +1301,87 @@ async def test_sync_clears_estimates_whose_message_was_discarded(
     assert await service.sync_from_traces() == 0
     rows = await db.execute_fetchall("SELECT source_key FROM token_usage_events")
     assert [row["source_key"] for row in rows] == [None]
+
+
+class _FailsAfterNExecutes:
+    """A connection proxy that stops working part-way through the backfill."""
+
+    def __init__(self, db: aiosqlite.Connection, limit: int) -> None:
+        self._db = db
+        self._limit = limit
+        self.calls = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
+
+    async def execute(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls > self._limit:
+            raise aiosqlite.IntegrityError("FOREIGN KEY constraint failed")
+        return await self._db.execute(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_backfill_commits_incrementally_instead_of_one_long_transaction(
+    tmp_path: Path,
+) -> None:
+    """The estimate backfill must not hold one write transaction over the whole
+    transcript.
+
+    Now that it runs on its own connection it is a second writer, and SQLite
+    grants the write lock to one connection at a time.  Committing only at the
+    end held that lock for as long as the backfill ran — measured 6.2s over 96k
+    messages — and the request path's next message INSERT waited out its full
+    5s busy_timeout and then failed with ``database is locked``.  Committing in
+    batches gives the waiting writer a window: the same 96k run let three
+    concurrent writes through, the slowest at 3.4s.
+
+    The observable consequence, and what is asserted here, is that a backfill
+    which dies part-way leaves its finished batches committed — visible to
+    another connection — so the next startup resumes rather than restarts.
+    """
+    db_path = tmp_path / "app.db"
+    writer = await aiosqlite.connect(str(db_path))
+    writer.row_factory = aiosqlite.Row
+    await writer.execute("PRAGMA journal_mode=WAL")
+    await app_schema.ensure_schema(writer)
+    await writer.execute(
+        "INSERT INTO agent_profiles (id, name, role) VALUES ('agent-1', 'Smith', 'assistant')"
+    )
+    await writer.execute("INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1')")
+    total = 3 * token_stats_module._ESTIMATE_COMMIT_INTERVAL
+    await writer.executemany(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, 's1', 'user', 'ask', ?)",
+        [
+            (f"m{index}", f"2026-07-14T{index // 3600:02d}:{index // 60 % 60:02d}:{index % 60:02d}+00:00")
+            for index in range(total)
+        ],
+    )
+    await writer.commit()
+
+    # Two leading statements (the superseded and orphan deletes) precede the
+    # per-message inserts, so this dies inside the second batch.
+    committed = token_stats_module._ESTIMATE_COMMIT_INTERVAL
+    proxy = _FailsAfterNExecutes(writer, limit=2 + committed + 17)
+
+    async def failing_provider():
+        return proxy
+
+    service = TokenStatsService(failing_provider, trace_root=tmp_path / "no-traces")
+    with pytest.raises(aiosqlite.IntegrityError):
+        await service.sync_from_traces()
+
+    reader = await aiosqlite.connect(str(db_path))
+    reader.row_factory = aiosqlite.Row
+    rows = await reader.execute_fetchall("SELECT count(*) AS n FROM token_usage_events")
+    assert int(rows[0]["n"]) == committed
+
+    # The next startup picks up exactly what is missing, not the whole transcript.
+    async def healthy_provider():
+        return writer
+
+    resumed = TokenStatsService(healthy_provider, trace_root=tmp_path / "no-traces")
+    assert await resumed.sync_from_traces() == total - committed
 
 
 @pytest.mark.asyncio

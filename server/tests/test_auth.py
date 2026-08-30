@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import sys
+import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -11,11 +15,25 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from common.database import close_db  # noqa: E402
 from common.paths import AppPaths  # noqa: E402
 from engine.execution import EventType, ExecutionEvent, RunObservationContext, RunStateStore  # noqa: E402
 from engine.observability import RunObservation, RunSummaryStore, TraceStore  # noqa: E402
 from app import main  # noqa: E402
 from app.infrastructure import auth  # noqa: E402
+from app.infrastructure.database import get_app_db  # noqa: E402
+from app.services.token_stats_service import TokenStatsService  # noqa: E402
+
+
+@asynccontextmanager
+async def _unused_backfill_connection():
+    """Keep lifespan tests off the real ``~/.agent-smith`` database.
+
+    ``_sync_token_stats`` opens a connection of its own before it reaches the
+    service, so a test that only fakes the service would still touch the user's
+    data directory.
+    """
+    yield None
 
 
 def test_auth_token_write_refuses_a_preplanted_symlink(
@@ -61,6 +79,9 @@ def test_server_lifespan_materializes_local_auth_token_before_shell_requests(
         await asyncio.sleep(3600)
 
     class FakeTokenStatsService:
+        def __init__(self, db_provider=None, **_kwargs) -> None:
+            self._db_provider = db_provider
+
         async def sync_from_traces(self) -> int:
             return 0
 
@@ -73,24 +94,55 @@ def test_server_lifespan_materializes_local_auth_token_before_shell_requests(
     monkeypatch.setattr(main, "run_scheduler", fake_scheduler)
     monkeypatch.setattr(main, "load_runtime_identity_catalog", lambda force=False: None)
     monkeypatch.setattr(main, "TokenStatsService", FakeTokenStatsService)
+    monkeypatch.setattr(main, "dedicated_connection", _unused_backfill_connection)
 
     with TestClient(main.app):
         assert token_path.is_file()
         assert token_path.read_text(encoding="utf-8").strip()
 
 
-def test_server_lifespan_syncs_token_stats_before_serving_requests(
+def test_server_lifespan_backfills_token_stats_without_blocking_requests(
     monkeypatch,
 ) -> None:
-    calls: list[str] = []
+    """The token backfill is a background task, and shutdown drains it.
+
+    It used to be awaited inside the lifespan, which kept the server from
+    answering anything until it finished; the shell gives up on a backend that
+    takes longer than 30s.  So "ran before the first request" is exactly the
+    guarantee that was given up, and asserting it now only measures how many
+    scheduler steps the fake happened to need.  What must hold instead: requests
+    are served while it is still running, and it is not left dangling at
+    shutdown — its private connection has to be closed with it.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+    closed: list[str] = []
 
     class FakeTokenStatsService:
+        def __init__(self, db_provider=None, **_kwargs) -> None:
+            self._db_provider = db_provider
+
         async def sync_from_traces(self) -> int:
-            calls.append("sync")
+            started.set()
+            try:
+                while not release.is_set():
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                outcome.append("cancelled")
+                raise
+            outcome.append("completed")
             return 0
 
         async def record_generation(self, record) -> None:
             return None
+
+    @asynccontextmanager
+    async def fake_dedicated_connection():
+        try:
+            yield "private-connection"
+        finally:
+            closed.append("closed")
 
     async def fake_get_app_db():
         return None
@@ -111,9 +163,73 @@ def test_server_lifespan_syncs_token_stats_before_serving_requests(
     monkeypatch.setattr(main, "run_scheduler", fake_scheduler)
     monkeypatch.setattr(main, "load_runtime_identity_catalog", lambda force=False: None)
     monkeypatch.setattr(main, "TokenStatsService", FakeTokenStatsService)
+    monkeypatch.setattr(main, "dedicated_connection", fake_dedicated_connection)
 
-    with TestClient(main.app):
-        assert calls == ["sync"]
+    try:
+        with TestClient(main.app) as client:
+            # Requests are answered while the backfill is deliberately stuck, and
+            # serving them is also what waits for it to start — no assumption
+            # about how many scheduler steps it needs to get there.
+            deadline = time.monotonic() + 10.0
+            while not started.is_set() and time.monotonic() < deadline:
+                assert client.get("/api/health").status_code == 200
+            assert started.is_set(), "the backfill task was never started"
+            assert client.get("/api/health").status_code == 200
+            assert outcome == []  # still running: shutdown has to deal with it
+    finally:
+        release.set()
+
+    assert outcome == ["cancelled"]
+    assert closed == ["closed"], "the backfill's own connection outlived the server"
+
+
+@pytest.mark.asyncio
+async def test_startup_backfill_failure_keeps_a_concurrent_request_write(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """P2 regression: a failed backfill must not erase a request's pending write.
+
+    ``_sync_message_estimates`` selects the unpriced messages and then inserts an
+    estimate per message.  A session deleted in between (the shell's ``/clear``
+    is a ``DELETE /api/agent/sessions/{id}``) makes that insert violate the
+    ``token_usage_events.session_id`` foreign key, and ``sync_from_traces``
+    rolls back.  Run on the shared connection, that rollback discarded every
+    other coroutine's uncommitted work too — and ``add_message`` executes its
+    INSERT and commits it across an await boundary, so a user's message
+    disappeared with no error raised on either side.
+    """
+    paths = AppPaths(data_dir=tmp_path / "data", project_root=tmp_path / "project")
+    main.common_config.reset_paths(paths)
+    try:
+        request_db = await get_app_db()  # the one connection every request uses
+        await request_db.execute(
+            "INSERT INTO agent_profiles (id, name, role) VALUES ('agent-1','Smith','x')"
+        )
+        await request_db.execute("INSERT INTO sessions (id, agent_id) VALUES ('s1','agent-1')")
+        await request_db.commit()
+
+        async def failing_estimate_sync(self, db) -> int:
+            # The request path is mid-flight: its INSERT has been executed and
+            # its commit has not been reached yet.
+            await request_db.execute(
+                "INSERT INTO messages (id, session_id, role, content, created_at) "
+                "VALUES ('u9','s1','user','keep me','2026-07-14T10:00:00+00:00')"
+            )
+            raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+
+        monkeypatch.setattr(
+            TokenStatsService, "_sync_message_estimates", failing_estimate_sync
+        )
+
+        await main._sync_token_stats()
+
+        await request_db.commit()  # the request finishes its own write
+        rows = await request_db.execute_fetchall("SELECT id FROM messages")
+        assert [str(row["id"]) for row in rows] == ["u9"]
+    finally:
+        await close_db()
+        main.common_config.reset_paths()
 
 
 def test_server_lifespan_recovers_interrupted_runs_before_serving_requests(
@@ -130,6 +246,9 @@ def test_server_lifespan_recovers_interrupted_runs_before_serving_requests(
             return ["run-1"]
 
     class FakeTokenStatsService:
+        def __init__(self, db_provider=None, **_kwargs) -> None:
+            self._db_provider = db_provider
+
         async def sync_from_traces(self) -> int:
             return 0
 
@@ -155,6 +274,7 @@ def test_server_lifespan_recovers_interrupted_runs_before_serving_requests(
     monkeypatch.setattr(main, "run_scheduler", fake_scheduler)
     monkeypatch.setattr(main, "load_runtime_identity_catalog", lambda force=False: None)
     monkeypatch.setattr(main, "TokenStatsService", FakeTokenStatsService)
+    monkeypatch.setattr(main, "dedicated_connection", _unused_backfill_connection)
     monkeypatch.setattr(main, "RunStateStore", FakeRunStateStore)
 
     with TestClient(main.app):
@@ -290,6 +410,9 @@ def test_server_lifespan_survives_unavailable_run_state_storage(
             raise OSError("permission denied")
 
     class FakeTokenStatsService:
+        def __init__(self, db_provider=None, **_kwargs) -> None:
+            self._db_provider = db_provider
+
         async def sync_from_traces(self) -> int:
             return 0
 
@@ -315,6 +438,7 @@ def test_server_lifespan_survives_unavailable_run_state_storage(
     monkeypatch.setattr(main, "run_scheduler", fake_scheduler)
     monkeypatch.setattr(main, "load_runtime_identity_catalog", lambda force=False: None)
     monkeypatch.setattr(main, "TokenStatsService", FakeTokenStatsService)
+    monkeypatch.setattr(main, "dedicated_connection", _unused_backfill_connection)
     monkeypatch.setattr(main, "RunStateStore", UnavailableRunStateStore)
 
     with TestClient(main.app):

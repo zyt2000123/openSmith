@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from common import config as common_config
-from common.database import close_db
+from common.database import close_db, dedicated_connection
 from engine.execution import RunObservationContext, RunStateError, RunStateStore
 from engine.llm.observability import set_default_generation_sink
 from engine.observability import RunSummaryStore, finalize_interrupted_run
@@ -87,6 +87,26 @@ def _reconcile_startup_observability(
             )
 
 
+async def _sync_token_stats() -> None:
+    """Backfill the /token dashboard, off the connection the requests use.
+
+    Running it on the shared connection made it a request-path problem twice
+    over: aiosqlite serialises one connection onto one worker thread, so the
+    backfill's statements queued ahead of every request's, and on failure its
+    ``rollback()`` also threw away writes other coroutines had executed but not
+    yet committed — a user message could disappear with no error anywhere.
+    """
+    try:
+        async with dedicated_connection() as backfill_db:
+
+            async def provide_backfill_db():
+                return backfill_db
+
+            await TokenStatsService(provide_backfill_db).sync_from_traces()
+    except Exception:
+        logger.warning("failed to sync token statistics during startup", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_local_token()
@@ -101,24 +121,18 @@ async def lifespan(app: FastAPI):
     except (RunStateError, OSError):
         logger.warning("failed to recover interrupted runs during startup", exc_info=True)
 
-    async def sync_token_stats() -> None:
-        try:
-            await TokenStatsService().sync_from_traces()
-        except Exception:
-            logger.warning("failed to sync token statistics during startup", exc_info=True)
-
     # The /token dashboard is instrumentation, not a serving dependency, and its
     # backfill walks every stored transcript.  Awaited here it kept the server
     # from answering a single request until it finished; the shell abandons a
     # backend that takes longer than 30s to come up (dev-server.ts).
-    stats_sync_task = asyncio.create_task(sync_token_stats())
+    stats_sync_task = asyncio.create_task(_sync_token_stats())
     set_default_generation_sink(TokenStatsService().record_generation)
     scheduler_task = asyncio.create_task(run_scheduler())
     yield
     set_default_generation_sink(None)
     scheduler_task.cancel()
-    # A backfill still walking traces must not outlive the connection it writes
-    # through, so it is drained here like the scheduler.
+    # A backfill still walking traces must not outlive this event loop; draining
+    # it here also runs its context manager's exit, closing its own connection.
     stats_sync_task.cancel()
     for task in (scheduler_task, stats_sync_task):
         try:

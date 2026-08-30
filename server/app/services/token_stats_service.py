@@ -46,9 +46,26 @@ _ESTIMATE_PREFIXES = ("message:", "estimate:")
 # session as exact and skipped it.  One event could therefore drop a 40-turn
 # conversation to whatever that single event was worth.
 #
-# The interval test is a seek, not a walk, only because messages is indexed on
-# (session_id, role, created_at); with session_id alone it re-reads the whole
-# session transcript once per candidate row.
+# Stating that as "no user message between them" leaves ``e.session_id`` as the
+# only constraint on the event side, so the test walked every event of the
+# session once per candidate estimate — and a session's events are mostly one
+# estimate per message, which makes that quadratic in the session's transcript
+# length.  The equivalent interval form bounds ``e.occurred_at`` directly:
+# ``m`` shares a turn with the events in [prev_user(m), next_user(m)), where
+# prev_user is the newest user message not after ``m`` and next_user the oldest
+# strictly after it.  ``''`` sorts below and ``char(1114111)`` (U+10FFFF, whose
+# UTF-8 lead byte 0xF4 is above every ASCII digit) above any ISO timestamp, so an
+# absent boundary means "unbounded on that side".
+#
+# Both bounds are seeks on messages(session_id, role, created_at), and the event
+# lookup becomes one range seek on token_usage_events(session_id, occurred_at)
+# instead of a full walk of the session's rows.  Measured on an on-disk WAL
+# database at the real schema, per record_usage() call / per startup delete:
+#   20 sessions x 2400 messages:   324 / 6482 ms  ->   5 /  89 ms
+#   1 session   x 4800 messages:  1271 / 1266 ms  ->   8 /   8 ms
+#   1 session   x 9600 messages:  5273 / 5412 ms  ->  17 /  17 ms
+# The shape where every turn already carries an event, on which the previous
+# form could short-circuit early, improves too: 20x2400 startup 20335 -> 175 ms.
 #
 # Both timestamps are UTC ISO-8601 strings, which is what makes these string
 # comparisons time comparisons; the rest of this module already relies on that.
@@ -57,12 +74,16 @@ EXISTS (
     SELECT 1 FROM token_usage_events e
     WHERE e.session_id = m.session_id
       AND (e.source_key IS NULL OR e.source_key NOT LIKE 'message:%')
-      AND NOT EXISTS (
-          SELECT 1 FROM messages b
+      AND e.occurred_at >= COALESCE((
+          SELECT max(b.created_at) FROM messages b
           WHERE b.session_id = m.session_id AND b.role = 'user'
-            AND b.created_at > min(m.created_at, e.occurred_at)
-            AND b.created_at <= max(m.created_at, e.occurred_at)
-      )
+            AND b.created_at <= m.created_at
+      ), '')
+      AND e.occurred_at < COALESCE((
+          SELECT min(b.created_at) FROM messages b
+          WHERE b.session_id = m.session_id AND b.role = 'user'
+            AND b.created_at > m.created_at
+      ), char(1114111))
 )
 """
 
@@ -127,6 +148,9 @@ WHERE NOT EXISTS (
   AND NOT {_SAME_TURN_USAGE_EXISTS}
 ORDER BY m.created_at ASC
 """
+
+# Rows per write transaction in the estimate backfill; see the loop for why.
+_ESTIMATE_COMMIT_INTERVAL = 500
 
 logger = logging.getLogger(__name__)
 
@@ -355,13 +379,21 @@ class TokenStatsService:
         Trace values that were redacted by older versions are ignored because they
         are not trustworthy numeric usage data. New traces preserve these metrics
         while continuing to redact secrets.
+
+        Must be given a connection of its own.  ``rollback()`` below discards
+        *everything* uncommitted on the connection it runs against, including an
+        INSERT another coroutine has executed but not yet committed — that is
+        how a user message written by ``add_message`` disappeared silently when
+        this ran on the shared connection.  ``main.lifespan`` supplies a private
+        one; a SAVEPOINT would not help, since the sibling's statements land
+        inside the savepoint too.
         """
         try:
             return await self._sync_from_traces_inner()
         except Exception:
-            # A failed import must not leave the shared connection inside an
-            # open write transaction: that would hold the database write lock
-            # for the process lifetime and lock out every other writer.
+            # A failed import must not leave its connection inside an open write
+            # transaction: that would hold the database write lock for the
+            # process lifetime and lock out every other writer.
             try:
                 await (await self._db_provider()).rollback()
             except Exception:
@@ -643,6 +675,19 @@ class TokenStatsService:
                 ),
             )
             imported += max(cursor.rowcount, 0)
+            # On its own connection this is a second writer, and SQLite grants
+            # the write lock to one connection at a time.  Committing only at
+            # the end held it for the whole backfill; measured against a
+            # concurrent ``add_message``-shaped INSERT on the request
+            # connection: at 48k messages the backfill held 2.65s and the
+            # request waited 2.69s, at 96k it held 6.16s and the request failed
+            # with ``database is locked`` after exhausting its 5s busy_timeout.
+            # Batching gives the waiting writer windows to win: the same 96k run
+            # let three writes through, the slowest at 3.39s.  The rows are
+            # ``INSERT OR IGNORE`` on a unique source_key, so a partially
+            # committed backfill is resumed by the next startup, not duplicated.
+            if imported % _ESTIMATE_COMMIT_INTERVAL == 0:
+                await db.commit()
         await db.commit()
         return imported
 
