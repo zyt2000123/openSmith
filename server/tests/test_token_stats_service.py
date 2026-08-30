@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import re
 import sys
 import time
@@ -11,9 +13,13 @@ from types import SimpleNamespace
 import aiosqlite
 import pytest
 import pytest_asyncio
+from app import main
 from app.infrastructure import schema as app_schema
+from app.infrastructure.database import get_app_db
+from app.infrastructure.repositories.session_repo import SessionRepo
 from app.services import token_stats_service as token_stats_module
 from app.services.token_stats_service import TokenStatsService
+from common.database import close_db
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -1329,16 +1335,19 @@ async def test_backfill_commits_incrementally_instead_of_one_long_transaction(
     transcript.
 
     Now that it runs on its own connection it is a second writer, and SQLite
-    grants the write lock to one connection at a time.  Committing only at the
-    end held that lock for as long as the backfill ran — measured 6.2s over 96k
-    messages — and the request path's next message INSERT waited out its full
-    5s busy_timeout and then failed with ``database is locked``.  Committing in
-    batches gives the waiting writer a window: the same 96k run let three
-    concurrent writes through, the slowest at 3.4s.
+    grants the write lock to one connection at a time, so a transaction that
+    spans the whole backfill locks the request path out of the database for its
+    whole duration.  That consequence is covered by
+    ``test_startup_backfill_never_locks_out_a_concurrent_request_write``; what
+    is asserted here is the other observable half — a backfill which dies
+    part-way leaves its finished batches committed, visible to another
+    connection, so the next startup resumes rather than restarts.
 
-    The observable consequence, and what is asserted here, is that a backfill
-    which dies part-way leaves its finished batches committed — visible to
-    another connection — so the next startup resumes rather than restarts.
+    Deliberately not asserted: *which* batch boundary the crash landed after.
+    The commit criterion is a time budget with a row count as a second ceiling,
+    so the boundary moves with how fast the machine is; pinning it to
+    ``_ESTIMATE_COMMIT_INTERVAL`` would turn a slower CI container into a
+    failure while the invariant still held.
     """
     db_path = tmp_path / "app.db"
     writer = await aiosqlite.connect(str(db_path))
@@ -1360,9 +1369,10 @@ async def test_backfill_commits_incrementally_instead_of_one_long_transaction(
     await writer.commit()
 
     # Two leading statements (the superseded and orphan deletes) precede the
-    # per-message inserts, so this dies inside the second batch.
-    committed = token_stats_module._ESTIMATE_COMMIT_INTERVAL
-    proxy = _FailsAfterNExecutes(writer, limit=2 + committed + 17)
+    # per-message inserts.  The row ceiling puts a boundary at or before 500, so
+    # dying here always lands after at least one committed batch and before the
+    # last one, whichever gate actually fired.
+    proxy = _FailsAfterNExecutes(writer, limit=2 + token_stats_module._ESTIMATE_COMMIT_INTERVAL + 17)
 
     async def failing_provider():
         return proxy
@@ -1374,7 +1384,10 @@ async def test_backfill_commits_incrementally_instead_of_one_long_transaction(
     reader = await aiosqlite.connect(str(db_path))
     reader.row_factory = aiosqlite.Row
     rows = await reader.execute_fetchall("SELECT count(*) AS n FROM token_usage_events")
-    assert int(rows[0]["n"]) == committed
+    committed = int(rows[0]["n"])
+    # Some batches survived the crash (not one transaction over the whole run)
+    # and not all of them did (the crash really was mid-backfill).
+    assert 0 < committed < total
 
     # The next startup picks up exactly what is missing, not the whole transcript.
     async def healthy_provider():
@@ -1382,6 +1395,174 @@ async def test_backfill_commits_incrementally_instead_of_one_long_transaction(
 
     resumed = TokenStatsService(healthy_provider, trace_root=tmp_path / "no-traces")
     assert await resumed.sync_from_traces() == total - committed
+
+    # And the two runs together priced every message exactly once — a resumed
+    # backfill must neither duplicate the committed prefix nor skip it.
+    rows = await reader.execute_fetchall(
+        "SELECT count(*) AS n, count(DISTINCT source_key) AS distinct_keys FROM token_usage_events"
+    )
+    assert int(rows[0]["n"]) == total
+    assert int(rows[0]["distinct_keys"]) == total
+
+
+# A transcript turn, not a token: prose, a code line and a hash, so the
+# tokeniser is billed what a real message costs it rather than what ``'ask'``
+# costs it.  The sibling test above runs on 3-character rows, and at that size
+# a row-counted batch looks bounded no matter how long it actually holds the
+# lock — which is exactly the blind spot this test exists to cover.
+_TRANSCRIPT_TURN_BYTES = 2048
+# 20k turns of that size is the transcript the defect was reported on, and the
+# smallest scale that makes a *row*-counted backfill hold the writer lock past
+# the request path's 5s ``busy_timeout``: measured on the pre-fix loop, one
+# request write waited 5.1s of a 5.7s backfill and failed, while the fixed loop
+# leaves the same write waiting 0.8s.  A smaller transcript only demotes that
+# to "waited 3s and survived", which is the reading that let the regression in.
+# It costs ~7s, most of it the backfill itself — the fix bounds the lock hold,
+# not the total work, so the run is no faster once it passes.
+_TRANSCRIPT_TURNS = 20_000
+
+
+def _transcript_turn(nbytes: int) -> str:
+    """One deterministic ~``nbytes`` message shaped like real transcript text."""
+    rng = random.Random(20260830)
+    chunks: list[str] = []
+    size = 0
+    while size < nbytes:
+        kind = rng.randrange(3)
+        if kind == 0:
+            chunk = " ".join(
+                rng.choice(
+                    [
+                        "the startup backfill holds the single writer lock",
+                        "回填在写事务里做编码, 请求侧只能干等",
+                        "add_message waited on busy_timeout and then failed",
+                    ]
+                )
+                for _ in range(2)
+            )
+        elif kind == 1:
+            chunk = (
+                f'    cursor = await db.execute(_INSERT_ESTIMATE, (row["session_id"], '
+                f'"message:{rng.randrange(10 ** 6)}", token_count))'
+            )
+        else:
+            chunk = "blob " + "".join(rng.choice("0123456789abcdef") for _ in range(56))
+        chunks.append(chunk)
+        size += len(chunk.encode()) + 1
+    return "\n".join(chunks)
+
+
+@pytest.mark.asyncio
+async def test_startup_backfill_never_locks_out_a_concurrent_request_write() -> None:
+    """A user sending a message during the startup backfill must not lose it.
+
+    The invariant: while ``_sync_token_stats`` runs on its own connection, a
+    request-path ``add_message`` on the shared connection still completes —
+    zero ``OperationalError``, every message on disk.
+
+    Why that needs its own test.  The backfill is a second writer, and SQLite
+    grants the write lock to one connection at a time.  A *row*-counted commit
+    interval bounds how many rows a transaction covers, not how long it holds
+    the lock: the per-row cost is dominated by tokenising the message, so the
+    same 500 rows hold the lock for milliseconds on ``'ask'`` and for most of a
+    second on real turns.  The waiting writer does not win the sub-millisecond
+    gap between one COMMIT and the next INSERT — measured here, it waits out
+    the *whole* backfill — so once the backfill outlasts the 5s
+    ``busy_timeout`` the request's INSERT raises ``database is locked``.  That
+    surfaces to the user as "执行失败", and the turn is lost: the user message
+    never reached the database.
+
+    Both assertions are on semantic facts rather than on how long anything
+    took.  Nothing here asserts a deadline for the backfill, because a deadline
+    can be widened until it stops meaning anything; a lost message and a
+    request that had to queue behind the entire backfill cannot be.
+    """
+    turn = _transcript_turn(_TRANSCRIPT_TURN_BYTES)
+    request_db = await get_app_db()  # the one connection every request uses
+    try:
+        await request_db.execute(
+            "INSERT INTO agent_profiles (id, name, role) VALUES ('agent-1','Smith','x')"
+        )
+        await request_db.execute("INSERT INTO sessions (id, agent_id) VALUES ('s1','agent-1')")
+        await request_db.executemany(
+            "INSERT INTO messages (id, session_id, role, content, created_at) "
+            "VALUES (?, 's1', 'user', ?, ?)",
+            [
+                (
+                    f"seed-{index}",
+                    turn,
+                    f"2026-07-14T{index // 3600 % 24:02d}:{index // 60 % 60:02d}:{index % 60:02d}+00:00",
+                )
+                for index in range(_TRANSCRIPT_TURNS)
+            ],
+        )
+        await request_db.commit()
+
+        repo = SessionRepo()
+        backfill_done = asyncio.Event()
+        backfill_seconds = 0.0
+        locked_out: list[str] = []
+        waits: list[float] = []
+        sent = 0
+
+        async def backfill() -> None:
+            nonlocal backfill_seconds
+            started = time.monotonic()
+            await main._sync_token_stats()
+            backfill_seconds = time.monotonic() - started
+            backfill_done.set()
+
+        async def keep_sending() -> None:
+            """The user keeps talking to Smith while the panel backfills."""
+            nonlocal sent
+            while not backfill_done.is_set():
+                started = time.monotonic()
+                try:
+                    await repo.add_message("s1", "user", f"live turn {sent}")
+                except aiosqlite.OperationalError as exc:
+                    locked_out.append(str(exc))
+                waits.append(time.monotonic() - started)
+                sent += 1
+                await asyncio.sleep(0.05)
+
+        await asyncio.gather(backfill(), keep_sending())
+        assert backfill_seconds > 0 and waits
+
+        # 1. The request path never saw the lock.
+        assert locked_out == []
+
+        # 2. Every message the user sent is on disk.  The count is the point:
+        #    the failure mode is a turn that vanishes, and an INSERT that raised
+        #    left nothing behind.
+        rows = await request_db.execute_fetchall(
+            "SELECT count(*) AS n FROM messages WHERE content LIKE 'live turn %'"
+        )
+        assert int(rows[0]["n"]) == sent
+
+        # 3. No single request write was queued behind the whole backfill.
+        #    Deliberately a ratio and not a deadline: a deadline is satisfied by
+        #    widening it, while both sides of this scale together, so a slower
+        #    machine (or a bigger transcript) does not move it.  Serialising the
+        #    request path behind the backfill puts one write at ~1.0; batching
+        #    that actually bounds the hold keeps every write far below it.
+        #    This is what still fails on a machine fast enough to drain the
+        #    backfill inside the 5s ``busy_timeout``, where assertion 1 would
+        #    pass by luck rather than by the invariant holding.
+        assert max(waits) * 2 < backfill_seconds, (
+            f"a request write waited {max(waits):.2f}s of a {backfill_seconds:.2f}s "
+            f"backfill ({sent} sent); the request path was queued behind it"
+        )
+
+        # 4. The backfill really did the work.  ``_sync_token_stats`` swallows
+        #    its own exceptions, so without this a backfill that died on its
+        #    first statement would satisfy everything above.
+        rows = await request_db.execute_fetchall(
+            "SELECT count(*) AS n FROM messages m WHERE m.id LIKE 'seed-%' AND NOT EXISTS ("
+            "  SELECT 1 FROM token_usage_events e WHERE e.source_key = 'message:' || m.id)"
+        )
+        assert int(rows[0]["n"]) == 0
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio
