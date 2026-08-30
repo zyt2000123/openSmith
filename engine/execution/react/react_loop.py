@@ -7,7 +7,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
 from uuid import uuid4
 
-from engine.context import ContextReceipt, fit_request, measure_request
+from engine.context import (
+    ContextReceipt,
+    estimate_tokens,
+    fit_request,
+    measure_request,
+)
 from engine.context.compression import (
     RUNTIME_USER_NOTE_PREFIX,
     compaction_policy_for_llm,
@@ -23,7 +28,7 @@ from engine.llm.contracts import (
     ToolCallData,
 )
 from engine.llm.events import ProviderEvent, ProviderEventType
-from engine.llm.usage import normalize_usage
+from engine.llm.usage import USAGE_REPORTED_KEY, normalize_usage
 from engine.safety.approval import (
     ApprovalRequest,
     ApprovalTimeoutError,
@@ -302,6 +307,39 @@ def _usage_event_data(usage: dict | None) -> dict | None:
     }
 
 
+def _estimated_usage_event_data(
+    receipt: ContextReceipt,
+    response: ChatResponse,
+) -> dict:
+    """Charge an estimate when the provider reported no usage at all.
+
+    Streaming usage arrives only if the provider honours
+    ``stream_options.include_usage``; plenty of OpenAI-compatible relays drop
+    it, and then no TOKEN_USAGE event was emitted for the turn.  Sub-agent
+    spend is metered from exactly those events, so both the per-agent and the
+    per-batch token budgets silently stopped applying — a runaway was bounded
+    only by the iteration cap and the wall-clock timeout.  An estimate is
+    wrong in the last digit; no event is wrong by the whole budget.
+
+    ``usage_reported`` stays 0: this is not a provider number, and the
+    observability side must keep being able to tell the difference.
+    """
+    output_text = (response.text or "") + (response.reasoning or "")
+    for call in response.tool_calls or ():
+        output_text += json.dumps(
+            getattr(call, "arguments", ""), ensure_ascii=False, default=str
+        )
+    input_tokens = receipt.estimated_input_tokens
+    output_tokens = estimate_tokens(output_text)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        USAGE_REPORTED_KEY: 0,
+        "estimated": True,
+    }
+
+
 def _context_usage_event(
     receipt: ContextReceipt,
     *,
@@ -477,6 +515,24 @@ async def react_event_loop(
     active_provision_ids: list[str] = []
     last_error_key: str | None = None
     identical_error_count = 0
+
+    def _repeats_of(error_key: str) -> int:
+        """Count consecutive rounds ending in the same refusal.
+
+        Shared by every path that can refuse the same call forever — a disabled
+        tool, a hook that always denies, a tool that always errors, and a user
+        who keeps declining the approval.  It lived inline in the first three;
+        the approval path was written without it and could re-prompt the same
+        call up to the recovery cap, which with a 300 s approval timeout is
+        unattended hours of a run waiting on a prompt nobody will grant.
+        """
+        nonlocal last_error_key, identical_error_count
+        if error_key == last_error_key:
+            identical_error_count += 1
+        else:
+            last_error_key = error_key
+            identical_error_count = 1
+        return identical_error_count
     context_recoveries = 0
     model_compaction_enabled = True
     compaction_failures = 0
@@ -689,9 +745,10 @@ async def react_event_loop(
                 conversation = _recover_context_after_provider_rejection(conversation, llm)
                 yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
                 continue
-        usage = _usage_event_data(response.usage)
-        if usage:
-            yield ExecutionEvent(EventType.TOKEN_USAGE, usage)
+        usage = _usage_event_data(response.usage) or _estimated_usage_event_data(
+            fit.receipt, response
+        )
+        yield ExecutionEvent(EventType.TOKEN_USAGE, usage)
         yield _context_usage_event(
             fit.receipt,
             input_tokens=usage.get("input_tokens") if usage else None,
@@ -1040,13 +1097,7 @@ async def react_event_loop(
                 })
                 round_had_failure = True
                 consecutive_errors += 1
-                error_key = f"{tc.name}:{content[:120]}"
-                if error_key == last_error_key:
-                    identical_error_count += 1
-                else:
-                    last_error_key = error_key
-                    identical_error_count = 1
-                if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                if _repeats_of(f"{tc.name}:{content[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
                     yield ExecutionEvent(
                         EventType.TEXT_DELTA,
                         {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
@@ -1158,6 +1209,23 @@ async def react_event_loop(
                             })
                             round_had_failure = True
                             consecutive_errors += 1
+                            # 没有拒绝记忆：模型重发同一调用就再弹一次审批窗、
+                            # 再等最长 300 秒。"Approval timed out" 读起来像瞬时
+                            # 故障，天然诱导重试 —— 无人值守时整个 run 就这么挂
+                            # 到恢复上限。同错熔断和其它三条拒绝路径一致。
+                            if _repeats_of(
+                                f"{tc.name}:{denial[:120]}"
+                            ) >= MAX_IDENTICAL_TOOL_ERRORS:
+                                yield ExecutionEvent(
+                                    EventType.TEXT_DELTA,
+                                    {"text": budget_exhausted_message(
+                                        TOOL_FAILURE_BUDGET_MESSAGE
+                                    )},
+                                )
+                                yield ExecutionEvent(EventType.INCOMPLETE, {
+                                    "reason": "identical_tool_error_loop",
+                                })
+                                return
                             continue
                     else:
                         conversation.append({"role": "tool", "tool_call_id": call.id, "content": decision.observation})
@@ -1236,13 +1304,7 @@ async def react_event_loop(
                     # other error paths already bound; without this the model can
                     # retry a permanently-blocked edit until the whole iteration
                     # budget is gone.
-                    error_key = f"{tc.name}:{denial[:120]}"
-                    if error_key == last_error_key:
-                        identical_error_count += 1
-                    else:
-                        last_error_key = error_key
-                        identical_error_count = 1
-                    if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                    if _repeats_of(f"{tc.name}:{denial[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
                         yield ExecutionEvent(
                             EventType.TEXT_DELTA,
                             {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
@@ -1308,13 +1370,7 @@ async def react_event_loop(
             if result.is_error:
                 round_had_failure = True
                 consecutive_errors += 1
-                error_key = f"{tc.name}:{result.content[:120]}"
-                if error_key == last_error_key:
-                    identical_error_count += 1
-                else:
-                    last_error_key = error_key
-                    identical_error_count = 1
-                if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                if _repeats_of(f"{tc.name}:{result.content[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
                     yield ExecutionEvent(
                         EventType.TEXT_DELTA,
                         {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},

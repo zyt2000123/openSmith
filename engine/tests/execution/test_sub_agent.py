@@ -852,6 +852,43 @@ async def test_usage_without_total_tokens_still_charges_the_budget(
 
 
 @pytest.mark.asyncio
+async def test_a_provider_reporting_no_usage_at_all_still_hits_the_budget(
+    tmp_path: Path,
+) -> None:
+    """No usage payload must not read as free either.
+
+    Streaming usage only arrives if the provider honours
+    ``stream_options.include_usage``; plenty of OpenAI-compatible relays drop
+    it.  No usage meant no TOKEN_USAGE event, and sub-agent spend is metered
+    from exactly those -- both budgets stopped applying, leaving only the
+    iteration cap and the wall-clock timeout.
+    """
+    class _SilentLLM(_BurningLLM):
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            response = await super().chat(messages, tools, prefix_cache_key)
+            return ChatResponse(
+                text=response.text,
+                tool_calls=response.tool_calls,
+                usage=None,
+            )
+
+    _write_type(tmp_path, "runaway", max_iters=40, token_budget=3000)
+    catalog = SubAgentCatalog.load(tmp_path)
+    llm = _SilentLLM(per_turn=1000)
+
+    outcomes = await run_sub_agents(
+        [SubAgentTask("runaway", "spin forever")],
+        catalog=catalog,
+        llm=llm,
+        tool_registry=_registry(),
+    )
+
+    assert not outcomes[0].ok
+    assert "budget exhausted" in outcomes[0].error
+    assert llm.calls < 40, f"budget never applied ({llm.calls} turns)"
+
+
+@pytest.mark.asyncio
 async def test_batch_budget_bounds_the_whole_fan_out(tmp_path: Path) -> None:
     _write_type(tmp_path, "runaway", max_iters=40, token_budget=1_000_000)
     catalog = SubAgentCatalog.load(tmp_path)

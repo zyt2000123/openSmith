@@ -808,6 +808,25 @@ def test_openai_stream_rejects_an_oversized_sse_event() -> None:
     asyncio.run(client.close())
 
 
+def test_stream_event_budget_scales_with_the_configured_output_limit() -> None:
+    """A token-streaming model must not hit the event cap inside its own budget.
+
+    The cap was a fixed 10k events, i.e. an assumption about tokens per event.
+    Configure 32k output on a reasoning model and a legitimate long answer was
+    killed mid-stream -- unretryable once content had been seen, with the
+    already-rendered text retracted and the tail usage chunk never read.
+    """
+    from engine.llm.adapters._http import MAX_STREAM_EVENTS, stream_event_budget
+
+    # 未声明输出上限时保持原样。
+    assert stream_event_budget(None) == MAX_STREAM_EVENTS
+    assert stream_event_budget(0) == MAX_STREAM_EVENTS
+    # 小上限不会把下限降下去。
+    assert stream_event_budget(1_024) == MAX_STREAM_EVENTS
+    # 大上限下，每 token 一个事件加上推理增量仍在预算内。
+    assert stream_event_budget(32_768) >= 32_768 * 2
+
+
 def test_anthropic_stream_malformed_delta_raises() -> None:
     from engine.llm.contracts import LLMResponseError as _Err
 

@@ -25,7 +25,7 @@ from ..contracts import (
     ToolCallData,
 )
 from ..events import ProviderEvent, ProviderEventType, normalize_finish_reason
-from ._http import HTTPAdapterMixin, SSEStreamLimiter
+from ._http import HTTPAdapterMixin, SSEStreamLimiter, stream_event_budget
 from ._retry import MAX_RETRIES, is_retryable_status, retry_after_seconds
 
 logger = logging.getLogger(__name__)
@@ -623,11 +623,14 @@ class AnthropicAdapter(HTTPAdapterMixin):
         if isinstance(source, dict):
             destination.update(source)
 
-    @staticmethod
-    async def _iter_sse(response: httpx.Response) -> AsyncIterator[tuple[str | None, str]]:
+    async def _iter_sse(
+        self, response: httpx.Response
+    ) -> AsyncIterator[tuple[str | None, str]]:
         event_name: str | None = None
         data_lines: list[str] = []
-        limiter = SSEStreamLimiter()
+        limiter = SSEStreamLimiter(
+            max_events=stream_event_budget(self.max_output_tokens),
+        )
         async for line in response.aiter_lines():
             limiter.consume_line(line)
             if line == "":
