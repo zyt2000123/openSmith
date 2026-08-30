@@ -124,11 +124,7 @@ server/ → engine/ → common/
         agents/   (loaded at runtime, never imported)
 ```
 
-Plus two frontends: `shell/` (Ink/React, terminal) and `desktop/` (Electron,
-DOM). They share **rendering decisions, not renderers** — Ink has no DOM
-backend. `shell/src/theme.ts` (palette), `presentation.ts` (markers, welcome
-art) and `diff-parse.ts` (unified-diff parsing) are Ink-free precisely so the
-desktop can import them; a marker or colour must never be duplicated.
+Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 
 | Layer | Directory | Source lines (non-test) | Responsibility |
 |---|---|---|---|
@@ -137,7 +133,6 @@ desktop can import them; a marker or colour must never be duplicated.
 | Content | `agents/` | 9.9k | Smith identity seed, pipelines, gates, conditions, tools, skills, hooks. Pure content. |
 | Platform | `server/` | 6.1k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints (34 router + `/api/health`). |
 | Terminal UI | `shell/` | 10.7k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
-| Desktop UI | `desktop/` | 3.1k TS | Electron shell. Imports `shell/src` verbatim; main process runs shell's own `ensureLocalServer()`. |
 
 Rules:
 
