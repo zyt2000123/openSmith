@@ -34,8 +34,8 @@ def _normalize_llm_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _maybe_record(client: LLMPort) -> LLMPort:
-    """Wrap the client so real runs land in a JSONL recording (opt-in).
+def _recording_path(usage: LLMUsage | None) -> Path | None:
+    """Resolve one route's JSONL recording target, or ``None`` when off (opt-in).
 
     Set ``AGENT_SMITH_RECORD_LLM=/path/to/case.jsonl`` and every model turn of
     every subsequent run appends there, ready to replay via
@@ -43,13 +43,30 @@ def _maybe_record(client: LLMPort) -> LLMPort:
     Only the *responses* are written, never the prompt — so a recording cannot
     leak conversation content, and replay does not need it (turns are served in
     recorded order rather than matched against messages).
+
+    Each non-interactive route writes its own ``<stem>.<usage>.jsonl`` file.
+    ``ReplayLLM`` serves turns by position, so a gate verdict — or the memory
+    compilation that runs after the turn ends — landing between two chat turns
+    would be fed back to the main loop as if it were the loop's own next turn:
+    a shape error, or worse a plausible wrong answer.  The interactive route
+    keeps the bare env-var path so recordings made before the split, and the
+    tooling that points at them, still replay unchanged.
     """
     target = os.environ.get("AGENT_SMITH_RECORD_LLM", "").strip()
     if not target:
+        return None
+    path = Path(target).expanduser()
+    if usage is not None and usage is not LLMUsage.INTERACTIVE:
+        path = path.with_name(f"{path.stem}.{usage.value}{path.suffix}")
+    return path
+
+
+def _maybe_record(client: LLMPort, path: Path | None) -> LLMPort:
+    """Wrap the client so real runs land in the recording ``path`` selects."""
+    if path is None:
         return client
     from engine.llm.replay import RecordingLLM
 
-    path = Path(target).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     return RecordingLLM(client, path)
 
@@ -63,14 +80,23 @@ class LLMClientManager:
 
     def get(self, usage: LLMUsage) -> LLMPort:
         config = resolve_llm_config(usage=usage)
-        return self.get_for_config(config)
+        return self.get_for_config(config, usage=usage)
 
-    def get_for_config(self, config: dict[str, Any]) -> LLMPort:
+    def get_for_config(
+        self, config: dict[str, Any], *, usage: LLMUsage | None = None
+    ) -> LLMPort:
+        recording_path = _recording_path(usage)
         fingerprint = _config_fingerprint(config)
+        if recording_path is not None:
+            # Routes that resolve to an identical config share one cached
+            # client, which would put their turns back into one file and undo
+            # the per-route split.  While recording, the target is part of the
+            # identity of the client being cached.
+            fingerprint = f"{fingerprint}|record={recording_path}"
         with self._lock:
             client = self._clients.get(fingerprint)
             if client is None:
-                client = _maybe_record(build_llm_client(config))
+                client = _maybe_record(build_llm_client(config), recording_path)
                 self._clients[fingerprint] = client
             return client
 
@@ -156,9 +182,9 @@ def build_engine_runtime(
     skill_registry = SkillRegistry()
     skill_registry.load_builtin(paths.builtin_skills_dir)
     services = RuntimeServices(
-        llm=manager.get_for_config(interactive_config),
-        gate_llm=manager.get_for_config(gate_config),
-        background_llm=manager.get_for_config(background_config),
+        llm=manager.get_for_config(interactive_config, usage=LLMUsage.INTERACTIVE),
+        gate_llm=manager.get_for_config(gate_config, usage=LLMUsage.GATE),
+        background_llm=manager.get_for_config(background_config, usage=LLMUsage.BACKGROUND),
         tool_registry=ToolRegistry(lazy_tool_schemas=True),
         skill_registry=skill_registry,
         tool_guard=ToolGuard(paths.safety_rules_path),
@@ -174,10 +200,12 @@ def build_memory_maintenance_services() -> RuntimeServices:
     """Build scheduler-safe services backed by process-scoped LLM clients."""
     gate_config = resolve_llm_config(usage=LLMUsage.GATE)
     background_config = resolve_llm_config(usage=LLMUsage.BACKGROUND)
-    background_llm = _llm_client_manager.get_for_config(background_config)
+    background_llm = _llm_client_manager.get_for_config(
+        background_config, usage=LLMUsage.BACKGROUND
+    )
     return RuntimeServices(
         llm=background_llm,
-        gate_llm=_llm_client_manager.get_for_config(gate_config),
+        gate_llm=_llm_client_manager.get_for_config(gate_config, usage=LLMUsage.GATE),
         background_llm=background_llm,
         tool_registry=ToolRegistry(),
         skill_registry=SkillRegistry(),

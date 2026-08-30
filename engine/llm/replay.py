@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -188,21 +187,19 @@ class RecordingLLM:
 
     def _append(self, payload: dict[str, Any]) -> None:
         line = json.dumps(payload, ensure_ascii=False) + "\n"
-        # Append through a same-directory temp file and an atomic rename so a
-        # crash mid-write cannot leave a truncated final line that would make
-        # the whole recording unloadable.  load_recording skips malformed lines
-        # as a second line of defense for files written by older versions.
-        # The lock serializes the read-modify-write: two overlapping turns
-        # (e.g. a compaction summary while the main loop records) must not both
-        # read the same tail and silently drop one line.
+        # One O_APPEND write per turn.  An earlier version rewrote the whole
+        # file through a temp file and a rename to buy crash tolerance, which
+        # made the recording cost O(N²) IO over a session — and both callers
+        # invoke this synchronously from an async method, so the stall lands on
+        # the event loop thread that is streaming the very turn being recorded.
+        # Appending gives the same tolerance for free: a crash can only
+        # truncate the final line, which load_recording already skips.
+        # The lock still serializes overlapping turns on one client (e.g. a
+        # compaction summary while the main loop records) so two payloads
+        # cannot interleave inside one line.
         with self._lock:
-            tmp = self._path.with_name(f"{self._path.name}.tmp")
-            try:
-                existing = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
-            except FileNotFoundError:
-                existing = ""
-            tmp.write_text(existing + line, encoding="utf-8")
-            os.replace(tmp, self._path)
+            with open(self._path, "a", encoding="utf-8") as handle:
+                handle.write(line)
 
     async def chat(
         self,

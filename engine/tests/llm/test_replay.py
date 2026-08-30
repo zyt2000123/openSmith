@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -252,6 +253,35 @@ def test_recorder_appends_atomically_without_leaving_temp_file(tmp_path) -> None
     turns = load_recording(path)
     assert [turn.response.text for turn in turns] == ["", "done"]
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_recorder_appends_without_reading_the_recording_back(tmp_path, monkeypatch) -> None:
+    """每轮追加必须与已录长度无关。
+
+    读改写的成本随文件线性增长(整场录制 O(N²)),而且它是从 async 方法里同步
+    调用的 —— 停顿落在正在推这一轮流的事件循环线程上。
+    """
+    path = tmp_path / "grow.jsonl"
+    path.write_text('{"response":{"text":"earlier session"}}\n', encoding="utf-8")
+    recorder = RecordingLLM(_FakeProvider(_turns()), path)
+
+    real_read_text = Path.read_text
+
+    def _forbid_reading_the_recording(self: Path, *args, **kwargs):
+        assert self != path, "追加一轮不该把整份录制读回来"
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _forbid_reading_the_recording)
+    asyncio.run(recorder.chat([{"role": "user", "content": "x"}]))
+    asyncio.run(recorder.chat([{"role": "user", "content": "y"}]))
+    monkeypatch.undo()
+
+    # 追加不是覆盖:上一场录制的内容必须原样留着。
+    assert [turn.response.text for turn in load_recording(path)] == [
+        "earlier session",
+        "",
+        "done",
+    ]
 
 
 # ── non-streaming ──────────────────────────────────────────────────────────
