@@ -294,6 +294,47 @@ def _provisional_retract_event(provision_id: str, reason: str) -> ExecutionEvent
     })
 
 
+def _final_text_delivery(parts: list[tuple[str, bool]]) -> tuple[str, bool]:
+    """Join the collected fragments and say whether the client already has them.
+
+    ``already_streamed`` means "skip rendering" to the consumer, so it may only
+    be set when *every* fragment reached the client as a stream.  A stream that
+    dies before its first semantic delta falls back to a non-streaming
+    ``llm.chat`` call, and that fragment was never sent; if it then finishes on
+    the length limit, the streamed continuation used to mark the whole join as
+    already rendered — the first half was persisted but never shown.
+
+    Reporting a mixed reply as not streamed re-renders it.  Under provisional
+    lifecycle the caller retracts the streamed draft first, so nothing is
+    duplicated; without it (pipeline nodes, sub-agents) the streamed fragment
+    is not retractable and shows twice — a visible repeat is recoverable for
+    the reader, silently losing half the answer is not.
+    """
+    text = "".join(part for part, _ in parts)
+    return text, bool(parts) and all(streamed for _, streamed in parts)
+
+
+def _final_text_events(
+    final_text: str,
+    *,
+    streamed: bool,
+    provision_ids: list[str],
+) -> list[ExecutionEvent]:
+    """Close the open drafts and emit the final text as one consistent pair.
+
+    Committing a draft and then re-sending the same text unmarked renders it
+    twice, so the draft is retracted exactly when the join is re-sent.
+    """
+    events: list[ExecutionEvent] = [
+        _provisional_commit_event(provision_id)
+        if streamed
+        else _provisional_retract_event(provision_id, "unstreamed_fragment_pending")
+        for provision_id in provision_ids
+    ]
+    events.append(_text_event(final_text, already_streamed=streamed))
+    return events
+
+
 def _usage_event_data(usage: dict | None) -> dict | None:
     normalized = normalize_usage(usage)
     if not any(normalized.values()):
@@ -510,8 +551,10 @@ async def react_event_loop(
     had_successful_tool = False
     incomplete_final_repairs = 0
     length_continuations = 0
-    final_text_parts: list[str] = []
-    final_text_was_streamed = False
+    # (fragment, was_streamed) per fragment, not one flag for the join: a reply
+    # can mix a non-streamed fallback fragment with a streamed continuation,
+    # and a single flag then mislabels one of them — see _final_text_delivery.
+    final_text_parts: list[tuple[str, bool]] = []
     active_provision_ids: list[str] = []
     last_error_key: str | None = None
     identical_error_count = 0
@@ -751,7 +794,13 @@ async def react_event_loop(
         yield ExecutionEvent(EventType.TOKEN_USAGE, usage)
         yield _context_usage_event(
             fit.receipt,
-            input_tokens=usage.get("input_tokens") if usage else None,
+            # Only a provider-reported count may pass as exact.  The estimated
+            # fallback feeds back receipt.estimated_input_tokens, so handing it
+            # over produced a positive int and flipped ``estimated`` to False —
+            # the one field whose whole job is telling the two apart.
+            input_tokens=(
+                usage.get("input_tokens") if usage.get(USAGE_REPORTED_KEY) else None
+            ),
             fit_status=fit.status.value,
             actions=fit.actions,
         )
@@ -768,7 +817,6 @@ async def react_event_loop(
                 yield _provisional_retract_event(provision_id, "tool_call_pending")
             active_provision_ids.clear()
             final_text_parts.clear()
-            final_text_was_streamed = False
 
         if response.finish_reason == "length" and response.has_tool_calls:
             # A length-limited tool call may have incomplete JSON arguments.
@@ -805,9 +853,8 @@ async def react_event_loop(
 
         if not response.has_tool_calls:
             if response.text:
-                final_text_parts.append(response.text)
-                final_text_was_streamed = final_text_was_streamed or response_text_was_streamed
-            final_text = "".join(final_text_parts)
+                final_text_parts.append((response.text, response_text_was_streamed))
+            final_text, final_text_streamed = _final_text_delivery(final_text_parts)
 
             if response.finish_reason == "length":
                 if length_continuations < MAX_LENGTH_CONTINUATIONS:
@@ -817,10 +864,13 @@ async def react_event_loop(
                     )
                     continue
                 if final_text:
-                    for provision_id in active_provision_ids:
-                        yield _provisional_commit_event(provision_id)
+                    for event in _final_text_events(
+                        final_text,
+                        streamed=final_text_streamed,
+                        provision_ids=active_provision_ids,
+                    ):
+                        yield event
                     active_provision_ids.clear()
-                    yield _text_event(final_text, already_streamed=final_text_was_streamed)
                 yield ExecutionEvent(EventType.INCOMPLETE, {
                     "reason": "model_output_limit",
                     "continuations": length_continuations,
@@ -833,7 +883,7 @@ async def react_event_loop(
                         yield _provisional_retract_event(provision_id, "content_filter")
                     active_provision_ids.clear()
                 elif final_text:
-                    yield _text_event(final_text, already_streamed=final_text_was_streamed)
+                    yield _text_event(final_text, already_streamed=final_text_streamed)
                 yield ExecutionEvent(EventType.INCOMPLETE, {"reason": "content_filter"})
                 return
 
@@ -850,7 +900,7 @@ async def react_event_loop(
                         yield _provisional_retract_event(provision_id, "unknown_provider_finish_reason")
                     active_provision_ids.clear()
                 elif final_text:
-                    yield _text_event(final_text, already_streamed=final_text_was_streamed)
+                    yield _text_event(final_text, already_streamed=final_text_streamed)
                 yield ExecutionEvent(EventType.INCOMPLETE, {
                     "reason": "unknown_provider_finish_reason",
                     "raw_finish_reason": response.raw_finish_reason,
@@ -874,13 +924,15 @@ async def react_event_loop(
                     conversation, response.text, response.reasoning
                 )
                 final_text_parts.clear()
-                final_text_was_streamed = False
                 continue
             if final_text:
-                for provision_id in active_provision_ids:
-                    yield _provisional_commit_event(provision_id)
+                for event in _final_text_events(
+                    final_text,
+                    streamed=final_text_streamed,
+                    provision_ids=active_provision_ids,
+                ):
+                    yield event
                 active_provision_ids.clear()
-                yield _text_event(final_text, already_streamed=final_text_was_streamed)
             else:
                 # A successful tool call is evidence gathering, not a valid
                 # chat completion.  The caller still needs a final assistant

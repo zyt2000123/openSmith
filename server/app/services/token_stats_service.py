@@ -7,10 +7,12 @@ from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import aiosqlite
 
 from common import config as common_config
+from engine.llm.usage import USAGE_REPORTED_KEY
 from engine.observability import ObservabilityReader, TraceIntegrityError
 
 if TYPE_CHECKING:
@@ -22,6 +24,16 @@ DbProvider = Callable[[], Awaitable[aiosqlite.Connection]]
 
 # These values describe unavailable or locally derived attribution, not a model.
 _NON_MODEL_STAT_KEYS = frozenset({"unknown", "local-estimate"})
+# source_key namespaces.  A NULL key means "provider-reported, recorded live";
+# everything else says where the row came from *and* whether its numbers are a
+# local guess: 'message:{id}' transcript estimate, 'estimate:live:{uuid}' engine
+# estimate recorded live, 'estimate:trace:{run}:{seq}' the same imported from a
+# trace, '{run}:{seq}' provider-reported and imported from a trace.  The two
+# estimate namespaces share a prefix so read paths test one string, and differ
+# in origin because the import path deletes its own rows by origin.
+_LIVE_ESTIMATE_PREFIX = "estimate:live:"
+_TRACE_ESTIMATE_PREFIX = "estimate:trace:"
+_ESTIMATE_PREFIXES = ("message:", "estimate:")
 logger = logging.getLogger(__name__)
 
 
@@ -73,17 +85,26 @@ class TokenStatsService:
         if total_tokens == 0:
             return
 
+        # usage_reported == 0 marks the engine's own estimate, emitted when the
+        # provider reported nothing.  Stored with a NULL source_key it would be
+        # indistinguishable from provider billing data, and a CJK turn estimated
+        # at 3 tokens per character overstates the panel by roughly 3x with no
+        # way for a reader to tell.  A missing flag is an older writer, which
+        # only ever emitted provider-reported usage.
+        estimated = not usage.get(USAGE_REPORTED_KEY, 1)
+        source_key = f"{_LIVE_ESTIMATE_PREFIX}{uuid4().hex}" if estimated else None
         db = await self._db_provider()
         await db.execute(
             """
             INSERT INTO token_usage_events (
-                session_id, run_id, project_name, project_path, model,
+                session_id, run_id, source_key, project_name, project_path, model,
                 input_tokens, output_tokens, total_tokens, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
                 run_id,
+                source_key,
                 project_name.strip(),
                 project_path.strip(),
                 model.strip() or "unknown",
@@ -93,10 +114,12 @@ class TokenStatsService:
                 (occurred_at or datetime.now(timezone.utc)).isoformat(),
             ),
         )
-        # An exact usage event supersedes the local text-token estimates for the
-        # same session (they carry source_key LIKE 'message:%'); clear them in the
-        # same transaction so get_stats never double-counts between this call and
-        # the next sync_from_traces.
+        # A per-turn usage event supersedes the local text-token estimates for
+        # the same session (they carry source_key LIKE 'message:%'); clear them
+        # in the same transaction so get_stats never double-counts between this
+        # call and the next sync_from_traces.  This holds for an engine estimate
+        # too: it covers the same turns from the prompt side, so keeping both
+        # would count one turn twice.
         await db.execute(
             "DELETE FROM token_usage_events "
             "WHERE source_key LIKE 'message:%' AND session_id=?",
@@ -111,7 +134,10 @@ class TokenStatsService:
             await db.execute(
                 "DELETE FROM token_usage_events "
                 "WHERE run_id=? AND source_key IS NOT NULL "
-                "AND source_key NOT LIKE 'message:%'",
+                "AND source_key NOT LIKE 'message:%' "
+                # Live estimates for this run are what this method just wrote;
+                # only trace-imported rows are the duplicates being healed.
+                "AND source_key NOT LIKE 'estimate:live:%'",
                 (run_id,),
             )
         await db.commit()
@@ -324,17 +350,20 @@ class TokenStatsService:
                 [(run_id,) for run_id in stale_cursor_ids],
             )
 
-        # Runs whose usage was already recorded live (source_key IS NULL, written
-        # by record_usage during an SSE stream) must not be re-imported from their
-        # traces: the same token_usage event would then exist twice and get_stats
-        # would double-count every interactive run after the first restart.  Auto
-        # tasks never call record_usage, so they still arrive through this import.
+        # Runs whose usage was already recorded live (by record_usage during an
+        # SSE stream) must not be re-imported from their traces: the same
+        # token_usage event would then exist twice and get_stats would
+        # double-count every interactive run after the first restart.  A live
+        # estimate counts as recorded — the trace holds that same estimated
+        # event, so importing it duplicates the turn.  Auto tasks never call
+        # record_usage, so they still arrive through this import.
         live_recorded_run_ids = {
             str(row["run_id"])
             for row in await db.execute_fetchall(
                 """
                 SELECT DISTINCT run_id FROM token_usage_events
-                WHERE source_key IS NULL AND run_id IS NOT NULL
+                WHERE (source_key IS NULL OR source_key LIKE 'estimate:live:%')
+                  AND run_id IS NOT NULL
                 """
             )
         }
@@ -346,6 +375,7 @@ class TokenStatsService:
                 DELETE FROM token_usage_events
                 WHERE run_id=? AND source_key IS NOT NULL
                   AND source_key NOT LIKE 'message:%'
+                  AND source_key NOT LIKE 'estimate:live:%'
                 """,
                 [(run_id,) for run_id in live_recorded_run_ids],
             )
@@ -409,7 +439,16 @@ class TokenStatsService:
                     continue
 
                 timestamp = self._parse_timestamp(record.get("timestamp"))
-                source_key = f"{run_id}:{record.get('seq', line_number)}"
+                # Same rule as the live path: an engine estimate keeps its own
+                # namespace so it is never read back as provider billing data.
+                # Auto-task runs reach the database only through this import,
+                # so leaving it out here would exempt them from the labelling.
+                prefix = (
+                    _TRACE_ESTIMATE_PREFIX
+                    if not data.get(USAGE_REPORTED_KEY, 1)
+                    else ""
+                )
+                source_key = f"{prefix}{run_id}:{record.get('seq', line_number)}"
                 cursor = await db.execute(
                     """
                     INSERT OR IGNORE INTO token_usage_events (
@@ -586,7 +625,9 @@ class TokenStatsService:
         for row in rows:
             day = str(row["occurred_at"])[:10]
             model = str(row["model"] or "unknown")
-            estimated = estimated or str(row["source_key"] or "").startswith("message:")
+            estimated = estimated or str(row["source_key"] or "").startswith(
+                _ESTIMATE_PREFIXES
+            )
             input_tokens = self._non_negative_int(row["input_tokens"])
             output_tokens = self._non_negative_int(row["output_tokens"])
             event_total = self._non_negative_int(row["total_tokens"])
