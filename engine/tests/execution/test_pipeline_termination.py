@@ -15,7 +15,7 @@ import pytest
 from engine.execution.orchestration.agent_loop import run_agent_stream
 from engine.execution.pipeline.backtrack import FailureLoopGuard, FailureSignature
 from engine.execution.events import EventType, ExecutionEvent
-from engine.execution.pipeline.gate import GateResult
+from engine.execution.pipeline.gate import GateResult, LLMGate
 from engine.execution.pipeline.pipeline import _evict_outputs_at_or_after, run_pipeline
 from engine.execution.react.react_loop import react_event_loop
 from engine.execution.react.budget import TOOL_CALL_BUDGET_MESSAGE, budget_exhausted_message
@@ -771,7 +771,75 @@ def test_checkpoint_save_offloads_sync_io_to_a_thread(
         CTX_RUN_ID: "run-p9",
     }
 
-    asyncio.run(pipeline_module._save_checkpoint(context, 0))
+    asyncio.run(pipeline_module._save_checkpoint(context, 0, "planning"))
 
     assert offloaded, "checkpoint persistence must be offloaded via asyncio.to_thread"
     assert (tmp_path / "sessions" / ".state" / "sess-p9.json").is_file()
+
+
+def test_gate_llm_outage_ends_the_round_without_re_running_the_node(
+    tmp_path: Path,
+) -> None:
+    """门禁侧 provider 故障不是节点产出的问题，不能按内容不合格处理。
+
+    回归前 LLMGate 的基础设施故障与"内容不合格"同为一种 fail：节点先被 ReAct
+    fallback 完整重跑一次，再被 FailureLoopGuard retry 一次，最后 switch 在没有
+    backtrack_map 时退化成 blocked 并删掉整条链的 checkpoint —— 两次完整节点执行
+    白烧，已通过的前序节点也要从头再来，而产出自始至终是合格的。
+    """
+
+    class BrokenGateLLM:
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            raise RuntimeError("gate provider down")
+
+    class CountingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls += 1
+            return ChatResponse(text=_RUBRIC_PASSING_TEXT)
+
+    class PassingGate:
+        async def check(self, output, context):
+            return GateResult("pass", "heuristic ok")
+
+    chain = SkillChain([
+        SkillNode("planning", PassingGate()),
+        SkillNode("testing", LLMGate(PassingGate(), "check {output}")),
+    ])
+
+    async def run():
+        llm = CountingLLM()
+        events = []
+        async for event in run_agent_stream(
+            llm, "system prompt", "build a feature",
+            FakeToolRegistry(), FakeSkillRegistry(),
+            FEATURE_ROUTE, chain, FailureLoopGuard(),
+            execution_context={
+                "agent_id": "a",
+                "session_id": "sess-gate-down",
+                "_state_dir": str(tmp_path),
+                "_working_dir": str(tmp_path.resolve()),
+                "_run_id": "run-gate-down",
+            },
+            gate_llm=BrokenGateLLM(),
+        ):
+            events.append(event)
+        return llm, events
+
+    llm, events = asyncio.run(asyncio.wait_for(run(), timeout=10))
+    types = [event.type for event in events]
+
+    assert llm.calls == 2, "a gate outage must not re-run the node it could not judge"
+    assert [
+        event.data["reason"] for event in events if event.type is EventType.FAILED
+    ] == ["gate_unavailable"]
+    assert EventType.BLOCKED not in types, "an outage is not a rejected output"
+    assert types[-1] == EventType.DONE
+
+    from engine.execution.pipeline.checkpoint import SessionStateManager
+
+    checkpoint = SessionStateManager(tmp_path).restore("sess-gate-down")
+    assert checkpoint is not None, "the passed node's checkpoint was deleted"
+    assert checkpoint.skill_chain_index == 0

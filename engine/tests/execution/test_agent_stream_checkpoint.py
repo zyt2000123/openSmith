@@ -661,6 +661,7 @@ def _seed_checkpoint(
     agent_id: str = "smith-id",
     identity_id: str = "smith",
     run_id: str = "crashedrun0000000000000000000001",
+    node_skill: str = "planning",
 ) -> None:
     """Seed a checkpoint the way a crashed run leaves one.
 
@@ -678,6 +679,7 @@ def _seed_checkpoint(
         identity_id=identity_id,
         route_id="feature",
         skill_chain_index=0,  # planning already passed before the crash
+        node_skill=node_skill,
         context={
             "user_message": user_message,
             "identity_id": identity_id,
@@ -885,6 +887,111 @@ def test_run_agent_stream_discards_checkpoint_from_another_identity(tmp_path: Pa
     assert started == ["planning", "testing"]
     assert len(llm.calls) == 2
     assert not (tmp_path / "sessions" / ".state" / "sess-identity.json").exists()
+
+
+def test_run_agent_stream_discards_checkpoint_when_the_paused_node_moved(
+    tmp_path: Path,
+) -> None:
+    """暂停期间改流水线后，index 已不指向当初提问的那个节点。
+
+    same_scope 过去对链形状只校验 ``0 <= index < node_count``：在 grilling 前插入
+    一个步骤后 index 0 变成了那个新节点，于是用户的回答被喂给一个从未提问的节点，
+    连 grilling 暂存的提问产出也一并继承了过去。
+    """
+    marker = "<!-- agent-smith:await-user-input -->"
+
+    class PausingLLM(FakeLLM):
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            return ChatResponse(text=f"Which user group is primary?\n{marker}")
+
+    class RecordingGate:
+        def __init__(self) -> None:
+            self.contexts: list[dict] = []
+
+        async def check(self, output: str, context: dict) -> GateResult:
+            self.contexts.append(dict(context))
+            return GateResult("pass", "ok")
+
+    route = RouteDecision(
+        _SMITH_IDENTITY, "requirements-research", "requirements-research", score=1
+    )
+
+    async def collect(llm, chain, message: str, run_id: str) -> None:
+        async for _ in run_agent_stream(
+            llm,
+            "system prompt",
+            message,
+            FakeToolRegistry(),
+            FakeSkillRegistry(),
+            route,
+            chain,
+            FailureLoopGuard(),
+            execution_context={
+                "agent_id": "smith-id",
+                "session_id": "sess-reshaped",
+                "_state_dir": str(tmp_path),
+                "_working_dir": str(tmp_path.resolve()),
+                "_run_id": run_id,
+            },
+        ):
+            pass
+
+    asyncio.run(collect(
+        PausingLLM(),
+        SkillChain([SkillNode("grilling", RecordingGate(), await_user_input_marker=marker)]),
+        "research the onboarding requirement",
+        "run-paused",
+    ))
+
+    # 用户在等待回答期间往 grilling 之前插入了一个新步骤。
+    clarify_gate = RecordingGate()
+    asyncio.run(collect(
+        FakeLLM(),
+        SkillChain([
+            SkillNode("clarify", clarify_gate),
+            SkillNode("grilling", RecordingGate(), await_user_input_marker=marker),
+        ]),
+        "Internal support engineers.",
+        "run-reshaped",
+    ))
+
+    assert clarify_gate.contexts, "the newly inserted first node must run"
+    entered = clarify_gate.contexts[0]
+    assert "user_response" not in entered, "answer handed to a node that never asked"
+    assert "grilling_output" not in entered, "paused node's question leaked into a new node"
+
+
+def test_run_agent_stream_resumes_a_checkpoint_written_before_node_skill(
+    tmp_path: Path,
+) -> None:
+    """升级不该作废用户手上正在跑的链：缺 node_skill 时按其余校验恢复。"""
+    _seed_checkpoint(tmp_path, "sess-legacy", "build a feature", node_skill="")
+
+    async def run() -> RecordingStreamingLLM:
+        llm = RecordingStreamingLLM()
+        async for _ in run_agent_stream(
+            llm,
+            "system prompt",
+            "build a feature",
+            FakeToolRegistry(),
+            FakeSkillRegistry(),
+            FEATURE_ROUTE,
+            SkillChain([
+                SkillNode("planning", PassingGate()),
+                SkillNode("testing", PassingGate()),
+            ]),
+            FailureLoopGuard(),
+            execution_context={
+                "agent_id": "smith-id",
+                "session_id": "sess-legacy",
+                "_state_dir": str(tmp_path),
+                "_working_dir": str(tmp_path.resolve()),
+            },
+        ):
+            pass
+        return llm
+
+    assert len(asyncio.run(run()).calls) == 1, "planning must still be skipped"
 
 
 def test_domain_gate_retry_hint_reaches_retry_attempt() -> None:

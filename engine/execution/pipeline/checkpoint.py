@@ -45,6 +45,16 @@ class SessionCheckpoint:
     # already streamed provisionally, so losing this flag across a crash
     # resume duplicates the final reply.
     provisional_outputs: dict = field(default_factory=dict)
+    # The skill running at ``skill_chain_index`` when this checkpoint was
+    # written.  The index alone does not identify a node: pipelines are re-read
+    # from YAML on every run and ``~/.agent-smith/pipelines/`` may override
+    # them, so editing a chain while it waits for an answer is supported — and
+    # an index that still fits the edited chain then points at a different
+    # node.  Empty means a checkpoint written before this field existed; that
+    # cannot be verified either way, and refusing it would throw away a chain
+    # the user is part-way through purely because of an upgrade, so it resumes
+    # on the remaining checks and self-heals at the next checkpoint write.
+    node_skill: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

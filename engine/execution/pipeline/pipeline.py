@@ -292,6 +292,7 @@ async def run_pipeline(
                     await _save_checkpoint(
                         context,
                         node_idx,
+                        node.skill_name,
                         awaiting_user_input=True,
                         provisional_outputs=committed_provisional_output,
                     )
@@ -325,6 +326,13 @@ async def run_pipeline(
                     base_passed = True
                     break
                 base_result = await _check_base_gates(base_gates, output, context, gate_llm or llm)
+                if base_result.infra_failure:
+                    provision_settled = True
+                    for event in _gate_unavailable_events(
+                        node.skill_name, provision_id, base_result.reason
+                    ):
+                        yield event
+                    return
                 if base_result.verdict == "pass":
                     base_passed = True
                     break
@@ -368,6 +376,14 @@ async def run_pipeline(
                 "evidence_hash": result.evidence_hash,
             })
 
+            if gate_result.infra_failure:
+                provision_settled = True
+                for event in _gate_unavailable_events(
+                    node.skill_name, provision_id, gate_result.reason
+                ):
+                    yield event
+                return
+
             if gate_result.verdict == "pass":
                 yield ExecutionEvent(EventType.PROVISIONAL_COMMIT, {"provision_id": provision_id})
                 provision_settled = True
@@ -379,6 +395,7 @@ async def run_pipeline(
                 await _save_checkpoint(
                     context,
                     node_idx,
+                    node.skill_name,
                     provisional_outputs=committed_provisional_output,
                 )
                 yield ExecutionEvent(EventType.SKILL_END, {"skill": node.skill_name, "status": "passed"})
@@ -693,6 +710,37 @@ def _is_budget_message(text: str) -> bool:
     return text.strip().endswith(_BUDGET_MESSAGE_SUFFIX)
 
 
+def _gate_unavailable_events(
+    skill_name: str, provision_id: str, reason: str
+) -> list[ExecutionEvent]:
+    """Terminal events for a gate whose own LLM was unavailable.
+
+    An outage on the gate side is not evidence about the node's output, so it
+    must stay out of the content-failure machinery.  Routed there it cost two
+    extra full node executions (ReAct fallback, then a FailureLoopGuard retry)
+    before ``switch`` degraded to ``blocked`` and deleted the whole chain's
+    checkpoint -- for a node whose product was never rejected.  It also handed
+    the main model a retry hint ("wait for the gate LLM") it cannot act on.
+
+    Ending the round as ``failed`` instead mirrors how the memory compiler
+    separates ``rejected`` (the draft's fault) from ``failed`` (a provider
+    outage): nothing is charged to the evidence, and the checkpoint survives so
+    re-sending the message once the gate LLM is back resumes at this node
+    rather than at node 0.  The gate still fails closed -- the node's output is
+    never committed and never becomes a reply.
+    """
+    return [
+        ExecutionEvent(EventType.PROVISIONAL_RETRACT, {
+            "provision_id": provision_id, "reason": "gate_unavailable",
+        }),
+        ExecutionEvent(EventType.FAILED, {
+            "reason": "gate_unavailable", "detail": reason,
+        }),
+        ExecutionEvent(EventType.SKILL_END, {"skill": skill_name, "status": "error"}),
+        ExecutionEvent(EventType.DONE, {}),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Internal: checkpoint helpers
 # ---------------------------------------------------------------------------
@@ -701,6 +749,7 @@ def _is_budget_message(text: str) -> bool:
 async def _save_checkpoint(
     context: dict,
     node_idx: int,
+    node_skill: str,
     *,
     awaiting_user_input: bool = False,
     provisional_outputs: dict[str, bool] | None = None,
@@ -717,6 +766,7 @@ async def _save_checkpoint(
             identity_id=str(context.get(CTX_IDENTITY_ID) or ""),
             route_id=str(context.get(CTX_ROUTE_ID) or ""),
             skill_chain_index=node_idx,
+            node_skill=node_skill,
             context={k: v for k, v in context.items() if not k.startswith("_")},
             timestamp=datetime.now(timezone.utc).isoformat(),
             working_dir=str(context.get(CTX_WORKING_DIR) or ""),
