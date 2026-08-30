@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -149,7 +150,20 @@ WHERE NOT EXISTS (
 ORDER BY m.created_at ASC
 """
 
-# Rows per write transaction in the estimate backfill; see the loop for why.
+# How long either import may hold SQLite's single writer lock before it commits
+# and gives a waiting writer a window.  Time is the criterion because rows are
+# not equally expensive, and a row count says nothing about what each row costs:
+# on 20k messages of which 5% are a 60KB transcript, 500 rows per transaction
+# held the lock 0.54s at the maximum and 0.09s at the median, which starved a
+# concurrent ``add_message``-shaped writer down to 11-16 attempts over the run
+# with a single write waiting up to 4.5s of its 5s busy_timeout.  On the same
+# budget the maximum hold is 0.02s and the writer gets ~160 attempts through.
+_WRITE_BATCH_SECONDS = 0.05
+
+# Second ceiling on the estimate backfill, so a transaction also stays bounded
+# in WAL pages and in how much work a crash discards, on a machine fast enough
+# that the time budget alone would swallow the whole transcript.  It is the
+# gate that fires in practice for small rows: 500 tiny INSERTs measure ~17ms.
 _ESTIMATE_COMMIT_INTERVAL = 500
 
 logger = logging.getLogger(__name__)
@@ -441,7 +455,16 @@ class TokenStatsService:
         # violate the sessions FK, so they are skipped up front.
         try:
             session_rows = await db.execute_fetchall("SELECT id FROM sessions")
-        except aiosqlite.OperationalError:
+        except aiosqlite.OperationalError as exc:
+            # Same split as _sync_message_estimates: a missing table is the
+            # minimal-database case, anything else (``database is locked`` above
+            # all) would silently reduce the import to "no sessions exist" and
+            # import nothing at all.
+            if "no such table" not in str(exc).lower():
+                logger.warning(
+                    "token trace import saw no sessions after a database error",
+                    exc_info=True,
+                )
             session_rows = []
         known_sessions = {str(row["id"]) for row in session_rows}
         cursor_rows = await db.execute_fetchall(
@@ -472,6 +495,12 @@ class TokenStatsService:
                 "DELETE FROM observability_trace_cursors WHERE run_id=?",
                 [(run_id,) for run_id in stale_cursor_ids],
             )
+            # Its own transaction, like every write below: this used to stay
+            # open until the very end of the import, so a large trace batch held
+            # the writer lock across the whole run.  Losing the rest of the
+            # import after this commit is harmless — the cursors it drops belong
+            # to traces that no longer exist, so nothing re-reads them.
+            await db.commit()
 
         # Runs whose usage was already recorded live (by record_usage during an
         # SSE stream) must not be re-imported from their traces: the same
@@ -502,6 +531,10 @@ class TokenStatsService:
                 """,
                 [(run_id,) for run_id in live_recorded_run_ids],
             )
+            # Committed on its own for the same reason.  These rows are
+            # duplicates of live-recorded usage, so their removal is the end
+            # state whether or not the rest of the import completes.
+            await db.commit()
 
         def read_new_trace_records():
             batches = []
@@ -525,6 +558,12 @@ class TokenStatsService:
 
         trace_batches = await asyncio.to_thread(read_new_trace_records)
         imported = 0
+        # This import had no batching at all: every event of every run and every
+        # cursor upsert landed in one transaction, so a startup that had a large
+        # backlog of traces to catch up on locked out the request path for its
+        # whole duration.  ``batch_started is None`` means no write transaction
+        # is open yet, so the clock starts at the statement that takes the lock.
+        batch_started: float | None = None
         for run_id, records, next_offset in trace_batches:
             session_id = run_sessions.get(run_id)
             if not session_id or session_id not in known_sessions:
@@ -572,6 +611,8 @@ class TokenStatsService:
                     else ""
                 )
                 source_key = f"{prefix}{run_id}:{record.get('seq', line_number)}"
+                if batch_started is None:
+                    batch_started = time.monotonic()
                 cursor = await db.execute(
                     """
                     INSERT OR IGNORE INTO token_usage_events (
@@ -593,6 +634,17 @@ class TokenStatsService:
                     ),
                 )
                 imported += max(cursor.rowcount, 0)
+                # Committing here stores this run's events with its cursor not
+                # yet advanced.  That direction is safe: the next startup
+                # re-reads the same bytes and ``INSERT OR IGNORE`` drops the
+                # repeats.  The reverse — a cursor moved past events that were
+                # never written — loses them for good, which is why the upsert
+                # below stays after the inserts and never before them.
+                if time.monotonic() - batch_started >= _WRITE_BATCH_SECONDS:
+                    await db.commit()
+                    batch_started = None
+            if batch_started is None:
+                batch_started = time.monotonic()
             await db.execute(
                 """
                 INSERT INTO observability_trace_cursors (
@@ -612,6 +664,9 @@ class TokenStatsService:
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+            if time.monotonic() - batch_started >= _WRITE_BATCH_SECONDS:
+                await db.commit()
+                batch_started = None
         await db.commit()
         return imported + await self._sync_message_estimates(db)
 
@@ -625,39 +680,54 @@ class TokenStatsService:
         session is never reduced to its priced tail.
         """
         try:
+            # Both deletes walk the whole table — ~0.10s over 20k stored
+            # estimates, and growing with it — and they used to share a
+            # transaction with the first insert batch, which made that batch the
+            # longest hold of the run.  Committing them on their own leaves the
+            # SELECT to a fresh read transaction, which returns the same set
+            # either way: the deletes remove superseded and orphaned estimates,
+            # and the SELECT asks for messages that carry *no* estimate and no
+            # same-turn event, so a deleted row can never come back through it.
             await db.execute(_SUPERSEDED_ESTIMATES_DELETE)
             await db.execute(_ORPHANED_ESTIMATES_DELETE)
+            await db.commit()
             rows = await db.execute_fetchall(_UNPRICED_TRANSCRIPT_MESSAGES)
-        except aiosqlite.OperationalError:
-            # Keep the service usable with a minimal/custom database in tests or
-            # during a partially completed schema migration.
+        except aiosqlite.OperationalError as exc:
+            # A missing table means a minimal/custom database in tests or a
+            # partially completed schema migration; that is expected and stays
+            # silent.  Everything else is not: since the backfill moved to its
+            # own connection, ``database is locked`` (a second process, or a
+            # dev-reload overlap) reaches this handler too, and swallowing it
+            # leaves the panel permanently empty with no signal anywhere.
+            if "no such table" not in str(exc).lower():
+                logger.warning(
+                    "token estimate backfill skipped after a database error",
+                    exc_info=True,
+                )
             return 0
 
         if not rows:
-            await db.commit()
             return 0
 
-        try:
-            import tiktoken
-
-            encoding = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            encoding = None
+        # Encoding inside the write transaction billed tiktoken's cost to the
+        # lock: a 60KB transcript takes milliseconds to encode, and 5% of them
+        # in a 20k-message backfill was the difference between a 0.54s and a
+        # 0.02s maximum hold.  The total runtime barely moves — the encoding
+        # still has to happen — but it now happens with no lock held and off the
+        # event loop the request path shares.  ``rows`` is already materialised,
+        # so one thread hop prices all of it before any lock is taken.
+        token_counts = await asyncio.to_thread(self._estimate_token_counts, rows)
 
         imported = 0
-        for row in rows:
-            content = str(row["content"] or "")
-            if not content.strip():
+        batch_rows = 0
+        batch_started = 0.0
+        for row, token_count in zip(rows, token_counts):
+            if token_count <= 0:
                 continue
-            if encoding is not None:
-                try:
-                    token_count = len(encoding.encode(content, disallowed_special=()))
-                except Exception:
-                    token_count = max(1, len(content) // 4)
-            else:
-                token_count = max(1, len(content) // 4)
             input_tokens = token_count if row["role"] != "assistant" else 0
             output_tokens = token_count if row["role"] == "assistant" else 0
+            if batch_rows == 0:
+                batch_started = time.monotonic()
             cursor = await db.execute(
                 """
                 INSERT OR IGNORE INTO token_usage_events (
@@ -675,21 +745,54 @@ class TokenStatsService:
                 ),
             )
             imported += max(cursor.rowcount, 0)
+            batch_rows += 1
             # On its own connection this is a second writer, and SQLite grants
-            # the write lock to one connection at a time.  Committing only at
-            # the end held it for the whole backfill; measured against a
-            # concurrent ``add_message``-shaped INSERT on the request
-            # connection: at 48k messages the backfill held 2.65s and the
-            # request waited 2.69s, at 96k it held 6.16s and the request failed
-            # with ``database is locked`` after exhausting its 5s busy_timeout.
-            # Batching gives the waiting writer windows to win: the same 96k run
-            # let three writes through, the slowest at 3.39s.  The rows are
-            # ``INSERT OR IGNORE`` on a unique source_key, so a partially
-            # committed backfill is resumed by the next startup, not duplicated.
-            if imported % _ESTIMATE_COMMIT_INTERVAL == 0:
+            # the write lock to one connection at a time, so the only thing that
+            # keeps the request path alive is how long each transaction holds
+            # it.  Measured on 20k messages of which 5% are 60KB, against a
+            # concurrent ``add_message``-shaped INSERT at a 1s busy_timeout:
+            # committing every 500 rows lost 2 of 16 writes to ``database is
+            # locked``, and 3 of 14 on the second startup where the deletes have
+            # a populated table to walk; on this budget 0 of ~160 fail.  The
+            # rows are ``INSERT OR IGNORE`` on a unique source_key, so a
+            # partially committed backfill is resumed by the next startup, not
+            # duplicated.
+            if (
+                time.monotonic() - batch_started >= _WRITE_BATCH_SECONDS
+                or batch_rows >= _ESTIMATE_COMMIT_INTERVAL
+            ):
                 await db.commit()
+                batch_rows = 0
         await db.commit()
         return imported
+
+    @staticmethod
+    def _estimate_token_counts(rows: list[aiosqlite.Row]) -> list[int]:
+        """Token count per row, aligned with ``rows``; 0 means nothing to price.
+
+        Runs off the event loop and outside any transaction — see the caller.
+        """
+        try:
+            import tiktoken
+
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            encoding = None
+
+        counts: list[int] = []
+        for row in rows:
+            content = str(row["content"] or "")
+            if not content.strip():
+                counts.append(0)
+                continue
+            if encoding is not None:
+                try:
+                    counts.append(len(encoding.encode(content, disallowed_special=())))
+                    continue
+                except Exception:
+                    pass
+            counts.append(max(1, len(content) // 4))
+        return counts
 
     @staticmethod
     def _parse_timestamp(value: object) -> datetime | None:
