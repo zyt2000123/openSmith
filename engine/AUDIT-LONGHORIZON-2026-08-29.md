@@ -7,6 +7,36 @@
 
 ---
 
+## 落地状态（截至 2026-08-30，`b3253d9..ab7f03a` 共 11 个提交）
+
+**20 条全部落地**，另加一轮对抗性 review 发现的 4 条补丁自身缺陷。
+
+| 状态 | 条目 |
+|---|---|
+| 已修 | #1–#20 全部 |
+| 部分保留 | **#15** 只做了 state/head/torn 清理；`DELETE FROM tool_executions` **未做** —— 删除副作用审计账本是策略决定，不该在补丁里顺手做，需单独立项 |
+
+### review 发现的补丁自身缺陷（已修）
+
+- **P0 回归**：#1 把 head 从固定 `conversation[:2]` 改成按角色选，拆掉了一个没人写下来的不变量（`[system, *历史, 请求]` 的 index 1 恰好是 user 轮）。裁出的对话可能以 assistant 开头，Anthropic 直接拒收且该错误不触发重试 —— 历史顶到 40 条上限的会话**每一轮第一次 provider 调用就炸**。切点增加"必要时前移到 user 轮"的对齐。
+- **#10 的 (b) 是承重的**，不是可选的另一半：删 state 让复活循环收敛了，但升级后**第一次**启动仍会把孤儿 state 盖上"刚刚"的时间戳，在同一轮对账里把真实历史全挤出保留窗。恢复路径已改用 `state.updated_at`。
+- **保留策略会删掉正在恢复执行的 run 的状态文件**：删除动作收进 `RunStateStore.prune()`，由状态的拥有者拒绝删活跃 run（同时消掉跨模块硬编码文件名耦合）。
+- **估算用量冒充精确计费数据**：#8 的兜底事件在存储层不可分辨，中文会话面板高估约 3 倍。已用 `source_key` 命名空间标注来源与可信度。
+
+### review 发现"锁不住修复"的测试（已补强）
+
+学习收尾上限（墙钟判据永真）、compaction 闩锁（只锁下界）、SSE 上限接线（只测纯函数）、`TOOL_CALL_START` 同步 fsync（无人看守）、pipeline base gate 的 infra 分支（与 domain 分支是两处独立实现）、#10 的级联结果（只测了删文件这个手段）。
+
+### 顺带删掉的假旋钮
+
+`SSEStreamLimiter.max_duration_seconds`：adapter 只从 `LLMProviderConfig` 构造，而那个 dataclass 没有路由字段，所以它只能永远是默认值。接上它得先加一个没人要求的 config 字段；留着则让读代码的人以为路由已被考虑过。
+
+### 文档待更新
+
+CLAUDE.md §9 测试基线（现为 engine 1211 / server 247+5 skipped）、§9 Seatbelt 段落重复、§6b「Spend is bounded twice」需补估算兜底、§6a cost-tracker 现已真通、§5 需记一条 observability→execution 的新依赖边。
+
+---
+
 ## P0（长会话确定性触发，丢失正在执行的指令）
 
 ### 1. 硬裁剪丢掉当前用户请求

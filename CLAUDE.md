@@ -124,7 +124,11 @@ server/ → engine/ → common/
         agents/   (loaded at runtime, never imported)
 ```
 
-Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
+Plus two frontends: `shell/` (Ink/React, terminal) and `desktop/` (Electron,
+DOM). They share **rendering decisions, not renderers** — Ink has no DOM
+backend. `shell/src/theme.ts` (palette), `presentation.ts` (markers, welcome
+art) and `diff-parse.ts` (unified-diff parsing) are Ink-free precisely so the
+desktop can import them; a marker or colour must never be duplicated.
 
 | Layer | Directory | Source lines (non-test) | Responsibility |
 |---|---|---|---|
@@ -133,6 +137,7 @@ Plus `shell/` as the terminal frontend (Ink/React, calls server over HTTP).
 | Content | `agents/` | 9.9k | Smith identity seed, pipelines, gates, conditions, tools, skills, hooks. Pure content. |
 | Platform | `server/` | 6.1k | FastAPI. Orchestration, session/agent lifecycle, 35 HTTP endpoints (34 router + `/api/health`). |
 | Terminal UI | `shell/` | 10.7k TS | Ink shell. Calls server over HTTP, auto-starts the backend. |
+| Desktop UI | `desktop/` | 3.1k TS | Electron shell. Imports `shell/src` verbatim; main process runs shell's own `ensureLocalServer()`. |
 
 Rules:
 
@@ -147,6 +152,14 @@ Rules:
 - `server/app/` is the FastAPI application package; keep this conventional layout
 - `agents/smith/` is where Smith's built-in identity seed lives
 - New capabilities → add skills, not new agents
+- `engine/observability/` and `engine/execution/orchestration/run_state.py`
+  share `~/.agent-smith/runs/`: the observability index holds `<id>.summary.json`,
+  the state store holds `<id>.json`. Retention lives with observability but
+  deletes both, so it goes through `RunStateStore.prune()` rather than building
+  the path itself — the state store owns the filename *and* the refusal to
+  delete a run that is still executing. A consequence worth knowing:
+  `AGENT_SMITH_OBSERVABILITY_*` therefore also bounds how long a finished run
+  stays resumable.
 
 `common/paths.py` is the single source of truth for the runtime data root
 (`~/.agent-smith`, created `0o700`/`0o600`; a pre-existing directory keeps the
@@ -240,6 +253,12 @@ agents/smith/hooks.yaml  # Hook configuration (which hooks are enabled)
 | `quality-gate` | Post | ✅ | Run format/lint checks (async) |
 | `cost-tracker` | Stop | ✅ | Write token usage to `~/.agent-smith/metrics/costs.jsonl` |
 
+`cost-tracker` bills the run's aggregated `TOKEN_USAGE` events against the
+interactive client's model name. It writes nothing when a run reported no usage
+at all — a setup failure that never reached the provider must not appear as a
+zero-token call. `MODEL_PRICING` only carries Anthropic rates, so another
+provider records `estimated_cost_usd: null` rather than a wrong number.
+
 The fact gate (require investigation before the first edit) is **not** a
 pluggable hook anymore: it lives at `engine/safety/fact_gate.py` and is wired
 per request in `lifecycle.py` (`use_fact_gate`), always active, challenge-only.
@@ -327,9 +346,15 @@ rather than failing the task.
 - **Spend is bounded twice.** `max_iters` bounds *turns*; `token_budget` bounds
   *tokens*, which is what a runaway with large tool results actually burns. A
   provider that omits `total_tokens` is charged input+output, so missing
-  accounting cannot read as free. Both stop the loop between turns and report
-  the partial state as a failure — the tokens are already spent, so the only
-  useful response is to stop compounding them.
+  accounting cannot read as free. A provider that reports *no* usage at all —
+  common on OpenAI-compatible relays that drop `stream_options.include_usage` —
+  is charged an estimate synthesized from the fitted input plus the output
+  text; without it neither budget applied. That estimate carries
+  `usage_reported: 0`, and the token-stats store files it under an
+  `estimate:` source key so a cost panel never shows a guess as billing data.
+  Both budgets stop the loop between turns and report the partial state as a
+  failure — the tokens are already spent, so the only useful response is to
+  stop compounding them.
 - **An uninstallable capability stays out of the prompt.** An absent or
   malformed `agents/subagents/` marks the tool `hidden` (logged at ERROR)
   rather than failing every turn.
@@ -431,15 +456,12 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline (macOS): engine 1100 passed, server 243 passed (5 skipped),
-shell 303 passed (not re-measured this change). The engine's ~59 Seatbelt skips appear on
-Linux only; every one carries `@pytest.mark.skipif(sys.platform != "darwin")`,
-so on macOS they run instead. A Seatbelt test *failing* rather than skipping on
-Linux means that marker is missing — add it.
-
-The engine's 59 skips are almost all macOS-only Seatbelt tests; every one carries
-`@pytest.mark.skipif(sys.platform != "darwin")`. A Seatbelt test *failing* rather
-than skipping on Linux means that marker is missing — add it.
+Current baseline (macOS): engine 1211 passed (0 skipped), server 247 passed
+(5 skipped), shell 303 passed (not re-measured this change). The engine's
+Seatbelt skips appear on Linux only; every one carries
+`@pytest.mark.skipif(sys.platform != "darwin")`, so on macOS they run instead.
+A Seatbelt test *failing* rather than skipping on Linux means that marker is
+missing — add it.
 
 `shell` has 12 auth-dependent tests that fail on a container with no
 `~/.agent-smith/auth_token`: they call the real `localAuthHeaders`, which reads
