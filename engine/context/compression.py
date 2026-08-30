@@ -33,6 +33,13 @@ _PRUNED_MARKER = "[pruned]"
 # instruction into compactable history, where compaction replaced it with a
 # summary of itself.
 RUNTIME_USER_NOTE_PREFIX = "[Current time]\n"
+# 这是**内容前缀**判定，不是结构标记：用户真的粘贴一段以它开头的文本时，
+# is_request_turn 会把那条请求当成引擎注记，active_turn_bounds 因此找不到活动
+# 轮，compact_history 就把正在执行的指令压成了摘要。
+# 想改成结构字段（例如给注记消息加一个 "_engine_note": True）前先注意：
+# adapters/openai.py 的 body 是 "messages": request.messages —— 消息 dict 被
+# 逐字发给 provider，多带一个自有键会真的发出去，而不少 OpenAI 兼容中转站对
+# 未知字段直接 400。要走这条路就得先在请求装配处剥掉该键，那是另一处改动。
 PRUNE_PROTECT_THRESHOLD_CHARS = 8000
 PRUNE_MIN_CHARS = 2000
 CONTEXT_TRIGGER_RATIO = 0.7

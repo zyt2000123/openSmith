@@ -155,7 +155,12 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
         forward_trimmed = kept(aligned(forward))
         if len(forward_trimmed) < len(conversation):
             return forward_trimmed
-    # 整条尾巴都是 tool/system 时没有安全切点，保持原样交给 fit_request 兜底。
+    # 没有安全切点：尾巴里除了当前这一轮的 assistant 之外再无轮次边界（一轮
+    # 40 个并行调用、中间还夹着 tool/system/[Current time] 时就是这样）。此时
+    # 唯一能切的地方是那个 assistant 本身，而切掉它等于丢掉整个活动轮 ——
+    # 正是 fit_request 明确保护、prune_tool_outputs 用"缩内容"而非"删消息"
+    # 处理的那部分。所以这道条数上限在这种形态下确实失效，是有意的：交给
+    # token 感知的那条路去缩工具结果的正文。
     return conversation
 
 
