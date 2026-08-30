@@ -46,6 +46,10 @@ _ESTIMATE_PREFIXES = ("message:", "estimate:")
 # session as exact and skipped it.  One event could therefore drop a 40-turn
 # conversation to whatever that single event was worth.
 #
+# The interval test is a seek, not a walk, only because messages is indexed on
+# (session_id, role, created_at); with session_id alone it re-reads the whole
+# session transcript once per candidate row.
+#
 # Both timestamps are UTC ISO-8601 strings, which is what makes these string
 # comparisons time comparisons; the rest of this module already relies on that.
 _SAME_TURN_USAGE_EXISTS = """
@@ -62,29 +66,65 @@ EXISTS (
 )
 """
 
-# A NULL :session_id means "every session".  The live path binds one because it
-# runs once per LLM turn and must not walk the whole table to clean up at most
-# its own turn's rows.
+# ``substr(source_key, 9)`` strips the 'message:' prefix, so the estimate row is
+# matched to its message through the messages primary key.  Comparing
+# ``'message:' || m.id`` to the source key instead is an expression over ``m``,
+# which no index can serve: every candidate estimate re-scanned the whole
+# messages table.
+_SUPERSEDED_BY_SAME_TURN_EVENT = f"""
+EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.id = substr(token_usage_events.source_key, 9)
+      AND {_SAME_TURN_USAGE_EXISTS}
+)
+"""
+
 _SUPERSEDED_ESTIMATES_DELETE = f"""
 DELETE FROM token_usage_events
 WHERE source_key LIKE 'message:%'
-  AND (:session_id IS NULL OR session_id = :session_id)
-  AND EXISTS (
+  AND {_SUPERSEDED_BY_SAME_TURN_EVENT}
+"""
+
+# The live path runs once per LLM turn and must not walk the whole table to
+# clean up at most its own turn's rows.  Written as a second statement rather
+# than ``(:session_id IS NULL OR session_id = :session_id)``: that form is not
+# sargable, so binding a session narrowed nothing and the hot path scanned every
+# row anyway.
+_SUPERSEDED_ESTIMATES_DELETE_FOR_SESSION = f"""
+DELETE FROM token_usage_events
+WHERE source_key LIKE 'message:%'
+  AND session_id = ?
+  AND {_SUPERSEDED_BY_SAME_TURN_EVENT}
+"""
+
+# An estimate whose message row is gone can never be matched by the turn-scoped
+# delete above, which reaches the estimate *through* that row.  Resume deletes
+# the assistant messages after the resumed user turn
+# (``discard_assistant_messages_after_user``), so without this the leftovers
+# accumulate one per resume — and a single one flips the whole panel's
+# ``estimated`` flag, which is the only thing that field is for.
+_ORPHANED_ESTIMATES_DELETE = """
+DELETE FROM token_usage_events
+WHERE source_key LIKE 'message:%'
+  AND NOT EXISTS (
       SELECT 1 FROM messages m
-      WHERE 'message:' || m.id = token_usage_events.source_key
-        AND {_SAME_TURN_USAGE_EXISTS}
+      WHERE m.id = substr(token_usage_events.source_key, 9)
   )
 """
 
+# The cheap term first: 'already has an estimate' is one seek on the unique
+# source_key index and retires almost every row, while the same-turn test costs
+# several seeks.  Written the other way round, the expensive term ran for rows
+# that were about to be discarded anyway.
 _UNPRICED_TRANSCRIPT_MESSAGES = f"""
 SELECT m.id, m.session_id, m.role, m.content, m.created_at
 FROM messages m
 JOIN sessions s ON s.id = m.session_id
-WHERE NOT {_SAME_TURN_USAGE_EXISTS}
-  AND NOT EXISTS (
+WHERE NOT EXISTS (
       SELECT 1 FROM token_usage_events prior
       WHERE prior.source_key = 'message:' || m.id
   )
+  AND NOT {_SAME_TURN_USAGE_EXISTS}
 ORDER BY m.created_at ASC
 """
 
@@ -175,7 +215,7 @@ class TokenStatsService:
         # too: it prices the same turn from the prompt side, so keeping both
         # would count that turn twice.  Earlier turns are a different matter —
         # see _SUPERSEDED_ESTIMATES_DELETE for why they must survive.
-        await db.execute(_SUPERSEDED_ESTIMATES_DELETE, {"session_id": session_id})
+        await db.execute(_SUPERSEDED_ESTIMATES_DELETE_FOR_SESSION, (session_id,))
         # A resumed run (server restarted after the trace was imported) would
         # otherwise keep both its live rows and the trace-imported rows for the
         # whole process lifetime: sync_from_traces only heals at the next startup.
@@ -553,7 +593,8 @@ class TokenStatsService:
         session is never reduced to its priced tail.
         """
         try:
-            await db.execute(_SUPERSEDED_ESTIMATES_DELETE, {"session_id": None})
+            await db.execute(_SUPERSEDED_ESTIMATES_DELETE)
+            await db.execute(_ORPHANED_ESTIMATES_DELETE)
             rows = await db.execute_fetchall(_UNPRICED_TRANSCRIPT_MESSAGES)
         except aiosqlite.OperationalError:
             # Keep the service usable with a minimal/custom database in tests or

@@ -100,19 +100,31 @@ async def lifespan(app: FastAPI):
             logger.warning("marked interrupted runs as resumable: %s", ", ".join(recovered))
     except (RunStateError, OSError):
         logger.warning("failed to recover interrupted runs during startup", exc_info=True)
-    try:
-        await TokenStatsService().sync_from_traces()
-    except Exception:
-        logger.warning("failed to sync token statistics during startup", exc_info=True)
+
+    async def sync_token_stats() -> None:
+        try:
+            await TokenStatsService().sync_from_traces()
+        except Exception:
+            logger.warning("failed to sync token statistics during startup", exc_info=True)
+
+    # The /token dashboard is instrumentation, not a serving dependency, and its
+    # backfill walks every stored transcript.  Awaited here it kept the server
+    # from answering a single request until it finished; the shell abandons a
+    # backend that takes longer than 30s to come up (dev-server.ts).
+    stats_sync_task = asyncio.create_task(sync_token_stats())
     set_default_generation_sink(TokenStatsService().record_generation)
     scheduler_task = asyncio.create_task(run_scheduler())
     yield
     set_default_generation_sink(None)
     scheduler_task.cancel()
-    try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        pass
+    # A backfill still walking traces must not outlive the connection it writes
+    # through, so it is drained here like the scheduler.
+    stats_sync_task.cancel()
+    for task in (scheduler_task, stats_sync_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     # Detached auto-task runs outlive the request and the tick that started them,
     # so drain them before the LLM clients they are still using go away.
     await cancel_background_runs()

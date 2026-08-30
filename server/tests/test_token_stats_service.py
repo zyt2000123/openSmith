@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,8 @@ from types import SimpleNamespace
 import aiosqlite
 import pytest
 import pytest_asyncio
+from app.infrastructure import schema as app_schema
+from app.services import token_stats_service as token_stats_module
 from app.services.token_stats_service import TokenStatsService
 
 
@@ -1011,4 +1015,283 @@ async def test_sync_rebuilds_estimates_only_for_turns_without_usage(
     ]
     # u3/a3 are turn 3's messages; the live estimate already prices that turn.
     assert await service.sync_from_traces() == 0
+
+
+# ``messages`` never loses rows outside a resume, and a resident Smith keeps one
+# transcript store across every session, so tens of thousands of rows is the
+# normal steady state rather than an extreme.  These two shapes are the ones the
+# cleanup cost is quadratic in: rows in the table, and rows per session.
+_SCALE_SESSIONS = 20
+_SCALE_MESSAGES_PER_SESSION = 600
+
+# Wall clock is the weaker of the two checks below — it is here to catch an
+# order-of-magnitude regression, not to measure anything.  Both bounds sit ~10x
+# above the observed cost on this fixture (0.41-0.42s startup, ~0.021s per
+# turn over repeated runs) and comfortably below the pre-fix cost (13.5s and
+# 0.60s), so neither is tight enough to trip on a loaded machine.
+_STARTUP_BUDGET_SECONDS = 5.0
+_TURN_BUDGET_SECONDS = 0.25
+
+# Every alias the transcript table is reachable under in these statements.
+_TRANSCRIPT_SCAN = re.compile(r"^SCAN (?:m|b|messages)\b")
+
+
+async def _plan(db: aiosqlite.Connection, sql: str, params: tuple = ()) -> list[str]:
+    rows = await db.execute_fetchall("EXPLAIN QUERY PLAN " + sql, params)
+    return [str(row["detail"]) for row in rows]
+
+
+async def _transcript_rescans(
+    db: aiosqlite.Connection, sql: str, params: tuple = ()
+) -> list[str]:
+    """Plan nodes that walk the transcript from inside a correlated subquery.
+
+    Enumerating ``messages`` once at the top level is what the backfill is for;
+    doing it again per candidate row of an enclosing loop is the quadratic
+    defect, so the nesting — not the scan — is what this looks for.
+    """
+    rows = await db.execute_fetchall("EXPLAIN QUERY PLAN " + sql, params)
+    nodes = {int(row["id"]): (int(row["parent"]), str(row["detail"])) for row in rows}
+
+    def inside_subquery(node_id: int) -> bool:
+        parent = nodes.get(node_id, (0, ""))[0]
+        while parent:
+            detail = nodes.get(parent, (0, ""))[1]
+            if "SUBQUERY" in detail:
+                return True
+            parent = nodes.get(parent, (0, ""))[0]
+        return False
+
+    return [
+        detail
+        for node_id, (_parent, detail) in nodes.items()
+        if _TRANSCRIPT_SCAN.match(detail) and inside_subquery(node_id)
+    ]
+
+
+async def _large_transcript_db() -> aiosqlite.Connection:
+    """A real-schema database holding a normal amount of accumulated history."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await app_schema.ensure_schema(db)
+    await db.execute(
+        "INSERT INTO agent_profiles (id, name, role) VALUES ('agent-1', 'Smith', 'assistant')"
+    )
+    sessions, messages, estimates, events = [], [], [], []
+    for session_index in range(_SCALE_SESSIONS):
+        session_id = f"s{session_index}"
+        sessions.append((session_id, "agent-1"))
+        for index in range(_SCALE_MESSAGES_PER_SESSION):
+            message_id = f"{session_id}-m{index}"
+            role = "user" if index % 2 == 0 else "assistant"
+            occurred_at = (
+                f"2026-07-14T{index // 3600:02d}:{index // 60 % 60:02d}:{index % 60:02d}.000000+00:00"
+            )
+            messages.append((message_id, session_id, role, "x" * 200, occurred_at))
+            estimates.append((session_id, f"message:{message_id}", occurred_at))
+        # One priced turn per session: enough to make the turn test run for real
+        # instead of short-circuiting on an event-free session.
+        events.append((session_id, "2026-07-14T00:09:59.000000+00:00"))
+    await db.executemany(
+        "INSERT INTO sessions (id, agent_id) VALUES (?, ?)", sessions
+    )
+    await db.executemany(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        messages,
+    )
+    await db.executemany(
+        "INSERT INTO token_usage_events "
+        "(session_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at) "
+        "VALUES (?, ?, 'local-estimate', 50, 0, 50, ?)",
+        estimates,
+    )
+    await db.executemany(
+        "INSERT INTO token_usage_events "
+        "(session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at) "
+        "VALUES (?, 'run-old', NULL, 'gpt-test', 100, 25, 125, ?)",
+        events,
+    )
+    await db.commit()
+    return db
+
+
+@pytest.mark.asyncio
+async def test_turn_scoped_cleanup_stays_index_bound_on_an_accumulated_transcript(
+    tmp_path: Path,
+) -> None:
+    """P1 regression: the turn-scoped cleanup must not cost O(messages^2).
+
+    Matching an estimate to its message through ``'message:' || m.id`` is an
+    expression no index can serve, and ``(:session_id IS NULL OR session_id =
+    :session_id)`` is not sargable either, so both the startup backfill and the
+    per-LLM-turn cleanup degraded into full scans of the transcript.  At 20k
+    accumulated messages startup took over 30s — past the shell's 30s backend
+    timeout — and every LLM turn added seconds inside the SSE stream.
+    """
+    db = await _large_transcript_db()
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    for label, sql, params in (
+        ("startup delete", token_stats_module._SUPERSEDED_ESTIMATES_DELETE, ()),
+        (
+            "per-turn delete",
+            token_stats_module._SUPERSEDED_ESTIMATES_DELETE_FOR_SESSION,
+            ("s0",),
+        ),
+        ("startup select", token_stats_module._UNPRICED_TRANSCRIPT_MESSAGES, ()),
+        ("orphan delete", token_stats_module._ORPHANED_ESTIMATES_DELETE, ()),
+    ):
+        assert not await _transcript_rescans(db, sql, params), (
+            label,
+            await _plan(db, sql, params),
+        )
+
+    # The turn test seeks a timestamp range through the composite index; without
+    # it, it falls back to walking every message of the session.
+    for sql in (
+        token_stats_module._SUPERSEDED_ESTIMATES_DELETE,
+        token_stats_module._UNPRICED_TRANSCRIPT_MESSAGES,
+    ):
+        plan = await _plan(db, sql)
+        assert any("idx_messages_session_role_time" in line for line in plan), plan
+
+    # The hot path binds a session and must actually narrow by it.
+    plan = await _plan(
+        db, token_stats_module._SUPERSEDED_ESTIMATES_DELETE_FOR_SESSION, ("s0",)
+    )
+    assert any(
+        line.startswith("SEARCH token_usage_events USING INDEX")
+        and "session_id=?" in line
+        for line in plan
+    ), plan
+
+    service = TokenStatsService(db_provider, trace_root=tmp_path)
+    started = time.perf_counter()
+    assert await service.sync_from_traces() == 0
+    startup_seconds = time.perf_counter() - started
+    assert startup_seconds < _STARTUP_BUDGET_SECONDS, startup_seconds
+
+    started = time.perf_counter()
+    await service.record_usage(
+        session_id="s0",
+        run_id="run-live",
+        project_name="demo-project",
+        project_path="/tmp/demo-project",
+        model="gpt-test",
+        usage={"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+        occurred_at=datetime.fromisoformat("2026-07-14T00:09:58+00:00"),
+    )
+    turn_seconds = time.perf_counter() - started
+    assert turn_seconds < _TURN_BUDGET_SECONDS, turn_seconds
+
+
+@pytest.mark.asyncio
+async def test_sync_clears_estimates_whose_message_was_discarded(
+    tmp_path: Path,
+) -> None:
+    """P3 regression: an estimate outlives the message row it was derived from.
+
+    Resuming an interrupted run deletes the assistant messages after the resumed
+    user turn (``discard_assistant_messages_after_user``).  The turn-scoped
+    delete reaches an estimate *through* its message row, so once that row is
+    gone the estimate can never be matched again: one leaks per resume, and a
+    single leftover is enough to mark the whole panel ``estimated``.
+    """
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL);
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE token_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            source_key TEXT UNIQUE,
+            project_name TEXT NOT NULL DEFAULT '',
+            project_path TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            occurred_at TEXT NOT NULL
+        );
+        INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1');
+        -- 'a1' is the half-finished assistant reply the resume threw away; only
+        -- the user message it answered is still in the transcript.
+        INSERT INTO messages (id, session_id, role, content, created_at) VALUES
+            ('u1', 's1', 'user', 'ask', '2026-07-14T10:00:00+00:00');
+        INSERT INTO token_usage_events
+            (session_id, run_id, source_key, model, input_tokens, output_tokens, total_tokens, occurred_at)
+        VALUES
+            ('s1', NULL, 'message:u1', 'local-estimate', 5, 0, 5, '2026-07-14T10:00:00+00:00'),
+            ('s1', NULL, 'message:a1', 'local-estimate', 0, 7, 7, '2026-07-14T10:00:01+00:00'),
+            ('s1', 'run-1', NULL, 'gpt-test', 100, 25, 125, '2026-07-14T10:00:05+00:00');
+        """
+    )
+
+    async def db_provider() -> aiosqlite.Connection:
+        return db
+
+    service = TokenStatsService(db_provider, trace_root=tmp_path)
+    assert await service.sync_from_traces() == 0
+
+    rows = await db.execute_fetchall("SELECT source_key FROM token_usage_events")
+    assert [row["source_key"] for row in rows] == [None]
+
+    stats = await service.get_stats("agent-1", year=2026)
+    assert stats["estimated"] is False
+    assert stats["total_tokens"] == 125
+
+    # Nothing is regenerated for the discarded message on the next startup.
+    assert await service.sync_from_traces() == 0
+    rows = await db.execute_fetchall("SELECT source_key FROM token_usage_events")
+    assert [row["source_key"] for row in rows] == [None]
+
+
+@pytest.mark.asyncio
+async def test_schema_upgrade_adds_the_turn_index_to_a_populated_database() -> None:
+    """The index has to reach installs that already hold history, without
+    disturbing it — an existing ``~/.agent-smith/app.db`` is the only copy of a
+    resident Smith's transcripts."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    # A database at the previous schema: everything except the new index.
+    await db.executescript(
+        app_schema.APP_SCHEMA.replace("messages(session_id, role, created_at)", "messages(session_id)")
+    )
+    await db.execute(
+        "INSERT INTO agent_profiles (id, name, role) VALUES ('agent-1', 'Smith', 'assistant')"
+    )
+    await db.execute("INSERT INTO sessions (id, agent_id) VALUES ('s1', 'agent-1')")
+    await db.execute(
+        "INSERT INTO messages (id, session_id, role, content, created_at) "
+        "VALUES ('u1', 's1', 'user', 'ask', '2026-07-14T10:00:00+00:00')"
+    )
+    await db.commit()
+
+    await app_schema.ensure_schema(db)
+
+    indexes = {
+        str(row["name"])
+        for row in await db.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
+        )
+    }
+    assert "idx_messages_session_role_time" in indexes
+    rows = await db.execute_fetchall("SELECT id, created_at FROM messages")
+    assert [dict(row) for row in rows] == [
+        {"id": "u1", "created_at": "2026-07-14T10:00:00+00:00"}
+    ]
+    # Idempotent: a second startup on the upgraded database is a no-op.
+    await app_schema.ensure_schema(db)
+    assert len(await db.execute_fetchall("SELECT id FROM messages")) == 1
 
