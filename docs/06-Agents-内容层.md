@@ -15,6 +15,7 @@
 | `agents/pipelines/` | identity route 对应的 skill chain | `SkillChain` |
 | `agents/skills/` | shipped `SKILL.md` 技能及其参考资料 | Skill loader；安装时物化到 builtin 路径 |
 | `agents/tools/` | 内建 Python tool provider | Tool registry |
+| `agents/subagents/` | 声明式子 Agent 类型（YAML）：提示词、工具白名单、模型角色、迭代与 token 上限 | `engine.execution.subagent.SubAgentCatalog`，经 `bind_sub_agent_tool()` 注入 |
 | `agents/gates/` | pipeline/skill 可复用的 gate 实现 | Pipeline gate loader |
 | `agents/conditions/` | pipeline 的条件函数 | Pipeline loader |
 | `agents/safety/` | 声明式危险命令规则 | ToolGuard |
@@ -126,9 +127,19 @@ steps:
 - `instructions`：注入该节点 skill 的执行指令，只能描述流程，不能绕过安全策略。
 
 `allowed_tools` 是四层收敛链的最后一环，逐层只能收窄：registry 硬编码文件名白名单
-`_BUILTIN_PROVIDER_FILENAMES`（18 个）→ profile `config.yaml` 的 `tools.enabled`
-（16 个，排除 `memory_ops`/`skill_load`）→ identity 的 `tools.enabled` → 节点
-`allowed_tools`。
+`_BUILTIN_PROVIDER_FILENAMES`（20 个）→ profile `config.yaml` 的 `tools.enabled`
+（18 个）→ identity 的 `tools.enabled` → 节点 `allowed_tools`。
+
+profile 那一层排除了两个，语义**完全不同**：
+
+- `memory_ops` 被排除是**正确的**——它声明了 `"hidden": True`，本就不面向模型，
+  由引擎内部调用；`enabled_tools_from_config()` 对这种名字会记一条 warning 并忽略。
+- `sub_agent` 被排除是**遗漏**——它不是 `hidden`，是一个正常的模型可见工具，但上线它的
+  `9180061` 没有同步这份种子。后果是能力已实现却对模型不可见（`registry.py:703`
+  会拦下调用）。详见 [24 · 子 Agent 委派系统](24-子Agent-委派系统.md)开头的状态说明。
+
+这条链的教训：能力可达需要**每一层都点头**，而"不在 `tools.enabled` 里"既可能是
+刻意隐藏，也可能是忘了加——两者从配置文件上看不出区别，只能回到 `TOOL_META` 判断。
 
 pipeline 顶层除 `route`、`steps`、`backtrack` 外还支持可选的 `base_gate`/`base_gates`：
 兜底 gate 层，每个节点产出先过它、再过节点自己的 gate。当前三条 shipped pipeline 均未使用。
@@ -175,11 +186,12 @@ loader 不会加载它们，也不报错；可加载技能为 16 个。
 
 `agents/tools/*.py` **不是**按 glob 自动发现的：registry 只加载
 `engine/tool/registry.py` 中硬编码文件名白名单 `_BUILTIN_PROVIDER_FILENAMES`
-（18 个）内的文件。一个 provider 声明工具元数据并提供异步 `execute(**kwargs)`；schema 会在 registry 构建时校验。
+（20 个）内的文件。一个 provider 声明工具元数据并提供异步 `execute(**kwargs)`；schema 会在 registry 构建时校验。
 
-18 个内建工具：`read_file`、`write_file`、`edit_file`、`list_dir`、`glob_files`、
+20 个内建工具：`read_file`、`write_file`、`edit_file`、`list_dir`、`glob_files`、
 `grep`、`shell`、`git_ops`、`read_pdf`、`render_pdf_page`、`web_search`、`web_fetch`、
-`web_crawl`、`todo`、`skill_manage`、`skill_load`、`memory_ops`、`render_ui`。
+`web_crawl`、`todo`、`skill_manage`、`skill_load`、`memory_ops`、`render_ui`、
+`get_current_time`、`sub_agent`。
 其中 `memory_ops` 与 `skill_load` 已注册但不在默认 profile 的 `tools.enabled`
 白名单内，默认调不到。
 

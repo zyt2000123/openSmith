@@ -2,7 +2,7 @@
 
 ## 本章结论
 
-`engine/identity/` 与 `engine/execution/routing/` 用声明式 YAML 将“任务应采用什么能力档案和流程”变成可检查的 `RouteDecision`。identity 不是 Agent 实例，更不会创建子 Agent；它只约束当前单个 Smith Run 的提示、能力集合和 pipeline 选择。
+`engine/identity/` 与 `engine/execution/routing/` 用声明式 YAML 将“任务应采用什么能力档案和流程”变成可检查的 `RouteDecision`。identity 不是 Agent 实例，也不会创建子 Agent；它只约束当前单个 Smith Run 的提示、能力集合和 pipeline 选择。（子 Agent 确实存在，但由 Smith 在对话中通过 `sub_agent` 工具显式委派，与路由无关——见 [24 · 子 Agent 委派系统](24-子Agent-委派系统.md)。）
 
 ## 总体架构
 
