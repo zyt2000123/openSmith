@@ -211,4 +211,4 @@ Smith 是 MCP client。配置的 stdio 或 streamable HTTP server 由 `engine.mc
 
 ## 运行时可编辑内容
 
-`~/.agent-smith/agent/skills/` 用于用户安装技能；`builtin/skills/` 用于发行版携带的技能，两者不能混为一类。`context.md`、`memory/recent.md` 与 `memory/durable.md` 是受 Memory Policy 维护的视图；`SMITH.md` 则由用户维护，自动学习不能覆盖它。详见[记忆系统](05-Engine-记忆系统.md)。
+`~/.agent-smith/agent/skills/` 用于用户安装技能；`builtin/skills/` 用于发行版携带的技能，两者不能混为一类。`context.md`、`memory/recent.md` 与 `memory/durable.md` 是受 Memory Policy 维护的视图；`SMITH.md` 则由用户维护，自动学习不能覆盖它。详见[记忆系统](21-记忆系统.md)。

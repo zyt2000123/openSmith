@@ -2,7 +2,7 @@
 
 ## 本章结论
 
-`engine/sandbox/` 将 Shell 类工具的“实际执行”与工具协议分离：`host.py` 管理异步子进程、输出上限、取消和进程组终止；`macos_seatbelt.py` 在 macOS 上构造额外的文件系统约束。它是安全体系的执行环境层，不替代 [04g · Safety](04g-Safety-安全与审批.md) 的策略和审批。
+`engine/sandbox/` 将 Shell 类工具的“实际执行”与工具协议分离：`host.py` 管理异步子进程、输出上限、取消和进程组终止；`macos_seatbelt.py` 在 macOS 上构造额外的文件系统约束。它是安全体系的执行环境层，不替代 [23 · 工具与安全体系](23-工具与安全体系.md) 的策略和审批。
 
 ## 总体架构
 

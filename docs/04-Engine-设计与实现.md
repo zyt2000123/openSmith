@@ -298,18 +298,18 @@ graph LR
 
 | 主题 | 专题文档 | 阅读目标 |
 | --- | --- | --- |
-| 执行、Run、pipeline 与恢复 | [04e · Execution](04e-Execution-运行生命周期与管线.md) | 理解 Run 状态、checkpoint、gate、回退与 provisional 提交 |
-| 单步模型—工具循环 | [04a · ReAct Loop](04a-ReAct-Loop-设计.md) | 理解事件、预算、流式与压缩 |
-| Prompt 与上下文预算 | [04c · Context](04c-Context-上下文系统.md) | 理解信任分层、fitting 与压缩 |
+| 执行、Run、pipeline 与恢复 | [20 · Agent Loop 运行机制](20-Agent-Loop-运行机制.md) | 理解 Run 状态、checkpoint、gate、回退与 provisional 提交 |
+| 单步模型—工具循环 | [20 · Agent Loop 运行机制](20-Agent-Loop-运行机制.md) | 理解事件、预算、流式与压缩 |
+| Prompt 与上下文预算 | [22 · 上下文治理](22-上下文治理.md) | 理解信任分层、fitting 与压缩 |
 | Identity 与路由 | [04d · Identity](04d-Identity-身份与路由.md) | 理解 YAML 能力档案与 direct/pipeline 路径选择 |
 | 模型 provider | [04b · LLM](04b-LLM模块设计.md) | 理解 adapter、配置与 usage |
-| 工具运行时 | [04f · Tool](04f-Tool-工具系统.md) | 理解发现、schema、scoped capability 与 ledger |
-| 安全与审批 | [04g · Safety](04g-Safety-安全与审批.md) | 理解 policy、guard、fact gate 与 approval |
+| 工具运行时 | [23 · 工具与安全体系](23-工具与安全体系.md) | 理解发现、schema、scoped capability 与 ledger |
+| 安全与审批 | [23 · 工具与安全体系](23-工具与安全体系.md) | 理解 policy、guard、fact gate 与 approval |
 | Skill 运行时 | [04h · Skill](04h-Skill-技能系统.md) | 理解发现、enablement、执行与交接 |
 | 外部 MCP | [04i · MCP](04i-MCP-外部工具协议.md) | 理解 transport、session pool 与本地治理 |
 | 可观测性 | [04j · Observability](04j-Observability-可观测性.md) | 理解 trace、summary、incident 与 health |
 | 主机执行环境 | [04k · Sandbox](04k-Sandbox-主机执行环境.md) | 理解进程组、I/O 上限、取消与 Seatbelt |
-| 记忆系统 | [05 · Memory](05-Engine-记忆系统.md) | 理解证据、双视图编译、审核与维护 |
+| 记忆系统 | [21 · 记忆系统](21-记忆系统.md) | 理解证据、双视图编译、审核与维护 |
 | 内容层编辑方式 | [06 · Agents](06-Agents-内容层.md) | 理解 identity、pipeline、skill 与 tool provider 的内容来源 |
 | 审批决策背景 | [ADR 0001](adr/0001-approval-gated-host-capabilities.md) | 追溯 host capability 的审批设计 |
 

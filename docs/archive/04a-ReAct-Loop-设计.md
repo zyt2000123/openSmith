@@ -1,5 +1,10 @@
 # 04a · ReAct Loop 设计
 
+> **已归档 —— 不是当前事实。**
+> 本文已被 [20 · Agent Loop 运行机制](../20-Agent-Loop-运行机制.md) 取代；两者冲突时以那一篇和源码为准。
+> 保留在此仅供追溯当时的设计取舍，不再随代码更新。
+
+
 > **源文件**：`engine/execution/react/react_loop.py`
 >
 > **定位**：ReAct Loop 是 Agent-Smith 执行引擎的最内层循环——LLM 在单个技能步骤内的"思考 → 调工具 → 观察 → 再思考"核心循环。所有 Agent 输出（文本/流式/事件）最终都经过这里。

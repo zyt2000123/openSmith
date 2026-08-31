@@ -2,7 +2,7 @@
 
 ## 本章结论
 
-`engine/skill/` 将一个目录中的 `SKILL.md` 变成可发现、可启用、可执行并可移交上下文的任务 SOP。它只定义单个技能如何进入 Agent 对话；多个技能的顺序、gate 与恢复属于 [04e · Execution](04e-Execution-运行生命周期与管线.md)。
+`engine/skill/` 将一个目录中的 `SKILL.md` 变成可发现、可启用、可执行并可移交上下文的任务 SOP。它只定义单个技能如何进入 Agent 对话；多个技能的顺序、gate 与恢复属于 [20 · Agent Loop 运行机制](20-Agent-Loop-运行机制.md)。
 
 ## 总体架构
 
