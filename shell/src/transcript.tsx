@@ -15,6 +15,7 @@ import { skillPresentation } from "./skill-presentation.js";
 import { SmithUiBlock as SmithUiView } from "./smith-ui.js";
 import { splitStreamingMarkdown } from "./streaming-markdown.js";
 import { truncateDisplay } from "./text-layout.js";
+import { TOOL_PRESENTATION } from "./presentation.js";
 import { ACCENT, ASSISTANT, BORDER, ERROR, INFO, MUTED, SKILL, SUCCESS, WARNING } from "./theme.js";
 import type {
   SkillBlock,
@@ -29,15 +30,6 @@ import type {
   TurnEntry,
 } from "./transcript-state.js";
 import { useWindowSize } from "./window-size.js";
-
-const TOOL_PRESENTATION: Record<ToolState, { color: string; marker: string; label: string }> = {
-  running: { color: WARNING, marker: "◐", label: "running" },
-  success: { color: SUCCESS, marker: "●", label: "success" },
-  error: { color: ERROR, marker: "✕", label: "error" },
-  blocked: { color: WARNING, marker: "⛔", label: "permission blocked" },
-  preflight: { color: WARNING, marker: "◆", label: "fact preflight" },
-  cancelled: { color: MUTED, marker: "○", label: "cancelled" },
-};
 
 const MARKDOWN_OPTIONS = {
   theme: { listMarker: { color: ASSISTANT } },

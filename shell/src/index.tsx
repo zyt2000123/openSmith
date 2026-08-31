@@ -65,6 +65,7 @@ import {
 import { type AppStore, createAppStore } from "./store.js";
 import { clearTerminal } from "./term.js";
 import { truncateDisplay } from "./text-layout.js";
+import { GHOST_BUDDY, HERO_HINTS, SMITH_LOGO } from "./presentation.js";
 import { ACCENT, BORDER, ERROR, INFO, MUTED, SELECTED_BACKGROUND, SELECTED_FOREGROUND, WARNING } from "./theme.js";
 import { TokenStatsPanel } from "./token-panel.js";
 import { TranscriptEntryView } from "./transcript.js";
@@ -74,15 +75,6 @@ import { useWindowSize } from "./window-size.js";
 const SHELL_VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 const PROJECT_CWD = path.resolve(process.env.SMITH_PROJECT_CWD?.trim() || process.cwd());
 
-const SMITH_LOGO = [
-  "███████╗███╗   ███╗██╗████████╗██╗  ██╗",
-  "██╔════╝████╗ ████║██║╚══██╔══╝██║  ██║",
-  "███████╗██╔████╔██║██║   ██║   ███████║",
-  "╚════██║██║╚██╔╝██║██║   ██║   ██╔══██║",
-  "███████║██║ ╚═╝ ██║██║   ██║   ██║  ██║",
-  "╚══════╝╚═╝     ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝",
-];
-const GHOST_BUDDY = ["  ─╥╥─  ", "▄██████▄", "██ ██ ██", " ██████ ", "╰╯╰╮╭╯╰╯"];
 
 const store = createAppStore(loadHistory());
 const bridge = new NodeBridge(store);
@@ -103,7 +95,6 @@ function armSkill(skill: SkillSummary): void {
   getState().set({ pendingSkill: skill, panel: "chat", statusLine: "" });
 }
 
-const HERO_HINTS = ["`/` for commands", "`@` for skills", "Enter confirms", "Esc goes back", "`/help` for all"];
 
 /** border(2) + paddingX(6) + logo(39) + gap(3) + buddy(8) — below this the art itself will not fit. */
 const HERO_MIN_COLUMNS = 58;
