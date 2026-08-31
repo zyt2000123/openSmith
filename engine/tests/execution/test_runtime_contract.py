@@ -1270,6 +1270,60 @@ def test_runtime_carries_assembled_prefix_key_to_capable_llm(tmp_path: Path) -> 
     )
 
 
+def test_finished_run_bills_its_token_usage_to_the_cost_tracker_hook(
+    tmp_path: Path,
+    isolate_runtime_data_dir: Path,
+) -> None:
+    """cost-tracker was a dead path: session_stats was hardcoded to ``{}``.
+
+    The hook opens with ``if not session_stats: return``, so every response
+    short-circuited and ``metrics/costs.jsonl`` never got a line, while
+    ``hooks.yaml`` and CLAUDE.md both listed the hook as enabled.  The existing
+    unit tests only fed the hook a synthetic non-empty dict, which is exactly
+    the input production never produced — so drive a real run with the real
+    hook loaded and assert the file.
+    """
+    cost_tracker = (
+        Path(__file__).resolve().parents[3]
+        / "agents" / "smith" / "hooks" / "cost_tracker.py"
+    )
+
+    async def run() -> None:
+        runtime, services, _ = _runtime(tmp_path)
+        smith_dir = runtime.agents_dir / "smith"
+        smith_dir.mkdir(parents=True, exist_ok=True)
+        (smith_dir / "hooks.yaml").write_text(
+            "hooks:\n"
+            "  stop:\n"
+            "    - id: cost-tracker\n"
+            "      enabled: true\n"
+            f'      module: "{cost_tracker}"\n'
+            '      class: "CostTrackerHook"\n',
+            encoding="utf-8",
+        )
+        stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
+        async for _event in stream.stream_events():
+            pass
+
+    asyncio.run(run())
+
+    cost_file = isolate_runtime_data_dir / "metrics" / "costs.jsonl"
+    assert cost_file.is_file()
+    records = [
+        json.loads(line)
+        for line in cost_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert records[0]["session_id"] == "sess-1"
+    assert records[0]["input_tokens"] > 0
+    assert records[0]["output_tokens"] > 0
+    assert (
+        records[0]["total_tokens"]
+        == records[0]["input_tokens"] + records[0]["output_tokens"]
+    )
+
+
 def test_run_stream_persists_queued_and_terminal_run_state(tmp_path: Path) -> None:
     async def run() -> tuple[str, RunStatus, int]:
         runtime, services, _ = _runtime(tmp_path)
@@ -1852,9 +1906,51 @@ def test_run_stream_bounds_post_run_learning_finalization(
         stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
         return [event async for event in stream.stream_events()]
 
-    events = asyncio.run(asyncio.wait_for(collect_events(), timeout=0.2))
+    # 墙钟不是判据：stub 睡 1 秒，任何宽到能容下忙盘的超时值，都同样容得下
+    # "上限被整个去掉"的情形（实测去掉后仍 1 秒内跑完、照过）。上限真正生效
+    # 时会置 memory_persist_failed 并打在终态事件上 —— 断言它，wait_for 只
+    # 留作防挂死的外层保险。
+    events = asyncio.run(asyncio.wait_for(collect_events(), timeout=10))
 
     assert events[-1].type is EventType.RUN_FINISHED
+    assert events[-1].data.get("memory_persist_failed") is True
+
+
+def test_cancelled_learning_still_records_a_terminal_run_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """取消落在记忆收尾窗口里，run 也必须落到终态。
+
+    终态记录排在记忆收尾之后，而收尾自己发 LLM 调用、最长 30 秒。窗口内断连
+    时 CancelledError 被重抛，RUN_FINISHED 整个跳过 —— run 永久停在 running，
+    只有重启才回收；暂停中的 pipeline 还会因为"owner 仍存活"被从头重跑并覆盖
+    原 checkpoint。
+    """
+    async def cancelled_persist(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_persist_runtime_learning",
+        cancelled_persist,
+    )
+
+    async def run() -> tuple[Path, str]:
+        runtime, services, _ = _runtime(tmp_path)
+        stream = run_stream_with_runtime(EngineRequest(message="hello"), runtime, services)
+        try:
+            _ = [event async for event in stream.stream_events()]
+        except asyncio.CancelledError:
+            pass
+        return runtime.profile_dir, stream.run_id
+
+    profile_dir, run_id = asyncio.run(run())
+
+    state = RunStateStore(profile_dir).get(run_id)
+    assert state is not None
+    assert state.status is not RunStatus.RUNNING, "run stranded at running"
+    assert state.status is RunStatus.COMPLETED
 
 
 def test_run_stream_closes_services_when_learning_is_cancelled(

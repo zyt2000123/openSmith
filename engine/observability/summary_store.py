@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from common.paths import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE
+from engine.execution.orchestration.run_state import RunStateStore
 
 from .index import (
     IndexedRun,
@@ -153,8 +154,20 @@ class RunSummaryStore:
             logger.warning("failed to initialize observability index", exc_info=True)
             self._index = None
 
-    def save(self, metadata: RunMetadata, summary: RunSummary) -> RunSummaryRecord:
-        """Atomically persist a terminal summary, merging earlier resumptions."""
+    def save(
+        self,
+        metadata: RunMetadata,
+        summary: RunSummary,
+        *,
+        finished_at: str | None = None,
+    ) -> RunSummaryRecord:
+        """Atomically persist a terminal summary, merging earlier resumptions.
+
+        ``finished_at`` defaults to now, which is right for a run finishing
+        now.  Crash recovery must pass the run's own last-known time instead:
+        retention orders by this field, so stamping a months-old run with the
+        current time sorts it ahead of every real run and evicts them.
+        """
         self._validate_metadata(metadata, summary)
         self._ensure_index()
         previous = self.get(metadata.run_id)
@@ -166,7 +179,7 @@ class RunSummaryStore:
                 if previous is not None
                 else metadata
             ),
-            finished_at=_now(),
+            finished_at=finished_at or _now(),
             summary=merged,
         )
         self._write(record)
@@ -254,10 +267,39 @@ class RunSummaryStore:
     def _apply_retention(self) -> None:
         if self._index is None:
             return
-        for run_id in self._index.retention_candidates(self._retention):
+        candidates = self._index.retention_candidates(self._retention)
+        if not candidates:
+            return
+        state_store = RunStateStore(self.profile_dir)
+        for run_id in candidates:
             try:
+                # Liveness first, and it gates *everything*.  A resumed run
+                # still carries its previous attempt's finished_at here, so it
+                # can be selected as a candidate mid-execution; deleting its
+                # trace out from under it is worse than losing the state file.
+                # TraceStore reopens the path with O_CREAT on the next append
+                # and its torn-tail check sees a shorter file, so the chain
+                # silently restarts from genesis -- the run's own history is
+                # gone and verify() still answers ok.  The summary going first
+                # also breaks the resumption merge save() promises: with no
+                # previous record there is nothing to merge, and the earlier
+                # attempt's counts vanish.
+                if not state_store.prune(run_id):
+                    continue
+                # Everything belonging to the run goes, not just the two files
+                # this store writes.  Leaving the lifecycle state behind made
+                # "terminal state, no summary" ambiguous, and startup
+                # reconciliation reads that as a crash window: it re-finalized
+                # every pruned run into an empty zombie summary stamped with the
+                # current time, which sorted ahead of real runs and evicted
+                # them -- the evicted ones then came back as zombies on the next
+                # start, so the index converged on holding nothing but zombies.
+                # The orphaned seal anchor is also what made the rebuilt trace
+                # verify as tampered.
                 self._path(run_id).unlink(missing_ok=True)
                 (self.trace_root / f"{run_id}.jsonl").unlink(missing_ok=True)
+                (self.trace_root / f"{run_id}.jsonl.head").unlink(missing_ok=True)
+                (self.trace_root / f"{run_id}.jsonl.torn").unlink(missing_ok=True)
                 self._index.remove(run_id)
             except (OSError, sqlite3.Error, ValueError):
                 logger.warning(

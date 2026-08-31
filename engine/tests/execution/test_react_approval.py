@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from engine.execution.events import EventType
+from engine.execution.react.budget import MAX_IDENTICAL_TOOL_ERRORS
 from engine.execution.react.react_loop import react_event_loop
 from engine.llm.client import ChatResponse
 from engine.llm.contracts import ToolCallData
@@ -230,6 +231,74 @@ def test_react_loop_treats_approval_timeout_as_blocked_without_executing_tool(tm
     assert len(timeout_events) == 1
     assert timeout_events[0].data["blocked"] is True
     assert timeout_events[0].data["approval_outcome"] == "timed_out"
+
+
+def test_repeated_approval_timeouts_break_the_loop(tmp_path: Path) -> None:
+    """一直等不到审批时必须熔断，不能把恢复预算耗光。
+
+    这条路径原本只加 consecutive_errors 就 continue，不记同错计数 —— 而
+    tool_disabled / pre-hook 阻断 / 工具报错三条拒绝路径都记。模型重发同一
+    调用就再弹一次审批窗、再等最长 300 秒，"Approval timed out" 读起来又像
+    瞬时故障，天然诱导重试：无人值守时整个 run 就挂在没人会批的提示上。
+    """
+    class TimedOutBroker(ApprovalBroker):
+        async def wait(self, request, *, timeout_seconds=300.0):
+            raise ApprovalTimeoutError("Approval timed out")
+
+    class _PersistentLLM:
+        """A model that keeps asking for the same blocked call."""
+
+        def __init__(self, target: Path) -> None:
+            self.target = target
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            self.calls += 1
+            return ChatResponse(
+                tool_calls=[
+                    ToolCallData(
+                        id=f"tool-{self.calls}",
+                        name="write_file",
+                        arguments={"path": str(self.target), "content": "x"},
+                    )
+                ]
+            )
+
+    async def run():
+        target = tmp_path / "must-not-exist.txt"
+        registry = ToolRegistry()
+
+        async def write_file(path: str, content: str):
+            Path(path).write_text(content, encoding="utf-8")
+            return "written"
+
+        registry.register(
+            "write_file", "Write", {}, write_file,
+            permission_level="write", approval_policy="policy", side_effect="write",
+        )
+        guard = ToolGuard(tmp_path / "missing-rules.json", allowed_dirs=[tmp_path])
+        guard.bind_definitions(registry.definitions())
+        llm = _PersistentLLM(target)
+        events = []
+        with use_approval_context(TimedOutBroker(), "run-1"):
+            async for event in react_event_loop(
+                llm,
+                [{"role": "user", "content": "write"}],
+                registry,
+                guard,
+                max_iters=40,
+            ):
+                events.append(event)
+        return events, llm.calls
+
+    events, calls = asyncio.run(run())
+
+    incomplete = [e for e in events if e.type is EventType.INCOMPLETE]
+    assert incomplete, "the loop never gave up on the unapprovable call"
+    assert incomplete[-1].data["reason"] == "identical_tool_error_loop"
+    assert calls <= MAX_IDENTICAL_TOOL_ERRORS + 1, (
+        f"kept re-prompting for approval {calls} times"
+    )
 
 
 class _ApprovalLLM:

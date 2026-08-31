@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id);
 
+-- Token accounting asks "is there a user message between these two instants?"
+-- once per candidate usage row.  Without role and created_at in the index that
+-- question walks the session's whole transcript instead of seeking a range.
+CREATE INDEX IF NOT EXISTS idx_messages_session_role_time
+    ON messages(session_id, role, created_at);
+
 CREATE TABLE IF NOT EXISTS auto_tasks (
     id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,

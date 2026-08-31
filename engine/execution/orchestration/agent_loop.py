@@ -121,7 +121,7 @@ async def run_agent_stream(
         context,
         route.route_id or "",
         user_message,
-        len(skill_chain.nodes),
+        [node.skill_name for node in skill_chain.nodes],
     )
 
     async for event in run_pipeline(
@@ -175,11 +175,29 @@ def _checkpoint_owner_still_running(
     }
 
 
+def _resume_node_still_matches(checkpoint, node_skills: list[str]) -> bool:
+    """Whether the checkpoint's node is still that node in the reloaded chain.
+
+    ``skill_chain_index`` is a position, not an identity.  Every run reloads
+    the chain from YAML (user overrides in ``~/.agent-smith/pipelines/`` win),
+    so a pipeline edited while a node waited for an answer keeps the index
+    valid while moving it onto a different node: the pending answer is then fed
+    to a node that never asked anything, and after a deletion crash recovery's
+    ``index + 1`` skips a node that never ran.  A checkpoint written before
+    ``node_skill`` existed carries no name to compare — see the field's comment
+    for why that resumes instead of being discarded.
+    """
+    index = checkpoint.skill_chain_index
+    if not 0 <= index < len(node_skills):
+        return False
+    return not checkpoint.node_skill or checkpoint.node_skill == node_skills[index]
+
+
 def _apply_session_checkpoint(
     context: dict,
     route_id: str,
     user_message: str,
-    node_count: int,
+    node_skills: list[str],
 ) -> tuple[dict, int]:
     """Resume a crash checkpoint or a deliberate user-input pause.
 
@@ -228,7 +246,7 @@ def _apply_session_checkpoint(
             and checkpoint.identity_id == expected_identity_id
             and checkpoint.working_dir == expected_working_dir
             and checkpoint.route_id == route_id
-            and 0 <= checkpoint.skill_chain_index < node_count
+            and _resume_node_still_matches(checkpoint, node_skills)
         )
         if checkpoint.awaiting_user_input and same_scope:
             logger.info(

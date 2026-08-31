@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from engine.execution.events import EventType, ExecutionEvent, RunObservationContext
+from engine.execution.orchestration.run_state import RunStateStore, RunStatus
 from engine.observability import (
     HealthCalculator,
     IncidentDetector,
@@ -329,6 +330,94 @@ def test_observability_retention_removes_oldest_completed_run_files(
         record.metadata.run_id
         for record in store.list("smith", limit=10)
     ] == ["run-3", "run-2"]
+
+
+def test_observability_retention_removes_the_whole_run_not_just_its_summary(
+    tmp_path,
+) -> None:
+    """A pruned run must leave nothing behind that reads as a crash window.
+
+    Retention deleted the summary and the trace but kept the lifecycle state
+    and the seal anchor, so startup reconciliation could not tell a pruned run
+    from one whose summary write was interrupted.  It re-finalized every pruned
+    run into an empty summary stamped with the current time, which sorted ahead
+    of real runs and evicted them -- and those came back as zombies on the next
+    start, until the index held nothing else.
+    """
+    policy = ObservabilityRetentionPolicy(
+        max_completed_runs=2,
+        max_age_days=None,
+        max_bytes=None,
+    )
+    store = RunSummaryStore(tmp_path, retention=policy)
+    states = RunStateStore(tmp_path)
+    traces = TraceStore(tmp_path)
+    for run_id in ("run-1", "run-2", "run-3"):
+        states.create(run_id, agent_id="smith")
+        states.transition(run_id, RunStatus.RUNNING)
+        states.transition(run_id, RunStatus.COMPLETED)
+        traces.append(run_id, ExecutionEvent(EventType.RUN_FINISHED, {"status": "completed"}))
+        traces.seal(run_id)
+        _save_completed_summary(store, run_id)
+
+    assert store.get("run-1") is None
+    assert not (tmp_path / "runs" / "run-1.json").exists()
+    assert not (tmp_path / "traces" / "run-1.jsonl.head").exists()
+    # 留下来的 run 一件不少。
+    assert (tmp_path / "runs" / "run-3.json").exists()
+    assert (tmp_path / "traces" / "run-3.jsonl.head").exists()
+
+
+def test_observability_retention_keeps_the_state_of_a_run_that_is_live_again(
+    tmp_path,
+) -> None:
+    """正在恢复执行的 run，保留策略一件产物都不能动。
+
+    resume 后的 run 在摘要索引里仍带着上一次尝试的 finished_at，所以它可能在
+    执行途中被选为修剪候选。删状态文件会让它彻底搁浅（之后每次 transition 都
+    抛异常且被 best-effort 吞掉，永远到不了终态；期间若触发审批，服务端看不到
+    WAITING_APPROVAL）；删 trace 更隐蔽 —— 下一次 append 用 O_CREAT 重建文件，
+    torn-tail 检查看到文件变短就把链重置回 genesis，该 run 自己的历史静默消失
+    而 verify() 仍然答 ok。
+    """
+    policy = ObservabilityRetentionPolicy(
+        max_completed_runs=2,
+        max_age_days=None,
+        max_bytes=None,
+    )
+    store = RunSummaryStore(tmp_path, retention=policy)
+    states = RunStateStore(tmp_path)
+    traces = TraceStore(tmp_path)
+    for run_id in ("run-old", "run-new"):
+        states.create(run_id, agent_id="smith")
+        states.transition(run_id, RunStatus.RUNNING)
+        # incomplete 才是可恢复的终态 —— 它同样进摘要索引、同样是修剪候选。
+        states.transition(run_id, RunStatus.INCOMPLETE)
+        traces.append(run_id, ExecutionEvent(EventType.TOOL_CALL_START, {"name": "shell"}))
+        _save_completed_summary(store, run_id)
+
+    # run-old 被 resume 了；它的摘要还带着上一次尝试的 finished_at。
+    states.resume("run-old")
+
+    # 再结束两个 run，保留窗只剩 2 个位置 —— 候选是最老的两个：run-old 与
+    # run-new。前者活着必须整条跳过，后者该照常清掉。
+    for run_id in ("run-newest", "run-newest-2"):
+        states.create(run_id, agent_id="smith")
+        states.transition(run_id, RunStatus.RUNNING)
+        states.transition(run_id, RunStatus.COMPLETED)
+        _save_completed_summary(store, run_id)
+
+    # 活跃 run 的四样产物一件都不能少 —— 只保状态文件是半修：trace 被删后
+    # TraceStore 下一次 append 用 O_CREAT 重建，torn-tail 检查看到文件变短就
+    # 把链重置回 genesis，该 run 自己的历史静默消失而 verify() 仍答 ok；
+    # summary 被删则让 save() 承诺的"合并上一次尝试"无从合并，旧计数一起丢。
+    assert (tmp_path / "runs" / "run-old.json").exists()
+    assert (tmp_path / "traces" / "run-old.jsonl").exists()
+    assert store.get("run-old") is not None
+    state = states.get("run-old")
+    assert state is not None and state.status is RunStatus.RUNNING
+    # 而真正过期的那个照常被清掉。
+    assert store.get("run-new") is None
 
 
 def test_observability_retention_keeps_the_newest_oversized_run(

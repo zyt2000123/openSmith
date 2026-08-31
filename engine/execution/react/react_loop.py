@@ -8,7 +8,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
 from uuid import uuid4
 
-from engine.context import ContextReceipt, fit_request, measure_request
+from engine.context import (
+    ContextReceipt,
+    estimate_tokens,
+    fit_request,
+    measure_request,
+)
 from engine.context.compression import (
     RUNTIME_USER_NOTE_PREFIX,
     compaction_policy_for_llm,
@@ -24,7 +29,7 @@ from engine.llm.contracts import (
     ToolCallData,
 )
 from engine.llm.events import ProviderEvent, ProviderEventType
-from engine.llm.usage import normalize_usage
+from engine.llm.usage import USAGE_REPORTED_KEY, normalize_usage
 from engine.safety.approval import (
     ApprovalRequest,
     ApprovalTimeoutError,
@@ -38,11 +43,9 @@ from engine.tool.interface import ToolCall
 
 from .budget import (
     CONTINUE_AFTER_LENGTH_HINT,
-    CONVERSATION_HARD_LIMIT,
-    CONVERSATION_KEEP_HEAD,
-    CONVERSATION_KEEP_RECENT,
     DEFAULT_MAX_REACT_ITERS,
     INCOMPLETE_FINAL_AFTER_TOOL_HINT,
+    MAX_COMPACTION_FAILURES,
     MAX_FAILED_TOOL_RECOVERY_ITERS,
     MAX_IDENTICAL_TOOL_ERRORS,
     MAX_INCOMPLETE_FINAL_REPAIRS,
@@ -55,6 +58,7 @@ from .budget import (
     TOOL_FAILURE_HINT,
     budget_exhausted_message,
     looks_like_incomplete_final_after_tool,
+    trim_conversation_to_message_cap,
 )
 from .smith_ui import smith_ui_fallback, validate_smith_ui_call
 
@@ -292,6 +296,47 @@ def _provisional_retract_event(provision_id: str, reason: str) -> ExecutionEvent
     })
 
 
+def _final_text_delivery(parts: list[tuple[str, bool]]) -> tuple[str, bool]:
+    """Join the collected fragments and say whether the client already has them.
+
+    ``already_streamed`` means "skip rendering" to the consumer, so it may only
+    be set when *every* fragment reached the client as a stream.  A stream that
+    dies before its first semantic delta falls back to a non-streaming
+    ``llm.chat`` call, and that fragment was never sent; if it then finishes on
+    the length limit, the streamed continuation used to mark the whole join as
+    already rendered — the first half was persisted but never shown.
+
+    Reporting a mixed reply as not streamed re-renders it.  Under provisional
+    lifecycle the caller retracts the streamed draft first, so nothing is
+    duplicated; without it (pipeline nodes, sub-agents) the streamed fragment
+    is not retractable and shows twice — a visible repeat is recoverable for
+    the reader, silently losing half the answer is not.
+    """
+    text = "".join(part for part, _ in parts)
+    return text, bool(parts) and all(streamed for _, streamed in parts)
+
+
+def _final_text_events(
+    final_text: str,
+    *,
+    streamed: bool,
+    provision_ids: list[str],
+) -> list[ExecutionEvent]:
+    """Close the open drafts and emit the final text as one consistent pair.
+
+    Committing a draft and then re-sending the same text unmarked renders it
+    twice, so the draft is retracted exactly when the join is re-sent.
+    """
+    events: list[ExecutionEvent] = [
+        _provisional_commit_event(provision_id)
+        if streamed
+        else _provisional_retract_event(provision_id, "unstreamed_fragment_pending")
+        for provision_id in provision_ids
+    ]
+    events.append(_text_event(final_text, already_streamed=streamed))
+    return events
+
+
 def _usage_event_data(usage: dict | None) -> dict | None:
     normalized = normalize_usage(usage)
     if not any(normalized.values()):
@@ -302,6 +347,39 @@ def _usage_event_data(usage: dict | None) -> dict | None:
         key: value
         for key, value in normalized.items()
         if value or key in ("input_tokens", "output_tokens", "total_tokens")
+    }
+
+
+def _estimated_usage_event_data(
+    receipt: ContextReceipt,
+    response: ChatResponse,
+) -> dict:
+    """Charge an estimate when the provider reported no usage at all.
+
+    Streaming usage arrives only if the provider honours
+    ``stream_options.include_usage``; plenty of OpenAI-compatible relays drop
+    it, and then no TOKEN_USAGE event was emitted for the turn.  Sub-agent
+    spend is metered from exactly those events, so both the per-agent and the
+    per-batch token budgets silently stopped applying — a runaway was bounded
+    only by the iteration cap and the wall-clock timeout.  An estimate is
+    wrong in the last digit; no event is wrong by the whole budget.
+
+    ``usage_reported`` stays 0: this is not a provider number, and the
+    observability side must keep being able to tell the difference.
+    """
+    output_text = (response.text or "") + (response.reasoning or "")
+    for call in response.tool_calls or ():
+        output_text += json.dumps(
+            getattr(call, "arguments", ""), ensure_ascii=False, default=str
+        )
+    input_tokens = receipt.estimated_input_tokens
+    output_tokens = estimate_tokens(output_text)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        USAGE_REPORTED_KEY: 0,
+        "estimated": True,
     }
 
 
@@ -391,30 +469,6 @@ def _should_repair_incomplete_final(
         and repair_count < MAX_INCOMPLETE_FINAL_REPAIRS
         and looks_like_incomplete_final_after_tool(text)
     )
-
-
-def _elision_note(dropped: list[dict]) -> list[dict]:
-    """Leave a marker where trimmed messages used to be.
-
-    Dropping the middle of the conversation outright removed every trace that
-    those calls ever happened -- strictly worse than a pruned result, which at
-    least keeps the call itself visible.  The model then re-ran work it had
-    already completed, which is the same failure mode `[pruned: ...]` stubs
-    exist to prevent.  One system line is far cheaper than the re-run.
-    """
-    if not dropped:
-        return []
-    tool_results = sum(1 for message in dropped if message.get("role") == "tool")
-    detail = f", including {tool_results} tool result(s)" if tool_results else ""
-    return [{
-        "role": "system",
-        "content": (
-            f"[{len(dropped)} earlier messages were elided to fit the context "
-            f"window{detail}. That work still happened: rely on what you already "
-            "established rather than repeating it, and say so if you genuinely "
-            "need a result again.]"
-        ),
-    }]
 
 
 def _repeat_key(tool_name: str, arguments: object) -> str:
@@ -514,44 +568,41 @@ async def react_event_loop(
     had_successful_tool = False
     incomplete_final_repairs = 0
     length_continuations = 0
-    final_text_parts: list[str] = []
-    final_text_was_streamed = False
+    # (fragment, was_streamed) per fragment, not one flag for the join: a reply
+    # can mix a non-streamed fallback fragment with a streamed continuation,
+    # and a single flag then mislabels one of them — see _final_text_delivery.
+    final_text_parts: list[tuple[str, bool]] = []
     active_provision_ids: list[str] = []
     last_error_key: str | None = None
     identical_error_count = 0
+
+    def _repeats_of(error_key: str) -> int:
+        """Count consecutive rounds ending in the same refusal.
+
+        Shared by every path that can refuse the same call forever — a disabled
+        tool, a hook that always denies, a tool that always errors, and a user
+        who keeps declining the approval.  It lived inline in the first three;
+        the approval path was written without it and could re-prompt the same
+        call up to the recovery cap, which with a 300 s approval timeout is
+        unattended hours of a run waiting on a prompt nobody will grant.
+        """
+        nonlocal last_error_key, identical_error_count
+        if error_key == last_error_key:
+            identical_error_count += 1
+        else:
+            last_error_key = error_key
+            identical_error_count = 1
+        return identical_error_count
+
+    # 与上面的同错熔断互补：那个数的是连续同错，这里数的是同参成功重复。
     repeat_counts: dict[str, int] = {}
     repeat_warned: set[str] = set()
     context_recoveries = 0
     model_compaction_enabled = True
+    compaction_failures = 0
 
     while productive_iters < max_iters:
-        if len(conversation) > CONVERSATION_HARD_LIMIT:
-            # ponytail: keep head (system + initial user) and recent tail
-            head = conversation[:CONVERSATION_KEEP_HEAD]
-            # 切点落在 tool 结果串中会拆散 assistant(tool_calls)/tool 配对
-            # （provider 400）。向前回退到 assistant/user 边界：同一轮的 tool
-            # 结果之间可能夹着 system 提示（TOOL_FAILURE_HINT 在 tool_calls
-            # 循环内 append），只认 role=="tool" 会在提示处停下留下孤儿。
-            requested_cut = len(conversation) - CONVERSATION_KEEP_RECENT
-            cut = requested_cut
-            while cut > CONVERSATION_KEEP_HEAD and conversation[cut].get("role") in ("tool", "system"):
-                cut -= 1
-            if cut <= CONVERSATION_KEEP_HEAD:
-                # 回退撞到 head 边界时 head+tail 就是整条对话，这道上限静默
-                # 失效：一轮 8 个并行工具调用即可（实测 41 条裁剪后仍是 41
-                # 条，30 个调用时 63 条原样返回）。改为向后找下一个边界 ——
-                # 丢弃的更多，但配对完整且一定有进展。整条尾巴都是
-                # tool/system 时没有安全切点，保持原样交给 fit_request 兜底。
-                forward = requested_cut
-                while forward < len(conversation) and conversation[forward].get("role") in ("tool", "system"):
-                    forward += 1
-                if forward < len(conversation):
-                    cut = forward
-            tail = conversation[cut:]
-            while head and head[-1].get("role") == "assistant" and head[-1].get("tool_calls"):
-                head.pop()
-            dropped = conversation[len(head):cut]
-            conversation = head + _elision_note(dropped) + tail
+        conversation = trim_conversation_to_message_cap(conversation)
 
         pre_fit_receipt = measure_request(conversation, tools, llm)
         compression_started = (
@@ -571,7 +622,11 @@ async def react_event_loop(
             action in {"compaction_failed", "compaction_rejected"}
             for action in fit.actions
         ):
-            model_compaction_enabled = False
+            # 闩锁而不是每轮重试：真正压不动的对话（history 为空）重试无用。
+            # 但一次超时/限流/被截断的摘要也会走到这里，单次即永久关停会让整
+            # 个 run 只剩删除式裁剪 —— 瞬时故障给一次重试再闩锁。
+            compaction_failures += 1
+            model_compaction_enabled = compaction_failures < MAX_COMPACTION_FAILURES
         fit_changed = list(fit.messages) != conversation
         if fit_changed and not compression_started:
             yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
@@ -754,12 +809,19 @@ async def react_event_loop(
                 conversation = _recover_context_after_provider_rejection(conversation, llm)
                 yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
                 continue
-        usage = _usage_event_data(response.usage)
-        if usage:
-            yield ExecutionEvent(EventType.TOKEN_USAGE, usage)
+        usage = _usage_event_data(response.usage) or _estimated_usage_event_data(
+            fit.receipt, response
+        )
+        yield ExecutionEvent(EventType.TOKEN_USAGE, usage)
         yield _context_usage_event(
             fit.receipt,
-            input_tokens=usage.get("input_tokens") if usage else None,
+            # Only a provider-reported count may pass as exact.  The estimated
+            # fallback feeds back receipt.estimated_input_tokens, so handing it
+            # over produced a positive int and flipped ``estimated`` to False —
+            # the one field whose whole job is telling the two apart.
+            input_tokens=(
+                usage.get("input_tokens") if usage.get(USAGE_REPORTED_KEY) else None
+            ),
             fit_status=fit.status.value,
             actions=fit.actions,
         )
@@ -776,7 +838,6 @@ async def react_event_loop(
                 yield _provisional_retract_event(provision_id, "tool_call_pending")
             active_provision_ids.clear()
             final_text_parts.clear()
-            final_text_was_streamed = False
 
         if response.finish_reason == "length" and response.has_tool_calls:
             # A length-limited tool call may have incomplete JSON arguments.
@@ -813,9 +874,8 @@ async def react_event_loop(
 
         if not response.has_tool_calls:
             if response.text:
-                final_text_parts.append(response.text)
-                final_text_was_streamed = final_text_was_streamed or response_text_was_streamed
-            final_text = "".join(final_text_parts)
+                final_text_parts.append((response.text, response_text_was_streamed))
+            final_text, final_text_streamed = _final_text_delivery(final_text_parts)
 
             if response.finish_reason == "length":
                 if length_continuations < MAX_LENGTH_CONTINUATIONS:
@@ -825,10 +885,13 @@ async def react_event_loop(
                     )
                     continue
                 if final_text:
-                    for provision_id in active_provision_ids:
-                        yield _provisional_commit_event(provision_id)
+                    for event in _final_text_events(
+                        final_text,
+                        streamed=final_text_streamed,
+                        provision_ids=active_provision_ids,
+                    ):
+                        yield event
                     active_provision_ids.clear()
-                    yield _text_event(final_text, already_streamed=final_text_was_streamed)
                 yield ExecutionEvent(EventType.INCOMPLETE, {
                     "reason": "model_output_limit",
                     "continuations": length_continuations,
@@ -841,7 +904,7 @@ async def react_event_loop(
                         yield _provisional_retract_event(provision_id, "content_filter")
                     active_provision_ids.clear()
                 elif final_text:
-                    yield _text_event(final_text, already_streamed=final_text_was_streamed)
+                    yield _text_event(final_text, already_streamed=final_text_streamed)
                 yield ExecutionEvent(EventType.INCOMPLETE, {"reason": "content_filter"})
                 return
 
@@ -858,7 +921,7 @@ async def react_event_loop(
                         yield _provisional_retract_event(provision_id, "unknown_provider_finish_reason")
                     active_provision_ids.clear()
                 elif final_text:
-                    yield _text_event(final_text, already_streamed=final_text_was_streamed)
+                    yield _text_event(final_text, already_streamed=final_text_streamed)
                 yield ExecutionEvent(EventType.INCOMPLETE, {
                     "reason": "unknown_provider_finish_reason",
                     "raw_finish_reason": response.raw_finish_reason,
@@ -883,13 +946,15 @@ async def react_event_loop(
                     conversation, response.text, response.reasoning
                 )
                 final_text_parts.clear()
-                final_text_was_streamed = False
                 continue
             if final_text:
-                for provision_id in active_provision_ids:
-                    yield _provisional_commit_event(provision_id)
+                for event in _final_text_events(
+                    final_text,
+                    streamed=final_text_streamed,
+                    provision_ids=active_provision_ids,
+                ):
+                    yield event
                 active_provision_ids.clear()
-                yield _text_event(final_text, already_streamed=final_text_was_streamed)
             else:
                 # A successful tool call is evidence gathering, not a valid
                 # chat completion.  The caller still needs a final assistant
@@ -1106,13 +1171,7 @@ async def react_event_loop(
                 })
                 round_had_failure = True
                 consecutive_errors += 1
-                error_key = f"{tc.name}:{content[:120]}"
-                if error_key == last_error_key:
-                    identical_error_count += 1
-                else:
-                    last_error_key = error_key
-                    identical_error_count = 1
-                if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                if _repeats_of(f"{tc.name}:{content[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
                     yield ExecutionEvent(
                         EventType.TEXT_DELTA,
                         {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
@@ -1224,6 +1283,23 @@ async def react_event_loop(
                             })
                             round_had_failure = True
                             consecutive_errors += 1
+                            # 没有拒绝记忆：模型重发同一调用就再弹一次审批窗、
+                            # 再等最长 300 秒。"Approval timed out" 读起来像瞬时
+                            # 故障，天然诱导重试 —— 无人值守时整个 run 就这么挂
+                            # 到恢复上限。同错熔断和其它三条拒绝路径一致。
+                            if _repeats_of(
+                                f"{tc.name}:{denial[:120]}"
+                            ) >= MAX_IDENTICAL_TOOL_ERRORS:
+                                yield ExecutionEvent(
+                                    EventType.TEXT_DELTA,
+                                    {"text": budget_exhausted_message(
+                                        TOOL_FAILURE_BUDGET_MESSAGE
+                                    )},
+                                )
+                                yield ExecutionEvent(EventType.INCOMPLETE, {
+                                    "reason": "identical_tool_error_loop",
+                                })
+                                return
                             continue
                     else:
                         conversation.append({"role": "tool", "tool_call_id": call.id, "content": decision.observation})
@@ -1302,13 +1378,7 @@ async def react_event_loop(
                     # other error paths already bound; without this the model can
                     # retry a permanently-blocked edit until the whole iteration
                     # budget is gone.
-                    error_key = f"{tc.name}:{denial[:120]}"
-                    if error_key == last_error_key:
-                        identical_error_count += 1
-                    else:
-                        last_error_key = error_key
-                        identical_error_count = 1
-                    if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                    if _repeats_of(f"{tc.name}:{denial[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
                         yield ExecutionEvent(
                             EventType.TEXT_DELTA,
                             {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
@@ -1374,13 +1444,7 @@ async def react_event_loop(
             if result.is_error:
                 round_had_failure = True
                 consecutive_errors += 1
-                error_key = f"{tc.name}:{result.content[:120]}"
-                if error_key == last_error_key:
-                    identical_error_count += 1
-                else:
-                    last_error_key = error_key
-                    identical_error_count = 1
-                if identical_error_count >= MAX_IDENTICAL_TOOL_ERRORS:
+                if _repeats_of(f"{tc.name}:{result.content[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
                     yield ExecutionEvent(
                         EventType.TEXT_DELTA,
                         {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},

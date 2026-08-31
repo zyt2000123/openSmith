@@ -603,5 +603,22 @@ def use_approval_context(broker: ApprovalBroker, run_id: str) -> Iterator[None]:
         _CURRENT_APPROVAL_CONTEXT.reset(token)
 
 
+@contextmanager
+def without_approval_context() -> Iterator[None]:
+    """Detach the current task from the user's approval broker.
+
+    A nested agent has no human in its loop: forwarding its approval request
+    to the parent's broker would block on ``broker.wait`` for a prompt the
+    user never sees. Detached, the ReAct loop takes its "broker unavailable"
+    branch instead — the call is refused, the agent is told why, and it can
+    adapt or report rather than hang until timeout.
+    """
+    token = _CURRENT_APPROVAL_CONTEXT.set(None)
+    try:
+        yield
+    finally:
+        _CURRENT_APPROVAL_CONTEXT.reset(token)
+
+
 def current_approval_context() -> tuple[ApprovalBroker, str] | None:
     return _CURRENT_APPROVAL_CONTEXT.get()

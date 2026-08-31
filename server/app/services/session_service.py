@@ -20,7 +20,11 @@ from engine.execution import (
     run_stream_with_runtime as engine_run_stream_with_runtime,
     resume_stream_with_runtime as engine_resume_stream_with_runtime,
 )
-from engine.context import CONTEXT_DISPLAY_WINDOW, summarize_session
+from engine.context import (
+    CONTEXT_DISPLAY_WINDOW,
+    SESSION_SUMMARY_PREFIX,
+    summarize_session,
+)
 from engine.identity import IdentityCatalog, IdentityCatalogError
 from engine.llm.model_config import resolve_llm_config
 from engine.llm.observability import generation_context
@@ -235,7 +239,7 @@ class SessionService:
         summary = context.get("context_summary") if isinstance(context, dict) else ""
         cutoff = context.get("context_summary_cutoff", 0) if isinstance(context, dict) else 0
         if summary:
-            history = [{"role": "user", "content": f"[Session context summary]\n{summary}"}]
+            history = [{"role": "user", "content": f"{SESSION_SUMMARY_PREFIX}{summary}"}]
             if isinstance(cutoff, int) and cutoff > 0:
                 # cutoff counts from the start of the session, so it cannot be
                 # paged from directly: get_messages caps a page at 200, and
@@ -273,7 +277,7 @@ class SessionService:
         cutoff = context.get("context_summary_cutoff", 0) if isinstance(context, dict) else 0
         history: list[dict] = []
         if isinstance(summary, str) and summary:
-            history.append({"role": "user", "content": f"[Session context summary]\n{summary}"})
+            history.append({"role": "user", "content": f"{SESSION_SUMMARY_PREFIX}{summary}"})
             if isinstance(cutoff, int) and cutoff > 0 and prior_rows:
                 # cutoff is absolute; prior_rows is a window of at most
                 # _HISTORY_LIMIT rows ending at message_id.  Slicing by the raw

@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import aiosqlite
 
 from common import config as common_config
+from engine.llm.usage import USAGE_REPORTED_KEY
 from engine.observability import ObservabilityReader, TraceIntegrityError
 
 if TYPE_CHECKING:
@@ -22,6 +25,147 @@ DbProvider = Callable[[], Awaitable[aiosqlite.Connection]]
 
 # These values describe unavailable or locally derived attribution, not a model.
 _NON_MODEL_STAT_KEYS = frozenset({"unknown", "local-estimate"})
+# source_key namespaces.  A NULL key means "provider-reported, recorded live";
+# everything else says where the row came from *and* whether its numbers are a
+# local guess: 'message:{id}' transcript estimate, 'estimate:live:{uuid}' engine
+# estimate recorded live, 'estimate:trace:{run}:{seq}' the same imported from a
+# trace, '{run}:{seq}' provider-reported and imported from a trace.  The two
+# estimate namespaces share a prefix so read paths test one string, and differ
+# in origin because the import path deletes its own rows by origin.
+_LIVE_ESTIMATE_PREFIX = "estimate:live:"
+_TRACE_ESTIMATE_PREFIX = "estimate:trace:"
+_ESTIMATE_PREFIXES = ("message:", "estimate:")
+
+# A usage event supersedes a transcript estimate only when the two describe the
+# *same turn*.  Turn boundaries are the user messages, so an event and a message
+# share a turn exactly when no user message falls between them.
+#
+# Scoping this per session instead — "this session now has a real usage event,
+# drop all of its 'message:' estimates" — also erased every earlier turn the
+# engine never priced (a relay that reported no usage, or turns older than the
+# feature).  The rows never came back either: the regeneration guard read the
+# session as exact and skipped it.  One event could therefore drop a 40-turn
+# conversation to whatever that single event was worth.
+#
+# Stating that as "no user message between them" leaves ``e.session_id`` as the
+# only constraint on the event side, so the test walked every event of the
+# session once per candidate estimate — and a session's events are mostly one
+# estimate per message, which makes that quadratic in the session's transcript
+# length.  The equivalent interval form bounds ``e.occurred_at`` directly:
+# ``m`` shares a turn with the events in [prev_user(m), next_user(m)), where
+# prev_user is the newest user message not after ``m`` and next_user the oldest
+# strictly after it.  ``''`` sorts below and ``char(1114111)`` (U+10FFFF, whose
+# UTF-8 lead byte 0xF4 is above every ASCII digit) above any ISO timestamp, so an
+# absent boundary means "unbounded on that side".
+#
+# Both bounds are seeks on messages(session_id, role, created_at), and the event
+# lookup becomes one range seek on token_usage_events(session_id, occurred_at)
+# instead of a full walk of the session's rows.  Measured on an on-disk WAL
+# database at the real schema, per record_usage() call / per startup delete:
+#   20 sessions x 2400 messages:   324 / 6482 ms  ->   5 /  89 ms
+#   1 session   x 4800 messages:  1271 / 1266 ms  ->   8 /   8 ms
+#   1 session   x 9600 messages:  5273 / 5412 ms  ->  17 /  17 ms
+# The shape where every turn already carries an event, on which the previous
+# form could short-circuit early, improves too: 20x2400 startup 20335 -> 175 ms.
+#
+# Both timestamps are UTC ISO-8601 strings, which is what makes these string
+# comparisons time comparisons; the rest of this module already relies on that.
+_SAME_TURN_USAGE_EXISTS = """
+EXISTS (
+    SELECT 1 FROM token_usage_events e
+    WHERE e.session_id = m.session_id
+      AND (e.source_key IS NULL OR e.source_key NOT LIKE 'message:%')
+      AND e.occurred_at >= COALESCE((
+          SELECT max(b.created_at) FROM messages b
+          WHERE b.session_id = m.session_id AND b.role = 'user'
+            AND b.created_at <= m.created_at
+      ), '')
+      AND e.occurred_at < COALESCE((
+          SELECT min(b.created_at) FROM messages b
+          WHERE b.session_id = m.session_id AND b.role = 'user'
+            AND b.created_at > m.created_at
+      ), char(1114111))
+)
+"""
+
+# ``substr(source_key, 9)`` strips the 'message:' prefix, so the estimate row is
+# matched to its message through the messages primary key.  Comparing
+# ``'message:' || m.id`` to the source key instead is an expression over ``m``,
+# which no index can serve: every candidate estimate re-scanned the whole
+# messages table.
+_SUPERSEDED_BY_SAME_TURN_EVENT = f"""
+EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.id = substr(token_usage_events.source_key, 9)
+      AND {_SAME_TURN_USAGE_EXISTS}
+)
+"""
+
+_SUPERSEDED_ESTIMATES_DELETE = f"""
+DELETE FROM token_usage_events
+WHERE source_key LIKE 'message:%'
+  AND {_SUPERSEDED_BY_SAME_TURN_EVENT}
+"""
+
+# The live path runs once per LLM turn and must not walk the whole table to
+# clean up at most its own turn's rows.  Written as a second statement rather
+# than ``(:session_id IS NULL OR session_id = :session_id)``: that form is not
+# sargable, so binding a session narrowed nothing and the hot path scanned every
+# row anyway.
+_SUPERSEDED_ESTIMATES_DELETE_FOR_SESSION = f"""
+DELETE FROM token_usage_events
+WHERE source_key LIKE 'message:%'
+  AND session_id = ?
+  AND {_SUPERSEDED_BY_SAME_TURN_EVENT}
+"""
+
+# An estimate whose message row is gone can never be matched by the turn-scoped
+# delete above, which reaches the estimate *through* that row.  Resume deletes
+# the assistant messages after the resumed user turn
+# (``discard_assistant_messages_after_user``), so without this the leftovers
+# accumulate one per resume — and a single one flips the whole panel's
+# ``estimated`` flag, which is the only thing that field is for.
+_ORPHANED_ESTIMATES_DELETE = """
+DELETE FROM token_usage_events
+WHERE source_key LIKE 'message:%'
+  AND NOT EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.id = substr(token_usage_events.source_key, 9)
+  )
+"""
+
+# The cheap term first: 'already has an estimate' is one seek on the unique
+# source_key index and retires almost every row, while the same-turn test costs
+# several seeks.  Written the other way round, the expensive term ran for rows
+# that were about to be discarded anyway.
+_UNPRICED_TRANSCRIPT_MESSAGES = f"""
+SELECT m.id, m.session_id, m.role, m.content, m.created_at
+FROM messages m
+JOIN sessions s ON s.id = m.session_id
+WHERE NOT EXISTS (
+      SELECT 1 FROM token_usage_events prior
+      WHERE prior.source_key = 'message:' || m.id
+  )
+  AND NOT {_SAME_TURN_USAGE_EXISTS}
+ORDER BY m.created_at ASC
+"""
+
+# How long either import may hold SQLite's single writer lock before it commits
+# and gives a waiting writer a window.  Time is the criterion because rows are
+# not equally expensive, and a row count says nothing about what each row costs:
+# on 20k messages of which 5% are a 60KB transcript, 500 rows per transaction
+# held the lock 0.54s at the maximum and 0.09s at the median, which starved a
+# concurrent ``add_message``-shaped writer down to 11-16 attempts over the run
+# with a single write waiting up to 4.5s of its 5s busy_timeout.  On the same
+# budget the maximum hold is 0.02s and the writer gets ~160 attempts through.
+_WRITE_BATCH_SECONDS = 0.05
+
+# Second ceiling on the estimate backfill, so a transaction also stays bounded
+# in WAL pages and in how much work a crash discards, on a machine fast enough
+# that the time budget alone would swallow the whole transcript.  It is the
+# gate that fires in practice for small rows: 500 tiny INSERTs measure ~17ms.
+_ESTIMATE_COMMIT_INTERVAL = 500
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,17 +217,26 @@ class TokenStatsService:
         if total_tokens == 0:
             return
 
+        # usage_reported == 0 marks the engine's own estimate, emitted when the
+        # provider reported nothing.  Stored with a NULL source_key it would be
+        # indistinguishable from provider billing data, and a CJK turn estimated
+        # at 3 tokens per character overstates the panel by roughly 3x with no
+        # way for a reader to tell.  A missing flag is an older writer, which
+        # only ever emitted provider-reported usage.
+        estimated = not usage.get(USAGE_REPORTED_KEY, 1)
+        source_key = f"{_LIVE_ESTIMATE_PREFIX}{uuid4().hex}" if estimated else None
         db = await self._db_provider()
         await db.execute(
             """
             INSERT INTO token_usage_events (
-                session_id, run_id, project_name, project_path, model,
+                session_id, run_id, source_key, project_name, project_path, model,
                 input_tokens, output_tokens, total_tokens, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
                 run_id,
+                source_key,
                 project_name.strip(),
                 project_path.strip(),
                 model.strip() or "unknown",
@@ -93,15 +246,14 @@ class TokenStatsService:
                 (occurred_at or datetime.now(timezone.utc)).isoformat(),
             ),
         )
-        # An exact usage event supersedes the local text-token estimates for the
-        # same session (they carry source_key LIKE 'message:%'); clear them in the
-        # same transaction so get_stats never double-counts between this call and
-        # the next sync_from_traces.
-        await db.execute(
-            "DELETE FROM token_usage_events "
-            "WHERE source_key LIKE 'message:%' AND session_id=?",
-            (session_id,),
-        )
+        # A per-turn usage event supersedes the local text-token estimates of
+        # *its own turn* (they carry source_key LIKE 'message:%'); clear them in
+        # the same transaction so get_stats never double-counts between this
+        # call and the next sync_from_traces.  This holds for an engine estimate
+        # too: it prices the same turn from the prompt side, so keeping both
+        # would count that turn twice.  Earlier turns are a different matter —
+        # see _SUPERSEDED_ESTIMATES_DELETE for why they must survive.
+        await db.execute(_SUPERSEDED_ESTIMATES_DELETE_FOR_SESSION, (session_id,))
         # A resumed run (server restarted after the trace was imported) would
         # otherwise keep both its live rows and the trace-imported rows for the
         # whole process lifetime: sync_from_traces only heals at the next startup.
@@ -111,7 +263,10 @@ class TokenStatsService:
             await db.execute(
                 "DELETE FROM token_usage_events "
                 "WHERE run_id=? AND source_key IS NOT NULL "
-                "AND source_key NOT LIKE 'message:%'",
+                "AND source_key NOT LIKE 'message:%' "
+                # Live estimates for this run are what this method just wrote;
+                # only trace-imported rows are the duplicates being healed.
+                "AND source_key NOT LIKE 'estimate:live:%'",
                 (run_id,),
             )
         await db.commit()
@@ -238,13 +393,21 @@ class TokenStatsService:
         Trace values that were redacted by older versions are ignored because they
         are not trustworthy numeric usage data. New traces preserve these metrics
         while continuing to redact secrets.
+
+        Must be given a connection of its own.  ``rollback()`` below discards
+        *everything* uncommitted on the connection it runs against, including an
+        INSERT another coroutine has executed but not yet committed — that is
+        how a user message written by ``add_message`` disappeared silently when
+        this ran on the shared connection.  ``main.lifespan`` supplies a private
+        one; a SAVEPOINT would not help, since the sibling's statements land
+        inside the savepoint too.
         """
         try:
             return await self._sync_from_traces_inner()
         except Exception:
-            # A failed import must not leave the shared connection inside an
-            # open write transaction: that would hold the database write lock
-            # for the process lifetime and lock out every other writer.
+            # A failed import must not leave its connection inside an open write
+            # transaction: that would hold the database write lock for the
+            # process lifetime and lock out every other writer.
             try:
                 await (await self._db_provider()).rollback()
             except Exception:
@@ -277,6 +440,12 @@ class TokenStatsService:
             return await self._sync_message_estimates(await self._db_provider())
 
         db = await self._db_provider()
+        # Duplicates the definition in infrastructure/schema.py, which owns the
+        # shared-connection migration; this copy exists for direct callers that
+        # bring a minimal database.  On the lifespan path ``ensure_schema`` has
+        # already created the table, and SQLite takes no write lock for an
+        # IF-NOT-EXISTS no-op, so running it on the backfill's private
+        # connection does not contend.  Changing one copy means changing both.
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS observability_trace_cursors (
@@ -292,7 +461,16 @@ class TokenStatsService:
         # violate the sessions FK, so they are skipped up front.
         try:
             session_rows = await db.execute_fetchall("SELECT id FROM sessions")
-        except aiosqlite.OperationalError:
+        except aiosqlite.OperationalError as exc:
+            # Same split as _sync_message_estimates: a missing table is the
+            # minimal-database case, anything else (``database is locked`` above
+            # all) would silently reduce the import to "no sessions exist" and
+            # import nothing at all.
+            if "no such table" not in str(exc).lower():
+                logger.warning(
+                    "token trace import saw no sessions after a database error",
+                    exc_info=True,
+                )
             session_rows = []
         known_sessions = {str(row["id"]) for row in session_rows}
         cursor_rows = await db.execute_fetchall(
@@ -323,18 +501,27 @@ class TokenStatsService:
                 "DELETE FROM observability_trace_cursors WHERE run_id=?",
                 [(run_id,) for run_id in stale_cursor_ids],
             )
+            # Its own transaction, like every write below: this used to stay
+            # open until the very end of the import, so a large trace batch held
+            # the writer lock across the whole run.  Losing the rest of the
+            # import after this commit is harmless — the cursors it drops belong
+            # to traces that no longer exist, so nothing re-reads them.
+            await db.commit()
 
-        # Runs whose usage was already recorded live (source_key IS NULL, written
-        # by record_usage during an SSE stream) must not be re-imported from their
-        # traces: the same token_usage event would then exist twice and get_stats
-        # would double-count every interactive run after the first restart.  Auto
-        # tasks never call record_usage, so they still arrive through this import.
+        # Runs whose usage was already recorded live (by record_usage during an
+        # SSE stream) must not be re-imported from their traces: the same
+        # token_usage event would then exist twice and get_stats would
+        # double-count every interactive run after the first restart.  A live
+        # estimate counts as recorded — the trace holds that same estimated
+        # event, so importing it duplicates the turn.  Auto tasks never call
+        # record_usage, so they still arrive through this import.
         live_recorded_run_ids = {
             str(row["run_id"])
             for row in await db.execute_fetchall(
                 """
                 SELECT DISTINCT run_id FROM token_usage_events
-                WHERE source_key IS NULL AND run_id IS NOT NULL
+                WHERE (source_key IS NULL OR source_key LIKE 'estimate:live:%')
+                  AND run_id IS NOT NULL
                 """
             )
         }
@@ -346,9 +533,14 @@ class TokenStatsService:
                 DELETE FROM token_usage_events
                 WHERE run_id=? AND source_key IS NOT NULL
                   AND source_key NOT LIKE 'message:%'
+                  AND source_key NOT LIKE 'estimate:live:%'
                 """,
                 [(run_id,) for run_id in live_recorded_run_ids],
             )
+            # Committed on its own for the same reason.  These rows are
+            # duplicates of live-recorded usage, so their removal is the end
+            # state whether or not the rest of the import completes.
+            await db.commit()
 
         def read_new_trace_records():
             batches = []
@@ -372,6 +564,12 @@ class TokenStatsService:
 
         trace_batches = await asyncio.to_thread(read_new_trace_records)
         imported = 0
+        # This import had no batching at all: every event of every run and every
+        # cursor upsert landed in one transaction, so a startup that had a large
+        # backlog of traces to catch up on locked out the request path for its
+        # whole duration.  ``batch_started is None`` means no write transaction
+        # is open yet, so the clock starts at the statement that takes the lock.
+        batch_started: float | None = None
         for run_id, records, next_offset in trace_batches:
             session_id = run_sessions.get(run_id)
             if not session_id or session_id not in known_sessions:
@@ -409,7 +607,18 @@ class TokenStatsService:
                     continue
 
                 timestamp = self._parse_timestamp(record.get("timestamp"))
-                source_key = f"{run_id}:{record.get('seq', line_number)}"
+                # Same rule as the live path: an engine estimate keeps its own
+                # namespace so it is never read back as provider billing data.
+                # Auto-task runs reach the database only through this import,
+                # so leaving it out here would exempt them from the labelling.
+                prefix = (
+                    _TRACE_ESTIMATE_PREFIX
+                    if not data.get(USAGE_REPORTED_KEY, 1)
+                    else ""
+                )
+                source_key = f"{prefix}{run_id}:{record.get('seq', line_number)}"
+                if batch_started is None:
+                    batch_started = time.monotonic()
                 cursor = await db.execute(
                     """
                     INSERT OR IGNORE INTO token_usage_events (
@@ -431,6 +640,17 @@ class TokenStatsService:
                     ),
                 )
                 imported += max(cursor.rowcount, 0)
+                # Committing here stores this run's events with its cursor not
+                # yet advanced.  That direction is safe: the next startup
+                # re-reads the same bytes and ``INSERT OR IGNORE`` drops the
+                # repeats.  The reverse — a cursor moved past events that were
+                # never written — loses them for good, which is why the upsert
+                # below stays after the inserts and never before them.
+                if time.monotonic() - batch_started >= _WRITE_BATCH_SECONDS:
+                    await db.commit()
+                    batch_started = None
+            if batch_started is None:
+                batch_started = time.monotonic()
             await db.execute(
                 """
                 INSERT INTO observability_trace_cursors (
@@ -450,6 +670,9 @@ class TokenStatsService:
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+            if time.monotonic() - batch_started >= _WRITE_BATCH_SECONDS:
+                await db.commit()
+                batch_started = None
         await db.commit()
         return imported + await self._sync_message_estimates(db)
 
@@ -457,74 +680,60 @@ class TokenStatsService:
         """Fill the first dashboard from local transcripts when exact usage is absent.
 
         This is intentionally marked by a ``message:`` source key. It is a local
-        text-token estimate, not provider billing usage, and is replaced for a
-        session as soon as an exact usage event exists for that session.
+        text-token estimate, not provider billing usage, and is replaced turn by
+        turn as soon as a usage event prices that turn. Turns the engine never
+        priced keep their estimate however many other turns did get one, so a
+        session is never reduced to its priced tail.
         """
         try:
-            exact_sessions = await db.execute_fetchall(
-                """
-                SELECT DISTINCT session_id
-                FROM token_usage_events
-                WHERE source_key IS NULL OR source_key NOT LIKE 'message:%'
-                """
-            )
-            if exact_sessions:
-                placeholders = ",".join("?" for _ in exact_sessions)
-                await db.execute(
-                    "DELETE FROM token_usage_events "
-                    "WHERE source_key LIKE 'message:%' AND session_id IN (" + placeholders + ")",
-                    [row["session_id"] for row in exact_sessions],
+            # Both deletes walk the whole table — ~0.10s over 20k stored
+            # estimates, and growing with it — and they used to share a
+            # transaction with the first insert batch, which made that batch the
+            # longest hold of the run.  Committing them on their own leaves the
+            # SELECT to a fresh read transaction, which returns the same set
+            # either way: the deletes remove superseded and orphaned estimates,
+            # and the SELECT asks for messages that carry *no* estimate and no
+            # same-turn event, so a deleted row can never come back through it.
+            await db.execute(_SUPERSEDED_ESTIMATES_DELETE)
+            await db.execute(_ORPHANED_ESTIMATES_DELETE)
+            await db.commit()
+            rows = await db.execute_fetchall(_UNPRICED_TRANSCRIPT_MESSAGES)
+        except aiosqlite.OperationalError as exc:
+            # A missing table means a minimal/custom database in tests or a
+            # partially completed schema migration; that is expected and stays
+            # silent.  Everything else is not: since the backfill moved to its
+            # own connection, ``database is locked`` (a second process, or a
+            # dev-reload overlap) reaches this handler too, and swallowing it
+            # leaves the panel permanently empty with no signal anywhere.
+            if "no such table" not in str(exc).lower():
+                logger.warning(
+                    "token estimate backfill skipped after a database error",
+                    exc_info=True,
                 )
-
-            rows = await db.execute_fetchall(
-                """
-                SELECT m.id, m.session_id, m.role, m.content, m.created_at
-                FROM messages m
-                JOIN sessions s ON s.id=m.session_id
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM token_usage_events e
-                    WHERE e.session_id=m.session_id
-                      AND (e.source_key IS NULL OR e.source_key NOT LIKE 'message:%')
-                )
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM token_usage_events e
-                    WHERE e.source_key = 'message:' || m.id
-                )
-                ORDER BY m.created_at ASC
-                """
-            )
-        except aiosqlite.OperationalError:
-            # Keep the service usable with a minimal/custom database in tests or
-            # during a partially completed schema migration.
             return 0
 
         if not rows:
-            await db.commit()
             return 0
 
-        try:
-            import tiktoken
-
-            encoding = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            encoding = None
+        # Encoding inside the write transaction billed tiktoken's cost to the
+        # lock: a 60KB transcript takes milliseconds to encode, and 5% of them
+        # in a 20k-message backfill was the difference between a 0.54s and a
+        # 0.02s maximum hold.  The total runtime barely moves — the encoding
+        # still has to happen — but it now happens with no lock held and off the
+        # event loop the request path shares.  ``rows`` is already materialised,
+        # so one thread hop prices all of it before any lock is taken.
+        token_counts = await asyncio.to_thread(self._estimate_token_counts, rows)
 
         imported = 0
-        for row in rows:
-            content = str(row["content"] or "")
-            if not content.strip():
+        batch_rows = 0
+        batch_started = 0.0
+        for row, token_count in zip(rows, token_counts):
+            if token_count <= 0:
                 continue
-            if encoding is not None:
-                try:
-                    token_count = len(encoding.encode(content, disallowed_special=()))
-                except Exception:
-                    token_count = max(1, len(content) // 4)
-            else:
-                token_count = max(1, len(content) // 4)
             input_tokens = token_count if row["role"] != "assistant" else 0
             output_tokens = token_count if row["role"] == "assistant" else 0
+            if batch_rows == 0:
+                batch_started = time.monotonic()
             cursor = await db.execute(
                 """
                 INSERT OR IGNORE INTO token_usage_events (
@@ -542,8 +751,54 @@ class TokenStatsService:
                 ),
             )
             imported += max(cursor.rowcount, 0)
+            batch_rows += 1
+            # On its own connection this is a second writer, and SQLite grants
+            # the write lock to one connection at a time, so the only thing that
+            # keeps the request path alive is how long each transaction holds
+            # it.  Measured on 20k messages of which 5% are 60KB, against a
+            # concurrent ``add_message``-shaped INSERT at a 1s busy_timeout:
+            # committing every 500 rows lost 2 of 16 writes to ``database is
+            # locked``, and 3 of 14 on the second startup where the deletes have
+            # a populated table to walk; on this budget 0 of ~160 fail.  The
+            # rows are ``INSERT OR IGNORE`` on a unique source_key, so a
+            # partially committed backfill is resumed by the next startup, not
+            # duplicated.
+            if (
+                time.monotonic() - batch_started >= _WRITE_BATCH_SECONDS
+                or batch_rows >= _ESTIMATE_COMMIT_INTERVAL
+            ):
+                await db.commit()
+                batch_rows = 0
         await db.commit()
         return imported
+
+    @staticmethod
+    def _estimate_token_counts(rows: list[aiosqlite.Row]) -> list[int]:
+        """Token count per row, aligned with ``rows``; 0 means nothing to price.
+
+        Runs off the event loop and outside any transaction — see the caller.
+        """
+        try:
+            import tiktoken
+
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            encoding = None
+
+        counts: list[int] = []
+        for row in rows:
+            content = str(row["content"] or "")
+            if not content.strip():
+                counts.append(0)
+                continue
+            if encoding is not None:
+                try:
+                    counts.append(len(encoding.encode(content, disallowed_special=())))
+                    continue
+                except Exception:
+                    pass
+            counts.append(max(1, len(content) // 4))
+        return counts
 
     @staticmethod
     def _parse_timestamp(value: object) -> datetime | None:
@@ -586,7 +841,9 @@ class TokenStatsService:
         for row in rows:
             day = str(row["occurred_at"])[:10]
             model = str(row["model"] or "unknown")
-            estimated = estimated or str(row["source_key"] or "").startswith("message:")
+            estimated = estimated or str(row["source_key"] or "").startswith(
+                _ESTIMATE_PREFIXES
+            )
             input_tokens = self._non_negative_int(row["input_tokens"])
             output_tokens = self._non_negative_int(row["output_tokens"])
             event_total = self._non_negative_int(row["total_tokens"])

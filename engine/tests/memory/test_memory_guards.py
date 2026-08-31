@@ -23,6 +23,7 @@ from _changeset_fixtures import evidence_ref_and_quote
 from engine.memory._review import MemoryCompilationError
 from engine.memory.compile import (
     _read_offset,
+    compile_context,
     compile_durable,
     ensure_durable_template,
 )
@@ -31,6 +32,8 @@ WORK_REF = "2026-08-12T10:00"
 FACT_REF = "2026-08-12T11:00"
 FORGET_REF = "2026-08-12T12:00"
 PARTIAL_REF = "2026-08-12T13:00"
+
+DECISION_REF = "2026-08-12T14:00"
 
 SOURCE = "\n".join((
     f"- [{WORK_REF}] (kind=work, scope=project) tune the loader: "
@@ -41,6 +44,8 @@ SOURCE = "\n".join((
     "user asked to forget the cache decision",
     f"- [{PARTIAL_REF}] (kind=partial_work, scope=project) index rebuild: "
     "half the shards are done",
+    f"- [{DECISION_REF}] (kind=decision, scope=project) cache: "
+    "我们决定改用 no cache",
 ))
 
 EXISTING = {
@@ -191,6 +196,43 @@ def test_a_decision_cannot_be_inverted_by_rewriting_it_in_place() -> None:
         reason="the loader work suggests otherwise",
         evidence_ref=WORK_REF,
         evidence_quote="tune the loader",
+    ))
+
+    assert allowed == []
+    assert refused[0].reason == "conclusion_changed_without_forget_or_correction"
+
+
+def test_a_new_decision_may_replace_the_decision_it_supersedes() -> None:
+    """Policy 1.4 requires updating the entry in place; the guard must allow it.
+
+    Demanding forget/correction for a *replace* left an explicitly stated new
+    decision no way into memory at all: replace refused here, a same-topic add
+    refused as a duplicate, a differently-keyed add leaving two contradictory
+    bullets.  The stale decision then kept being injected into every prompt.
+    """
+    change = _change(
+        "replace", "Decisions",
+        target="Cache",
+        content="- **Cache**: 决定 改用 no cache；适用范围：loader。",
+        reason="user decided otherwise",
+        evidence_ref=DECISION_REF,
+        evidence_quote="我们决定改用 no cache",
+    )
+
+    allowed, refused = _judge(change)
+
+    assert refused == []
+    assert allowed == [change]
+
+
+def test_a_new_decision_still_cannot_delete_the_conclusion_outright() -> None:
+    """Updating a conclusion is not the same as erasing it."""
+    allowed, refused = _judge(_change(
+        "remove", "Decisions",
+        target="Cache",
+        reason="superseded",
+        evidence_ref=DECISION_REF,
+        evidence_quote="我们决定改用 no cache",
     ))
 
     assert allowed == []
@@ -536,6 +578,102 @@ def test_three_rejected_cycles_skip_the_batch_without_writing_memory(
     # The accepted view is still the empty template, never a degraded draft.
     written = (memory_dir / "durable.md").read_text(encoding="utf-8")
     assert "Ghost" not in written
+
+
+def test_reviewer_sees_every_evidence_line_when_both_inputs_are_full(
+    tmp_path: Path,
+) -> None:
+    """Evidence is the reviewer's ground truth and must never be truncated.
+
+    Prior memory (10k) plus evidence (24k) overran the reviewer's own 32k
+    window, and head/tail truncation dropped a middle slice that always landed
+    inside the evidence — so the reviewer could not find a quote the guards had
+    already verified, hard-failed the draft as fabricated, and the cycle
+    repeated forever (rejected neither backs off nor skips the batch).
+    """
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "task": f"task {index}",
+            "summary": f"事件{index}号的证据行内容如下：" + "证" * 300,
+            "timestamp": f"2026-08-12T{index // 60:02d}:{index % 60:02d}",
+            "kind": "work",
+            "scope": "project",
+        }
+        for index in range(80)
+    ]
+    (memory_dir / "recent.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n",
+        encoding="utf-8",
+    )
+    ensure_durable_template(memory_dir)
+    durable = memory_dir / "durable.md"
+    durable.write_text(
+        durable.read_text(encoding="utf-8") + "\n" + ("- 旧结论。\n" * 1500),
+        encoding="utf-8",
+    )
+    assert len(durable.read_text(encoding="utf-8")) > 9_000
+
+    generator = _CountingLLM(json.dumps({"changes": [{
+        "op": "add",
+        "section": "Active Work",
+        "content": "- **事件 0** — 状态：running；下一步：确认。",
+        "evidence": {
+            "ref": "2026-08-12T00:00",
+            "quote": "事件0号的证据行内容如下：",
+        },
+    }]}, ensure_ascii=False))
+    reviewer = _CountingLLM('{"pass": true, "hard_fail": [], "soft_fail": []}')
+
+    asyncio.run(compile_durable(memory_dir, generator, reviewer))
+
+    assert reviewer.calls, "reviewer must have been reached"
+    prompt = "\n".join(m.get("content", "") for m in reviewer.calls[0])
+    evidence_part = prompt.split("SELECTED NEW EVIDENCE (ground truth):", 1)[1]
+    assert len(evidence_part) > 20_000, "evidence must be at its full budget here"
+    assert "event content omitted" not in evidence_part
+
+
+def test_three_deferred_cycles_skip_the_batch_for_context_too(
+    tmp_path: Path,
+) -> None:
+    """Policy 6.2 is per view; context had no escape at all.
+
+    Dream reclaims up to min(both cursors), so a context batch that can never
+    yield an applicable change pinned the event log forever — and with no
+    backoff on that failure, every compile cycle re-sent the same evidence to
+    the model.
+    """
+    memory_dir = tmp_path / "memory"
+    _write_events(memory_dir, 2, kind="preference", scope="user")
+    (memory_dir.parent / "context.md").write_text(
+        "# Context\n\n## Confirmed Preferences\n", encoding="utf-8"
+    )
+    history = memory_dir / "memory_history.jsonl"
+    history.write_text(
+        "".join(
+            json.dumps({"target": "context", "status": "deferred"}) + "\n"
+            for _ in range(2)
+        ),
+        encoding="utf-8",
+    )
+    generator = _CountingLLM(UNSUPPORTED)
+    reviewer = _CountingLLM('{"pass": true, "hard_fail": [], "soft_fail": []}')
+
+    with pytest.raises(MemoryCompilationError):
+        asyncio.run(compile_context(memory_dir, generator, reviewer))
+
+    assert _read_offset(memory_dir, "context") == 2
+    records = [
+        json.loads(line)
+        for line in history.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records[-1]["status"] == "skipped"
+    assert records[-1]["target"] == "context"
+    # 跳的是游标，不是文档：durable 侧游标不受影响。
+    assert _read_offset(memory_dir) == 0
 
 
 def test_a_failed_cycle_leaves_the_fingerprint_alone(tmp_path: Path) -> None:

@@ -26,6 +26,11 @@ class GateResult:
     verdict: Literal["pass", "fail", "retry"]
     reason: str
     retry_hint: str | None = None
+    # The gate could not be evaluated at all -- its *own* LLM was missing or
+    # raised -- so this says nothing about the checked output.  The verdict is
+    # still "fail" (a gate fails closed), but ``run_pipeline`` must not charge
+    # the node for it: see ``_gate_unavailable_events``.
+    infra_failure: bool = False
 
 
 class Gate(Protocol):
@@ -34,8 +39,14 @@ class Gate(Protocol):
 
 def coerce_gate_result(value: object) -> GateResult:
     """Adapt declarative content decisions without importing engine types there."""
+    # ``infra_failure`` is deliberately read only off a real GateResult: it is
+    # the engine's own statement that the gate never ran.  Honouring it on an
+    # arbitrary content shape would hand a content gate a way to skip the
+    # retry/backtrack machinery by declaring its own failures unattributable.
+    infra_failure = False
     if isinstance(value, GateResult):
         verdict, reason, retry_hint = value.verdict, value.reason, value.retry_hint
+        infra_failure = value.infra_failure
     elif isinstance(value, Mapping):
         verdict = value.get("verdict")
         reason = value.get("reason")
@@ -51,7 +62,7 @@ def coerce_gate_result(value: object) -> GateResult:
         raise TypeError("gate must return verdict=pass|fail|retry and a string reason")
     if retry_hint is not None and not isinstance(retry_hint, str):
         raise TypeError("gate retry_hint must be a string when provided")
-    return GateResult(verdict, reason, retry_hint=retry_hint)
+    return GateResult(verdict, reason, retry_hint=retry_hint, infra_failure=infra_failure)
 
 
 _MAX_GATE_OUTPUT_CHARS = 2000
@@ -124,6 +135,7 @@ class LLMGate:
                 "fail",
                 "LLM verification unavailable",
                 retry_hint="Retry after the gate LLM becomes available.",
+                infra_failure=True,
             )
 
         try:
@@ -173,4 +185,5 @@ class LLMGate:
                 "fail",
                 "LLM verification failed",
                 retry_hint="Retry after the gate LLM becomes available.",
+                infra_failure=True,
             )

@@ -9,7 +9,7 @@ import pytest
 from common.yaml_utils import YamlConfigError
 from engine.llm.adapters.anthropic import AnthropicAdapter
 from engine.llm.adapters.openai import OpenAIAdapter
-from engine.llm.adapters._http import MAX_STREAM_EVENT_BYTES
+from engine.llm.adapters._http import MAX_STREAM_EVENT_BYTES, MAX_STREAM_EVENTS
 from engine.llm.adapters._retry import MAX_RETRY_AFTER_SECONDS, retry_after_seconds
 from engine.llm.client import ProviderClient
 from engine.llm.contracts import (
@@ -47,11 +47,15 @@ class _InterruptedSseStream(httpx.AsyncByteStream):
         return None
 
 
-def _openai_client() -> ProviderClient:
-    return ProviderClient(OpenAIAdapter(LLMProviderConfig(
-        provider="openai", api_key="k",
-        base_url="http://llm.test", model="m",
-    )))
+def _openai_client(**overrides: object) -> ProviderClient:
+    values: dict[str, object] = {
+        "provider": "openai",
+        "api_key": "k",
+        "base_url": "http://llm.test",
+        "model": "m",
+    }
+    values.update(overrides)
+    return ProviderClient(OpenAIAdapter(LLMProviderConfig(**values)))  # type: ignore[arg-type]
 
 
 def _anthropic_config(**overrides: object) -> LLMProviderConfig:
@@ -806,6 +810,141 @@ def test_openai_stream_rejects_an_oversized_sse_event() -> None:
     with pytest.raises(_Err, match="stream event exceeds"):
         asyncio.run(_collect_events_generic(client))
     asyncio.run(client.close())
+
+
+def test_stream_event_budget_scales_with_the_configured_output_limit() -> None:
+    """A token-streaming model must not hit the event cap inside its own budget.
+
+    The cap was a fixed 10k events, i.e. an assumption about tokens per event.
+    Configure 32k output on a reasoning model and a legitimate long answer was
+    killed mid-stream -- unretryable once content had been seen, with the
+    already-rendered text retracted and the tail usage chunk never read.
+    """
+    from engine.llm.adapters._http import MAX_STREAM_EVENTS, stream_event_budget
+
+    # 未声明输出上限时保持原样。
+    assert stream_event_budget(None) == MAX_STREAM_EVENTS
+    assert stream_event_budget(0) == MAX_STREAM_EVENTS
+    # 小上限不会把下限降下去。
+    assert stream_event_budget(1_024) == MAX_STREAM_EVENTS
+    # 大上限下，每 token 一个事件加上推理增量仍在预算内。
+    assert stream_event_budget(32_768) >= 32_768 * 2
+
+
+def _openai_sse_flood(events: int) -> bytes:
+    """``events`` no-op chunks, then the tail usage chunk and ``[DONE]``."""
+    return b"".join([
+        b'data: {"choices":[{"delta":{}}]}\n\n' * events,
+        b'data: {"usage":{"total_tokens":41}}\n\n',
+        b"data: [DONE]\n\n",
+    ])
+
+
+def _anthropic_sse_flood(events: int) -> bytes:
+    """``events`` ignorable ``ping`` events, then the usage-bearing tail."""
+    return b"".join([
+        b'event: message_start\ndata: {"type":"message_start","message":{}}\n\n',
+        b'event: ping\ndata: {"type":"ping"}\n\n' * events,
+        b'event: message_delta\ndata: {"type":"message_delta",'
+        b'"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":41}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ])
+
+
+def _fake_stream_send(payload: bytes):
+    async def fake_send(request, *, stream: bool):
+        return httpx.Response(200, request=request, stream=_SseStream([payload]))
+
+    return fake_send
+
+
+def test_openai_stream_event_cap_follows_the_configured_output_limit() -> None:
+    """The budget has to reach the live stream, not just exist as a helper.
+
+    Asserting ``stream_event_budget`` alone leaves the adapter free to go back
+    to the flat constant: a 32k-output reasoning model then dies past 10k
+    events, and because the failure lands after content has been seen it is
+    unretryable, the rendered text is retracted, and the tail usage chunk --
+    the only record of what was already spent -- is never read.
+    """
+    client = _openai_client(max_output_tokens=32_768)
+    client.adapter._http.send = _fake_stream_send(  # type: ignore[assignment]
+        _openai_sse_flood(MAX_STREAM_EVENTS + 1)
+    )
+    try:
+        events = asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    usage = [event for event in events if event.type is ProviderEventType.USAGE]
+    assert usage and usage[-1].data["usage"]["total_tokens"] == 41
+    assert events[-1].type is ProviderEventType.RESPONSE_COMPLETED
+
+
+def test_openai_stream_event_cap_holds_without_a_declared_output_limit() -> None:
+    """Scaling the cap must not amount to removing it."""
+    from engine.llm.contracts import LLMResponseError as _Err
+
+    client = _openai_client()
+    client.adapter._http.send = _fake_stream_send(  # type: ignore[assignment]
+        _openai_sse_flood(MAX_STREAM_EVENTS + 1)
+    )
+    with pytest.raises(_Err, match="exceeds the event limit"):
+        asyncio.run(_collect_events_generic(client))
+    asyncio.run(client.close())
+
+
+def test_anthropic_stream_event_cap_follows_the_configured_output_limit() -> None:
+    """Same wiring, second adapter -- ``_iter_sse`` builds its own limiter."""
+    adapter = AnthropicAdapter(_anthropic_config(max_output_tokens=32_768))
+    client = ProviderClient(adapter)
+    adapter._http.send = _fake_stream_send(  # type: ignore[assignment]
+        _anthropic_sse_flood(MAX_STREAM_EVENTS + 1)
+    )
+    try:
+        events = asyncio.run(_collect_events_generic(client))
+    finally:
+        asyncio.run(client.close())
+
+    usage = [event for event in events if event.type is ProviderEventType.USAGE]
+    assert usage and usage[-1].data["usage"]["output_tokens"] == 41
+    assert events[-1].type is ProviderEventType.RESPONSE_COMPLETED
+
+
+def test_anthropic_stream_event_cap_holds_without_a_declared_output_limit() -> None:
+    from engine.llm.contracts import LLMResponseError as _Err
+
+    adapter = AnthropicAdapter(_anthropic_config(max_output_tokens=None))
+    client = ProviderClient(adapter)
+    adapter._http.send = _fake_stream_send(  # type: ignore[assignment]
+        _anthropic_sse_flood(MAX_STREAM_EVENTS + 1)
+    )
+    with pytest.raises(_Err, match="exceeds the event limit"):
+        asyncio.run(_collect_events_generic(client))
+    asyncio.run(client.close())
+
+
+def test_sse_stream_limiter_has_no_per_stream_duration_knob() -> None:
+    """The duration ceiling is an engine constant, not adapter configuration.
+
+    A ``max_duration_seconds`` field existed and no adapter ever passed it, so
+    the "relax the ceiling for the background route" half of the original fix
+    was never implemented while the field made it look like it had been.  An
+    adapter is built from LLMProviderConfig alone, which names no route, so
+    there is nothing for the knob to read -- it goes rather than lies.
+    """
+    from engine.llm.adapters._http import MAX_STREAM_DURATION_SECONDS, SSEStreamLimiter
+
+    with pytest.raises(TypeError):
+        SSEStreamLimiter(max_duration_seconds=60)  # type: ignore[call-arg]
+
+    # The ceiling itself still applies to every stream.
+    limiter = SSEStreamLimiter()
+    limiter.started_at -= MAX_STREAM_DURATION_SECONDS + 1
+    from engine.llm.contracts import LLMResponseError as _Err
+
+    with pytest.raises(_Err, match="exceeds the duration limit"):
+        limiter.consume_line("data: {}")
 
 
 def test_anthropic_stream_malformed_delta_raises() -> None:

@@ -46,10 +46,33 @@ _CONTEXT_LIMIT_MARKERS = (
 )
 
 
+def stream_event_budget(max_output_tokens: int | None) -> int:
+    """Scale the event cap to the output the operator actually asked for.
+
+    A fixed 10k events is a token-rate assumption, not a safety property -- the
+    byte caps are the safety property.  A reasoning model configured for 32k
+    output legitimately emits one event per token plus reasoning deltas, so the
+    fixed cap killed the stream mid-answer: the error is not retryable once
+    content has been seen, the already-rendered text is retracted, and the usage
+    chunk at the tail is never read, so tokens that were spent record as zero.
+    """
+    if not max_output_tokens or max_output_tokens <= 0:
+        return MAX_STREAM_EVENTS
+    return max(MAX_STREAM_EVENTS, max_output_tokens * 2)
+
+
 @dataclass
 class SSEStreamLimiter:
-    """Bound an untrusted provider SSE stream across every adapter."""
+    """Bound an untrusted provider SSE stream across every adapter.
 
+    The duration ceiling is deliberately *not* a per-instance knob.  Relaxing
+    it for the background route was considered, but an adapter is constructed
+    from :class:`LLMProviderConfig` alone, which names no route -- so the knob
+    could only ever have been set to its own default, and a caller reading the
+    field would have believed the route was accounted for when it was not.
+    """
+
+    max_events: int = MAX_STREAM_EVENTS
     total_bytes: int = 0
     event_bytes: int = 0
     events: int = 0
@@ -68,7 +91,7 @@ class SSEStreamLimiter:
 
     def finish_event(self) -> None:
         self.events += 1
-        if self.events > MAX_STREAM_EVENTS:
+        if self.events > self.max_events:
             raise LLMResponseError("Provider stream exceeds the event limit.")
         self.event_bytes = 0
 

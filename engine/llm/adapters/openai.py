@@ -21,7 +21,7 @@ from ..contracts import (
     ToolCallData,
 )
 from ..events import ProviderEvent, ProviderEventType, normalize_finish_reason
-from ._http import HTTPAdapterMixin, SSEStreamLimiter
+from ._http import HTTPAdapterMixin, SSEStreamLimiter, stream_event_budget
 from ._retry import MAX_RETRIES, is_retryable_status, retry_after_seconds
 
 logger = logging.getLogger(__name__)
@@ -209,7 +209,9 @@ class OpenAIAdapter(HTTPAdapterMixin):
             try:
                 response = await self._http.send(http_request, stream=True)
                 await self._raise_for_status(response)
-                limiter = SSEStreamLimiter()
+                limiter = SSEStreamLimiter(
+                    max_events=stream_event_budget(self.max_output_tokens),
+                )
                 async for payload in self._iter_sse_payloads(response, limiter):
                     if payload.strip() == "[DONE]":
                         saw_done = True

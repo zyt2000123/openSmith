@@ -130,9 +130,21 @@ def test_trace_store_defers_sync_for_high_frequency_stream_events(
         "run-sync",
         ExecutionEvent(EventType.PROVISIONAL_TEXT_DELTA, {"text": "draft"}),
     )
+    # The per-iteration progress records joined the deferred set: they used to
+    # fsync one by one on the SSE delivery path, and they carry no resume or
+    # approval decision.  seal() fsyncs the whole log before anchoring the head,
+    # so a finished run stays durable without them.
+    store.append("run-sync", ExecutionEvent(EventType.THINKING, {"text": "t"}))
+    store.append("run-sync", ExecutionEvent(EventType.TOKEN_USAGE, {"total_tokens": 3}))
+    store.append("run-sync", ExecutionEvent(EventType.CONTEXT_USAGE, {"used_tokens": 1}))
+    # TOOL_CALL_START is just as frequent but deliberately stays synchronous:
+    # the run-state store projects the same event into current_tool and fsyncs
+    # it, so deferring it here would let a crash leave a state file naming a
+    # running tool the trace has no record of.
+    store.append("run-sync", ExecutionEvent(EventType.TOOL_CALL_START, {"name": "shell"}))
     store.append("run-sync", ExecutionEvent(EventType.RUN_FINISHED, {}))
 
-    assert len(sync_calls) == 1
+    assert len(sync_calls) == 2
 
 
 def test_trace_store_recovers_sequence_without_reading_the_whole_file(

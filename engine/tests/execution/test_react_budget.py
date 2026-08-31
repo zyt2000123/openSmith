@@ -8,6 +8,7 @@ from engine.tests.execution.react_text_adapters import (
     react_loop as _react_loop,
     react_stream_loop as _react_stream_loop,
 )
+from engine.context.compression import RUNTIME_USER_NOTE_PREFIX, is_request_turn
 from engine.execution.events import EventType
 from engine.execution.react.react_loop import FailedAgentRunError, IncompleteAgentRunError
 from engine.llm.client import ChatResponse, ToolCallData
@@ -16,12 +17,13 @@ from engine.llm.contracts import ModelLimits, ProviderCapabilities
 from engine.llm.events import ProviderEvent, ProviderEventType
 from engine.execution.react.budget import (
     CONVERSATION_HARD_LIMIT,
-    CONVERSATION_KEEP_HEAD,
     CONVERSATION_KEEP_RECENT,
+    MAX_COMPACTION_FAILURES,
     MAX_FAILED_TOOL_RECOVERY_ITERS,
     MAX_IDENTICAL_TOOL_ERRORS,
     MAX_PREFLIGHT_CHALLENGE_ITERS,
     REPEATED_SUCCESS_WARN_THRESHOLD,
+    trim_conversation_to_message_cap,
 )
 from engine.safety.fact_gate import FactGate, FactGateContext
 from engine.skill.executor import execute_skill_events
@@ -666,6 +668,75 @@ def test_react_event_loop_discards_length_draft_when_continuation_calls_tool():
     assert finals == [{"text": "answer", "already_streamed": True}]
 
 
+def test_react_event_loop_rerenders_a_reply_that_mixes_streamed_and_fallback_parts():
+    """A reply assembled from a non-streamed fragment plus a streamed one must
+    reach the screen whole.
+
+    ``already_streamed`` used to be one flag for the join, so the streamed
+    continuation marked its unstreamed sibling as rendered too; the consumer
+    skips rendering those, and the fallback half was persisted but never shown.
+    """
+
+    class StreamThenFallbackLLM(StreamingFakeLLM):
+        """A ``None`` turn fails the stream before any semantic delta — exactly
+        the condition under which react_loop retries with non-streaming chat."""
+
+        def __init__(self, event_turns, responses) -> None:
+            super().__init__(event_turns)
+            self.responses = list(responses)
+
+        async def chat_events(self, messages, tools=None, prefix_cache_key=None):
+            turn = self.event_turns.pop(0)
+            if turn is None:
+                raise LLMResponseError("stream died")
+            for event in turn:
+                yield event
+
+    async def run():
+        llm = StreamThenFallbackLLM(
+            [
+                None,
+                [
+                    ProviderEvent(ProviderEventType.OUTPUT_TEXT_DELTA, {"delta": "第二段。"}),
+                    ProviderEvent(
+                        ProviderEventType.RESPONSE_COMPLETED,
+                        {"finish_reason": "stop", "raw_finish_reason": "stop"},
+                    ),
+                ],
+            ],
+            [ChatResponse(text="第一段：", finish_reason="length")],
+        )
+        return [
+            event
+            async for event in _react_event_loop(
+                llm,
+                [{"role": "user", "content": "完整回答"}],
+                _registry(),
+                max_iters=2,
+            )
+        ]
+
+    events = asyncio.run(run())
+    drafts = [event.data for event in events if event.type == EventType.PROVISIONAL_TEXT_DELTA]
+    retractions = [event.data for event in events if event.type == EventType.PROVISIONAL_RETRACT]
+    commits = [event.data for event in events if event.type == EventType.PROVISIONAL_COMMIT]
+    finals = [event.data for event in events if event.type == EventType.TEXT_DELTA]
+
+    assert [draft["text"] for draft in drafts] == ["第二段。"]
+    # No already_streamed marker: the consumer must render this, or 第一段 never
+    # reaches the screen.
+    assert finals == [{"text": "第一段：第二段。"}]
+    # The streamed half is on screen as a draft, so it is withdrawn before the
+    # join is re-sent — committing it and re-sending would render it twice.
+    assert retractions == [
+        {
+            "provision_id": drafts[0]["provision_id"],
+            "reason": "unstreamed_fragment_pending",
+        },
+    ]
+    assert commits == []
+
+
 def test_react_event_loop_rejects_active_work_that_cannot_fit_without_rewriting_it():
     class CompressionFailingStreamingLLM(StreamingFakeLLM):
         context_window = 10_000
@@ -1033,6 +1104,35 @@ def test_react_event_loop_emits_token_usage():
     assert context["actions"] == []
 
 
+def test_context_usage_flags_a_turn_the_provider_never_priced():
+    """CONTEXT_USAGE.estimated exists to separate a provider count from a local
+    guess.  The usage fallback hands ``receipt.estimated_input_tokens`` back
+    through the very argument that decides the flag, so on every relay that
+    drops ``stream_options.include_usage`` the guess used to report itself as
+    a measured number.
+    """
+
+    async def run():
+        llm = FakeLLM([ChatResponse(text="完成")])
+        return [
+            event
+            async for event in _react_event_loop(
+                llm,
+                [{"role": "user", "content": "hello"}],
+                _registry(),
+                max_iters=1,
+            )
+        ]
+
+    events = asyncio.run(run())
+    usage = [event.data for event in events if event.type == EventType.TOKEN_USAGE][-1]
+    context = [event.data for event in events if event.type == EventType.CONTEXT_USAGE][-1]
+
+    assert usage["usage_reported"] == 0
+    assert context["context_tokens"] == usage["input_tokens"] > 0
+    assert context["estimated"] is True
+
+
 def test_context_usage_reports_which_fitting_actions_ran():
     """A shrunk request must say WHAT was dropped, not merely that it shrank.
 
@@ -1383,8 +1483,14 @@ def test_react_event_loop_identical_tool_error_short_circuits():
     assert incomplete[0].data["reason"] == "identical_tool_error_loop"
 
 
-def test_react_event_loop_conversation_pruning_keeps_head():
-    """Pruning must keep system + first user message, not just conversation[0]."""
+def test_react_event_loop_conversation_pruning_keeps_contract_and_request():
+    """Pruning keeps the system contract and the turn being executed.
+
+    It used to keep ``conversation[:2]`` — right only when the run opens with
+    [system, request].  In a continuing session index 1 is the *oldest* history
+    message, so pinning it wasted the head slot on stale context; what must
+    survive is the newest user turn.
+    """
     async def run():
         base = [
             {"role": "system", "content": "system prompt"},
@@ -1406,12 +1512,207 @@ def test_react_event_loop_conversation_pruning_keeps_head():
         return llm.chat_calls[0]["messages"]
 
     messages = asyncio.run(run())
+    newest_request = {
+        "role": "user",
+        "content": f"follow-up-{CONVERSATION_HARD_LIMIT - 1}",
+    }
     assert messages[0] == {"role": "system", "content": "system prompt"}
-    assert messages[1] == {"role": "user", "content": "important initial question"}
-    # head + one elision marker + recent tail: the marker is what tells the model
-    # the dropped turns ever happened.
-    assert len(messages) == CONVERSATION_KEEP_HEAD + 1 + CONVERSATION_KEEP_RECENT
-    assert "elided" in messages[CONVERSATION_KEEP_HEAD]["content"]
+    assert newest_request in messages
+    # 条数不精确断言：切点还要对齐到 user 轮，落点随历史形状浮动。锁的是
+    # "确实裁短了"且不超出尾窗预算（head + 省略痕 + 尾窗），而不是某个
+    # 结构细节。
+    assert CONVERSATION_KEEP_RECENT - 2 <= len(messages) <= 2 + CONVERSATION_KEEP_RECENT
+    # 切口必须留痕：整段丢弃比 [pruned: ...] 更彻底 —— 模型连"调用发生过"
+    # 都看不到，于是重跑已完成的工作。痕恰好一条，多了本身就是在烧上下文。
+    elision_notes = [
+        message
+        for message in messages
+        if message.get("role") == "system" and "elided" in str(message.get("content", ""))
+    ]
+    assert len(elision_notes) == 1
+
+
+def test_hard_limit_does_not_cut_on_the_injected_clock_note():
+    """[Current time] 注记不是轮次边界，切在它上面会留下孤儿 tool 结果。
+
+    get_current_time 的结果是两条消息（tool ack + 一条 role=user 的运行时
+    注记），而它们是在 tool_calls 循环里 extend 进去的 —— 一次
+    [get_current_time, grep] 的并行调用产生
+    assistant(tool_calls) / tool / [Current time] / tool。回退扫描原本只把
+    tool 和 system 当作不安全落点，撞上这条 user 注记就停，后面那条 tool
+    结果失去它的 assistant：OpenAI 兼容端报 "tool must be a response to a
+    preceding message with tool_calls"，Anthropic 则发出一个找不到 tool_use
+    的 tool_result —— 两边都是 400，且不是 context-limit 错误，整个 run 失败。
+    """
+    conversation: list[dict] = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "帮我把这个 bug 查清楚"},
+    ]
+    for round_index in range(22):
+        if round_index == 8:
+            conversation.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t8a", "function": {"name": "get_current_time"}},
+                    {"id": "t8b", "function": {"name": "grep"}},
+                ],
+            })
+            conversation.append({"role": "tool", "tool_call_id": "t8a", "content": "ack"})
+            conversation.append({
+                "role": "user",
+                "content": f"{RUNTIME_USER_NOTE_PREFIX}2026-08-30T10:00:00+08:00",
+            })
+            conversation.append({"role": "tool", "tool_call_id": "t8b", "content": "grep result"})
+            continue
+        conversation.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": f"t{round_index}", "function": {"name": "grep"}}],
+        })
+        conversation.append({
+            "role": "tool", "tool_call_id": f"t{round_index}", "content": "r",
+        })
+
+    trimmed = trim_conversation_to_message_cap(conversation)
+
+    _assert_tool_pairing_intact(trimmed)
+
+
+def test_trimmed_conversation_always_opens_on_a_user_turn():
+    """裁剪后首条非 system 消息必须是 user 轮。
+
+    Anthropic 直接拒绝不以 user 开头的对话，而那个错误不是 context-limit
+    错误，所以它会让整个 run 失败而不是触发重试。旧的固定 conversation[:2]
+    head 是碰巧满足的（[system, *历史, 请求] 的 index 1 是历史里的 user 轮）；
+    改成按角色选 head 之后这个巧合没了：边界回退扫描会心安理得地停在
+    assistant 上，于是历史顶到 40 条上限的会话每一轮都在第一次 provider
+    调用上失败。
+    """
+    # 历史顶到 server 侧 _HISTORY_LIMIT 的稳态形状，不是边界值。
+    for history_len in (38, 39, 40):
+        for with_summary in (False, True):
+            conversation = [{"role": "system", "content": "system prompt"}]
+            if with_summary:
+                conversation.append(
+                    {"role": "user", "content": "[Session context summary]\n…"}
+                )
+            for i in range(history_len):
+                conversation.append({
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"old-{i}",
+                })
+            conversation.append({"role": "user", "content": "current request"})
+
+            trimmed = trim_conversation_to_message_cap(conversation)
+
+            non_system = [m for m in trimmed if m.get("role") != "system"]
+            assert non_system, f"history={history_len} summary={with_summary}"
+            assert non_system[0]["role"] == "user", (
+                f"history={history_len} summary={with_summary} "
+                f"opens on {non_system[0]['role']}"
+            )
+            assert {"role": "user", "content": "current request"} in trimmed
+
+
+def test_react_event_loop_keeps_the_request_behind_session_history():
+    """The live request must survive a tool marathon, history in front of it.
+
+    Production layout is [system, *session history, request] (agent_loop), and
+    the cap ran every iteration: as tool traffic pushed the request left out of
+    the tail window it was silently deleted, leaving the model to call tools
+    against a days-old user turn for the rest of the run.
+    """
+    request = "current request: 把 A 改成 B"
+
+    async def run():
+        history = [
+            {"role": "user" if i % 2 else "assistant", "content": f"old-{i}"}
+            for i in range(30)
+        ]
+        conversation = [
+            {"role": "system", "content": "system prompt"},
+            *history,
+            {"role": "user", "content": request},
+        ]
+        # 每轮迭代 +2 条消息，裁剪后回到 30 条：要跑到第三次裁剪
+        # （旧实现正是在那一次把请求切掉的）需要约 16 轮工具调用。
+        turns = [
+            ChatResponse(text="", tool_calls=[_tool_call("ok", f"call-{i}")])
+            for i in range(20)
+        ]
+        turns.append(ChatResponse(text="done"))
+        llm = FakeLLM(turns)
+        async for _event in _react_event_loop(
+            llm,
+            conversation,
+            _registry(),
+            max_iters=25,
+        ):
+            pass
+        return llm.chat_calls
+
+    calls = asyncio.run(run())
+    assert len(calls) > 16, "test must run long enough to trim three times"
+    for index, call in enumerate(calls):
+        contents = [message.get("content") for message in call["messages"]]
+        assert request in contents, f"request lost from provider call #{index}"
+
+
+def test_one_failed_compaction_does_not_disable_it_for_the_whole_run():
+    """A transient compaction failure must not latch the run into hard trimming.
+
+    Compaction runs its own LLM call; one timeout or one truncated summary used
+    to set model_compaction_enabled=False with no way back, so the rest of a
+    60-iteration run could only delete history instead of summarizing it.
+    """
+    class FlakyCompactionLLM(FakeLLM):
+        limits = ModelLimits(
+            context_window=8_192,
+            context_window_declared=True,
+            max_output_tokens=1_024,
+            max_output_tokens_declared=True,
+        )
+
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.compaction_attempts = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None):
+            summarizing = any(
+                "summarizing a conversation" in (m.get("content") or "")
+                for m in messages
+                if m.get("role") == "system"
+            )
+            if summarizing:
+                self.compaction_attempts += 1
+                raise LLMResponseError("compaction provider timeout")
+            return await super().chat(messages, tools, prefix_cache_key)
+
+    async def run():
+        conversation = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "证" * 4_000},
+            {"role": "assistant", "content": "earlier work"},
+            {"role": "user", "content": "current request"},
+        ]
+        llm = FlakyCompactionLLM([
+            ChatResponse(text="", tool_calls=[_tool_call("ok", "call-1")]),
+            ChatResponse(text="done"),
+        ])
+        async for _event in _react_event_loop(llm, conversation, _registry(), max_iters=5):
+            pass
+        return llm.compaction_attempts
+
+    attempts = asyncio.run(run())
+    # 下界：一次瞬时失败不该让整个 run 退化为删除式裁剪。
+    assert attempts >= 2, "compaction must be retried after one transient failure"
+    # 上界同样是不变量：真压不动的对话若每轮都重试，就是每轮白烧一次压缩
+    # LLM 调用 —— 闩锁存在的理由。只锁下界的话，把闩锁整个删掉也照过。
+    assert attempts == MAX_COMPACTION_FAILURES, (
+        f"compaction must latch off after {MAX_COMPACTION_FAILURES} failures "
+        f"(attempted {attempts})"
+    )
 
 
 def test_react_event_loop_stream_fallback_on_early_error():
@@ -1492,7 +1793,11 @@ def _assert_tool_pairing_intact(messages: list[dict]) -> None:
             assert not open_ids, f"unanswered tool calls before assistant: {open_ids}"
             for tc in msg.get("tool_calls") or []:
                 open_ids.add(tc["id"])
-        elif role == "user":
+        elif role == "user" and is_request_turn(msg):
+            # 只有**真实**请求轮才必须关闭未决调用。get_current_time 的结果是
+            # tool ack + 一条 [Current time] user 注记，两条都在 tool_calls
+            # 循环里 extend 进去，所以那条注记合法地坐在轮次中间 —— 把它当作
+            # 违规会让这个 helper 拒绝一条生产上完全正常的对话。
             assert not open_ids, f"user turn with pending tool calls: {open_ids}"
         elif role == "tool":
             call_id = msg.get("tool_call_id")
@@ -1550,9 +1855,11 @@ def test_hard_limit_cut_inside_tool_round_keeps_pairing():
         return llm.chat_calls[0]["messages"]
 
     messages = asyncio.run(run())
+    # 这条测试只管配对完整（R8 回归）。"请求存活"由
+    # test_react_event_loop_keeps_the_request_behind_session_history 负责 ——
+    # 这里的请求是对话最后一条，天然落在尾窗内，在此断言它存活是空转。
     _assert_tool_pairing_intact(messages)
     assert messages[0]["content"] == "system prompt"
-    assert messages[1]["content"] == "question"
     assert len(messages) < CONVERSATION_HARD_LIMIT
 
 

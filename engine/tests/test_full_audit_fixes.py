@@ -683,7 +683,7 @@ def test_live_owner_checkpoint_is_kept_not_cleared(tmp_path: Path) -> None:
         },
         "feature",
         "build a feature",
-        2,
+        ["planning", "testing"],
     )
     assert start == 0, "a live owner's checkpoint must not be adopted"
     assert manager.restore("s-live") is not None, "the live run's checkpoint was deleted"

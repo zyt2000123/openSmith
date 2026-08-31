@@ -60,6 +60,18 @@ _REQUIRED_SUMMARY_SECTIONS = (
     "current_plan",
 )
 
+# A carried summary is itself the product of an earlier compaction, injected as
+# a user turn by ``compact_history`` (engine) or by session history assembly
+# (server).  Both name it with one of these prefixes so the per-message
+# truncation below can exempt it: cutting a summary at a fixed head length
+# removes exactly the sections the prompt puts last -- <recent_actions> and
+# <current_plan> -- so the next summary silently forgets the plan in progress,
+# once more every compaction round.  Its size is already bounded by the budget
+# that produced it; over-budget input is ``_fit_summary_request``'s job.
+PREVIOUS_SUMMARY_PREFIX = "[Previous conversation summary]\n"
+SESSION_SUMMARY_PREFIX = "[Session context summary]\n"
+CARRIED_SUMMARY_PREFIXES = (PREVIOUS_SUMMARY_PREFIX, SESSION_SUMMARY_PREFIX)
+
 
 class SessionSummaryStatus(str, Enum):
     COMPLETE = "complete"
@@ -199,6 +211,9 @@ def _summary_request(
             })
             continue
         if role in ("user", "assistant") and isinstance(content, str) and content:
+            if role == "user" and content.startswith(CARRIED_SUMMARY_PREFIXES):
+                messages.append({"role": role, "content": content})
+                continue
             source_was_trimmed = source_was_trimmed or len(content) > 2000
             messages.append({"role": role, "content": content[:2000]})
     messages.append({"role": "user", "content": COMPACT_USER_PROMPT})
@@ -245,6 +260,9 @@ def _fit_summary_request(
 
 
 __all__ = (
+    "CARRIED_SUMMARY_PREFIXES",
+    "PREVIOUS_SUMMARY_PREFIX",
+    "SESSION_SUMMARY_PREFIX",
     "SessionSummaryResult",
     "SessionSummaryStatus",
     "summarize_session",

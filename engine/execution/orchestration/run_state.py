@@ -98,6 +98,26 @@ _HIGH_FREQUENCY_STREAM_EVENTS = frozenset({
     EventType.RAW_RESPONSE_EVENT,
     EventType.PROVISIONAL_TEXT_DELTA,
 })
+# Progress-only events: they move the two counters a status poll displays and
+# nothing else — never status, approval, current_skill or current_tool, the
+# fields resume and approval recovery actually read.  Unlike the set above they
+# are still *counted*; only the disk write is deferred (RunStateStore.defer_event).
+# TOOL_CALL_START/RESULT deliberately stay synchronous even though they are just
+# as frequent: RESULT carries the approval transition, and START sets the "what
+# is this run doing right now" field a status poll needs *while* a slow tool is
+# still running — exactly when someone polls.
+# A run in one of these is either executing now or waiting on a person; its
+# state file is load-bearing and must outlive any retention sweep.
+_LIVE_RUN_STATUSES = frozenset({
+    RunStatus.QUEUED,
+    RunStatus.RUNNING,
+    RunStatus.WAITING_APPROVAL,
+})
+_DEFERRED_STATE_EVENTS = frozenset({
+    EventType.THINKING,
+    EventType.TOKEN_USAGE,
+    EventType.CONTEXT_USAGE,
+})
 
 
 def _now() -> str:
@@ -351,6 +371,8 @@ class RunStateStore:
         self.root.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
         self.root.chmod(PRIVATE_DIR_MODE)
         self._lock = _root_lock(self.root)
+        # run_id -> (buffered event count, last buffered event type)
+        self._deferred: dict[str, tuple[int, str | None]] = {}
 
     @staticmethod
     def _validate_run_id(run_id: str) -> str:
@@ -616,10 +638,78 @@ class RunStateStore:
         state = RunState.from_dict(data)
         if state.run_id != run_id:
             raise RunStateError(f"Run state id mismatch for {run_id!r}")
+        self._apply_deferred(state)
         return state
+
+    def prune(self, run_id: str) -> bool:
+        """Delete a finished run's state file; refuse while it is still live.
+
+        Observability retention decides *when* a run leaves the window, but the
+        filename and "is this run still executing?" belong here -- the two
+        stores share ``profile_dir/runs`` and nothing but a matching string
+        literal kept them in step.
+
+        The refusal is not theoretical: a resumed run keeps the ``finished_at``
+        of its previous attempt in the summary index, so it can be picked as a
+        retention candidate *while it runs*.  Deleting its state then strands
+        it -- every later transition raises (best-effort, so silently), it never
+        reaches a terminal status, and an approval it raises never becomes
+        visible to the server, leaving the tool to sit out its timeout.
+        """
+        run_id = self._validate_run_id(run_id)
+        with self._lock:
+            try:
+                state = self.get(run_id)
+            except (RunStateError, OSError, ValueError):
+                state = None
+            if state is not None and state.status in _LIVE_RUN_STATUSES:
+                return False
+            self._path(run_id).unlink(missing_ok=True)
+            self._deferred.pop(run_id, None)
+            return True
+
+    def defer_event(self, run_id: str, event_type: str) -> None:
+        """Buffer a progress-only event instead of rewriting the state file.
+
+        Projecting an event is a read-modify-write of the JSON state, and
+        :meth:`save` costs two fsyncs (the file, then the parent directory to
+        make the rename durable).  That ran once per event, inline on the SSE
+        delivery path: a tool-heavy 40-iteration turn paid hundreds of them and
+        stalled token delivery on a busy disk.
+
+        Buffering rather than dropping keeps ``event_seq`` an exact count of
+        every delivered event; the deltas are folded back in by
+        :meth:`_apply_deferred` on the next read and made durable by the next
+        :meth:`save`.  A crash before that write loses the counter, never the
+        status — which is what resume and approval recovery read.
+        """
+        run_id = self._validate_run_id(run_id)
+        with self._lock:
+            count, _ = self._deferred.get(run_id, (0, None))
+            self._deferred[run_id] = (count + 1, _bounded_text(event_type))
+
+    def _apply_deferred(self, state: RunState) -> None:
+        """Fold buffered progress deltas into a freshly read state.
+
+        Applied on read rather than on write so the buffered events land
+        *before* whatever the current caller is about to record, keeping
+        ``last_event_type`` in stream order.  Not popped here: a read that
+        never reaches ``save`` (``validate_resume``) must not drop them, and
+        re-applying to another fresh read is idempotent.
+        """
+        buffered = self._deferred.get(state.run_id)
+        if buffered is None:
+            return
+        count, last_event_type = buffered
+        state.event_seq += count
+        if last_event_type is not None:
+            state.last_event_type = last_event_type
 
     def save(self, state: RunState) -> None:
         path = self._path(state.run_id)
+        # ``state`` already carries the buffered deltas (applied by ``get``);
+        # this write makes them durable, so the buffer has done its job.
+        self._deferred.pop(state.run_id, None)
         payload = json.dumps(
             state.to_dict(),
             ensure_ascii=False,
@@ -714,6 +804,9 @@ def project_execution_event(
         return
     try:
         event_type = event.type.value
+        if event.type in _DEFERRED_STATE_EVENTS:
+            store.defer_event(run_id, event_type)
+            return
         if event.type is EventType.RUN_STARTED:
             store.transition(run_id, RunStatus.RUNNING, event_type=event_type)
             return

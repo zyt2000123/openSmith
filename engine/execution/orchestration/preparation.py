@@ -32,6 +32,7 @@ from .builtin_tools import (
     bind_skill_load_tool,
     bind_skill_manage_tool,
     bind_snapshot_tools,
+    bind_sub_agent_tool,
     bind_todo_tool,
 )
 from .runtime import EngineRequest, RuntimeContext, RuntimeServices
@@ -319,6 +320,10 @@ async def prepare_runtime(
     bind_snapshot_tools(services, runtime.session_id)
     bind_memory_ops_tool(services, state_dir)
     bind_todo_tool(services, state_dir, runtime.session_id)
+    # Bound before the enabled-tools allowlist is computed: an empty or
+    # malformed catalog hides the tool, and a hidden tool must not then be
+    # re-enabled by config.
+    bind_sub_agent_tool(services, runtime.agents_dir)
     profile_config = await _load_profile_config(runtime)
     await _register_mcp_tools(profile_config, runtime, services)
 

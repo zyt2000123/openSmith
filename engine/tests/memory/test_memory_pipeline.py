@@ -885,6 +885,151 @@ def test_dream_recovers_cleanup_after_log_replacement_without_replaying_evidence
     assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "0"
 
 
+def _stale_event(index: int) -> str:
+    return json.dumps({
+        "task": f"stale task {index}",
+        "summary": f"stale reply {index}",
+        "timestamp": "2020-01-01T00:00:00+00:00",
+    }) + "\n"
+
+
+def _crashing_write(monkeypatch: pytest.MonkeyPatch, doomed: str):
+    """Make Dream's write of *doomed* raise, then hand back the real writer."""
+    original = dream_module.atomic_write_text
+
+    def fail_on(path: Path, content: str) -> None:
+        if path.name == doomed:
+            raise OSError(f"simulated crash before {doomed} was written")
+        original(path, content)
+
+    monkeypatch.setattr(dream_module, "atomic_write_text", fail_on)
+    return original
+
+
+def test_dream_cleanup_recovery_survives_evidence_appended_after_the_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash between the trim and the cursor rebase must not stall Dream forever.
+
+    整文件哈希做判据时，崩溃窗口之后任何一轮入账追加都让 old/new 两个哈希同时
+    落空：run_dream 每次都在恢复处提前返回，回收和 sanitize 一起停摆，唯一自愈
+    手段是人工删 .dream_cleanup.json。
+    """
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
+    survivor = _stale_event(2)
+    (memory_dir / "recent.jsonl").write_text(
+        _stale_event(0) + _stale_event(1) + survivor, encoding="utf-8"
+    )
+    _mark_consumed(memory_dir, 2)
+
+    original_atomic_write = _crashing_write(monkeypatch, ".compile_offset")
+    first = asyncio.run(run_dream(memory_dir, StaticLLM()))
+
+    assert first.errors
+    assert (memory_dir / ".dream_cleanup.json").exists()
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == survivor
+    monkeypatch.setattr(dream_module, "atomic_write_text", original_atomic_write)
+
+    # 重启后又跑了一轮入账，往日志尾部追加了一行。
+    appended = json.dumps({
+        "task": "task after the crash",
+        "summary": "reply after the crash",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }) + "\n"
+    with (memory_dir / "recent.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(appended)
+    # 留一行干净内容：整份文件都是密钥时 sanitize 会拒绝把非空层清空，
+    # 那样这条断言测的就不是"sanitize 有没有跑到"了。
+    (memory_dir / "durable.md").write_text(
+        "# Durable\napi_key: sk-12345678901234567890\n", encoding="utf-8"
+    )
+
+    second = asyncio.run(run_dream(memory_dir, StaticLLM()))
+
+    assert second.errors == []
+    assert not (memory_dir / ".dream_cleanup.json").exists()
+    # 修剪确实发生过，所以补写游标才是正确的收尾。
+    assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "0"
+    assert (memory_dir / ".compile_offset_context").read_text(encoding="utf-8") == "0"
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == survivor + appended
+    # 恢复不再提前返回，后面的 sanitize 也就跟着复活。
+    assert second.secrets_removed == 1
+
+
+def test_dream_cleanup_recovery_clears_unapplied_journal_after_evidence_appended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same stall through the other window: journal on disk, trim never applied."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
+    survivor = _stale_event(2)
+    source = _stale_event(0) + _stale_event(1) + survivor
+    (memory_dir / "recent.jsonl").write_text(source, encoding="utf-8")
+    _mark_consumed(memory_dir, 2)
+
+    original_atomic_write = _crashing_write(monkeypatch, "recent.jsonl")
+    first = asyncio.run(run_dream(memory_dir, StaticLLM()))
+
+    assert first.errors
+    assert (memory_dir / ".dream_cleanup.json").exists()
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == source
+    monkeypatch.setattr(dream_module, "atomic_write_text", original_atomic_write)
+
+    appended = json.dumps({
+        "task": "task after the crash",
+        "summary": "reply after the crash",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }) + "\n"
+    with (memory_dir / "recent.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(appended)
+
+    second = asyncio.run(run_dream(memory_dir, StaticLLM()))
+
+    assert second.errors == []
+    assert not (memory_dir / ".dream_cleanup.json").exists()
+    # 恢复丢掉没落地的 journal 之后，本轮的回收照常重做一遍。
+    assert (memory_dir / "recent.jsonl").read_text(encoding="utf-8") == survivor + appended
+    assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "0"
+
+
+def test_dream_cleanup_recovery_accepts_legacy_journal_without_prefix_lengths(
+    tmp_path: Path,
+) -> None:
+    """磁盘上可能已经躺着只存整文件哈希的旧 journal，缺键不能判成损坏。"""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "durable.md").write_text("exists", encoding="utf-8")
+    remaining = json.dumps({
+        "task": "fresh task",
+        "summary": "fresh reply",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }) + "\n"
+    (memory_dir / "recent.jsonl").write_text(remaining, encoding="utf-8")
+    _mark_consumed(memory_dir, 3)
+    (memory_dir / ".dream_cleanup.json").write_text(
+        json.dumps({
+            "cleaned": 2,
+            "old_recent_hash": dream_module._text_hash("the pre-trim log"),
+            "new_recent_hash": dream_module._text_hash(remaining),
+            "compile_offset": 1,
+            "context_offset": 1,
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    report = asyncio.run(run_dream(memory_dir, StaticLLM()))
+
+    assert report.errors == []
+    assert not (memory_dir / ".dream_cleanup.json").exists()
+    assert (memory_dir / ".compile_offset").read_text(encoding="utf-8") == "1"
+    assert (memory_dir / ".compile_offset_context").read_text(encoding="utf-8") == "1"
+
+
 def _mark_consumed(memory_dir: Path, lines: int) -> None:
     """Record that *both* views have compiled through *lines*.
 

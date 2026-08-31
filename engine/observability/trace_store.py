@@ -40,6 +40,15 @@ _MAX_DEPTH = 4
 _DEFERRED_SYNC_EVENTS = {
     EventType.RAW_RESPONSE_EVENT,
     EventType.PROVISIONAL_TEXT_DELTA,
+    # Per-iteration progress records.  An fsync per event ran inline on the SSE
+    # delivery path, so a tool-heavy turn paid hundreds of them; these three
+    # carry no resume or approval decision, and ``seal`` fsyncs the whole log
+    # before it anchors the head, so a finished run is durable regardless.
+    # TOOL_CALL_START/RESULT stay synchronous to match the run-state store,
+    # whose approval transition rides on the same events.
+    EventType.THINKING,
+    EventType.TOKEN_USAGE,
+    EventType.CONTEXT_USAGE,
 }
 # Name-based redaction cannot see a credential carried *inside* a value, and
 # TOOL_CALL_START writes the full tool arguments — so a shell command holding a

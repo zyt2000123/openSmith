@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import aiosqlite
@@ -13,6 +14,17 @@ _db: aiosqlite.Connection | None = None
 _db_path: Path | None = None
 _db_lock = asyncio.Lock()
 _db_init_lock = asyncio.Lock()
+
+# Every connection to this file must agree on these; a second connection that
+# skipped WAL or foreign_keys would change the semantics of the writes made
+# through it, not just its own performance.
+_CONNECTION_PRAGMAS = (
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA foreign_keys=ON",
+    # Wait for a concurrent writer (server/CLI share this file) instead
+    # of failing immediately with "database is locked".
+    "PRAGMA busy_timeout=5000",
+)
 
 
 async def _execute_pragma(conn: aiosqlite.Connection, statement: str) -> None:
@@ -70,11 +82,8 @@ async def get_db() -> aiosqlite.Connection:
         db = await aiosqlite.connect(str(sqlite_path))
         try:
             db.row_factory = aiosqlite.Row
-            await _execute_pragma(db, "PRAGMA journal_mode=WAL")
-            await _execute_pragma(db, "PRAGMA foreign_keys=ON")
-            # Wait for a concurrent writer (server/CLI share this file) instead
-            # of failing immediately with "database is locked".
-            await _execute_pragma(db, "PRAGMA busy_timeout=5000")
+            for pragma in _CONNECTION_PRAGMAS:
+                await _execute_pragma(db, pragma)
         except BaseException:
             await db.close()
             raise
@@ -82,6 +91,37 @@ async def get_db() -> aiosqlite.Connection:
             _db = db
             _db_path = sqlite_path
         return db
+
+
+@asynccontextmanager
+async def dedicated_connection() -> AsyncIterator[aiosqlite.Connection]:
+    """A private connection to the same database file, closed on exit.
+
+    ``get_db`` hands every caller one connection, and aiosqlite runs all of that
+    connection's statements on a single worker thread.  A task that holds a
+    transaction across thousands of statements therefore does two things to the
+    request path: it queues every other coroutine's query behind its own, and
+    its ``rollback()`` discards their executed-but-uncommitted writes as well
+    (measured: a message inserted by ``add_message`` vanished with no error).
+    A private connection removes both — under WAL the readers never block, and
+    the two writers interleave under ``busy_timeout``.
+
+    The schema is *not* created here: this is for a second writer against a
+    database ``get_app_db`` has already migrated.  (A caller may still run its
+    own ``CREATE TABLE IF NOT EXISTS`` — the token backfill does — which is a
+    no-op taking no write lock once the migration has run.)
+    """
+    paths = config.PATHS
+    await asyncio.to_thread(paths.ensure_base_dirs)
+    db = await aiosqlite.connect(str(paths.sqlite_path))
+    try:
+        db.row_factory = aiosqlite.Row
+        for pragma in _CONNECTION_PRAGMAS:
+            await _execute_pragma(db, pragma)
+        yield db
+    finally:
+        with suppress(sqlite3.Error, ValueError):
+            await db.close()
 
 
 async def close_db() -> None:

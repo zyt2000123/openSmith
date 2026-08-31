@@ -8,7 +8,9 @@ import subprocess
 import pytest
 
 from engine.memory._snapshot import (
+    _GC_LOOSE_OBJECT_LIMIT,
     TRACKED_VIEWS,
+    compact_snapshots,
     list_snapshots,
     restore_snapshot,
     snapshot_baseline,
@@ -31,6 +33,24 @@ def _write_views(root, *, context: str, durable: str, recent: str | None = None)
     # which is what the real pipeline produces.
     line = recent if recent is not None else json.dumps({"note": durable.strip()}) + "\n"
     (root / "memory" / "recent.jsonl").write_text(line, encoding="utf-8")
+
+
+def _loose_objects(root) -> int:
+    return sum(1 for _ in (root / ".git" / "objects").glob("??/*"))
+
+
+def _packs(root) -> list:
+    return list((root / ".git" / "objects" / "pack").glob("*.pack"))
+
+
+def _snapshot_past_the_gc_limit(root) -> None:
+    """Take snapshots until the repository holds more loose objects than the limit."""
+    for i in range(_GC_LOOSE_OBJECT_LIMIT + 1):
+        _write_views(root, context=f"# ctx v{i}\n", durable=f"# dur v{i}\n")
+        snapshot_views(root, f"memory: durable (v{i})")
+        if _loose_objects(root) > _GC_LOOSE_OBJECT_LIMIT:
+            return
+    raise AssertionError("snapshots stopped accumulating loose objects")
 
 
 def _show(root, ref: str, path: str) -> str:
@@ -278,6 +298,52 @@ def test_reclaimed_evidence_is_recoverable(tmp_path):
 
     assert restore_snapshot(root, restorable[0].ref) is True
     assert "event 0" in (memory_dir / "recent.jsonl").read_text(encoding="utf-8")
+
+
+def test_snapshot_history_is_repacked_instead_of_growing_forever(tmp_path):
+    """Every writer here only commits, and `git commit` triggers no auto-gc, so
+    each snapshot's *full* copy of recent.jsonl stayed a delta-free loose blob
+    for the life of the install -- growth with no ceiling and no reclaim."""
+    root = _agent_root(tmp_path)
+    _snapshot_past_the_gc_limit(root)
+
+    assert not _packs(root), "committing must not be assumed to pack anything"
+    before = _loose_objects(root)
+
+    assert compact_snapshots(root) is True
+
+    assert _loose_objects(root) < before
+    assert _loose_objects(root) <= _GC_LOOSE_OBJECT_LIMIT
+    assert _packs(root)
+
+    # Packing moves objects, it never drops a snapshot: `gc` prunes only
+    # unreachable objects and every commit here hangs off HEAD.  The undo path
+    # must survive compaction or it buys space by destroying the recovery it
+    # exists for.
+    history = list_snapshots(root, limit=_GC_LOOSE_OBJECT_LIMIT)
+    assert len(history) > 1
+    oldest = history[-1]
+    assert "v0" in _show(root, oldest.ref, "memory/durable.md")
+    assert restore_snapshot(root, oldest.ref) is True
+    assert (root / "memory" / "durable.md").read_text(encoding="utf-8") == "# dur v0\n"
+
+
+def test_dream_is_what_compacts_the_snapshot_repository(tmp_path):
+    """Compaction has to sit on a path that actually runs. Dream is the only
+    low-frequency pass; every other snapshot writer is on a per-turn path that
+    cannot afford a repack."""
+    import asyncio
+
+    from engine.memory.dream import run_dream
+
+    root = _agent_root(tmp_path)
+    _snapshot_past_the_gc_limit(root)
+
+    # run_dream never touches the LLM: it sanitizes and reclaims, both local.
+    asyncio.run(run_dream(root / "memory", None))  # type: ignore[arg-type]
+
+    assert _packs(root)
+    assert _loose_objects(root) <= _GC_LOOSE_OBJECT_LIMIT
 
 
 @pytest.mark.parametrize("view", TRACKED_VIEWS)

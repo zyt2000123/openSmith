@@ -23,11 +23,17 @@ from .fitting import (
     fit_request,
     measure_request,
 )
-from .summary import SessionSummaryResult, SessionSummaryStatus, summarize_session
+from .summary import (
+    SESSION_SUMMARY_PREFIX,
+    SessionSummaryResult,
+    SessionSummaryStatus,
+    summarize_session,
+)
 
 __all__ = (
     "AssembledPrompt",
     "CONTEXT_DISPLAY_WINDOW",
+    "SESSION_SUMMARY_PREFIX",
     "ContextBudget",
     "ContextFitResult",
     "ContextFitStatus",
