@@ -13,11 +13,23 @@ DEFAULT_MAX_REACT_ITERS = 60
 MAX_FAILED_TOOL_RECOVERY_ITERS = 20
 MAX_PREFLIGHT_CHALLENGE_ITERS = 20
 MAX_INCOMPLETE_FINAL_REPAIRS = 2
+# How much text may still count as "only a promise".  The cap stands in for
+# "delivered nothing", so it has to be generous enough to cover a promise that
+# comes with a paragraph of preamble -- 240 chars is barely two sentences of
+# English.  It cannot go much higher without catching real answers that close
+# with a suggestion ("接下来你可以自己跑一下测试"), and that misfire costs one
+# extra repair round, where a miss costs the user an unanswered question.
+INCOMPLETE_FINAL_MAX_CHARS = 400
 MAX_LENGTH_CONTINUATIONS = 2
 CONVERSATION_HARD_LIMIT = 40
 CONVERSATION_KEEP_RECENT = 28
 MAX_IDENTICAL_TOOL_ERRORS = 6
 MAX_COMPACTION_FAILURES = 2
+# Identical *successful* calls had no ceiling at all: identical_error_count only
+# counts failures and is reset by every success, so a tool could be re-run with
+# the same arguments until max_iters ran out.  Warn rather than block -- a file
+# may legitimately have changed between two reads.
+REPEATED_SUCCESS_WARN_THRESHOLD = 3
 TOOL_FAILURE_HINT = tool_failure_recovery_prompt()
 INCOMPLETE_FINAL_AFTER_TOOL_HINT = incomplete_final_repair_prompt()
 CONTINUE_AFTER_LENGTH_HINT = continue_after_length_prompt()
@@ -61,9 +73,45 @@ _INCOMPLETE_FINAL_PATTERNS = (
 def looks_like_incomplete_final_after_tool(text: str) -> bool:
     """Return true when a supposed final answer is only a promise to keep acting."""
     normalized = " ".join(text.strip().split()).lower()
-    if not normalized or len(normalized) > 240:
+    if not normalized or len(normalized) > INCOMPLETE_FINAL_MAX_CHARS:
         return False
     return any(pattern.search(normalized) for pattern in _INCOMPLETE_FINAL_PATTERNS)
+
+
+def _elision_note(dropped: list[dict]) -> list[dict]:
+    """Leave a marker where trimmed messages used to be.
+
+    Dropping the middle of the conversation outright removed every trace that
+    those calls ever happened -- strictly worse than a pruned result, which at
+    least keeps the call itself visible.  The model then re-ran work it had
+    already completed, which is the same failure mode `[pruned: ...]` stubs
+    exist to prevent.  One system line is far cheaper than the re-run.
+    """
+    if not dropped:
+        return []
+    tool_results = sum(1 for message in dropped if message.get("role") == "tool")
+    detail = f", including {tool_results} tool result(s)" if tool_results else ""
+    return [{
+        "role": "system",
+        "content": (
+            f"[{len(dropped)} {_ELISION_MARKER}{detail}. That work still "
+            "happened: rely on what you already established rather than "
+            "repeating it, and say so if you genuinely need a result again.]"
+        ),
+    }]
+
+
+_ELISION_MARKER = "earlier messages were elided to fit the context window"
+
+
+def _is_elision_note(message: dict) -> bool:
+    content = message.get("content")
+    return (
+        message.get("role") == "system"
+        and isinstance(content, str)
+        and content.startswith("[")
+        and _ELISION_MARKER in content
+    )
 
 
 def _is_round_boundary(message: dict) -> bool:
@@ -98,6 +146,11 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
         return conversation
 
     leading_system_count, active_start = active_turn_bounds(conversation)
+    # 上一次裁剪留下的省略痕是 system 角色、紧跟在 head 之后，会被
+    # active_turn_bounds 计入前导契约块 —— 不踢回去它就永久驻留，每裁一次
+    # 多一条。踢回可丢弃区后它随本次裁剪一起被丢，并被计入新痕的条数。
+    while leading_system_count > 0 and _is_elision_note(conversation[leading_system_count - 1]):
+        leading_system_count -= 1
 
     def aligned(cut: int) -> int:
         """Move *cut* forward so the tail opens on a user turn when it must.
@@ -121,11 +174,19 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
 
     def kept(cut: int) -> list[dict]:
         head = conversation[:leading_system_count]
+        dropped = conversation[leading_system_count:cut]
         if active_start is not None and active_start < cut:
             # 请求落在被丢弃的中段：钉进 head。它之后的工作照常可裁 ——
             # 保住的是指令本身，不是整条活动轮。
             head = [*head, conversation[active_start]]
-        return head + conversation[cut:]
+            dropped = [
+                message
+                for index, message in enumerate(dropped, start=leading_system_count)
+                if index != active_start
+            ]
+        # 留痕占一条消息：调用方用"结果是否真的变短"判断裁剪是否生效，
+        # dropped 只有一条时头+痕+尾与原长相等，正确地落入向后回退分支。
+        return head + _elision_note(dropped) + conversation[cut:]
 
     # 切点落在 tool 结果串中会拆散 assistant(tool_calls)/tool 配对
     # （provider 400）。向前回退到 assistant 或**真实**请求轮的边界：同一轮的

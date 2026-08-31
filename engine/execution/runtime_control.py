@@ -51,6 +51,17 @@ def incomplete_final_repair_prompt() -> str:
     )
 
 
+def repeated_success_prompt(tool_name: str, count: int) -> str:
+    """Tell the model it is re-running a call that already succeeded."""
+    return (
+        f"You have already called `{tool_name}` {count} times with identical arguments, "
+        "and each call succeeded. An earlier result may have been replaced by a "
+        "`[pruned: ...]` placeholder to save context, but the call did happen. "
+        "Use what you already established instead of repeating it, and only call it "
+        "again if you specifically need to observe a change."
+    )
+
+
 def continue_after_length_prompt() -> str:
     """Continue a length-limited answer without duplicating previous output."""
     return (

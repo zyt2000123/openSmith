@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
@@ -20,7 +21,7 @@ from engine.context.compression import (
 )
 from engine.execution.evidence import tool_result_hash
 from engine.execution.events import EventType, ExecutionEvent
-from engine.execution.runtime_control import tool_blocked_prompt
+from engine.execution.runtime_control import repeated_success_prompt, tool_blocked_prompt
 from engine.llm.contracts import (
     ChatResponse,
     LLMContextLengthError,
@@ -50,6 +51,7 @@ from .budget import (
     MAX_INCOMPLETE_FINAL_REPAIRS,
     MAX_LENGTH_CONTINUATIONS,
     MAX_PREFLIGHT_CHALLENGE_ITERS,
+    REPEATED_SUCCESS_WARN_THRESHOLD,
     PREFLIGHT_BUDGET_MESSAGE,
     TOOL_CALL_BUDGET_MESSAGE,
     TOOL_FAILURE_BUDGET_MESSAGE,
@@ -469,6 +471,21 @@ def _should_repair_incomplete_final(
     )
 
 
+def _repeat_key(tool_name: str, arguments: object) -> str:
+    """Identify a call by name plus arguments.
+
+    Hashed rather than truncated: two different calls that share a long common
+    prefix -- the same directory, the same file with a different line range --
+    would collide under a slice and warn about a repeat that never happened.
+    """
+    try:
+        rendered = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = repr(arguments)
+    digest = hashlib.sha256(rendered.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{tool_name}:{digest}"
+
+
 def _assistant_turn(text: str, reasoning: str = "") -> dict[str, object]:
     """构造一条 assistant 消息，按需带上 reasoning。
 
@@ -576,6 +593,10 @@ async def react_event_loop(
             last_error_key = error_key
             identical_error_count = 1
         return identical_error_count
+
+    # 与上面的同错熔断互补：那个数的是连续同错，这里数的是同参成功重复。
+    repeat_counts: dict[str, int] = {}
+    repeat_warned: set[str] = set()
     context_recoveries = 0
     model_compaction_enabled = True
     compaction_failures = 0
@@ -918,8 +939,9 @@ async def react_event_loop(
                 incomplete_final_repairs += 1
                 # 只追加本轮分片：更早的分片已由 _append_length_continuation
                 # 写进 conversation，重复追加会让同一段文本在修复提示里出现
-                # 两次。（当前 looks_like_incomplete_final_after_tool 有 240
-                # 字上限，续写过的文本够不到，所以这是补一个陷阱而非在燃 bug。）
+                # 两次。这条路径现在真的够得到 —— INCOMPLETE_FINAL_MAX_CHARS
+                # 放宽后，一段续写过的文本可以同时是假结尾，交互由
+                # test_a_continued_answer_can_still_be_repaired_without_duplication 锁住。
                 _append_incomplete_final_repair(
                     conversation, response.text, response.reasoning
                 )
@@ -1438,6 +1460,21 @@ async def react_event_loop(
                 consecutive_errors = 0
                 last_error_key = None
                 identical_error_count = 0
+                repeat_key = _repeat_key(tc.name, call.arguments)
+                repeat_counts[repeat_key] = repeat_counts.get(repeat_key, 0) + 1
+                if (
+                    repeat_counts[repeat_key] >= REPEATED_SUCCESS_WARN_THRESHOLD
+                    and repeat_key not in repeat_warned
+                ):
+                    # Warn once per call shape: re-appending every round would
+                    # itself flood the context this guard exists to protect.
+                    repeat_warned.add(repeat_key)
+                    conversation.append({
+                        "role": "system",
+                        "content": repeated_success_prompt(
+                            tc.name, repeat_counts[repeat_key]
+                        ),
+                    })
 
         if round_had_preflight:
             preflight_iters += 1
