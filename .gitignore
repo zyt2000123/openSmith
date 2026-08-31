@@ -21,3 +21,7 @@ __pycache__/
 tmp/
 .workbuddy/
 .codebuddy/
+# claude-flow drops a ~3MB trajectory store into whatever directory an agent
+# runs in, and it records absolute local paths.  Unlike .mypy_cache/.pytest_cache
+# it does not write a self-ignoring .gitignore, so it has to be listed here.
+.claude-flow/

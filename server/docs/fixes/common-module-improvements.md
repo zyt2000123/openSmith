@@ -2,7 +2,7 @@
 
 **分支**: `codex/common-runtime-fixes`
 **日期**: 2026-08-02
-**当前状态**: 已由后续运行时加固更新；以 `common/` 源码和 `docs/03-Common-基础设施.md` 为准。
+**当前状态**: 已由后续运行时加固更新；以 `common/` 源码和 `docs/layers/40-Common.md` 为准。
 
 ## 问题与修复总结
 

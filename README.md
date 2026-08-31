@@ -239,12 +239,20 @@ openSmith/
 
 ## Documentation
 
-**Start with [`docs/wiki/`](docs/wiki/README.md)** — 14 chapters organised by
-subsystem, covering technology choices, architecture, parameters, and the
-trade-offs behind them. All of it is written against the source.
+**Start with [`docs/README.md`](docs/README.md)** — the reading map. Every topic
+has exactly one authoritative document, all of it written against the source:
 
-The `00`–`11` files in the `docs/` root are an earlier set that was not kept in
-sync with later refactors; writing and diagram conventions are described in
+| Where | What |
+| --- | --- |
+| [`docs/guide/`](docs/guide) | What Smith is, and getting it running |
+| [`docs/architecture/`](docs/architecture) | Layers, one request end to end, glossary |
+| [`docs/subsystems/`](docs/subsystems) | How each subsystem runs — loop, memory, context, tools & safety, sub-agents, LLM, MCP, observability, routing, skills, sandbox |
+| [`docs/layers/`](docs/layers) | What each code layer is responsible for |
+| [`docs/project/`](docs/project) | Conventions, roadmap, external comparisons |
+
+Superseded drafts live in [`docs/archive/`](docs/archive) and are **not current
+fact** — each carries a banner naming the document that replaced it and why.
+Writing and diagram conventions are in
 [`docs/00`](docs/00-文档阅读指南与表达规范.md). When documentation and code
 disagree, the code wins.
 

@@ -2,9 +2,9 @@
 
 > 调研日期：2026-07-29
 > 范围：只核对 Nous Research 官方 `hermes-agent` 仓库、其随仓文档和源码；本文是设计输入，不是 Agent-Smith 当前实现规格。
-> 名称消歧：这里的 “Hermes/Hermess” 指 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)，而不是 Hermes 系列模型或其他同名项目。项目既有 [竞品文档](../09-竞品架构对比.md) 也以 “Hermes Agent” 指向该项目。
+> 名称消歧：这里的 “Hermes/Hermess” 指 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)，而不是 Hermes 系列模型或其他同名项目。项目既有 [竞品文档](../project/52-竞品对比.md) 也以 “Hermes Agent” 指向该项目。
 >
-> 实现注（2026-07-29）：本文的 P0 已采用为 Engine-owned 的 `memory/nudge.py`，每 20 个有效记忆回合受限地产生候选；为保持 `memory_ops` 对主 Agent 隐藏，候选不会通过该工具调用。当前规范以 [`05-Engine-记忆系统.md`](../05-Engine-记忆系统.md) 与 [`MEMORY_POLICY.md`](../../engine/memory/MEMORY_POLICY.md) 为准。
+> 实现注（2026-07-29）：本文的 P0 已采用为 Engine-owned 的 `memory/nudge.py`，每 20 个有效记忆回合受限地产生候选；为保持 `memory_ops` 对主 Agent 隐藏，候选不会通过该工具调用。当前规范以 [`21-记忆系统.md`](../subsystems/21-记忆系统.md) 与 [`MEMORY_POLICY.md`](../../engine/memory/MEMORY_POLICY.md) 为准。
 
 ## 结论先行
 
@@ -80,7 +80,9 @@ Agent-Smith 的依据：
 
 - [`save_conversation_memory()`](../../engine/memory/store.py) 只为工具工作、显式信号或稳定信号生成事件，并在同一入口独立推进 compile 与 Dream 计数器。
 - [`_entries_for_view()`](../../engine/memory/compile.py) 与 [`DURABLE_MEMORY_KINDS`](../../engine/memory/policy.py) 对 durable 做类型和 scope 筛选；[`compile_durable()`](../../engine/memory/compile.py) 才生成并提交文档。
-- [`retrieve_relevant_memory()`](../../engine/memory/store.py) 将 recent 设为被动工作层，durable/episodes 走按需召回；[`SearchIndex`](../../engine/memory/search.py) 已是可恢复的 SQLite FTS5 episode 索引。
+- [`retrieve_relevant_memory()`](../../engine/memory/store.py) 将 recent 设为被动工作层，durable/episodes 走按需召回；`SearchIndex`（`engine/memory/search.py`）当时是可恢复的 SQLite FTS5 episode 索引。
+> **该层已不存在**：2026-08-08 的 `b71be4b` 把记忆坍缩为两个整体注入的视图，
+> 一并移除了 episode 层与检索索引。当前实现见 [21 · 记忆系统](../subsystems/21-记忆系统.md)。
 - [`PromptAssembler.build_layers()`](../../engine/context/assembler.py) 把 memory 标成低权限的 reference，而不是可执行指令。
 
 ## 建议的最小借鉴方案
