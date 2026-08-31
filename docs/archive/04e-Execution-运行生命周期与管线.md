@@ -1,7 +1,7 @@
 # 04e · Execution 运行生命周期与管线
 
 > **已归档 —— 不是当前事实。**
-> 本文已被 [20 · Agent Loop 运行机制](../20-Agent-Loop-运行机制.md) 取代；两者冲突时以那一篇和源码为准。
+> 本文已被 [20 · Agent Loop 运行机制](../subsystems/20-Agent-Loop.md) 取代；两者冲突时以那一篇和源码为准。
 > 保留在此仅供追溯当时的设计取舍，不再随代码更新。
 
 
@@ -33,7 +33,7 @@ graph LR
 | `orchestration/` | runtime 装配、Run 生命周期、恢复、事件边界 | `runtime.py`、`preparation.py`、`lifecycle.py`、`agent_loop.py`、`run_state.py` |
 | `pipeline/` | skill node、gate、checkpoint、回退与产物上下文 | `skill_chain.py`、`pipeline.py`、`gate.py`、`checkpoint.py` |
 | `react/` | 单步模型—工具循环 | `react_loop.py`，详见 [04a](04a-ReAct-Loop-设计.md) |
-| `routing/` | 请求到 route decision | `task_router.py`，详见 [04d](../04d-Identity-身份与路由.md) |
+| `routing/` | 请求到 route decision | `task_router.py`，详见 [04d](../subsystems/28-身份与路由.md) |
 | 根文件 | 事件、证据 hash、运行控制提示、回放签名 | `events.py`、`evidence.py`、`run_signature.py` |
 
 ## 核心对象

@@ -93,7 +93,7 @@ Pipeline 执行规则：节点先从 `SkillRegistry` 解析出与 `steps[].skill
 
 ## 文档索引
 
-- `docs/06-Agents-内容层.md` — 内容层设计权威文档
+- `docs/layers/42-Agents.md` — 内容层设计权威文档
 - `gates/README.md` — 门禁/条件编写规范
 - `identities/README.md` — 身份目录契约、路由选择规则与最小格式
 - `skills/README.md` — SKILL.md 运行时契约

@@ -1,6 +1,6 @@
 # Agent memory quality research
 
-> 调研记录，不是当前实现规格。后续设计已决定不引入 candidate 层或人工审核；最终方案见 `docs/21-记忆系统.md` 与 `engine/memory/MEMORY_POLICY.md`。
+> 调研记录，不是当前实现规格。后续设计已决定不引入 candidate 层或人工审核；最终方案见 `docs/subsystems/21-记忆系统.md` 与 `engine/memory/MEMORY_POLICY.md`。
 
 ## Executive conclusion
 
