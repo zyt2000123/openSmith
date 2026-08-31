@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseUnifiedDiff, renderDiffLines } from "./diff-block.js";
+import { renderDiffLines } from "./diff-block.js";
+import { parseUnifiedDiff } from "./diff-parse.js";
 import { displayWidth } from "./text-layout.js";
 
 const SOURCE = [
