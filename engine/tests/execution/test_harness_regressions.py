@@ -1,9 +1,4 @@
-"""Two proposed behavior regressions against the inspected openSmith snapshot.
-
-These tests intentionally FAIL on the reviewed implementation. They are not
-changes to the user's repository and do not call a real model or the network.
-Run with the reviewed repository on PYTHONPATH and pytest installed.
-"""
+"""Behavior regressions discovered during the harness review."""
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +12,6 @@ from engine.tool import truncation
 
 def test_archived_outputs_remain_distinct_within_one_second(tmp_path, monkeypatch):
     monkeypatch.setattr(truncation, "_OUTPUT_DIR", tmp_path)
-    monkeypatch.setattr(truncation.time, "time", lambda: 1800000000.0)
     first = truncation.truncate_output("same\n" * 3000, tool_name="read_file")
     second = truncation.truncate_output("same\n" * 2000 + "different\n" * 1000,
                                         tool_name="read_file")

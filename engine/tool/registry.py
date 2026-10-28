@@ -18,7 +18,7 @@ from engine.safety.risk import RiskTier
 from engine.sandbox import ExecutionEnvironment, LocalExecutionEnvironment
 
 from .interface import ToolCall, ToolDefinition, ToolResult
-from .truncation import truncate_output
+from .output_store import ToolOutputStore
 
 if TYPE_CHECKING:
     from engine.safety.tool_guard import ToolGuard
@@ -591,15 +591,16 @@ class ToolRegistry:
 
     @staticmethod
     def _finalize_result(result: ToolResult, tool_name: str) -> ToolResult:
+        captured = ToolOutputStore().capture(result.content, tool_name)
         return ToolResult(
             call_id=result.call_id,
-            content=truncate_output(result.content, tool_name=tool_name),
+            content=captured.preview,
             is_error=result.is_error,
             error_kind=result.error_kind,
             retryable=result.retryable,
             timed_out=result.timed_out,
             side_effect_status=result.side_effect_status,
-            metadata=dict(result.metadata),
+            metadata={**result.metadata, "output": captured.metadata()},
         )
 
     async def _execute_registered(
