@@ -108,3 +108,24 @@ def test_closing_model_stream_closes_its_active_tool_round(monkeypatch):
         # Closing the parent must synchronously release the nested iterator.
         assert len([e async for e in runner.run([])]) == 1
     asyncio.run(run())
+
+
+def test_replay_without_raw_digest_does_not_claim_stagnation():
+    from engine.execution.react.tool_round import ToolRoundRunner
+    from engine.llm.contracts import ToolCallData
+    from engine.safety.tool_policy import ToolPolicy
+    from engine.tool.interface import ToolResult
+    from engine.tool.registry import ToolRegistry
+    async def run():
+        class ReplayedRegistry(ToolRegistry):
+            async def execute(self, call):
+                return ToolResult(call.id, 'persisted preview', metadata={'replayed': True})
+        registry = ReplayedRegistry()
+        registry.register('write', 'Write', {}, lambda: 'unused')
+        runner = ToolRoundRunner(registry, ToolPolicy(None))
+        messages = []
+        for n in range(4):
+            events = [e async for e in runner.run([ToolCallData(str(n), 'write', {})])]
+            messages.extend(events[-1].messages)
+        assert not any('identical arguments' in m['content'] for m in messages)
+    asyncio.run(run())
