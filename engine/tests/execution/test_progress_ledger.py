@@ -59,3 +59,12 @@ def test_invalid_window_is_rejected():
     import pytest
     with pytest.raises(ValueError):
         ledger(window_size=2)
+
+
+def test_failure_interrupts_an_otherwise_repeated_cycle():
+    subject = ledger()
+    for tool in ['a', 'b'] * 2:
+        observe(subject, tool=tool)
+    observe(subject, tool='failed', error=True)
+    observe(subject, tool='a')
+    assert observe(subject, tool='b').kind != 'cycle'
