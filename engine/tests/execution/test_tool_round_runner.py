@@ -80,3 +80,31 @@ def test_lazy_schemas_preserve_previous_request_snapshot():
         assert len(original) == 1
         assert len(runner.tools) == 2
     asyncio.run(run())
+
+
+def test_closing_model_stream_closes_its_active_tool_round(monkeypatch):
+    import importlib
+    from engine.execution.events import EventType
+    from engine.execution.react.tool_round import ToolRoundRunner
+    from engine.llm.contracts import ChatResponse, ToolCallData
+    from engine.safety.tool_policy import ToolPolicy
+    from engine.tool.registry import ToolRegistry
+    loop_module = importlib.import_module('engine.execution.react.react_loop')
+    async def run():
+        touched = []
+        registry = ToolRegistry()
+        registry.register('read', 'Read', {}, lambda: touched.append(True))
+        runner = ToolRoundRunner(registry, ToolPolicy(None))
+        monkeypatch.setattr(loop_module, 'ToolRoundRunner', lambda *args: runner)
+        class Model:
+            async def chat(self, messages, **kwargs):
+                return ChatResponse(tool_calls=[ToolCallData('one', 'read', {})])
+        stream = loop_module.react_event_loop(Model(), [{'role': 'user', 'content': 'read'}], registry)
+        async for event in stream:
+            if event.type == EventType.TOOL_CALL_START:
+                break
+        await stream.aclose()
+        assert not touched
+        # Closing the parent must synchronously release the nested iterator.
+        assert len([e async for e in runner.run([])]) == 1
+    asyncio.run(run())
