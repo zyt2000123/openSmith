@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
 from uuid import uuid4
@@ -838,18 +839,19 @@ async def react_event_loop(
         ]
         conversation.append(assistant_message)
 
-        async for item in tool_runner.run(response.tool_calls):
-            if isinstance(item, ToolRoundResult):
-                conversation.extend(item.messages)
-                tools = tool_runner.tools
-                had_successful_tool |= item.had_operational_success
-                round_had_success = item.had_success
-                round_had_failure = item.had_failure
-                round_had_preflight = item.had_preflight
-                if item.terminal:
-                    return
-            else:
-                yield item
+        async with aclosing(tool_runner.run(response.tool_calls)) as rounds:
+            async for item in rounds:
+                if isinstance(item, ToolRoundResult):
+                    conversation.extend(item.messages)
+                    tools = tool_runner.tools
+                    had_successful_tool |= item.had_operational_success
+                    round_had_success = item.had_success
+                    round_had_failure = item.had_failure
+                    round_had_preflight = item.had_preflight
+                    if item.terminal:
+                        return
+                else:
+                    yield item
 
         if round_had_preflight:
             preflight_iters += 1

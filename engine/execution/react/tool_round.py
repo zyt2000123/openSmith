@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncIterator
 from uuid import uuid4
@@ -159,10 +160,11 @@ class ToolRoundRunner:
         batch = _Batch()
         try:
             self.policy.begin_round()
-            async for event in self._execute(calls, batch):
-                if event.type == EventType.INCOMPLETE:
-                    batch.terminal = True
-                yield event
+            async with aclosing(self._execute(calls, batch)) as events:
+                async for event in events:
+                    if event.type == EventType.INCOMPLETE:
+                        batch.terminal = True
+                    yield event
             if batch.had_failure:
                 self.progress.break_sequence()
             yield batch.finish()
