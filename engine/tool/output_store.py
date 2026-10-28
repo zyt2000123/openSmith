@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,7 +75,8 @@ class ToolOutputStore:
             hint = f"Full output saved to: {path}\nUse read_file with offset/limit to view specific sections."
         except (OSError, RuntimeError):
             if path is not None:
-                path.unlink(missing_ok=True)
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
             path = None
             hint = "(Failed to save full output to file)"
 

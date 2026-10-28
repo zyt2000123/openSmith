@@ -135,7 +135,7 @@ class ToolRoundRunner:
         self.consecutive_errors = 0
         self.progress = ProgressLedger(repeat_threshold=REPEATED_SUCCESS_WARN_THRESHOLD)
         self._running = False
-        self.lazy_tool_schemas = bool(getattr(tool_registry, "self.lazy_tool_schemas", False))
+        self.lazy_tool_schemas = bool(getattr(tool_registry, "lazy_tool_schemas", False))
         if self.lazy_tool_schemas:
             # Tool descriptions live in the stable prompt prefix. The provider sees
             # only this tiny loader schema until the model explicitly asks for one
