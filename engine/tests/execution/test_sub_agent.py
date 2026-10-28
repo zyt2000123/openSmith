@@ -1108,7 +1108,7 @@ async def test_a_sub_agent_works_under_the_runtimes_lazy_schema_mode(
     view — not the parent registry — must answer the load. Every other test
     here runs eager, so this is the one that exercises the real config.
     """
-    from engine.execution.react.react_loop import _TOOL_SCHEMA_LOADER
+    schema_loader = "get_tool_schema"
 
     registry = ToolRegistry(lazy_tool_schemas=True)
     registry.register(
@@ -1135,9 +1135,9 @@ async def test_a_sub_agent_works_under_the_runtimes_lazy_schema_mode(
             if not replies:
                 # Try the out-of-scope tool first — the scoped view must refuse.
                 return ChatResponse(tool_calls=[
-                    ToolCallData(id="s1", name=_TOOL_SCHEMA_LOADER,
+                    ToolCallData(id="s1", name=schema_loader,
                                  arguments={"name": "forbidden_tool"}),
-                    ToolCallData(id="s2", name=_TOOL_SCHEMA_LOADER,
+                    ToolCallData(id="s2", name=schema_loader,
                                  arguments={"name": "echo_tool"}),
                 ])
             if len(replies) == 2:
@@ -1158,7 +1158,7 @@ async def test_a_sub_agent_works_under_the_runtimes_lazy_schema_mode(
 
     assert outcomes[0].ok, outcomes[0].error
     # Only the loader is offered up front — that is what lazy mode means.
-    assert seen["offered"] == _TOOL_SCHEMA_LOADER
+    assert seen["offered"] == schema_loader
     # The scope holds even through the loader.
     assert "unavailable" in seen["forbidden"].lower()
     assert "echo_tool" in seen["allowed"]

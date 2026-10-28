@@ -1535,9 +1535,8 @@ def test_react_event_loop_conversation_pruning_keeps_contract_and_request():
 def test_hard_limit_does_not_cut_on_the_injected_clock_note():
     """[Current time] 注记不是轮次边界，切在它上面会留下孤儿 tool 结果。
 
-    get_current_time 的结果是两条消息（tool ack + 一条 role=user 的运行时
-    注记），而它们是在 tool_calls 循环里 extend 进去的 —— 一次
-    [get_current_time, grep] 的并行调用产生
+    旧版本把 get_current_time 的 tool ack 和 role=user 运行时注记都在
+    tool_calls 循环里 extend 进去，一次 [get_current_time, grep] 调用产生
     assistant(tool_calls) / tool / [Current time] / tool。回退扫描原本只把
     tool 和 system 当作不安全落点，撞上这条 user 注记就停，后面那条 tool
     结果失去它的 assistant：OpenAI 兼容端报 "tool must be a response to a
@@ -1794,10 +1793,9 @@ def _assert_tool_pairing_intact(messages: list[dict]) -> None:
             for tc in msg.get("tool_calls") or []:
                 open_ids.add(tc["id"])
         elif role == "user" and is_request_turn(msg):
-            # 只有**真实**请求轮才必须关闭未决调用。get_current_time 的结果是
-            # tool ack + 一条 [Current time] user 注记，两条都在 tool_calls
-            # 循环里 extend 进去，所以那条注记合法地坐在轮次中间 —— 把它当作
-            # 违规会让这个 helper 拒绝一条生产上完全正常的对话。
+            # 这里检查裁剪对旧版历史的兼容性，容忍工具结果间的运行时注记。
+            # 新组装的请求必须先关闭整批调用再加注记，严格的 HTTP 边界检查
+            # 见 test_tool_round_protocol.py；此 helper 不证明请求符合协议。
             assert not open_ids, f"user turn with pending tool calls: {open_ids}"
         elif role == "tool":
             call_id = msg.get("tool_call_id")
