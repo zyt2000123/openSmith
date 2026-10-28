@@ -14,7 +14,8 @@ Agent-Smith is a local-first personal assistant Agent workbench that runs in the
 
 - Smith is the single, always-on Agent
 - Smith uses the skill system to switch workflows per task type
-- No sub-agents, no multi-agent routing — one Agent, one conversation, accumulating memory over time
+- Smith owns the resident conversation; bounded delegated tasks already run through
+  `engine/execution/subagent/runner.py` with scoped tools and isolated conversations.
 
 One-line:
 
@@ -117,6 +118,8 @@ anchors its non-bypassable platform-write protection on it.
 | Run lifecycle | `engine/execution/orchestration/lifecycle.py` |
 | Agent dispatch | `engine/execution/orchestration/agent_loop.py` |
 | ReAct loop | `engine/execution/react/react_loop.py` |
+| Tool batch execution / progress | `engine/execution/react/tool_round.py`, `.../progress.py` |
+| Tool output capture | `engine/tool/output_store.py` (`truncation.py` compatibility wrapper) |
 | Task routing | `engine/execution/routing/task_router.py`, `engine/identity/catalog.py` |
 | Pipeline + skill chain | `engine/execution/pipeline/pipeline.py`, `.../skill_chain.py` |
 | Prompt assembly | `engine/context/assembler.py` |
@@ -172,7 +175,9 @@ cd shell && npm run build && npm test
 cd server && uv run uvicorn app.main:app --port 8000
 ```
 
-Current baseline: engine 717 passed, server 155 passed (5 skipped).
+Harness refactor verification (including the known server timing baseline):
+`docs/superpowers/specs/2026-10-28-harness-validation.md`. Re-run the suites
+for the current checkout rather than relying on a static test count.
 
 ## 10. Not Implemented Yet
 
@@ -183,17 +188,13 @@ Product intent recorded here so it is not mistaken for existing behavior:
   mechanism exists. `agent_profiles.knowledge` is a `list[str]` column that the
   prompt assembler does not read.
 
-- **Future multi-Agent orchestration.** Smith currently remains a single Agent:
-  improve the terminal experience, memory, skills, and the existing pipeline
-  path before expanding the execution model. A future direction is a controlled
-  coordinator model where Smith plans, delegates bounded domain tasks, enforces
-  permissions and quality gates, then synthesizes the final result. This is not
-  yet implemented and must not be approximated by ad-hoc sub-Agent calls.
-  When implemented, every delegated or side-query Agent must inherit an
-  immutable, byte-for-byte cache-aligned prefix from its parent: system and
-  developer prompts, tool definitions, model configuration, message prefix, and
-  reasoning configuration. Task-specific delegation data belongs only in the
-  suffix after that shared prefix, so it does not invalidate prefix-cache reuse.
+- **Broader multi-Agent orchestration.** Bounded delegation is implemented in
+  `engine/execution/subagent/runner.py`; it shares the ReAct harness but constructs
+  fresh conversations, applies scoped tools, and bounds concurrency/time/tokens.
+  It does not inherit a byte-for-byte parent prompt prefix. A future cache-aligned
+  coordinator would need an explicit design for immutable shared system/developer
+  prompts, tool definitions, model configuration, and reasoning configuration,
+  with task-specific data in the suffix. Do not assume that future design exists.
 
 ## 11. Default Decision Rule
 

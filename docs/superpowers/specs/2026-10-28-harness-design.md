@@ -1,6 +1,7 @@
 # Agent Harness SDD
 
-Status: accepted for implementation. Scope: the shared Python ReAct execution path.
+Status: implemented and verified; see [validation](2026-10-28-harness-validation.md).
+Scope: the shared Python ReAct execution path.
 
 ## Problem and outcome
 
