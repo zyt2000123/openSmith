@@ -82,8 +82,8 @@ def _tool_result_messages(tool_name: str, call_id: str, content: str, *, is_erro
     """Keep tool-call protocol valid while placing live time in user context.
 
     Providers require a matching ``tool`` turn for every assistant tool call.
-    The actual volatile value is also appended as a user turn, per product
-    policy, so it never alters the stable system-prompt prefix.  It carries the
+    The actual volatile value is appended after all results as a user turn,
+    so it never alters the stable system-prompt prefix. It carries the
     shared prefix so the context fitter can tell engine framing apart from the
     request being executed (see ``compression._split_active_context``).
     """
@@ -163,6 +163,8 @@ class ToolRoundRunner:
                 if event.type == EventType.INCOMPLETE:
                     batch.terminal = True
                 yield event
+            if batch.had_failure:
+                self.progress.break_sequence()
             yield batch.finish()
         finally:
             self._running = False
@@ -216,7 +218,7 @@ class ToolRoundRunner:
                     ):
                         # Provider adapters may retain the argument list for
                         # diagnostics; replace rather than mutate it so a past
-                        # request remains an accurate snapshot of its self.tools.
+                        # request remains an accurate snapshot of its tools.
                         self.tools = [*self.tools, schema]
                     # Loading a schema consumes an iteration, but is not an
                     # evidence-gathering tool success: a following text answer
@@ -239,7 +241,7 @@ class ToolRoundRunner:
             # for a capability the profile/identity allowlist already grants, so
             # complete the handshake here.  Reporting it as ``Tool disabled``
             # read as terminal and made runs abandon a working tool for the rest
-            # of the batch.messages.  ``_requested_tool_schema`` resolves through
+            # of the conversation.  ``_requested_tool_schema`` resolves through
             # ``get_schemas``, so a pipeline-scoped registry still refuses a
             # capability its node never had.
             if self.lazy_tool_schemas and call.name not in self.visible_tool_names:

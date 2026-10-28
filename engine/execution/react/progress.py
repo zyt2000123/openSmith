@@ -35,7 +35,12 @@ class ProgressLedger:
         self._last_failure = None
         self._failures = 0
 
+    def break_sequence(self) -> None:
+        self._history.clear()
+        self._warned.clear()
+
     def record_failure(self, identity: str) -> int:
+        self.break_sequence()
         # Retain a digest, not potentially sensitive tool output or arguments.
         fingerprint = hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
         self._failures = self._failures + 1 if fingerprint == self._last_failure else 1
