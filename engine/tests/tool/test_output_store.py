@@ -86,3 +86,26 @@ def test_registry_records_full_digest_before_truncation():
         assert result.metadata['output']['truncated'] is True
         assert result.metadata['output']['size_bytes'] == len(raw.encode())
     asyncio.run(run())
+
+
+def test_write_and_cleanup_failure_do_not_hide_tool_result(tmp_path, monkeypatch):
+    from engine.tool import output_store
+    from pathlib import Path
+    class BrokenFile:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.file.close()
+        def write(self, value):
+            raise OSError('disk full')
+    original_fdopen = output_store.os.fdopen
+    def broken_fdopen(fd, mode):
+        broken = BrokenFile()
+        broken.file = original_fdopen(fd, mode)
+        return broken
+    def cannot_unlink(*args, **kwargs):
+        raise OSError('filesystem unavailable')
+    monkeypatch.setattr(output_store.os, 'fdopen', broken_fdopen)
+    monkeypatch.setattr(Path, 'unlink', cannot_unlink)
+    capture = store(tmp_path, max_bytes=1).capture('hello')
+    assert capture.path is None and 'Failed to save' in capture.preview

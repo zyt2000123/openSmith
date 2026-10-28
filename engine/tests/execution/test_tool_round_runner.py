@@ -62,3 +62,21 @@ def test_cancellation_does_not_execute_remaining_calls_and_releases_runner():
         events = [e async for e in runner.run([])]
         assert isinstance(events[-1], ToolRoundResult)
     asyncio.run(run())
+
+
+def test_lazy_schemas_preserve_previous_request_snapshot():
+    from engine.execution.react.tool_round import ToolRoundRunner
+    from engine.llm.contracts import ToolCallData
+    from engine.safety.tool_policy import ToolPolicy
+    from engine.tool.registry import ToolRegistry
+    async def run():
+        registry = ToolRegistry(lazy_tool_schemas=True)
+        registry.register('read', 'Read', {}, lambda: 'hello')
+        runner = ToolRoundRunner(registry, ToolPolicy(None))
+        original = runner.tools
+        assert [s['function']['name'] for s in original] == ['get_tool_schema']
+        events = [e async for e in runner.run([ToolCallData('load', 'get_tool_schema', {'name': 'read'})])]
+        assert events[-1].had_success and not events[-1].had_operational_success
+        assert len(original) == 1
+        assert len(runner.tools) == 2
+    asyncio.run(run())
