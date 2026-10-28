@@ -654,9 +654,13 @@ class ToolRoundRunner:
                 self.progress.reset_failures()
                 output = result.metadata.get("output")
                 digest = output.get("raw_digest") if isinstance(output, dict) else None
+                if not isinstance(digest, str) and result.metadata.get("replayed"):
+                    # Persisted previews cannot establish equality of full
+                    # results. Abstain until fresh output evidence is available.
+                    self.progress.break_sequence()
+                    continue
                 if not isinstance(digest, str):
-                    # Older replay entries contain only their bounded stored
-                    # content. Do not label its digest as a raw output digest.
+                    # Compatibility for registries returning unwrapped results.
                     digest = hashlib.sha256(result.content.encode("utf-8", "replace")).hexdigest()
                 observation = self.progress.observe(call.name, call.arguments, digest)
                 if observation.warn:

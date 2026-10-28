@@ -36,7 +36,9 @@ optional path, raw/stored digests, original size, and truncation flag. Exclusive
 temporary-file creation supplies identity and permissions. Only oversized outputs
 are archived. `truncate_output` remains a compatibility wrapper. Registry metadata
 uses `output` as a reserved namespace; execution-ledger replay without capture
-metadata falls back to a digest of its available replay content (not claimed raw).
+metadata interrupts progress observation: a bounded preview cannot establish full
+result equality. Fresh results from registries without capture metadata use their
+returned content digest. No execution-ledger migration is introduced.
 
 `ToolRoundRunner` is created once per run with registry, ToolPolicy and optional
 hooks. `run(calls)` is an async iterator yielding existing ExecutionEvents followed
