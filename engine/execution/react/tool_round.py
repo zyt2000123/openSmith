@@ -671,4 +671,3 @@ class ToolRoundRunner:
                         else repeated_success_prompt(call.name, observation.count)
                     )
                     batch.messages.append({"role": "system", "content": content})
-
