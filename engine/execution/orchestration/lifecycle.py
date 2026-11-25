@@ -751,6 +751,17 @@ async def _run_events_with_runtime(
         drained = True
     except Exception as exc:
         logger.exception("agent execution failed (agent=%s)", runtime.agent_id)
+        undrained = STEERING_BROKER.close_run(run_id)
+        if undrained:
+            deferred_event = ExecutionEvent(EventType.STEERING_DEFERRED, {
+                "steer_ids": [item.steer_id for item in undrained],
+                "items": [
+                    {"steer_id": item.steer_id, "content": item.content}
+                    for item in undrained
+                ],
+            })
+            await boundary.record(deferred_event)
+            yield deferred_event
         terminal_status = "failed"
         terminal_reason = "execution_error"
         terminal_error = _execution_error_details(

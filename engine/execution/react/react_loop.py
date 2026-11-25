@@ -997,8 +997,11 @@ async def react_event_loop(
                     for provision_id in active_provision_ids:
                         yield _provisional_retract_event(provision_id, "steering_redirect")
                     active_provision_ids.clear()
-                    if final_text:
-                        conversation.append(_assistant_turn(final_text, response.reasoning))
+                    # Append only this round's fragment (response.text): any
+                    # earlier length-continuation fragments were already written
+                    # to conversation by _append_length_continuation.
+                    if response.text:
+                        conversation.append(_assistant_turn(response.text, response.reasoning))
                     final_text_parts.clear()
                     conversation.append({
                         "role": "user",

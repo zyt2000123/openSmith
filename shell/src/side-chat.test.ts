@@ -238,3 +238,102 @@ test("H1: side channel blocks /resume, /new, /clear, /sessions and closeSideChat
     globalThis.fetch = originalFetch;
   }
 });
+
+test("dual concurrent streams on main and side run independently without cross-wiring", async () => {
+  const store = createAppStore();
+  const mainSession = {
+    id: "main-c",
+    agent_id: "agent-1",
+    title: "Main",
+    created_at: "2026-11-25T00:00:00Z",
+    message_count: 0,
+    session_kind: "main" as const,
+  };
+  const sideSession = {
+    id: "side-c",
+    agent_id: "agent-1",
+    title: "Side",
+    created_at: "2026-11-25T00:00:01Z",
+    message_count: 0,
+    session_kind: "side" as const,
+    parent_session_id: "main-c",
+  };
+  store.getState().set({
+    baseUrl: "http://127.0.0.1:9999",
+    agent: { id: "agent-1", name: "Smith", role: "personal-assistant", description: "" },
+    currentSession: mainSession,
+  });
+
+  const bridge = new NodeBridge(store);
+  let releaseMain!: () => void;
+  let mainStreamStarted!: () => void;
+  const mainStartedPromise = new Promise<void>((r) => {
+    mainStreamStarted = r;
+  });
+
+  const encoder = new TextEncoder();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/sessions/main-c/messages/stream")) {
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(encoder.encode('event: run_started\ndata: {"run_id":"r-main"}\n\n'));
+          controller.enqueue(encoder.encode('event: message\ndata: {"text":"MAIN_CHUNK_1 "}\n\n'));
+          mainStreamStarted();
+          await new Promise<void>((r) => {
+            releaseMain = r;
+          });
+          controller.enqueue(encoder.encode('event: message\ndata: {"text":"MAIN_CHUNK_2"}\n\n'));
+          controller.enqueue(encoder.encode('event: done\ndata: {"status":"completed","run_id":"r-main"}\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }
+    if (url.includes("/sessions/main-c/side")) {
+      return new Response(JSON.stringify(sideSession), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.includes("/sessions/side-c/messages/stream")) {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('event: run_started\ndata: {"run_id":"r-side"}\n\n'));
+          controller.enqueue(encoder.encode('event: message\ndata: {"text":"SIDE_ANSWER"}\n\n'));
+          controller.enqueue(encoder.encode('event: done\ndata: {"status":"completed","run_id":"r-side"}\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify([mainSession]), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    // 1. Start main stream
+    const mainPromise = bridge.sendMessage("main long task");
+    await mainStartedPromise;
+
+    // 2. While main is streaming, open /side and complete a side question
+    await bridge.openSideChat("quick side question");
+    const sideTurn = store.getState().transcript[0];
+    assert.ok(sideTurn?.kind === "turn");
+    assert.equal(sideTurn.assistantText, "SIDE_ANSWER");
+
+    // 3. Finish main stream while still viewing side, then switch /back
+    releaseMain();
+    await mainPromise;
+    bridge.switchBackToMain();
+
+    const mainTurn = store.getState().transcript[0];
+    assert.ok(mainTurn?.kind === "turn");
+    assert.equal(mainTurn.assistantText, "MAIN_CHUNK_1 MAIN_CHUNK_2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -208,6 +208,14 @@ export class NodeBridge {
     main: null,
     side: null,
   };
+  private steeringInFlight: Record<ChatChannel, boolean> = {
+    main: false,
+    side: false,
+  };
+  private pendingSteers: Record<ChatChannel, Array<{ steerId: string; content: string }>> = {
+    main: [],
+    side: [],
+  };
   private tokenStatsRequestId = 0;
   private observabilityRequestId = 0;
   private booting = false;
@@ -252,59 +260,94 @@ export class NodeBridge {
     return true;
   }
 
+  private forceEnqueueMessage(text: string, channel: ChatChannel, skillName?: string): boolean {
+    const normalized = text.trim();
+    if (!normalized) return false;
+    const chState = this.s.getChannelState(channel);
+    const queuedMessages = chState?.queuedMessages ?? (channel === this.s.activeChannel ? this.s.queuedMessages : []);
+    const item: QueuedMessage = {
+      id: `queue-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text: normalized,
+      ...(skillName ? { skillName } : {}),
+    };
+    this.s.updateChannel(channel, { queuedMessages: [...queuedMessages, item] });
+    return true;
+  }
+
   async steerMessage(text: string, skillName?: string): Promise<boolean> {
     const normalized = text.trim();
     if (!normalized) return false;
 
-    if (!this.activeRequest) {
-      return this.sendMessage(normalized, skillName);
+    // M9: Pin the originating channel before any async boundary so switching
+    // between main and side mid-POST never cross-wires transcript or queue state.
+    const channel: ChatChannel = this.s.activeChannel;
+    if (this.steeringInFlight[channel]) {
+      return this.enqueueMessage(normalized, skillName, channel);
     }
 
-    const { baseUrl, currentSession, recoverableRunId } = this.s;
-    if (!baseUrl || !currentSession) {
-      return this.enqueueMessage(normalized, skillName);
+    if (!this.activeRequests[channel]) {
+      // M7: Do not block the caller for the entire lifetime of the fallback run.
+      void this.sendMessage(normalized, skillName, channel);
+      return true;
     }
 
+    const baseUrl = this.s.baseUrl;
+    const chState = this.s.getChannelState(channel);
+    const session = chState?.session ?? null;
+    const runId = chState?.recoverableRunId ?? null;
+    if (!baseUrl || !session) {
+      return this.enqueueMessage(normalized, skillName, channel);
+    }
+
+    this.steeringInFlight[channel] = true;
     try {
-      const result = await steerSession(baseUrl, currentSession.id, normalized, recoverableRunId);
+      const result = await steerSession(baseUrl, session.id, normalized, runId);
       if (result.accepted) {
-        this.s.set({
-          transcript: appendQueuedSteering(
-            this.s.transcript,
-            result.steer_id ?? `st_${Date.now()}`,
-            normalized,
-          ),
-          statusLine:
-            result.status === "queued_while_waiting_approval"
-              ? "Steer queued; will apply after approval is resolved."
-              : "Steer injected; will apply before the next step.",
-        });
+        const steerId = result.steer_id ?? `st_${Date.now()}`;
+        this.pendingSteers[channel].push({ steerId, content: normalized });
+        const latestState = this.s.getChannelState(channel);
+        if (latestState) {
+          this.s.updateChannel(channel, {
+            transcript: appendQueuedSteering(latestState.transcript, steerId, normalized),
+          });
+        }
+        if (channel === this.s.activeChannel) {
+          this.s.set({
+            statusLine:
+              result.status === "queued_while_waiting_approval"
+                ? "Steer queued; will apply after approval is resolved."
+                : "Steer injected; will apply before the next step.",
+          });
+        }
         return true;
       }
 
       if (result.status === "no_active_run") {
         // Race window where the run ended right as the user pressed Enter.
-        if (!this.activeRequest) {
-          return this.sendMessage(normalized, skillName);
+        if (!this.activeRequests[channel]) {
+          void this.sendMessage(normalized, skillName, channel);
+          return true;
         }
-        return this.enqueueMessage(normalized, skillName);
+        return this.enqueueMessage(normalized, skillName, channel);
       }
 
       if (result.status === "inbox_full") {
-        const queued = this.enqueueMessage(normalized, skillName);
-        if (queued) {
+        const queued = this.enqueueMessage(normalized, skillName, channel);
+        if (queued && channel === this.s.activeChannel) {
           this.s.set({ statusLine: "Steering inbox full; queued for next turn." });
         }
         return queued;
       }
 
-      return this.enqueueMessage(normalized, skillName);
+      return this.enqueueMessage(normalized, skillName, channel);
     } catch (error) {
-      const queued = this.enqueueMessage(normalized, skillName);
-      if (queued) {
+      const queued = this.enqueueMessage(normalized, skillName, channel);
+      if (queued && channel === this.s.activeChannel) {
         this.s.set({ statusLine: `Steer unavailable (${errorMessage(error)}); queued for next turn.` });
       }
       return queued;
+    } finally {
+      this.steeringInFlight[channel] = false;
     }
   }
 
@@ -322,20 +365,40 @@ export class NodeBridge {
   }
 
   cancelRequest(): boolean {
-    const controller = this.activeRequest;
+    const channel: ChatChannel = this.s.activeChannel;
+    const controller = this.activeRequests[channel];
     if (!controller || controller.signal.aborted) return false;
 
     controller.abort();
-    this.s.interruptTurn("cancelled");
     const pendingApproval = this.s.pendingApproval;
-    this.s.set({
+    this.s.interruptTurnForChannel(channel, "cancelled");
+    const afterInterrupt = this.s.getChannelState(channel);
+    this.s.updateChannel(channel, {
       pendingApproval: null,
       approvalResolving: false,
       busy: false,
       compressing: false,
       runStartedAt: null,
-      statusLine: "Cancelled.",
-      ...(pendingApproval ? { transcript: removeApprovalNotice(this.s.transcript, pendingApproval.approvalId) } : {}),
+      ...(pendingApproval && afterInterrupt
+        ? { transcript: removeApprovalNotice(afterInterrupt.transcript, pendingApproval.approvalId) }
+        : {}),
+    });
+
+    // M10: Preserve accepted-but-unapplied steers by requeuing them on cancel
+    // so Esc behaves consistently with queued follow-up messages.
+    const unapplied = this.pendingSteers[channel];
+    this.pendingSteers[channel] = [];
+    let requeued = 0;
+    for (const steer of unapplied) {
+      if (this.forceEnqueueMessage(steer.content, channel)) {
+        requeued += 1;
+      }
+    }
+    this.s.set({
+      statusLine:
+        requeued > 0
+          ? `Cancelled. Moved ${requeued} pending steer(s) to queue.`
+          : "Cancelled.",
     });
     return true;
   }
@@ -1142,6 +1205,7 @@ export class NodeBridge {
     if (this.activeRequests[channel] !== controller) return;
 
     this.activeRequests[channel] = null;
+    this.pendingSteers[channel] = [];
     const next = this.takeQueuedMessage(channel);
     if (next) {
       this.s.updateChannel(channel, { pendingApproval: null, approvalResolving: false });
@@ -1281,12 +1345,26 @@ export class NodeBridge {
         const status = applyBatchedStreamEvent(event, messageBatcher, provisionalBatcher, (next) =>
           this.s.applyEventForChannel(channel, next),
         );
+        if (event.type === "steering_applied" && event.steerIds.length > 0) {
+          const applied = new Set(event.steerIds);
+          this.pendingSteers[channel] = this.pendingSteers[channel].filter((item) => !applied.has(item.steerId));
+        }
         if (event.type === "steering_deferred" && event.items.length > 0) {
+          const deferredIds = new Set(event.steerIds);
+          this.pendingSteers[channel] = this.pendingSteers[channel].filter((item) => !deferredIds.has(item.steerId));
+          let requeued = 0;
           for (const item of event.items) {
-            this.enqueueMessage(item.content, undefined, channel);
+            if (this.forceEnqueueMessage(item.content, channel)) {
+              requeued += 1;
+            }
           }
           if (channel === this.s.activeChannel) {
-            this.s.set({ statusLine: "Run finished before steer could apply; queued for next turn." });
+            this.s.set({
+              statusLine:
+                requeued > 0
+                  ? "Run finished before steer could apply; queued for next turn."
+                  : "Run finished before steer could apply; could not requeue empty steer.",
+            });
           }
         }
         if (status) {
@@ -1360,14 +1438,17 @@ export class NodeBridge {
 
   private reportRequestError(error: unknown, channel: ChatChannel = this.s.activeChannel): void {
     const message = errorMessage(error);
-    const chState = this.s.getChannelState(channel);
-    const pendingApproval = chState?.pendingApproval ?? null;
+    const pendingApproval = this.s.getChannelState(channel)?.pendingApproval ?? null;
     this.s.interruptTurnForChannel(channel, "error");
+    // M8: Read channel state AFTER interruptTurnForChannel so removing the
+    // approval notice does not overwrite the interrupted transcript with a
+    // stale pre-interrupt snapshot where tools still appear running.
+    const afterInterrupt = this.s.getChannelState(channel);
     this.s.updateChannel(channel, {
       pendingApproval: null,
       approvalResolving: false,
-      ...(pendingApproval && chState
-        ? { transcript: removeApprovalNotice(chState.transcript, pendingApproval.approvalId) }
+      ...(pendingApproval && afterInterrupt
+        ? { transcript: removeApprovalNotice(afterInterrupt.transcript, pendingApproval.approvalId) }
         : {}),
     });
     this.s.pushSystemLineForChannel(channel, `[error] ${message}`, "error");

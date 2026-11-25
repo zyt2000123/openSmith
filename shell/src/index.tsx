@@ -903,13 +903,21 @@ async function submitWhileBusy(
     }
     return;
   }
-  const accepted = skill
-    ? bridge.enqueueMessage(payload, skill.name)
-    : await bridge.steerMessage(payload);
-  if (!accepted) return;
+  if (skill) {
+    if (!bridge.enqueueMessage(payload, skill.name)) return;
+    rememberSubmittedInput(input);
+    getState().set({ pendingSkill: null });
+    return;
+  }
 
+  // M7: Clear composer and record history BEFORE awaiting the steer network
+  // round-trip so pressing Enter again or falling back to sendMessage cannot
+  // duplicate or stall clearing the input.
   rememberSubmittedInput(input);
-  if (skill) getState().set({ pendingSkill: null });
+  const accepted = await bridge.steerMessage(payload);
+  if (!accepted && !getState().inputValue) {
+    getState().set({ inputValue: input });
+  }
 }
 
 async function submitSlashCommand(

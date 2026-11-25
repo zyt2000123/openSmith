@@ -141,6 +141,15 @@ class SessionRepo:
             return None
         return await self.get_owned(session_id, agent_id)
 
+    async def list_child_sides(self, parent_session_id: str, agent_id: str) -> list[str]:
+        """Return all child side-session IDs attached to *parent_session_id*."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT id FROM sessions WHERE agent_id=? AND parent_session_id=? AND session_kind='side'",
+            (agent_id, parent_session_id),
+        )
+        return [str(row["id"]) for row in rows]
+
     async def cleanup_stale_sides(self, *, max_age_days: int = 7) -> list[str]:
         """Delete unpromoted side sessions with no updates older than ``max_age_days``."""
         db = await get_app_db()

@@ -339,6 +339,22 @@ class SessionService:
             raise HTTPException(404, "Session not found")
         return SessionOut(**row)
 
+    async def _cleanup_session_resources(self, session_id: str) -> None:
+        from common import config as common_config
+        from engine.safety.taint import delete_session_taint
+
+        delete_session_taint(common_config.PATHS.agent_dir, session_id)
+        await close_session_mcp_clients(session_id)
+        # Drop the per-session stream lock so deleted sessions do not leak a lock
+        # for the server's lifetime.  Under the guard, and only when idle: an
+        # unguarded pop racing an in-flight turn (or one popping a lock a waiter
+        # still holds a slot on) breaks the same serialization the map provides.
+        # A busy slot is left for refcount eviction once its turn drains.
+        with _SESSION_STREAM_LOCKS_GUARD:
+            if _SESSION_STREAM_LOCK_USERS.get(session_id, 0) == 0:
+                _SESSION_STREAM_LOCKS.pop(session_id, None)
+                _SESSION_STREAM_LOCK_USERS.pop(session_id, None)
+
     async def delete_session(
         self,
         agent_id: str,
@@ -355,23 +371,26 @@ class SessionService:
                     409,
                     f"Refused to delete {owned.get('session_kind', 'main')} session as {expected_kind}",
                 )
+        list_sides = getattr(self.session_repo, "list_child_sides", None)
+        child_side_ids = (
+            await list_sides(session_id, agent_id)
+            if callable(list_sides)
+            else []
+        )
         deleted = await self.session_repo.delete_owned(session_id, agent_id)
         if not deleted:
             raise HTTPException(404, "Session not found")
-        from common import config as common_config
-        from engine.safety.taint import delete_session_taint
+        for side_id in child_side_ids:
+            await self.session_repo.delete_owned(side_id, agent_id)
+            await self._cleanup_session_resources(side_id)
+        await self._cleanup_session_resources(session_id)
 
-        delete_session_taint(common_config.PATHS.agent_dir, session_id)
-        await close_session_mcp_clients(session_id)
-        # Drop the per-session stream lock so deleted sessions do not leak a lock
-        # for the server's lifetime.  Under the guard, and only when idle: an
-        # unguarded pop racing an in-flight turn (or one popping a lock a waiter
-        # still holds a slot on) breaks the same serialization the map provides.
-        # A busy slot is left for refcount eviction once its turn drains.
-        with _SESSION_STREAM_LOCKS_GUARD:
-            if _SESSION_STREAM_LOCK_USERS.get(session_id, 0) == 0:
-                _SESSION_STREAM_LOCKS.pop(session_id, None)
-                _SESSION_STREAM_LOCK_USERS.pop(session_id, None)
+    async def cleanup_stale_sides(self, *, max_age_days: int = 7) -> list[str]:
+        """Delete stale unpromoted side sessions and release their taint/MCP/lock state."""
+        stale_ids = await self.session_repo.cleanup_stale_sides(max_age_days=max_age_days)
+        for side_id in stale_ids:
+            await self._cleanup_session_resources(side_id)
+        return stale_ids
 
     async def _build_parent_snapshot(
         self,

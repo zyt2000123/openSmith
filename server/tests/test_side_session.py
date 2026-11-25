@@ -316,5 +316,61 @@ async def test_delete_session_expected_kind_guards_main_from_side_close():
         assert ok_del.status_code == 204
 
 
+@pytest.mark.asyncio
+async def test_delete_parent_cascades_side_and_cleanup_stale_sides_releases_taint():
+    """M5: Deleting a parent session cascades its child side sessions and taint files;
+    cleanup_stale_sides removes expired sides and cleans up their taint files."""
+    from engine.safety.taint import taint_file_for_session
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", headers=_auth_headers()) as client:
+        main_resp = await client.post("/api/agent/sessions", json={"title": "Parent To Delete"})
+        main_id = main_resp.json()["id"]
+        agent_id = main_resp.json()["agent_id"]
+
+        # Taint parent and create side (inherits taint -> creates side taint file)
+        SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=main_id).record(
+            "sensitive_file", "read_file", "file:.env"
+        )
+        side_resp = await client.post(f"/api/agent/sessions/{main_id}/side", json={})
+        side_id = side_resp.json()["id"]
+        side_taint_path = taint_file_for_session(common_config.PATHS.agent_dir, side_id)
+        assert side_taint_path.exists()
+
+        # Deleting parent cascades deletion of child side session AND its taint file
+        del_resp = await client.delete(f"/api/agent/sessions/{main_id}")
+        assert del_resp.status_code == 204
+        repo = SessionRepo()
+        assert await repo.get_owned(side_id, agent_id) is None
+        assert not side_taint_path.exists()
+
+        # Test stale side cleanup releases taint file while preserving fresh side
+        parent2 = await client.post("/api/agent/sessions", json={"title": "Keep Parent"})
+        parent2_id = parent2.json()["id"]
+        SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=parent2_id).record(
+            "sensitive_file", "read_file", "file:.env"
+        )
+        stale_side = (await client.post(f"/api/agent/sessions/{parent2_id}/side", json={"reuse_existing": False})).json()["id"]
+        fresh_side = (await client.post(f"/api/agent/sessions/{parent2_id}/side", json={"reuse_existing": False})).json()["id"]
+        stale_taint_path = taint_file_for_session(common_config.PATHS.agent_dir, stale_side)
+        assert stale_taint_path.exists()
+
+        # Backdate stale_side created_at by 10 days
+        from app.infrastructure.database import get_app_db
+        db = await get_app_db()
+        await db.execute(
+            "UPDATE sessions SET created_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (stale_side,),
+        )
+        await db.commit()
+
+        service = SessionService(repo, AgentProfileRepo())
+        cleaned = await service.cleanup_stale_sides(max_age_days=7)
+        assert cleaned == [stale_side]
+        assert await repo.get_owned(stale_side, agent_id) is None
+        assert not stale_taint_path.exists()
+        assert await repo.get_owned(fresh_side, agent_id) is not None
+
+
 async def _drain(gen):
     return [ev async for ev in gen]

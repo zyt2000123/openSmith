@@ -307,3 +307,115 @@ async def test_pipeline_steering_reaches_active_and_subsequent_nodes():
     node1_text = "\n".join(str(m.get("content", "")) for m in llm.calls[1])
     assert "keep functions under 20 lines" in node1_text
     assert "add docstring to output" in node1_text
+
+
+@pytest.mark.asyncio
+async def test_drain_b_after_length_continuation_does_not_duplicate_fragments():
+    """M6: When a reply had a length continuation before Drain B triggers, only response.text
+    (the newest fragment) is appended to conversation — earlier fragments are not duplicated."""
+    registry = ToolRegistry()
+    inbox = SteeringInbox()
+
+    def on_call(idx: int, _messages):
+        if idx == 1:
+            # Steer arrives while model generates the continuation fragment
+            inbox.push("add a conclusion")
+
+    llm = _ScriptedLLM(
+        [
+            ChatResponse(text="PART_ONE ", finish_reason="length", tool_calls=[]),
+            ChatResponse(text="PART_TWO", finish_reason="stop", tool_calls=[]),
+            ChatResponse(text="FINAL_CONCLUDED", finish_reason="stop", tool_calls=[]),
+        ],
+        on_call=on_call,
+    )
+
+    with use_steering_inbox(inbox):
+        _ = [
+            ev
+            async for ev in react_event_loop(
+                llm,
+                [{"role": "user", "content": "write essay"}],
+                registry,
+            )
+        ]
+
+    # Third LLM call should see PART_ONE exactly once across assistant messages
+    assistant_contents = [
+        str(m.get("content", ""))
+        for m in llm.calls[2]
+        if m.get("role") == "assistant"
+    ]
+    joined = "".join(assistant_contents)
+    assert joined.count("PART_ONE") == 1
+    assert joined.count("PART_TWO") == 1
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_exception_closes_steering_and_emits_deferred_before_failed(tmp_path: Path):
+    """M4: When execution raises an exception, undrained steers are immediately closed and
+    emitted as STEERING_DEFERRED before FAILED/DONE rather than silently dropped."""
+    from engine.execution.orchestration.lifecycle import run_stream_with_runtime
+    from engine.execution.orchestration.runtime import (
+        EngineRequest,
+        RuntimeContext,
+        RuntimeServices,
+    )
+    from engine.execution.steering import STEERING_BROKER
+    from engine.safety.tool_guard import ToolGuard
+    from engine.skill.registry import SkillRegistry
+
+    data_dir = tmp_path / "data"
+    profile_dir = data_dir / "agent"
+    profile_dir.mkdir(parents=True)
+    for fname in ("role.md", "style.md", "workflow.md", "context.md"):
+        (profile_dir / fname).write_text(f"# {fname}\n", encoding="utf-8")
+    work_dir = tmp_path / "ws"
+    work_dir.mkdir()
+    agents_dir = Path(__file__).resolve().parents[3] / "agents"
+
+    session_id = "sess-exc-steer"
+
+    class _ExplodingLLM:
+        model = "test-model"
+        provider = "openai"
+
+        async def chat(self, messages, tools=None, **kwargs):
+            # Submit a steer right before failing
+            res = STEERING_BROKER.submit(session_id=session_id, content="save me on failure")
+            assert res.accepted is True
+            raise RuntimeError("boom provider crash")
+
+        async def close(self):
+            return None
+
+    services = RuntimeServices(
+        llm=_ExplodingLLM(),
+        tool_registry=ToolRegistry(),
+        skill_registry=SkillRegistry(),
+        tool_guard=ToolGuard(tmp_path / "rules.json"),
+    )
+    runtime = RuntimeContext(
+        agent_id="smith-1",
+        agent_name="Smith",
+        profile_dir=profile_dir,
+        agents_dir=agents_dir,
+        session_id=session_id,
+    )
+    request = EngineRequest(
+        message="trigger crash",
+        working_dir=str(work_dir),
+        ephemeral=True,
+    )
+
+    stream = run_stream_with_runtime(request, runtime, services)
+    events = [ev async for ev in stream.stream_events()]
+    types = [ev.type for ev in events]
+
+    assert EventType.STEERING_DEFERRED in types
+    assert EventType.FAILED in types
+    assert types.index(EventType.STEERING_DEFERRED) < types.index(EventType.FAILED)
+    deferred = [ev for ev in events if ev.type is EventType.STEERING_DEFERRED][0]
+    assert [item["content"] for item in deferred.data["items"]] == ["save me on failure"]
+    # Broker must be closed for this session
+    assert STEERING_BROKER.active_run_id(session_id) is None
