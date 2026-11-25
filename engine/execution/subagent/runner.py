@@ -190,6 +190,7 @@ async def _run_one(
     failure = ""
 
     from engine.execution.react.react_loop import react_event_loop
+    from engine.execution.steering import without_steering_inbox
     from engine.safety.approval import without_approval_context
     from engine.safety.fact_gate import (
         FactGate,
@@ -235,7 +236,7 @@ async def _run_one(
     try:
         # ``use_fact_gate`` also displaces the parent's gate for anything in
         # this task that reads the ContextVar directly.
-        with without_approval_context(), use_fact_gate(sub_gate):
+        with without_approval_context(), without_steering_inbox(), use_fact_gate(sub_gate):
             async with asyncio.timeout(timeout_seconds):
                 # ``aclosing`` finalizes the loop deterministically when a
                 # budget break leaves it suspended, instead of waiting on the

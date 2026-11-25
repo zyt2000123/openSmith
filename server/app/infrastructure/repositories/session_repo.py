@@ -235,16 +235,47 @@ class SessionRepo:
         rows.reverse()
         return [dict(r) for r in rows]
 
-    async def add_message(self, session_id: str, role: str, content: str) -> dict:
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        kind: str = "normal",
+        parent_message_id: str | None = None,
+    ) -> dict:
         db = await get_app_db()
         mid = uuid.uuid4().hex[:12]
         now = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-            (mid, session_id, role, content, now),
+            "INSERT INTO messages (id, session_id, role, content, kind, parent_message_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (mid, session_id, role, content, kind, parent_message_id, now),
         )
         await db.commit()
-        return {"id": mid, "session_id": session_id, "role": role, "content": content, "created_at": now}
+        return {
+            "id": mid,
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+            "kind": kind,
+            "parent_message_id": parent_message_id,
+            "created_at": now,
+        }
+
+    async def get_steering_messages(
+        self,
+        session_id: str,
+        parent_message_id: str,
+    ) -> list[dict]:
+        """Return applied steering messages bound to one user turn, ascending."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND role='user' "
+            "AND kind='steering' AND parent_message_id=? ORDER BY created_at ASC",
+            (session_id, parent_message_id),
+        )
+        return [dict(r) for r in rows]
 
     async def discard_assistant_messages_after_user(
         self,
@@ -262,7 +293,8 @@ class SessionRepo:
         cursor = await db.execute(
             "DELETE FROM messages WHERE session_id=? AND role='assistant' "
             "AND rowid > ? AND rowid < COALESCE(("
-            "SELECT MIN(rowid) FROM messages WHERE session_id=? AND role='user' AND rowid > ?"
+            "SELECT MIN(rowid) FROM messages WHERE session_id=? AND role='user' "
+            "AND kind='normal' AND rowid > ?"
             "), 9223372036854775807)",
             (session_id, rows[0]["rowid"], session_id, rows[0]["rowid"]),
         )

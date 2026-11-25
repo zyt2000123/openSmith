@@ -50,4 +50,27 @@ class MessageOut(BaseModel):
     session_id: str
     role: str
     content: str
+    kind: str = "normal"
+    parent_message_id: str | None = None
     created_at: str
+
+
+class SteerCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=10_000)
+    run_id: str | None = None
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("content must not be blank")
+        return trimmed
+
+
+class SteerOut(BaseModel):
+    accepted: bool
+    status: str
+    run_id: str | None = None
+    steer_id: str | None = None
+    pending_count: int = 0

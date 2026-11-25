@@ -34,6 +34,8 @@ class EventType(str, Enum):
     PROVISIONAL_TEXT_DELTA = "provisional_text_delta"
     PROVISIONAL_COMMIT = "provisional_commit"
     PROVISIONAL_RETRACT = "provisional_retract"
+    STEERING_APPLIED = "steering_applied"
+    STEERING_DEFERRED = "steering_deferred"
     SMITH_UI = "smith_ui"
     SMITH_UI_FALLBACK = "smith_ui_fallback"
     INCOMPLETE = "incomplete"

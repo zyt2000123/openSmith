@@ -42,6 +42,7 @@ const HELP_TEXT = [
   "- `/doctor` — run environment and live sandbox containment diagnostics",
   "- `/resume [session-id]` — recover the latest interrupted run, or open a session; use `/resume run <run-id>` for a specific run",
   "- `/compact` — switch to compact view; Ctrl+O toggles compact/transcript",
+  "- `/queue <msg>` — queue a follow-up message to run after the current task finishes",
   "- `/reconnect` — retry the local server connection after a failed boot",
   "- `/exit` — quit",
 ].join("\n");
@@ -389,6 +390,18 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
   },
   "/compact": (_args, context) =>
     context.getState().set({ viewMode: "compact", panel: "chat", statusLine: "Compact view." }),
+  "/queue": async (args, context) => {
+    const prompt = args.join(" ").trim();
+    if (!prompt) {
+      context.getState().set({ statusLine: "Usage: /queue <message>" });
+      return;
+    }
+    if (context.getState().busy) {
+      context.bridge.enqueueMessage(prompt);
+    } else {
+      await context.bridge.sendMessage(prompt);
+    }
+  },
   "/reconnect": async (_args, context) => {
     context.getState().set({ statusLine: "Reconnecting…", welcomeNotice: null });
     await context.bridge.boot();

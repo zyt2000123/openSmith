@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from ..schemas.agent_profile import AgentProfileOut
@@ -15,6 +16,8 @@ from ..schemas.session import (
     SessionCreate,
     SessionModelUpdate,
     SessionOut,
+    SteerCreate,
+    SteerOut,
 )
 from ..schemas.memory import MemoryMaintenanceOut
 from ..schemas.project_instruction import ProjectInstructionInit, ProjectInstructionOut
@@ -112,6 +115,18 @@ async def stream_message(
     # ping keeps idle SSE connections (long LLM thinking turns) alive through
     # proxies that would otherwise time out the connection.
     return EventSourceResponse(stream, ping=15)
+
+
+@router.post("/sessions/{session_id}/steer", response_model=SteerOut)
+async def steer_session(
+    session_id: str,
+    body: SteerCreate,
+    svc: AgentService = Depends(get_agent_service),
+):
+    result = await svc.steer_session(session_id, body.content, run_id=body.run_id)
+    if not result.accepted:
+        return JSONResponse(status_code=409, content=result.model_dump())
+    return result
 
 
 @router.get("/skills", response_model=list[SkillSummaryOut])

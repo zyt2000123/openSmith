@@ -838,13 +838,27 @@ async function submitWhileBusy(
   slashItems: SlashItem[],
   slashIndex: number,
 ): Promise<void> {
+  if (input.startsWith("/queue")) {
+    const queuedPrompt = input.slice("/queue".length).trim();
+    if (!queuedPrompt) {
+      getState().set({ statusLine: "Usage: /queue <message>" });
+      return;
+    }
+    if (!bridge.enqueueMessage(queuedPrompt, skill?.name)) return;
+    rememberSubmittedInput(input);
+    if (skill) getState().set({ pendingSkill: null });
+    return;
+  }
   if (input.startsWith("/")) {
     if (!completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
       getState().set({ statusLine: `${input} is unavailable while Smith is working. Press Esc to cancel the run.` });
     }
     return;
   }
-  if (!bridge.enqueueMessage(payload, skill?.name)) return;
+  const accepted = skill
+    ? bridge.enqueueMessage(payload, skill.name)
+    : await bridge.steerMessage(payload);
+  if (!accepted) return;
 
   rememberSubmittedInput(input);
   if (skill) getState().set({ pendingSkill: null });

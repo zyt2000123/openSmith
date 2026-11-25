@@ -208,6 +208,26 @@ export type PendingApproval = {
   scope?: ApprovalScope;
 };
 
+export type SteerItem = {
+  steerId: string;
+  content: string;
+};
+
+export type SteerStatus =
+  | "injected"
+  | "queued_while_waiting_approval"
+  | "no_active_run"
+  | "run_mismatch"
+  | "inbox_full";
+
+export type SteerResult = {
+  accepted: boolean;
+  status: SteerStatus;
+  run_id: string | null;
+  steer_id: string | null;
+  pending_count: number;
+};
+
 export type StreamEvent =
   | { type: "message"; text: string }
   | { type: "smith_ui"; payload: SmithUiPayload }
@@ -217,6 +237,8 @@ export type StreamEvent =
   | { type: "provisional_text_delta"; provisionId: string; text: string }
   | { type: "provisional_commit"; provisionId: string }
   | { type: "provisional_retract"; provisionId: string; reason: string }
+  | { type: "steering_applied"; steerIds: string[]; count: number; items: SteerItem[]; iteration: number }
+  | { type: "steering_deferred"; steerIds: string[]; items: SteerItem[] }
   | { type: "thinking"; text: string; done: boolean }
   | { type: "tool_call"; id: string; name: string; hint: string }
   | { type: "tool_result"; id: string; error: boolean; blocked: boolean; preflight: boolean; summary: string }
@@ -656,6 +678,44 @@ export async function deleteSession(baseUrl: string, sessionId: string): Promise
   });
 }
 
+export async function steerSession(
+  baseUrl: string,
+  sessionId: string,
+  content: string,
+  runId?: string | null,
+): Promise<SteerResult> {
+  const authHeaders = await localAuthHeaders();
+  const timeout = createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(buildUrl(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}/steer`), {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...authHeaders,
+      },
+      signal: timeout.signal,
+      body: JSON.stringify({ content, ...(runId ? { run_id: runId } : {}) }),
+    });
+
+    if (response.status === 409) {
+      return (await response.json()) as SteerResult;
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HTTP ${response.status}: ${terminalText(text || response.statusText)}`);
+    }
+
+    return (await response.json()) as SteerResult;
+  } catch (error) {
+    if (timeout.didTimeout()) throw timeoutError(DEFAULT_REQUEST_TIMEOUT_MS);
+    throw error;
+  } finally {
+    timeout.dispose();
+  }
+}
+
 type StreamOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -850,6 +910,42 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     provisionId: String(payload.provision_id ?? ""),
     reason: sanitizeUnknownText(payload.reason),
   }),
+  steering_applied: (payload) => {
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    const items: SteerItem[] = rawItems.flatMap((entry) => {
+      const item = objectPayload(entry);
+      const steerId = String(item.steer_id ?? "");
+      const content = sanitizeUnknownText(item.content).trim();
+      return content ? [{ steerId, content }] : [];
+    });
+    const steerIds = Array.isArray(payload.steer_ids)
+      ? payload.steer_ids.map((id) => String(id))
+      : items.map((item) => item.steerId);
+    return {
+      type: "steering_applied",
+      steerIds,
+      count: finiteNumber(payload.count, items.length),
+      items,
+      iteration: finiteNumber(payload.iteration, 0),
+    };
+  },
+  steering_deferred: (payload) => {
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    const items: SteerItem[] = rawItems.flatMap((entry) => {
+      const item = objectPayload(entry);
+      const steerId = String(item.steer_id ?? "");
+      const content = sanitizeUnknownText(item.content).trim();
+      return content ? [{ steerId, content }] : [];
+    });
+    const steerIds = Array.isArray(payload.steer_ids)
+      ? payload.steer_ids.map((id) => String(id))
+      : items.map((item) => item.steerId);
+    return {
+      type: "steering_deferred",
+      steerIds,
+      items,
+    };
+  },
   thinking: (payload) => ({
     type: "thinking",
     text: sanitizeUnknownText(payload.text),

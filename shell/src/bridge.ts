@@ -37,6 +37,7 @@ import {
   type StreamTerminalStatus,
   setLlmConfig,
   setSkillEnabled,
+  steerSession,
   streamMessage,
   streamRunResume,
   updateSessionModel,
@@ -48,7 +49,13 @@ import { sanitizeTerminalText } from "./sanitize.js";
 import { createSetupDraft, fieldValue, setupFieldAt } from "./setup.js";
 import { type AppStore, TRANSCRIPT_LIMIT } from "./store.js";
 import { clearTerminal } from "./term.js";
-import { limitTranscript, removeApprovalNotice, restartLatestTurn, restoreTranscript } from "./transcript-state.js";
+import {
+  appendQueuedSteering,
+  limitTranscript,
+  removeApprovalNotice,
+  restartLatestTurn,
+  restoreTranscript,
+} from "./transcript-state.js";
 
 /** Shown wherever a missing baseUrl blocks the action — always with the way back out. */
 const NOT_READY_STATUS = "Shell is not ready yet. Run /reconnect to retry the local server.";
@@ -221,6 +228,62 @@ export class NodeBridge {
       statusLine: `Queued ${queuedMessages.length + 1}/${MAX_QUEUED_MESSAGES}.`,
     });
     return true;
+  }
+
+  async steerMessage(text: string, skillName?: string): Promise<boolean> {
+    const normalized = text.trim();
+    if (!normalized) return false;
+
+    if (!this.activeRequest) {
+      return this.sendMessage(normalized, skillName);
+    }
+
+    const { baseUrl, currentSession, recoverableRunId } = this.s;
+    if (!baseUrl || !currentSession) {
+      return this.enqueueMessage(normalized, skillName);
+    }
+
+    try {
+      const result = await steerSession(baseUrl, currentSession.id, normalized, recoverableRunId);
+      if (result.accepted) {
+        this.s.set({
+          transcript: appendQueuedSteering(
+            this.s.transcript,
+            result.steer_id ?? `st_${Date.now()}`,
+            normalized,
+          ),
+          statusLine:
+            result.status === "queued_while_waiting_approval"
+              ? "Steer queued; will apply after approval is resolved."
+              : "Steer injected; will apply before the next step.",
+        });
+        return true;
+      }
+
+      if (result.status === "no_active_run") {
+        // Race window where the run ended right as the user pressed Enter.
+        if (!this.activeRequest) {
+          return this.sendMessage(normalized, skillName);
+        }
+        return this.enqueueMessage(normalized, skillName);
+      }
+
+      if (result.status === "inbox_full") {
+        const queued = this.enqueueMessage(normalized, skillName);
+        if (queued) {
+          this.s.set({ statusLine: "Steering inbox full; queued for next turn." });
+        }
+        return queued;
+      }
+
+      return this.enqueueMessage(normalized, skillName);
+    } catch (error) {
+      const queued = this.enqueueMessage(normalized, skillName);
+      if (queued) {
+        this.s.set({ statusLine: `Steer unavailable (${errorMessage(error)}); queued for next turn.` });
+      }
+      return queued;
+    }
   }
 
   removeQueuedMessage(index: number): QueuedMessage | null {
@@ -1056,6 +1119,12 @@ export class NodeBridge {
         const status = applyBatchedStreamEvent(event, messageBatcher, provisionalBatcher, (next) =>
           this.s.applyEvent(next),
         );
+        if (event.type === "steering_deferred" && event.items.length > 0) {
+          for (const item of event.items) {
+            this.enqueueMessage(item.content);
+          }
+          this.s.set({ statusLine: "Run finished before steer could apply; queued for next turn." });
+        }
         if (status) {
           terminalStatus = status;
           terminalReason = event.type === "done" ? event.reason : undefined;

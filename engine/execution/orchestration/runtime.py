@@ -41,6 +41,9 @@ class EngineRequest:
     execution_identity_id: str | None = None
     working_dir: str | None = None
     message_id: str | None = None
+    steering_history: tuple[str, ...] = ()
+    ephemeral: bool = False
+    read_only_tools: bool = False
 
 
 @dataclass(frozen=True)

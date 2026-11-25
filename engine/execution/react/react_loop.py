@@ -22,6 +22,11 @@ from engine.context.compression import (
 from engine.execution.evidence import tool_result_hash
 from engine.execution.events import EventType, ExecutionEvent
 from engine.execution.runtime_control import repeated_success_prompt, tool_blocked_prompt
+from engine.execution.steering import (
+    MAX_STEERING_CONTINUATIONS,
+    current_steering_inbox,
+    format_steering_message,
+)
 from engine.llm.contracts import (
     ChatResponse,
     LLMContextLengthError,
@@ -576,6 +581,7 @@ async def react_event_loop(
     had_successful_tool = False
     incomplete_final_repairs = 0
     length_continuations = 0
+    steering_continuations = 0
     # (fragment, was_streamed) per fragment, not one flag for the join: a reply
     # can mix a non-streamed fallback fragment with a streamed continuation,
     # and a single flag then mislabels one of them — see _final_text_delivery.
@@ -610,6 +616,26 @@ async def react_event_loop(
     compaction_failures = 0
 
     while productive_iters < max_iters:
+        # Drain point A: fold any mid-turn user steering BEFORE fit_request()
+        # so the injected note counts toward the model's context budget.
+        steering_inbox = current_steering_inbox()
+        if steering_inbox is not None and steering_inbox.has_pending():
+            steered = steering_inbox.drain()
+            if steered:
+                conversation.append({
+                    "role": "user",
+                    "content": format_steering_message(steered),
+                })
+                yield ExecutionEvent(EventType.STEERING_APPLIED, {
+                    "steer_ids": [item.steer_id for item in steered],
+                    "count": len(steered),
+                    "items": [
+                        {"steer_id": item.steer_id, "content": item.content}
+                        for item in steered
+                    ],
+                    "iteration": productive_iters,
+                })
+
         conversation = trim_conversation_to_message_cap(conversation)
 
         pre_fit_receipt = measure_request(conversation, tools, llm)
@@ -955,6 +981,39 @@ async def react_event_loop(
                 )
                 final_text_parts.clear()
                 continue
+            # Drain point B: if a steering message arrived while the model was
+            # generating its final answer, fold it in and continue (up to cap)
+            # instead of silently dropping it.
+            steering_inbox = current_steering_inbox()
+            if (
+                steering_inbox is not None
+                and steering_inbox.has_pending()
+                and steering_continuations < MAX_STEERING_CONTINUATIONS
+            ):
+                steered = steering_inbox.drain()
+                if steered:
+                    steering_continuations += 1
+                    for provision_id in active_provision_ids:
+                        yield _provisional_retract_event(provision_id, "steering_redirect")
+                    active_provision_ids.clear()
+                    if final_text:
+                        conversation.append(_assistant_turn(final_text, response.reasoning))
+                    final_text_parts.clear()
+                    conversation.append({
+                        "role": "user",
+                        "content": format_steering_message(steered),
+                    })
+                    yield ExecutionEvent(EventType.STEERING_APPLIED, {
+                        "steer_ids": [item.steer_id for item in steered],
+                        "count": len(steered),
+                        "items": [
+                            {"steer_id": item.steer_id, "content": item.content}
+                            for item in steered
+                        ],
+                        "iteration": productive_iters,
+                    })
+                    continue
+
             if final_text:
                 for event in _final_text_events(
                     final_text,

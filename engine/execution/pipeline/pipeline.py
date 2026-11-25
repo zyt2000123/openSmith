@@ -125,6 +125,29 @@ async def run_pipeline(
 
         yield ExecutionEvent(EventType.SKILL_START, {"skill": node.skill_name, "index": node_idx})
 
+        # Drain any steering that arrived between pipeline nodes so the next
+        # node receives it in its context instead of dropping it at the boundary.
+        from engine.execution.steering import current_steering_inbox, format_steering_message
+
+        steering_inbox = current_steering_inbox()
+        if steering_inbox is not None and steering_inbox.has_pending():
+            steered = steering_inbox.drain()
+            if steered:
+                existing_note = str(context.get("steering_notes") or "").strip()
+                formatted = format_steering_message(steered)
+                context["steering_notes"] = (
+                    f"{existing_note}\n\n{formatted}" if existing_note else formatted
+                )
+                yield ExecutionEvent(EventType.STEERING_APPLIED, {
+                    "steer_ids": [item.steer_id for item in steered],
+                    "count": len(steered),
+                    "items": [
+                        {"steer_id": item.steer_id, "content": item.content}
+                        for item in steered
+                    ],
+                    "iteration": node_idx,
+                })
+
         # 两层门禁：先过 chain.base_gates（YAML 声明的兜底层，可为空），
         # 通过后再过节点自己的 gate（领域层）。引擎不预置任何具体门禁。
         base_gates = chain.base_gates

@@ -20,6 +20,7 @@ from engine.execution import (
     run_stream_with_runtime as engine_run_stream_with_runtime,
     resume_stream_with_runtime as engine_resume_stream_with_runtime,
 )
+from engine.execution.steering import STEERING_BROKER
 from engine.context import (
     CONTEXT_DISPLAY_WINDOW,
     SESSION_SUMMARY_PREFIX,
@@ -31,7 +32,7 @@ from engine.llm.observability import generation_context
 from engine.observability.trace_store import _redact_secrets_in_text
 from common.yaml_utils import YamlConfigError
 
-from ..schemas.session import ContextCompressionOut, SessionOut, MessageOut
+from ..schemas.session import ContextCompressionOut, SessionOut, MessageOut, SteerOut
 from ..infrastructure.repositories.session_repo import SessionRepo
 from ..infrastructure.repositories.agent_profile_repo import AgentProfileRepo
 from .engine_runtime import build_engine_runtime, close_session_mcp_clients
@@ -454,11 +455,25 @@ class SessionService:
         after_rows = await self.session_repo.get_messages_since(
             state.session_id, state.message_id, limit=20
         )
-        if any(row.get("role") == "user" for row in after_rows):
+        if any(
+            row.get("role") == "user" and row.get("kind", "normal") == "normal"
+            for row in after_rows
+        ):
             raise HTTPException(
                 409,
                 "Run has a newer user turn and cannot be resumed into this session safely",
             )
+        get_steering = getattr(self.session_repo, "get_steering_messages", None)
+        steering_rows = (
+            await get_steering(state.session_id, state.message_id)
+            if callable(get_steering)
+            else []
+        )
+        steering_history = tuple(
+            str(row["content"])
+            for row in steering_rows
+            if isinstance(row.get("content"), str) and row["content"].strip()
+        )
         history = await self._history_before_message(
             state.session_id,
             state.message_id,
@@ -477,6 +492,44 @@ class SessionService:
             _resume_run_id=run_id,
             _message_id=state.message_id,
             _execution_identity_id=state.identity_id,
+            _steering_history=steering_history,
+        )
+
+    async def steer_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        content: str,
+        *,
+        run_id: str | None = None,
+    ) -> SteerOut:
+        """Inject a mid-turn steering message into an active run without acquiring turn lock."""
+        if not await self.session_repo.exists(session_id, agent_id):
+            raise HTTPException(404, "Session not found")
+
+        active_id = STEERING_BROKER.active_run_id(session_id)
+        waiting_approval = False
+        if active_id and self.run_state_store is not None:
+            try:
+                state = self.run_state_store.get(active_id)
+                waiting_approval = (
+                    state is not None and state.status is RunStatus.WAITING_APPROVAL
+                )
+            except Exception:
+                waiting_approval = False
+
+        res = STEERING_BROKER.submit(
+            session_id=session_id,
+            content=content,
+            run_id=run_id,
+            waiting_approval=waiting_approval,
+        )
+        return SteerOut(
+            accepted=res.accepted,
+            status=res.status,
+            run_id=res.run_id,
+            steer_id=res.steer_id,
+            pending_count=res.pending_count,
         )
 
     async def prepare_stream_message(
@@ -493,6 +546,7 @@ class SessionService:
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
         _execution_identity_id: str | None = None,
+        _steering_history: tuple[str, ...] = (),
     ) -> AsyncGenerator[dict, None]:
         """Validate the session before an HTTP caller commits to an SSE 200."""
         selected_identity_id = await self._resolve_session_identity(
@@ -516,6 +570,7 @@ class SessionService:
             _resume_run_id=_resume_run_id,
             _message_id=_message_id,
             execution_identity_id=_execution_identity_id,
+            steering_history=_steering_history,
         )
 
     async def _stream_message(
@@ -533,6 +588,7 @@ class SessionService:
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
         execution_identity_id: str | None = None,
+        steering_history: tuple[str, ...] = (),
     ) -> AsyncGenerator[dict, None]:
         """Yield SSE event dicts. Streams text chunks as they arrive from the engine."""
         # Stream structured events from engine
@@ -572,6 +628,7 @@ class SessionService:
                 execution_identity_id=execution_identity_id,
                 working_dir=working_dir,
                 message_id=message_id,
+                steering_history=steering_history,
             )
             if _resume_run_id is None:
                 # RunStateStore.create() fsyncs; keep the blocking I/O off the
@@ -631,6 +688,37 @@ class SessionService:
                     full_reply.append(chunk)
                     if not ev.data.get("already_streamed"):
                         yield sse("message", {"text": chunk})
+                elif t == "steering_applied":
+                    items = ev.data.get("items")
+                    if isinstance(items, list):
+                        for item in items:
+                            item_content = item.get("content") if isinstance(item, dict) else None
+                            if isinstance(item_content, str) and item_content.strip():
+                                try:
+                                    await self.session_repo.add_message(
+                                        session_id,
+                                        "user",
+                                        item_content,
+                                        kind="steering",
+                                        parent_message_id=message_id,
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "failed to persist steering message (session=%s)",
+                                        session_id,
+                                        exc_info=True,
+                                    )
+                    yield sse("steering_applied", {
+                        "steer_ids": ev.data.get("steer_ids", []),
+                        "count": ev.data.get("count", 0),
+                        "items": ev.data.get("items", []),
+                        "iteration": ev.data.get("iteration", 0),
+                    })
+                elif t == "steering_deferred":
+                    yield sse("steering_deferred", {
+                        "steer_ids": ev.data.get("steer_ids", []),
+                        "items": ev.data.get("items", []),
+                    })
                 elif t == "thinking":
                     yield sse("thinking", {"text": ev.data.get("text", ""), "done": bool(ev.data.get("done"))})
                 elif t == "tool_call_start":

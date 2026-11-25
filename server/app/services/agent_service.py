@@ -13,7 +13,7 @@ from ..infrastructure.repositories.session_repo import SessionRepo
 from ..schemas.agent_profile import AgentProfileOut
 from ..schemas.auto_task import AutoTaskCreate, AutoTaskRunOut, AutoTaskUpdate
 from ..schemas.memory import MemoryMaintenanceOut
-from ..schemas.session import ContextCompressionOut, MessageOut, SessionOut
+from ..schemas.session import ContextCompressionOut, MessageOut, SessionOut, SteerOut
 from ..schemas.run import ApprovalDecision
 from ..schemas.mcp import McpServerOut
 from .auto_task_service import AutoTaskService
@@ -182,6 +182,20 @@ class AgentService:
         return await self.session_service.prepare_resume_run(
             await self._profile_id(),
             run_id,
+        )
+
+    async def steer_session(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        run_id: str | None = None,
+    ) -> SteerOut:
+        return await self.session_service.steer_session(
+            await self._profile_id(),
+            session_id,
+            content,
+            run_id=run_id,
         )
 
     async def list_skills(self):
