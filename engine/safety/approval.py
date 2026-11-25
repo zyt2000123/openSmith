@@ -66,6 +66,28 @@ class ApprovalScope:
     high_risk: bool = False
 
     @classmethod
+    def sandbox_command(
+        cls, command: str, *, high_risk: bool = False
+    ) -> ApprovalScope:
+        return cls(
+            kind="sandbox_command",
+            target=command,
+            access=("workspace", "process"),
+            high_risk=high_risk,
+        )
+
+    @classmethod
+    def sandbox_network(
+        cls, command: str, *, high_risk: bool = True
+    ) -> ApprovalScope:
+        return cls(
+            kind="sandbox_network",
+            target=command,
+            access=("workspace", "process", "network"),
+            high_risk=high_risk,
+        )
+
+    @classmethod
     def host_command(cls, command: str, *, high_risk: bool = False) -> ApprovalScope:
         return cls(
             kind="host_command",
@@ -117,7 +139,22 @@ class ApprovalScope:
         return self.kind == "host_command"
 
     @property
+    def grants_network_execution(self) -> bool:
+        return self.kind in {"sandbox_network", "host_command"}
+
+    @property
+    def grants_sandbox_execution(self) -> bool:
+        return self.kind in {"sandbox_command", "sandbox_network", "host_command"}
+
+    @property
     def description(self) -> str:
+        if self.kind == "sandbox_command":
+            return "Sandboxed workspace execution (no outbound network)"
+        if self.kind == "sandbox_network":
+            return (
+                "Sandboxed workspace execution with outbound network access "
+                "(filesystem sandbox active; on Linux, shares host network namespace)"
+            )
         if self.kind == "host_command":
             return "Host filesystem, network, and process access for this exact command"
         if self.kind == "network":
@@ -153,6 +190,7 @@ _DETAIL_LABELS = {
     "environment": "Environment",
     "index": "Task index",
     "message": "Commit message",
+    "network": "Outbound network",
     "new_string": "Replacement text",
     "old_string": "Text to replace",
     "path": "Path",
@@ -168,7 +206,7 @@ _DETAIL_LABELS = {
     "version_id": "Version",
 }
 _DETAIL_ORDER = {
-    "shell": ("command", "cwd", "timeout"),
+    "shell": ("command", "cwd", "network", "timeout"),
     "write_file": ("path", "append", "content"),
     "edit_file": ("path", "old_string", "new_string", "replace_all"),
     "git_ops": ("action", "cwd", "branch", "message", "files", "path", "staged"),
@@ -215,6 +253,9 @@ class ApprovalRequest:
     # Risk tier triaging this approval (see engine.safety.risk).  Carried so
     # the consumer can render/route the flow without re-deriving it.
     risk: "RiskTier | None" = None
+    rule_id: str | None = None
+    taint_sources: tuple[str, ...] = ()
+    repeat_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -231,6 +272,12 @@ class ApprovalRequest:
             payload["scope"] = self.scope.to_dict()
         if self.presentation is not None:
             payload["presentation"] = self.presentation.to_dict()
+        if self.rule_id:
+            payload["rule_id"] = self.rule_id
+        if self.taint_sources:
+            payload["taint_sources"] = list(self.taint_sources)
+        if self.repeat_count >= 2:
+            payload["repeat_count"] = self.repeat_count
         return payload
 
 
@@ -513,6 +560,9 @@ def _approval_details(
     arguments: dict[str, object],
     *,
     scope: ApprovalScope | None = None,
+    taint_sources: tuple[str, ...] = (),
+    repeat_count: int = 0,
+    rule_id: str | None = None,
 ) -> tuple[ApprovalDetail, ...]:
     order = {key: index for index, key in enumerate(_DETAIL_ORDER.get(tool_name, ()))}
     entries = [
@@ -522,6 +572,22 @@ def _approval_details(
     ]
     entries.sort(key=lambda item: (order.get(item[0], len(order)), item[0]))
     details: list[ApprovalDetail] = []
+    if taint_sources:
+        details.append(
+            ApprovalDetail(
+                label="Taint warning",
+                value=f"Session read private data: {', '.join(taint_sources)}",
+            )
+        )
+    if repeat_count >= 2:
+        details.append(
+            ApprovalDetail(
+                label="Repeat guard",
+                value=f"Attempt #{repeat_count} in this run",
+            )
+        )
+    if rule_id:
+        details.append(ApprovalDetail(label="Rule", value=rule_id))
     for key, value in entries:
         label = _DETAIL_LABELS.get(key, _humanize_name(key))
         details.append(ApprovalDetail(label=label, value=_display_value(value)))
@@ -538,15 +604,45 @@ def build_approval_presentation(
     *,
     tool_description: str = "",
     scope: ApprovalScope | None = None,
+    taint_sources: tuple[str, ...] = (),
+    repeat_count: int = 0,
+    rule_id: str | None = None,
 ) -> ApprovalPresentation:
     """Build a user-facing description from safe, bounded tool arguments."""
     action = str(arguments.get("action") or "").strip().lower()
     target = _display_value(arguments.get("path") or arguments.get("file_path") or "")
 
     if tool_name == "shell":
-        title = "Run a shell command"
-        summary = "Execute the requested command"
-        fallback_reason = "This command may change files or system state."
+        # Check scope.kind FIRST: a degraded host_command has NO OS sandbox
+        # isolation even when network=True, and must never be mislabeled as
+        # "sandboxed with outbound network".
+        if scope is not None and scope.kind == "host_command":
+            if arguments.get("network") is True:
+                title = "Run a host shell command with outbound network [NO OS SANDBOX]"
+                summary = (
+                    "Execute the requested command on the host without OS sandbox "
+                    "isolation (outbound network enabled)"
+                )
+            else:
+                title = "Run a host shell command [NO OS SANDBOX]"
+                summary = "Execute the requested command on the host without OS sandbox isolation"
+            fallback_reason = (
+                "This command runs on the host with NO OS SANDBOX isolation "
+                "(host filesystem and network accessible)."
+            )
+        elif (scope is not None and scope.kind == "sandbox_network") or (
+            scope is None and arguments.get("network") is True
+        ):
+            title = "Run a shell command with outbound network"
+            summary = "Execute the requested sandboxed command with outbound network access"
+            fallback_reason = (
+                "This command requests outbound network access "
+                "(filesystem sandbox remains active)."
+            )
+        else:
+            title = "Run a shell command"
+            summary = "Execute the requested command inside the workspace sandbox"
+            fallback_reason = "This command may change workspace files or process state."
     elif tool_name == "write_file":
         title = "Write a file"
         summary = f"{'Append to' if arguments.get('append') else 'Write to'} {target or 'the requested path'}"
@@ -582,7 +678,14 @@ def build_approval_presentation(
     return ApprovalPresentation(
         title=title,
         summary=summary,
-        details=_approval_details(tool_name, arguments, scope=scope),
+        details=_approval_details(
+            tool_name,
+            arguments,
+            scope=scope,
+            taint_sources=taint_sources,
+            repeat_count=repeat_count,
+            rule_id=rule_id,
+        ),
         reason=_specific_reason(reason, fallback_reason),
     )
 

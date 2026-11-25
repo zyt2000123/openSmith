@@ -679,8 +679,8 @@ def test_run_stream_executes_shell_only_after_approval_through_sandbox(
     sandbox_calls: list[dict[str, object]] = []
 
     class RecordingSeatbelt(MacOSSeatbeltEnvironment):
-        def __init__(self, *, workspace: str | Path) -> None:
-            super().__init__(workspace=workspace)
+        def __init__(self, *, workspace: str | Path, profile=None) -> None:
+            super().__init__(workspace=workspace, profile=profile)
             self.workspace = Path(workspace).resolve()
 
         async def run_command(
@@ -691,6 +691,7 @@ def test_run_stream_executes_shell_only_after_approval_through_sandbox(
             cwd=None,
             timeout_seconds=30.0,
             env=None,
+            network: bool = False,
         ) -> CommandResult:
             sandbox_calls.append(
                 {
@@ -699,6 +700,7 @@ def test_run_stream_executes_shell_only_after_approval_through_sandbox(
                     "cwd": cwd,
                     "timeout_seconds": timeout_seconds,
                     "env": env,
+                    "network": network,
                     "workspace": self.workspace,
                 }
             )
@@ -708,12 +710,16 @@ def test_run_stream_executes_shell_only_after_approval_through_sandbox(
                 cwd=cwd,
                 timeout_seconds=timeout_seconds,
                 env=env,
+                network=network,
             )
 
     monkeypatch.setattr(
         preparation_module,
-        "MacOSSeatbeltEnvironment",
-        RecordingSeatbelt,
+        "create_sandbox_environment",
+        lambda profile, **_kw: RecordingSeatbelt(
+            workspace=profile.workspace,
+            profile=profile,
+        ),
     )
 
     async def run() -> tuple[str, list[ExecutionEvent], Path, Path, Path]:
@@ -863,8 +869,10 @@ def test_approved_shell_can_read_user_owned_sensitive_data_for_that_exact_comman
         and event.data.get("approval_outcome") == "granted"
     )
     assert result_event.data["blocked"] is False
-    assert "must-not-leak" in str(result_event.data["content"])
-    assert "[exit_code=0]" in str(result_event.data["content"])
+    # Routine shell approval grants `sandbox_command` (not `host_command`),
+    # keeping Seatbelt's .env isolation active so secrets cannot be read.
+    assert "must-not-leak" not in str(result_event.data["content"])
+    assert "Operation not permitted" in str(result_event.data["content"])
     assert (project_dir / ".env").read_text(encoding="utf-8") == (
         "SMITH_SECRET=must-not-leak\n"
     )
@@ -942,8 +950,10 @@ def test_approved_shell_can_write_user_owned_git_metadata_for_that_exact_command
         and event.data.get("approval_outcome") == "granted"
     )
     assert result_event.data["blocked"] is False
-    assert "[exit_code=0]" in str(result_event.data["content"])
-    assert git_config.read_text(encoding="utf-8") == "compromised"
+    # Routine shell approval grants `sandbox_command` (not `host_command`),
+    # keeping Seatbelt's .git metadata write protection active.
+    assert "Operation not permitted" in str(result_event.data["content"])
+    assert git_config.read_text(encoding="utf-8") == "original\n"
     assert events[-1].type is EventType.RUN_FINISHED
     assert events[-1].data["status"] == "completed"
 

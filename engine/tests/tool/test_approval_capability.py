@@ -22,18 +22,26 @@ class _ScopeAwareSandbox:
         raise AssertionError("not used by this contract test")
 
 
-def test_registry_binds_dynamic_host_scope_to_the_exact_approved_call(tmp_path: Path) -> None:
+def test_registry_binds_sandbox_command_and_network_scopes_without_escalation(
+    tmp_path: Path,
+) -> None:
     async def run():
         registry = ToolRegistry()
 
-        async def shell(*, command: str, environment) -> str:
+        async def shell(*, command: str, network: bool = False, environment) -> str:
             assert environment.scope is not None
-            return f"{environment.scope.kind}:{environment.scope.target}"
+            return f"{environment.scope.kind}:{environment.scope.target}:net={network}"
 
         registry.register(
             "shell",
             "Run a command",
-            {"type": "object", "properties": {"command": {"type": "string"}}},
+            {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "network": {"type": "boolean", "default": False},
+                },
+            },
             shell,
             opaque_command=True,
             permission_level="execute",
@@ -44,15 +52,29 @@ def test_registry_binds_dynamic_host_scope_to_the_exact_approved_call(tmp_path: 
         guard = ToolGuard(tmp_path / "missing-rules.json", tool_registry=registry.definitions())
         registry.bind_tool_guard(guard)
         registry.bind_execution_environment(_ScopeAwareSandbox())
-        call = ToolCall(id="approved-call", name="shell", arguments={"command": "pwd"})
-        scope = ApprovalScope.host_command("pwd")
 
+        call = ToolCall(id="approved-call", name="shell", arguments={"command": "pwd"})
+        scope = ApprovalScope.sandbox_command("pwd")
+        net_call = ToolCall(
+            id="approved-net", name="shell", arguments={"command": "curl x", "network": True}
+        )
+        net_scope = ApprovalScope.sandbox_network("curl x", high_risk=True)
+
+        # Mismatched scope (wrong command or wrong scope kind) is rejected
         with registry.authorize_execution(
             call,
             approval_id="approval-1",
-            approval_scope=ApprovalScope.host_command("id"),
+            approval_scope=ApprovalScope.sandbox_command("id"),
         ):
             mismatched_scope = await registry.execute(call)
+
+        # Cannot replay a sandbox_command approval for a network=True call
+        with registry.authorize_execution(
+            net_call,
+            approval_id="approval-1",
+            approval_scope=ApprovalScope.sandbox_command("curl x"),
+        ):
+            wrong_kind = await registry.execute(net_call)
 
         with registry.authorize_execution(
             call,
@@ -61,6 +83,13 @@ def test_registry_binds_dynamic_host_scope_to_the_exact_approved_call(tmp_path: 
         ):
             approved = await registry.execute(call)
 
+        with registry.authorize_execution(
+            net_call,
+            approval_id="approval-2",
+            approval_scope=net_scope,
+        ):
+            approved_net = await registry.execute(net_call)
+
         changed = ToolCall(id="approved-call", name="shell", arguments={"command": "id"})
         with registry.authorize_execution(
             call,
@@ -68,13 +97,40 @@ def test_registry_binds_dynamic_host_scope_to_the_exact_approved_call(tmp_path: 
             approval_scope=scope,
         ):
             replay = await registry.execute(changed)
-        return mismatched_scope, approved, replay
 
-    mismatched_scope, approved, replay = asyncio.run(run())
+        # Degraded host sandbox elevates to host_command scope and CRITICAL risk
+        guard.set_sandbox_degraded(True)
+        degraded_decision = guard.check(call, audit=False)
+        return (
+            mismatched_scope,
+            wrong_kind,
+            approved,
+            approved_net,
+            replay,
+            degraded_decision,
+        )
+
+    (
+        mismatched_scope,
+        wrong_kind,
+        approved,
+        approved_net,
+        replay,
+        degraded_decision,
+    ) = asyncio.run(run())
 
     assert mismatched_scope.is_error
     assert "approval" in mismatched_scope.content.lower()
-    assert approved.content == "host_command:pwd"
+    assert wrong_kind.is_error
+    assert "approval" in wrong_kind.content.lower()
+    assert approved.content == "sandbox_command:pwd:net=False"
     assert not approved.is_error
+    assert approved.metadata["network_used"] is False
+    assert approved_net.content == "sandbox_network:curl x:net=True"
+    assert not approved_net.is_error
+    assert approved_net.metadata["network_used"] is True
     assert replay.is_error
     assert "approval" in replay.content.lower()
+    assert degraded_decision.approval_scope is not None
+    assert degraded_decision.approval_scope.kind == "host_command"
+    assert "[NO OS SANDBOX]" in degraded_decision.reason

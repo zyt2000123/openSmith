@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ..database import get_app_db
 
 
 class SessionRepo:
 
-    async def list_by_agent(self, agent_id: str) -> list[dict]:
+    async def list_by_agent(self, agent_id: str, *, include_side: bool = False) -> list[dict]:
         db = await get_app_db()
+        kind_filter = "" if include_side else " AND s.session_kind='main'"
         rows = await db.execute_fetchall(
             "SELECT s.id, s.agent_id, s.identity_id, s.model_profile, s.title, s.created_at, "
+            "  s.session_kind, s.parent_session_id, s.snapshot_cutoff_message_id, "
             "  (SELECT content FROM messages m WHERE m.session_id=s.id ORDER BY m.created_at DESC LIMIT 1) as last_message_preview, "
             "  (SELECT created_at FROM messages m WHERE m.session_id=s.id ORDER BY m.created_at DESC LIMIT 1) as last_message_at, "
             "  (SELECT count(*) FROM messages m WHERE m.session_id=s.id) as message_count "
-            "FROM sessions s WHERE s.agent_id=? ORDER BY s.created_at DESC",
+            f"FROM sessions s WHERE s.agent_id=?{kind_filter} ORDER BY s.created_at DESC",
             (agent_id,),
         )
         result = []
@@ -38,7 +40,8 @@ class SessionRepo:
         sid = uuid.uuid4().hex[:12]
         now = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "INSERT INTO sessions (id, agent_id, identity_id, model_profile, title, created_at) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO sessions (id, agent_id, identity_id, model_profile, title, created_at, session_kind) "
+            "VALUES (?,?,?,?,?,?,'main')",
             (sid, agent_id, identity_id, model_profile, title, now),
         )
         await db.commit()
@@ -49,7 +52,120 @@ class SessionRepo:
             "model_profile": model_profile,
             "title": title,
             "created_at": now,
+            "session_kind": "main",
+            "parent_session_id": None,
+            "snapshot_cutoff_message_id": None,
         }
+
+    async def get_active_side(self, agent_id: str, parent_session_id: str) -> dict | None:
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT id, agent_id, identity_id, model_profile, title, created_at, "
+            "  session_kind, parent_session_id, snapshot_cutoff_message_id, "
+            "  (SELECT count(*) FROM messages m WHERE m.session_id=sessions.id) as message_count "
+            "FROM sessions WHERE agent_id=? AND parent_session_id=? AND session_kind='side' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (agent_id, parent_session_id),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def create_side(
+        self,
+        agent_id: str,
+        *,
+        parent_session_id: str | None,
+        snapshot_cutoff_message_id: str | None,
+        title: str = "Side chat",
+        identity_id: str | None = None,
+        model_profile: str | None = None,
+    ) -> dict:
+        db = await get_app_db()
+        sid = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            "INSERT INTO sessions "
+            "(id, agent_id, identity_id, model_profile, title, created_at, session_kind, "
+            "parent_session_id, snapshot_cutoff_message_id) "
+            "VALUES (?,?,?,?,?,?,'side',?,?)",
+            (
+                sid,
+                agent_id,
+                identity_id,
+                model_profile,
+                title,
+                now,
+                parent_session_id,
+                snapshot_cutoff_message_id,
+            ),
+        )
+        await db.commit()
+        return {
+            "id": sid,
+            "agent_id": agent_id,
+            "identity_id": identity_id,
+            "model_profile": model_profile,
+            "title": title,
+            "created_at": now,
+            "session_kind": "side",
+            "parent_session_id": parent_session_id,
+            "snapshot_cutoff_message_id": snapshot_cutoff_message_id,
+            "message_count": 0,
+        }
+
+    async def promote_side(
+        self,
+        session_id: str,
+        agent_id: str,
+        *,
+        title: str | None = None,
+        context_summary: str | None = None,
+    ) -> dict | None:
+        db = await get_app_db()
+        updates = ["session_kind='main'"]
+        params: list[object] = []
+        if title is not None:
+            updates.append("title=?")
+            params.append(title)
+        if context_summary is not None:
+            updates.append("context_summary=?")
+            params.append(context_summary)
+            updates.append("context_summary_cutoff=0")
+        params.extend([session_id, agent_id])
+        cursor = await db.execute(
+            f"UPDATE sessions SET {', '.join(updates)} "
+            "WHERE id=? AND agent_id=? AND session_kind='side'",
+            params,
+        )
+        await db.commit()
+        if cursor.rowcount != 1:
+            return None
+        return await self.get_owned(session_id, agent_id)
+
+    async def list_child_sides(self, parent_session_id: str, agent_id: str) -> list[str]:
+        """Return all child side-session IDs attached to *parent_session_id*."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT id FROM sessions WHERE agent_id=? AND parent_session_id=? AND session_kind='side'",
+            (agent_id, parent_session_id),
+        )
+        return [str(row["id"]) for row in rows]
+
+    async def cleanup_stale_sides(self, *, max_age_days: int = 7) -> list[str]:
+        """Delete unpromoted side sessions with no updates older than ``max_age_days``."""
+        db = await get_app_db()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+        rows = await db.execute_fetchall(
+            "SELECT s.id FROM sessions s WHERE s.session_kind='side' "
+            "AND COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.session_id=s.id), s.created_at) < ?",
+            (cutoff,),
+        )
+        stale_ids = [str(row["id"]) for row in rows]
+        if not stale_ids:
+            return []
+        placeholders = ",".join("?" for _ in stale_ids)
+        await db.execute(f"DELETE FROM sessions WHERE id IN ({placeholders})", stale_ids)
+        await db.commit()
+        return stale_ids
 
     async def exists(self, session_id: str, agent_id: str) -> bool:
         db = await get_app_db()
@@ -62,7 +178,10 @@ class SessionRepo:
     async def get_owned(self, session_id: str, agent_id: str) -> dict | None:
         db = await get_app_db()
         rows = await db.execute_fetchall(
-            "SELECT id, agent_id, identity_id, model_profile, title, created_at FROM sessions WHERE id=? AND agent_id=?",
+            "SELECT id, agent_id, identity_id, model_profile, title, created_at, "
+            "  session_kind, parent_session_id, snapshot_cutoff_message_id, "
+            "  (SELECT count(*) FROM messages m WHERE m.session_id=sessions.id) as message_count "
+            "FROM sessions WHERE id=? AND agent_id=?",
             (session_id, agent_id),
         )
         return dict(rows[0]) if rows else None
@@ -235,16 +354,47 @@ class SessionRepo:
         rows.reverse()
         return [dict(r) for r in rows]
 
-    async def add_message(self, session_id: str, role: str, content: str) -> dict:
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        kind: str = "normal",
+        parent_message_id: str | None = None,
+    ) -> dict:
         db = await get_app_db()
         mid = uuid.uuid4().hex[:12]
         now = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-            (mid, session_id, role, content, now),
+            "INSERT INTO messages (id, session_id, role, content, kind, parent_message_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (mid, session_id, role, content, kind, parent_message_id, now),
         )
         await db.commit()
-        return {"id": mid, "session_id": session_id, "role": role, "content": content, "created_at": now}
+        return {
+            "id": mid,
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+            "kind": kind,
+            "parent_message_id": parent_message_id,
+            "created_at": now,
+        }
+
+    async def get_steering_messages(
+        self,
+        session_id: str,
+        parent_message_id: str,
+    ) -> list[dict]:
+        """Return applied steering messages bound to one user turn, ascending."""
+        db = await get_app_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE session_id=? AND role='user' "
+            "AND kind='steering' AND parent_message_id=? ORDER BY created_at ASC",
+            (session_id, parent_message_id),
+        )
+        return [dict(r) for r in rows]
 
     async def discard_assistant_messages_after_user(
         self,
@@ -262,7 +412,8 @@ class SessionRepo:
         cursor = await db.execute(
             "DELETE FROM messages WHERE session_id=? AND role='assistant' "
             "AND rowid > ? AND rowid < COALESCE(("
-            "SELECT MIN(rowid) FROM messages WHERE session_id=? AND role='user' AND rowid > ?"
+            "SELECT MIN(rowid) FROM messages WHERE session_id=? AND role='user' "
+            "AND kind='normal' AND rowid > ?"
             "), 9223372036854775807)",
             (session_id, rows[0]["rowid"], session_id, rows[0]["rowid"]),
         )

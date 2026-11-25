@@ -8,13 +8,29 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from itertools import pairwise
 from pathlib import Path
 from typing import Optional
 
 from common.hash_chain import ChainVerification, HashChainLog, verify_chain
+from common.sensitive_rules import (
+    CREDENTIAL_CONFIG_FILES,
+    CREDENTIAL_DIRS,
+    CREDENTIAL_PATH_PAIRS,
+    ENV_TEMPLATE_SUFFIXES,
+    GIT_CREDENTIAL_FILES,
+    PRIVATE_KEY_EXTENSIONS,
+    SENSITIVE_WRITE_FILES,
+    SSH_KEY_NAME_RE,
+    is_sensitive_path,
+    is_sensitive_read_name,
+    is_sensitive_write_name,
+    match_credential_pair,
+    runtime_credential_paths,
+)
+from common.vault import VaultStore, extract_vault_placeholders
 from engine.safety.approval import (
     ApprovalScope,
     _SECRET_FLAG_RE,
@@ -24,7 +40,19 @@ from engine.safety.approval import (
     current_approval_context,
 )
 from engine.safety.risk import RiskTier, risk_for_approval
-from engine.tool.interface import ToolCall, ToolDefinition
+from engine.safety.rules import (
+    BucketKey,
+    RepeatSensitiveChecker,
+    SafetyConfig,
+    classify_sensitive_bucket,
+)
+from engine.safety.taint import (
+    EgressTarget,
+    SessionTaintStore,
+    detect_secret_in_text,
+    resolve_egress_target,
+)
+from engine.tool.interface import ToolCall, ToolDefinition, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +85,11 @@ class GuardResult:
     # Risk tier used to triage the approval flow (see engine.safety.risk).
     # HIGH/CRITICAL approvals are never eligible for session-whitelist caching.
     risk: RiskTier = RiskTier.ROUTINE
+    # Observability & decision metadata for declarative rules, taint, and repeat guard.
+    rule_id: str | None = None
+    taint_sources: tuple[str, ...] = ()
+    repeat_count: int = 0
+    repeat_bucket: BucketKey | None = None
 
 
 # ── Path guard (req #3: symlink, traversal, sensitive files) ──
@@ -207,77 +240,32 @@ def _shares_inode_with_protected_file(
     return False
 
 
-_SENSITIVE_READ_EXTENSIONS = (".pem", ".key", ".p12", ".pfx")
-_ENV_TEMPLATE_SUFFIXES = (".env.example", ".env.template", ".env.sample")
-# A basename matching this (with word boundaries) is an SSH-style private key
-# even when it has been copied away from ``.ssh`` — ``id_rsa_old``,
-# ``backup-id_ed25519`` and the like.
-_SENSITIVE_KEY_NAME_RE = re.compile(
-    r"(?:^|[-_.])(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:[-_.]|$)"
-)
-# Files inside any ``.git`` directory whose read warrants high-risk approval:
-# ``config`` embeds remote URLs (often ``https://user:token@host``), the
-# ``credentials`` file stores passwords verbatim, ``config.worktree`` the same.
-_GIT_CREDENTIAL_FILES = frozenset({"config", "config.worktree", "credentials"})
-# Package-manager and VCS credential stores.  These live as ordinary files with
-# ordinary-looking names, so no extension or key-name rule below reaches them.
-#
-# This set is deliberately identical to ``macos_seatbelt._CREDENTIAL_CONFIGS``
-# and to the file entries of ``agents/tools/grep.py``'s ``SECRET_EXCLUDED``.
-# The three copies exist because the sandbox may not import the safety layer
-# and ``agents/`` may not import the engine at all; they had already drifted
-# apart, and the weakest copy set the real security level: the shell tool was
-# denied ``~/.npmrc`` by the Seatbelt profile while ``read_file`` returned the
-# same npm token with no approval at all.  Change all three together.
-_CREDENTIAL_CONFIG_NAMES = frozenset({".npmrc", ".pypirc", ".netrc", ".git-credentials"})
-# Credential stores identified by a parent/child directory pair rather than by a
-# single component, so ``_ALWAYS_BLOCKED`` cannot express them.
-_CREDENTIAL_PATH_PAIRS = frozenset(
-    {(".config", "gh"), (".config", "gcloud"), ("library", "keychains")}
-)
+_SENSITIVE_READ_EXTENSIONS = PRIVATE_KEY_EXTENSIONS
+_ENV_TEMPLATE_SUFFIXES = ENV_TEMPLATE_SUFFIXES
+_SENSITIVE_KEY_NAME_RE = SSH_KEY_NAME_RE
+_GIT_CREDENTIAL_FILES = GIT_CREDENTIAL_FILES
+_CREDENTIAL_CONFIG_NAMES = CREDENTIAL_CONFIG_FILES
+_CREDENTIAL_PATH_PAIRS = CREDENTIAL_PATH_PAIRS
 
 
 def _credential_pair(path: Path) -> str | None:
     """Return the ``parent/child`` credential directory this path enters, if any."""
-    folded = tuple(part.lower() for part in path.parts)
-    for parent, child in pairwise(folded):
-        if (parent, child) in _CREDENTIAL_PATH_PAIRS:
-            return f"{parent}/{child}"
-    return None
+    return match_credential_pair(path)
 
 
 def _is_sensitive_read_name(name: str) -> bool:
-    """Whether a case-folded basename warrants high-risk approval when read.
-
-    The read path has no write-branch equivalent: ``read_file`` declares
-    ``approval_policy="never"``, so the only protection is the case-sensitive
-    regex rules, which miss ``.ENV``, ``.env.staging``, ``key.PEM`` and a
-    stray ``id_rsa`` — all reachable on a case-insensitive APFS filesystem.
-    This mirrors the write branch (any ``.env*``) plus the private-key rule
-    set, matched case-insensitively.  Documented env templates and public keys
-    stay ordinary reads.
-    """
-    folded = name.lower()
-    if folded.endswith(".pub"):
-        return False
-    if folded.startswith(".env"):
-        return not folded.endswith(_ENV_TEMPLATE_SUFFIXES)
-    if folded in _CREDENTIAL_CONFIG_NAMES:
-        return True
-    if folded.endswith(_SENSITIVE_READ_EXTENSIONS):
-        return True
-    return bool(_SENSITIVE_KEY_NAME_RE.search(folded))
+    """Whether a case-folded basename warrants high-risk approval when read."""
+    return is_sensitive_read_name(name)
 
 
 class FileGuard:
-    # Mirrors ``macos_seatbelt._CREDENTIAL_DIRECTORIES`` minus ``.agent-smith``,
-    # which has its own dedicated platform-state and runtime-credential rules.
-    _ALWAYS_BLOCKED = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
-    _SENSITIVE_WRITE = frozenset({".env", ".env.local", ".env.production", ".npmrc", ".pypirc"})
+    _ALWAYS_BLOCKED = CREDENTIAL_DIRS
+    _SENSITIVE_WRITE = SENSITIVE_WRITE_FILES
     _SENSITIVE_DIRS = frozenset({".git"})
 
     def __init__(self, allowed_dirs: list[Path] | None = None):
         self._working_dir: Path | None = None
+        self._extra_roots: tuple[Path, ...] = ()
         self._non_delegable_write_roots: tuple[Path, ...] = ()
         self.set_allowed_dirs(allowed_dirs)
 
@@ -295,12 +283,23 @@ class FileGuard:
         else:
             self._allowed = [p.resolve() for p in allowed_dirs]
 
-    def set_working_directory(self, working_dir: Path) -> None:
+    def set_working_directory(
+        self,
+        working_dir: Path,
+        *,
+        extra_roots: Iterable[Path] = (),
+    ) -> None:
         root = Path(working_dir).expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"working directory does not exist: {working_dir}")
         self._working_dir = root
-        self.set_allowed_dirs([root])
+        resolved_extra: list[Path] = []
+        for extra in extra_roots:
+            resolved = Path(extra).expanduser().resolve()
+            if resolved != root and resolved.is_dir() and resolved not in resolved_extra:
+                resolved_extra.append(resolved)
+        self._extra_roots = tuple(resolved_extra)
+        self.set_allowed_dirs([root, *self._extra_roots])
 
     def set_non_delegable_write_roots(self, roots: list[Path]) -> None:
         """Configure paths that model tools may read but never modify.
@@ -511,7 +510,7 @@ class FileGuard:
             # innocuous name, and the write it authorizes is a git hook — code
             # that runs on the next git operation.
             for name in _ordered_unique(target.name.lower(), lexical.name.lower()):
-                if name in self._SENSITIVE_WRITE or name.startswith(".env"):
+                if is_sensitive_write_name(name):
                     return self._path_approval(
                         target,
                         writing=True,
@@ -864,12 +863,7 @@ _REDIRECT_RE = re.compile(r"(?:>>?|[12]>>?|&>>?)\s*([^\s;|&]+)")
 _PLATFORM_DATA_ROOT = (Path.home() / ".agent-smith").resolve()
 _MEMORY_WRITE_ROOT = _PLATFORM_DATA_ROOT / "agent" / "memory"
 _MEMORY_WRITE_FILES = frozenset({"recent.jsonl", "recent.md", "durable.md"})
-_RUNTIME_CREDENTIAL_PATHS = frozenset({
-    _PLATFORM_DATA_ROOT / "config.yaml",
-    _PLATFORM_DATA_ROOT / "config.yml",
-    _PLATFORM_DATA_ROOT / "agent" / "config.yaml",
-    _PLATFORM_DATA_ROOT / "agent" / "config.yml",
-})
+_RUNTIME_CREDENTIAL_PATHS = frozenset(runtime_credential_paths(_PLATFORM_DATA_ROOT))
 
 
 def _is_runtime_credential_path(*paths: Path) -> bool:
@@ -951,6 +945,18 @@ def _rule_match_targets(arguments: dict) -> list[str]:
     return targets
 
 
+def call_requests_network_egress(
+    tool_call: ToolCall,
+    definition: ToolDefinition | None,
+) -> bool:
+    """True when a tool call opens external network connections."""
+    if definition is not None and getattr(definition, "network_access", False):
+        return True
+    if definition is not None and definition.opaque_command:
+        return tool_call.arguments.get("network") is True
+    return False
+
+
 # ── Main guard ──────────────────────────────────────────────
 
 class ToolGuard:
@@ -978,6 +984,72 @@ class ToolGuard:
         self.audit = AuditLog()
         self.whitelist = SessionWhitelist()
         self._tool_registry: dict[str, ToolDefinition] = tool_registry or {}
+        self._sandbox_is_degraded: bool = False
+        self._sandbox_allows_host_loopback: bool = False
+        self._safety_config: SafetyConfig = SafetyConfig()
+        self._taint_store: SessionTaintStore | None = None
+        self._vault_store: VaultStore | None = None
+        self._repeat_guard: RepeatSensitiveChecker = RepeatSensitiveChecker(
+            self._safety_config.repeat_guard
+        )
+        self._subagent_mode: bool = False
+
+    def set_sandbox_degraded(self, degraded: bool) -> None:
+        """Mark whether the bound sandbox is running in degraded host fallback mode."""
+        self._sandbox_is_degraded = bool(degraded)
+
+    def set_sandbox_host_loopback(self, enabled: bool) -> None:
+        """Mark whether the sandbox can reach host 127.0.0.1 (e.g. macOS loopback_only)."""
+        self._sandbox_allows_host_loopback = bool(enabled)
+
+    def configure_safety(
+        self,
+        safety_config: SafetyConfig | None = None,
+        *,
+        taint_store: SessionTaintStore | None = None,
+        vault_store: VaultStore | None = None,
+        subagent_mode: bool = False,
+    ) -> None:
+        """Attach declarative rules, session taint store, and vault store."""
+        if safety_config is not None:
+            self._safety_config = safety_config
+            self._repeat_guard = RepeatSensitiveChecker(safety_config.repeat_guard)
+        if taint_store is not None:
+            self._taint_store = taint_store
+        if vault_store is not None:
+            self._vault_store = vault_store
+        self._subagent_mode = bool(subagent_mode)
+
+    @property
+    def taint_store(self) -> SessionTaintStore | None:
+        return self._taint_store
+
+    @property
+    def safety_config(self) -> SafetyConfig:
+        return self._safety_config
+
+    @property
+    def vault_store(self) -> VaultStore | None:
+        return self._vault_store
+
+    def fork_for_subagent(self) -> tuple[ToolGuard, SessionTaintStore]:
+        """Return a subagent-scoped guard copy and an isolated taint collector.
+
+        Subagents inherit the parent's current taint state (read-only snapshot)
+        and enforce hard-deny for taint egress and repeat sensitive calls.
+        Any new taint sources recorded during the subagent run stay in the
+        returned collector for monotonic upward merge into the parent store.
+        """
+        import copy as _copy
+
+        child_taint = SessionTaintStore()
+        if self._taint_store is not None:
+            child_taint.merge_from(self._taint_store.sources)
+        child = _copy.copy(self)
+        child._taint_store = child_taint
+        child._repeat_guard = RepeatSensitiveChecker(self._safety_config.repeat_guard)
+        child._subagent_mode = True
+        return child, child_taint
 
     def bind_definitions(self, definitions: dict[str, ToolDefinition]) -> None:
         """Bind tool definitions after registry load so metadata-first checks apply."""
@@ -993,9 +1065,14 @@ class ToolGuard:
         self.whitelist.allow_file(str(target))
         return target
 
-    def set_working_directory(self, working_dir: Path) -> None:
-        """Constrain project-facing file tools to one resolved workspace."""
-        self.file_guard.set_working_directory(working_dir)
+    def set_working_directory(
+        self,
+        working_dir: Path,
+        *,
+        extra_roots: Iterable[Path] = (),
+    ) -> None:
+        """Constrain project-facing file tools to one resolved workspace (plus extra_roots)."""
+        self.file_guard.set_working_directory(working_dir, extra_roots=extra_roots)
 
     def set_non_delegable_write_roots(self, roots: list[Path]) -> None:
         """Block model writes to runtime-owned executable provider roots."""
@@ -1183,10 +1260,12 @@ class ToolGuard:
             tool_call.name
         )
         if opaque_command:
-            return ApprovalScope.host_command(
-                str(tool_call.arguments.get("command") or ""),
-                high_risk=high_risk,
-            )
+            cmd = str(tool_call.arguments.get("command") or "")
+            if self._sandbox_is_degraded:
+                return ApprovalScope.host_command(cmd, high_risk=True)
+            if tool_call.arguments.get("network") is True:
+                return ApprovalScope.sandbox_network(cmd, high_risk=True)
+            return ApprovalScope.sandbox_command(cmd, high_risk=high_risk)
 
         definition = self._tool_registry.get(tool_call.name)
         if definition is not None and getattr(definition, "network_access", False):
@@ -1228,46 +1307,7 @@ class ToolGuard:
                 )
         return ApprovalScope.operation(tool_call.name, high_risk=high_risk)
 
-    def check(self, tool_call: ToolCall, *, audit: bool = True) -> GuardResult:
-        """Evaluate one call.
-
-        ``audit=False`` suppresses the audit record for a re-check of a call
-        that was already evaluated and logged.  The registry runs this guard a
-        second time as an execution backstop; without this the audit trail
-        would report twice the number of tool calls that actually happened.
-        """
-        level = self._resolve_permission_level(tool_call.name)
-        tool_whitelisted = self.whitelist.is_tool_allowed(tool_call.name)
-        approval_context = current_approval_context()
-        audit_context: dict[str, object] = {"call_id": tool_call.id}
-        if approval_context is not None:
-            audit_context["run_id"] = approval_context[1]
-
-        def record(result: GuardResult, **extra: object) -> None:
-            if audit:
-                self.audit.record(
-                    tool_call.name,
-                    tool_call.arguments,
-                    result,
-                    **extra,
-                    **audit_context,
-                )
-
-        if self._resolve_path_metadata(tool_call.name)[3] and _command_mentions_runtime_credential(
-            str(tool_call.arguments.get("command") or "")
-        ):
-            result = GuardResult(
-                allowed=False,
-                reason=(
-                    "[runtime-secret-001] Agent runtime credential files are not "
-                    "delegable to model tools"
-                ),
-                level=level,
-                risk=RiskTier.CRITICAL,
-            )
-            record(result)
-            return result
-
+    def _check_dangerous_rules(self, tool_call: ToolCall) -> GuardResult | None:
         match_targets = _rule_match_targets(tool_call.arguments)
         for rule in self._rules:
             scoped_tools = rule.get("tools")
@@ -1290,7 +1330,7 @@ class ToolGuard:
                     if any(ep and re.search(ep, target) for ep in exclude_patterns):
                         continue
                     reason = rule.get("reason") or rule.get("description") or f"Blocked: {pattern}"
-                    result = GuardResult(
+                    return GuardResult(
                         allowed=False,
                         reason=(
                             f"[{rule.get('id', '?')}] {reason}; high-risk approval "
@@ -1301,47 +1341,644 @@ class ToolGuard:
                         approval_required=True,
                         approval_scope=self._approval_scope_for(tool_call, high_risk=True),
                         risk=RiskTier.CRITICAL,
+                        rule_id=str(rule.get("id") or "") or None,
                     )
-                    record(result, rule_id=rule.get("id"))
+        return None
+
+    def _classify_call_bucket(
+        self,
+        tool_call: ToolCall,
+        definition: ToolDefinition | None,
+        *,
+        file_result: GuardResult | None,
+        dangerous_hit: bool,
+        egress_target: EgressTarget | None,
+        tainted: bool,
+        risk: RiskTier,
+    ) -> tuple[BucketKey, str] | None:
+        is_sensitive_path_hit = bool(
+            file_result is not None
+            and file_result.approval_required
+            and not file_result.boundary_block
+        )
+        is_outside_write = bool(
+            file_result is not None
+            and file_result.boundary_block
+            and definition is not None
+            and definition.is_write_tool
+        )
+        is_host_or_dangerous = bool(
+            dangerous_hit
+            or (
+                definition is not None
+                and definition.opaque_command
+                and self._sandbox_is_degraded
+            )
+        )
+        return classify_sensitive_bucket(
+            tool_call,
+            definition,
+            is_sensitive_path=is_sensitive_path_hit,
+            is_outside_write=is_outside_write,
+            is_host_or_dangerous=is_host_or_dangerous,
+            egress_target=egress_target,
+            tainted=tainted,
+            risk=risk,
+            min_risk=self._safety_config.repeat_guard.min_risk,
+        )
+
+    def check(self, tool_call: ToolCall, *, audit: bool = True) -> GuardResult:
+        """Evaluate one call against the L0–L7 decision matrix.
+
+        ``audit=False`` suppresses the audit record for a re-check of a call
+        that was already evaluated and logged.  The registry runs this guard a
+        second time as an execution backstop; without this the audit trail
+        would report twice the number of tool calls that actually happened.
+        """
+        level = self._resolve_permission_level(tool_call.name)
+        tool_whitelisted = self.whitelist.is_tool_allowed(tool_call.name)
+        definition = self._tool_registry.get(tool_call.name)
+        is_opaque = bool(self._resolve_path_metadata(tool_call.name)[3])
+        is_tainted = bool(
+            self._safety_config.taint.enabled
+            and self._taint_store is not None
+            and self._taint_store.is_tainted
+        )
+        taint_labels = self._taint_store.labels() if is_tainted and self._taint_store is not None else ()
+        egress_target = resolve_egress_target(
+            tool_call,
+            definition,
+            working_dir=self.file_guard._working_dir,
+            sandbox_is_degraded=self._sandbox_is_degraded,
+            sandbox_allows_host_loopback=self._sandbox_allows_host_loopback,
+        )
+        vault_keys = extract_vault_placeholders(tool_call.arguments)
+
+        approval_context = current_approval_context()
+        audit_context: dict[str, object] = {"call_id": tool_call.id}
+        if approval_context is not None:
+            audit_context["run_id"] = approval_context[1]
+        if is_tainted:
+            audit_context["tainted"] = True
+        if egress_target is not None:
+            audit_context["egress_target"] = egress_target.target
+        if vault_keys:
+            audit_context["vault_keys"] = vault_keys
+
+        def record(result: GuardResult, **extra: object) -> None:
+            if audit:
+                if result.rule_id and "rule_id" not in extra:
+                    extra["rule_id"] = result.rule_id
+                if result.repeat_count >= 2:
+                    extra["repeat_count"] = result.repeat_count
+                self.audit.record(
+                    tool_call.name,
+                    tool_call.arguments,
+                    result,
+                    **extra,
+                    **audit_context,
+                )
+
+        # ── L0: Non-bypassable hard floor ──
+        if is_opaque and _command_mentions_runtime_credential(
+            str(tool_call.arguments.get("command") or "")
+        ):
+            result = GuardResult(
+                allowed=False,
+                reason=(
+                    "[runtime-secret-001] Agent runtime credential files are not "
+                    "delegable to model tools"
+                ),
+                level=level,
+                risk=RiskTier.CRITICAL,
+            )
+            record(result)
+            return result
+
+        if vault_keys:
+            if is_opaque:
+                result = GuardResult(
+                    allowed=False,
+                    reason=(
+                        "[vault-shell-001] Vault placeholders ({{vault:...}}) are "
+                        "forbidden in opaque shell commands"
+                    ),
+                    level=level,
+                    risk=RiskTier.CRITICAL,
+                )
+                record(result)
+                return result
+            if definition is not None and not definition.accepts_vault_placeholders:
+                result = GuardResult(
+                    allowed=False,
+                    reason=(
+                        f"[vault-shell-001] Tool '{tool_call.name}' does not accept "
+                        "vault placeholders ({{vault:...}})"
+                    ),
+                    level=level,
+                    risk=RiskTier.CRITICAL,
+                )
+                record(result)
+                return result
+            if self._vault_store is not None:
+                target_domain = (
+                    egress_target.target
+                    if egress_target is not None and egress_target.kind == "http_host"
+                    else None
+                )
+                ok_vault, vault_err, _ = self._vault_store.validate_placeholders(
+                    tool_call.name,
+                    tool_call.arguments,
+                    target_domain=target_domain,
+                )
+                if not ok_vault:
+                    result = GuardResult(
+                        allowed=False,
+                        reason=vault_err,
+                        level=level,
+                        risk=RiskTier.CRITICAL,
+                    )
+                    record(result)
                     return result
 
-        # Classify known high-risk patterns before returning the more general
-        # outside-workspace result. Otherwise ``read_file /etc/shadow`` would
-        # be presented as an ordinary directory-boundary approval rather than
-        # the high-risk credential/system-file access it actually is.
+        if is_opaque and "network" in tool_call.arguments and not isinstance(
+            tool_call.arguments["network"], bool
+        ):
+            bad_net = GuardResult(
+                allowed=False,
+                level=level,
+                reason="Argument 'network' must be a boolean",
+                risk=RiskTier.HIGH,
+            )
+            record(bad_net)
+            return bad_net
+
         file_result = self._check_file_paths(tool_call)
-        if file_result is not None:
+        if file_result is not None and not file_result.allowed and not file_result.approval_required:
             file_result.level = level
             file_result.risk = self._risk_for_file_result(file_result)
             record(file_result)
             return file_result
 
-        approval_required = self._requires_approval(tool_call)
-        approval_scope = self._approval_scope_for(tool_call) if approval_required else None
-        definition = self._tool_registry.get(tool_call.name)
-        network_access = bool(
-            definition is not None and getattr(definition, "network_access", False)
-        )
-        result = GuardResult(
-            allowed=True,
-            level=level,
-            reason=f"Approval required for {tool_call.name}" if approval_required else "",
-            approval_required=approval_required,
-            approval_scope=approval_scope,
-            risk=(
-                risk_for_approval(
-                    level=level.value,
-                    high_risk=bool(
-                        approval_scope is not None and approval_scope.high_risk
-                    ),
-                    network_access=network_access,
+        # ── L1: Declarative rules with action: deny ──
+        deny_rule = self._safety_config.match_deny(tool_call, tainted=is_tainted)
+        if deny_rule is not None:
+            result = GuardResult(
+                allowed=False,
+                reason=f"[{deny_rule.id}] {deny_rule.reason}",
+                level=level,
+                risk=deny_rule.risk,
+                rule_id=deny_rule.id,
+                taint_sources=taint_labels,
+            )
+            record(result)
+            return result
+
+        # ── L2: Session taint egress gate ──
+        taint_ask_result: GuardResult | None = None
+        if is_tainted and egress_target is not None:
+            if not self._safety_config.taint.allowlist.allows(egress_target):
+                sources_desc = ", ".join(taint_labels)
+                reason = (
+                    f"[taint-egress-001] Outbound egress to '{egress_target.raw_display}' "
+                    f"blocked/escalated because this session read private data ({sources_desc})"
                 )
-                if approval_required
-                else RiskTier.ROUTINE
-            ),
+                if self._subagent_mode or self._safety_config.taint.on_egress == "deny":
+                    result = GuardResult(
+                        allowed=False,
+                        reason=reason,
+                        level=level,
+                        risk=RiskTier.CRITICAL,
+                        taint_sources=taint_labels,
+                    )
+                    record(result)
+                    return result
+                if self._safety_config.taint.on_egress == "ask":
+                    taint_ask_result = GuardResult(
+                        allowed=False,
+                        reason=reason,
+                        level=level,
+                        needs_confirmation=True,
+                        approval_required=True,
+                        approval_scope=self._approval_scope_for(tool_call, high_risk=True),
+                        risk=RiskTier.CRITICAL,
+                        taint_sources=taint_labels,
+                    )
+
+        # Match non-deny declarative rule (L5) early so L3/L4 know whether allow applies
+        matched_rule = self._safety_config.match_non_deny(tool_call, tainted=is_tainted)
+
+        # ── L3: Built-in dangerous rules & FileGuard high-risk paths ──
+        dangerous_result = self._check_dangerous_rules(tool_call)
+        candidate: GuardResult | None = None
+        dangerous_hit = dangerous_result is not None
+
+        if taint_ask_result is not None:
+            candidate = taint_ask_result
+        elif dangerous_result is not None:
+            candidate = dangerous_result
+        elif file_result is not None:
+            file_result.level = level
+            file_result.risk = self._risk_for_file_result(file_result)
+            if file_result.boundary_block:
+                # L4: outside-workspace boundary can be waived by an explicit allow rule
+                # when the session is not tainted.
+                if (
+                    matched_rule is not None
+                    and matched_rule.action == "allow"
+                    and not is_tainted
+                ):
+                    candidate = GuardResult(
+                        allowed=True,
+                        level=level,
+                        risk=RiskTier.ROUTINE,
+                        rule_id=matched_rule.id,
+                    )
+                else:
+                    candidate = file_result
+            else:
+                # L3 high-risk sensitive path: only override if explicitly allowed by
+                # a non-CRITICAL override_builtin_approval rule when clean.
+                if (
+                    matched_rule is not None
+                    and matched_rule.action == "allow"
+                    and matched_rule.override_builtin_approval
+                    and not is_tainted
+                    and file_result.risk is not RiskTier.CRITICAL
+                ):
+                    candidate = GuardResult(
+                        allowed=True,
+                        level=level,
+                        risk=RiskTier.ROUTINE,
+                        rule_id=matched_rule.id,
+                    )
+                else:
+                    candidate = file_result
+
+        # ── L5 & L6: Declarative ask/allow + default tool approval policy ──
+        if candidate is None:
+            if matched_rule is not None and matched_rule.action == "ask":
+                high = matched_rule.risk >= RiskTier.HIGH
+                candidate = GuardResult(
+                    allowed=False,
+                    level=level,
+                    reason=f"[{matched_rule.id}] {matched_rule.reason}",
+                    needs_confirmation=True,
+                    approval_required=True,
+                    approval_scope=self._approval_scope_for(tool_call, high_risk=high),
+                    risk=matched_rule.risk,
+                    rule_id=matched_rule.id,
+                    taint_sources=taint_labels if is_tainted else (),
+                )
+            elif matched_rule is not None and matched_rule.action == "allow":
+                candidate = GuardResult(
+                    allowed=True,
+                    level=level,
+                    reason="",
+                    approval_required=False,
+                    approval_scope=None,
+                    risk=RiskTier.ROUTINE,
+                    rule_id=matched_rule.id,
+                )
+            else:
+                approval_required = self._requires_approval(tool_call)
+                approval_scope = (
+                    self._approval_scope_for(tool_call) if approval_required else None
+                )
+                network_access = call_requests_network_egress(tool_call, definition)
+                if is_opaque and self._sandbox_is_degraded:
+                    reason = (
+                        f"[NO OS SANDBOX] Approval required for {tool_call.name} "
+                        "(running in explicit host_with_approval fallback mode)"
+                    )
+                    risk = RiskTier.CRITICAL
+                elif is_opaque and network_access:
+                    reason = (
+                        f"Outbound network approval required for {tool_call.name} "
+                        "(filesystem sandbox remains active)"
+                    )
+                    risk = RiskTier.HIGH
+                else:
+                    reason = (
+                        f"Approval required for {tool_call.name}"
+                        if approval_required
+                        else ""
+                    )
+                    risk = (
+                        risk_for_approval(
+                            level=level.value,
+                            high_risk=bool(
+                                approval_scope is not None and approval_scope.high_risk
+                            ),
+                            network_access=network_access,
+                        )
+                        if approval_required
+                        else RiskTier.ROUTINE
+                    )
+                candidate = GuardResult(
+                    allowed=True,
+                    level=level,
+                    reason=reason,
+                    approval_required=approval_required,
+                    approval_scope=approval_scope,
+                    risk=risk,
+                )
+
+        # ── L7: Repeat sensitive call guard (cannot be bypassed by allow/whitelist) ──
+        bucket_info = self._classify_call_bucket(
+            tool_call,
+            definition,
+            file_result=file_result,
+            dangerous_hit=dangerous_hit,
+            egress_target=egress_target,
+            tainted=is_tainted,
+            risk=candidate.risk,
         )
-        record(result, whitelisted=tool_whitelisted)
-        return result
+        if bucket_info is not None:
+            bucket_key, bucket_label = bucket_info
+            candidate.repeat_bucket = bucket_key
+            triggered, next_count = self._repeat_guard.should_trigger(bucket_key)
+            if triggered:
+                repeat_reason = (
+                    f"[repeat-sensitive-001] Sensitive operation ({bucket_label}) "
+                    f"attempt #{next_count} in this run requires explicit confirmation"
+                )
+                if (
+                    self._subagent_mode
+                    or self._safety_config.repeat_guard.on_trigger == "deny"
+                ):
+                    candidate = GuardResult(
+                        allowed=False,
+                        reason=repeat_reason,
+                        level=candidate.level,
+                        needs_confirmation=False,
+                        approval_required=False,
+                        risk=RiskTier.CRITICAL,
+                        rule_id=candidate.rule_id,
+                        taint_sources=candidate.taint_sources or (taint_labels if is_tainted else ()),
+                        repeat_count=next_count,
+                        repeat_bucket=bucket_key,
+                    )
+                else:
+                    candidate = GuardResult(
+                        allowed=False,
+                        reason=repeat_reason,
+                        level=candidate.level,
+                        needs_confirmation=True,
+                        approval_required=True,
+                        approval_scope=self._approval_scope_for(
+                            tool_call, high_risk=True
+                        ),
+                        risk=RiskTier.CRITICAL,
+                        rule_id=candidate.rule_id,
+                        taint_sources=candidate.taint_sources or (taint_labels if is_tainted else ()),
+                        repeat_count=next_count,
+                        repeat_bucket=bucket_key,
+                    )
+
+        record(
+            candidate,
+            whitelisted=tool_whitelisted,
+            sandbox_backend="host_degraded" if (is_opaque and self._sandbox_is_degraded) else None,
+        )
+        return candidate
+
+    def is_taint_sensitive_if_tainted(self, tool_call: ToolCall) -> bool:
+        """Whether a pending local read flipping session taint could alter policy for *tool_call*."""
+        if not self._safety_config.taint.enabled or self._taint_store is None:
+            return False
+        if self._taint_store.is_tainted:
+            # Already tainted; taint is monotonic so another read cannot untaint.
+            return False
+        return self._safety_config.has_taint_sensitive_rule_for(tool_call.name)
+
+    def _effective_eval_risk(
+        self,
+        tool_call: ToolCall,
+        definition: ToolDefinition | None,
+        *,
+        file_result: GuardResult | None,
+        dangerous_hit: bool,
+        egress_target: EgressTarget | None,
+        is_tainted: bool,
+    ) -> RiskTier:
+        """Mirror ``check()``'s effective risk so RepeatGuard bucketing and headroom agree."""
+        if dangerous_hit or (
+            definition is not None
+            and definition.opaque_command
+            and self._sandbox_is_degraded
+        ):
+            return RiskTier.CRITICAL
+        matched_rule = self._safety_config.match_non_deny(tool_call, tainted=is_tainted)
+        if file_result is not None:
+            file_risk = self._risk_for_file_result(file_result)
+            if (
+                file_result.boundary_block
+                and matched_rule is not None
+                and matched_rule.action == "allow"
+                and not is_tainted
+            ):
+                return RiskTier.ROUTINE
+            if (
+                not file_result.boundary_block
+                and matched_rule is not None
+                and matched_rule.action == "allow"
+                and matched_rule.override_builtin_approval
+                and not is_tainted
+                and file_risk is not RiskTier.CRITICAL
+            ):
+                return RiskTier.ROUTINE
+            return file_risk
+        if (
+            is_tainted
+            and egress_target is not None
+            and not self._safety_config.taint.allowlist.allows(egress_target)
+        ):
+            return RiskTier.CRITICAL
+        if matched_rule is not None:
+            if matched_rule.action == "allow":
+                return RiskTier.ROUTINE
+            if matched_rule.action == "ask":
+                return matched_rule.risk
+        if call_requests_network_egress(tool_call, definition):
+            return RiskTier.HIGH
+        return RiskTier.ROUTINE
+
+    def repeat_guard_headroom(self, tool_call: ToolCall) -> tuple[BucketKey, int] | None:
+        """Return ``(bucket_key, remaining_before_trigger)`` if RepeatGuard tracks this call.
+
+        Read-only parallel batching calls this before queueing another call in
+        the same bucket so a batch can never slip past ``repeat_guard.threshold``
+        before ``record_post_execution`` increments the real counter.
+        """
+        if not self._safety_config.repeat_guard.enabled:
+            return None
+        definition = self._tool_registry.get(tool_call.name)
+        file_result = self._check_file_paths(tool_call)
+        dangerous_hit = self._check_dangerous_rules(tool_call) is not None
+        egress_target = resolve_egress_target(
+            tool_call,
+            definition,
+            working_dir=self.file_guard._working_dir,
+            sandbox_is_degraded=self._sandbox_is_degraded,
+            sandbox_allows_host_loopback=self._sandbox_allows_host_loopback,
+        )
+        is_tainted = bool(
+            self._safety_config.taint.enabled
+            and self._taint_store is not None
+            and self._taint_store.is_tainted
+        )
+        eval_risk = self._effective_eval_risk(
+            tool_call,
+            definition,
+            file_result=file_result,
+            dangerous_hit=dangerous_hit,
+            egress_target=egress_target,
+            is_tainted=is_tainted,
+        )
+
+        bucket_info = self._classify_call_bucket(
+            tool_call,
+            definition,
+            file_result=file_result,
+            dangerous_hit=dangerous_hit,
+            egress_target=egress_target,
+            tainted=is_tainted,
+            risk=eval_risk,
+        )
+        if bucket_info is None:
+            return None
+        bucket_key = bucket_info[0]
+        current = self._repeat_guard.current_count(bucket_key)
+        headroom = max(0, self._safety_config.repeat_guard.threshold - 1 - current)
+        return bucket_key, headroom
+
+    def record_post_execution(
+        self,
+        tool_call: ToolCall,
+        result: ToolResult,
+        *,
+        run_id: str = "",
+    ) -> None:
+        """Update repeat sensitive counters and session taint immediately after execution.
+
+        Taint and secret detection ALWAYS run on executed calls — even when
+        ``result.is_error`` is True (for example a non-zero exit code such as
+        ``cat prod.yaml; false`` or content starting with ``Error:``).  Only
+        unexecuted policy/registry rejections are skipped, and repeat-guard
+        counters still only increment on non-error executions.
+        """
+        if result.error_kind in {
+            "policy_blocked",
+            "approval_required",
+            "unknown_tool",
+            "tool_disabled",
+            "environment_unavailable",
+        }:
+            return
+        definition = self._tool_registry.get(tool_call.name)
+
+        # 1. Update repeat sensitive counter for semantic bucket (only on success)
+        if not result.is_error:
+            file_result = self._check_file_paths(tool_call)
+            dangerous_hit = self._check_dangerous_rules(tool_call) is not None
+            egress_target = resolve_egress_target(
+                tool_call,
+                definition,
+                working_dir=self.file_guard._working_dir,
+                sandbox_is_degraded=self._sandbox_is_degraded,
+                sandbox_allows_host_loopback=self._sandbox_allows_host_loopback,
+            )
+            was_tainted = bool(
+                self._taint_store is not None and self._taint_store.is_tainted
+            )
+            eval_risk = self._effective_eval_risk(
+                tool_call,
+                definition,
+                file_result=file_result,
+                dangerous_hit=dangerous_hit,
+                egress_target=egress_target,
+                is_tainted=was_tainted,
+            )
+
+            bucket_info = self._classify_call_bucket(
+                tool_call,
+                definition,
+                file_result=file_result,
+                dangerous_hit=dangerous_hit,
+                egress_target=egress_target,
+                tainted=was_tainted,
+                risk=eval_risk,
+            )
+            if bucket_info is not None:
+                self._repeat_guard.record(bucket_info[0])
+
+        # 2. Update SessionTaintStore immediately (before next tool_call in same turn!),
+        #    regardless of whether result.is_error is True.
+        if self._taint_store is None or not self._safety_config.taint.enabled:
+            return
+
+        # 2a. Static private-data tool (e.g. memory_ops search, configured private MCP)
+        if definition is not None and definition.reads_private_data:
+            action = str(tool_call.arguments.get("action") or "").lower()
+            if tool_call.name != "memory_ops" or action in {"", "search"}:
+                label = (
+                    f"mcp:{tool_call.name}"
+                    if tool_call.name.startswith("mcp_")
+                    else f"tool:{tool_call.name}"
+                )
+                self._taint_store.record(
+                    "private_tool", tool_call.name, label, run_id=run_id
+                )
+
+        # 2b. Sensitive file read or outside-workspace read
+        if definition is not None and not definition.is_write_tool and definition.path_args:
+            for arg_name in definition.path_args:
+                raw_path = tool_call.arguments.get(arg_name)
+                if not isinstance(raw_path, str) or not raw_path:
+                    continue
+                p = Path(raw_path).expanduser()
+                try:
+                    resolved = p.resolve()
+                except OSError:
+                    resolved = p
+                if is_sensitive_path(resolved) or is_sensitive_path(p):
+                    self._taint_store.record(
+                        "sensitive_file",
+                        tool_call.name,
+                        f"file:{resolved.name or p.name}",
+                        run_id=run_id,
+                    )
+                elif (
+                    self.file_guard.is_working_directory_scoped
+                    and not self.file_guard.is_inside_allowed_dirs(resolved)
+                ):
+                    self._taint_store.record(
+                        "outside_workspace",
+                        tool_call.name,
+                        f"outside:{resolved.name or str(resolved)}",
+                        run_id=run_id,
+                    )
+
+        # 2c. Host-level shell execution
+        if definition is not None and definition.opaque_command:
+            if (
+                self._sandbox_is_degraded
+                or result.metadata.get("sandbox_backend") == "host_degraded"
+                or result.metadata.get("sandbox_backend") == "host"
+            ):
+                self._taint_store.record(
+                    "host_shell", tool_call.name, "host:shell", run_id=run_id
+                )
+
+        # 2d. Output contained high-confidence secret or triggered vault redaction
+        if result.metadata.get("vault_redacted") or detect_secret_in_text(result.content):
+            self._taint_store.record(
+                "secret_output",
+                tool_call.name,
+                f"secret:{tool_call.name}",
+                run_id=run_id,
+            )
 
     @staticmethod
     def _risk_for_file_result(result: GuardResult) -> RiskTier:

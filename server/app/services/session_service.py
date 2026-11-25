@@ -16,6 +16,7 @@ from engine.execution import (
     RunStateError,
     RunStateStore,
     RunStatus,
+    STEERING_BROKER,
     raw_text_delta,
     run_stream_with_runtime as engine_run_stream_with_runtime,
     resume_stream_with_runtime as engine_resume_stream_with_runtime,
@@ -31,7 +32,7 @@ from engine.llm.observability import generation_context
 from engine.observability.trace_store import _redact_secrets_in_text
 from common.yaml_utils import YamlConfigError
 
-from ..schemas.session import ContextCompressionOut, SessionOut, MessageOut
+from ..schemas.session import ContextCompressionOut, SessionOut, MessageOut, SteerOut
 from ..infrastructure.repositories.session_repo import SessionRepo
 from ..infrastructure.repositories.agent_profile_repo import AgentProfileRepo
 from .engine_runtime import build_engine_runtime, close_session_mcp_clients
@@ -108,6 +109,27 @@ async def _session_turn_lock(session_id: str) -> AsyncIterator[None]:
 # lost sight of its own opening question long before the work was done.  The
 # engine's context fitter still compacts whatever does not fit the window.
 _HISTORY_LIMIT = 40
+_SIDE_SNAPSHOT_MESSAGE_LIMIT = 16
+_SIDE_SNAPSHOT_MAX_CHARS = 12_000
+_SIDE_SNAPSHOT_PREFIX = "[Read-only snapshot of main conversation]\n"
+
+
+def _redact_snapshot_text(text: str) -> str:
+    """Redact both pattern-matched secrets and configured Vault literals."""
+    if not text:
+        return ""
+    redacted = _redact_secrets_in_text(text)
+    try:
+        from common import config as common_config
+        from common.vault import VaultRedactor, VaultStore
+
+        vault = VaultStore(common_config.PATHS.data_dir / "vault.json")
+        entries = vault.all_entries()
+        if entries:
+            redacted, _ = VaultRedactor.redact(redacted, all_entries=entries)
+    except Exception:
+        logger.warning("vault redaction skipped for snapshot", exc_info=True)
+    return redacted
 # Upper bound for one compress call; far beyond any real session while still
 # bounding the row count (compression already loads the conversation into memory).
 _COMPRESS_MESSAGE_CAP = 50_000
@@ -317,10 +339,11 @@ class SessionService:
             raise HTTPException(404, "Session not found")
         return SessionOut(**row)
 
-    async def delete_session(self, agent_id: str, session_id: str) -> None:
-        deleted = await self.session_repo.delete_owned(session_id, agent_id)
-        if not deleted:
-            raise HTTPException(404, "Session not found")
+    async def _cleanup_session_resources(self, session_id: str) -> None:
+        from common import config as common_config
+        from engine.safety.taint import delete_session_taint
+
+        delete_session_taint(common_config.PATHS.agent_dir, session_id)
         await close_session_mcp_clients(session_id)
         # Drop the per-session stream lock so deleted sessions do not leak a lock
         # for the server's lifetime.  Under the guard, and only when idle: an
@@ -331,6 +354,213 @@ class SessionService:
             if _SESSION_STREAM_LOCK_USERS.get(session_id, 0) == 0:
                 _SESSION_STREAM_LOCKS.pop(session_id, None)
                 _SESSION_STREAM_LOCK_USERS.pop(session_id, None)
+
+    async def delete_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        *,
+        expected_kind: str | None = None,
+    ) -> None:
+        if expected_kind is not None:
+            owned = await self.session_repo.get_owned(session_id, agent_id)
+            if owned is None:
+                raise HTTPException(404, "Session not found")
+            if owned.get("session_kind", "main") != expected_kind:
+                raise HTTPException(
+                    409,
+                    f"Refused to delete {owned.get('session_kind', 'main')} session as {expected_kind}",
+                )
+        list_sides = getattr(self.session_repo, "list_child_sides", None)
+        child_side_ids = (
+            await list_sides(session_id, agent_id)
+            if callable(list_sides)
+            else []
+        )
+        deleted = await self.session_repo.delete_owned(session_id, agent_id)
+        if not deleted:
+            raise HTTPException(404, "Session not found")
+        for side_id in child_side_ids:
+            await self.session_repo.delete_owned(side_id, agent_id)
+            await self._cleanup_session_resources(side_id)
+        await self._cleanup_session_resources(session_id)
+
+    async def cleanup_stale_sides(self, *, max_age_days: int = 7) -> list[str]:
+        """Delete stale unpromoted side sessions and release their taint/MCP/lock state."""
+        stale_ids = await self.session_repo.cleanup_stale_sides(max_age_days=max_age_days)
+        for side_id in stale_ids:
+            await self._cleanup_session_resources(side_id)
+        return stale_ids
+
+    async def _build_parent_snapshot(
+        self,
+        parent_session_id: str,
+        cutoff_message_id: str | None = None,
+    ) -> str:
+        """Build a bounded, secret- and vault-redacted read-only snapshot of the parent session."""
+        parts: list[str] = []
+        context_reader = getattr(self.session_repo, "get_context", None)
+        context = await context_reader(parent_session_id) if context_reader is not None else {}
+        summary = context.get("context_summary") if isinstance(context, dict) else ""
+        if isinstance(summary, str) and summary.strip():
+            parts.append(f"Summary:\n{_redact_snapshot_text(summary.strip())}")
+
+        rows: list[dict] = []
+        if cutoff_message_id:
+            cutoff_msg = await self.session_repo.get_message(parent_session_id, cutoff_message_id)
+            if cutoff_msg is not None:
+                prior = await self.session_repo.get_messages_before(
+                    parent_session_id,
+                    cutoff_message_id,
+                    limit=_SIDE_SNAPSHOT_MESSAGE_LIMIT - 1,
+                )
+                rows = [*prior, cutoff_msg]
+        if not rows:
+            rows = await self.session_repo.get_recent_messages(
+                parent_session_id,
+                _SIDE_SNAPSHOT_MESSAGE_LIMIT,
+            )
+
+        if rows:
+            lines: list[str] = []
+            for row in rows:
+                role = str(row.get("role") or "user")
+                body = _redact_snapshot_text(str(row.get("content") or "")).strip()
+                if not body:
+                    continue
+                if len(body) > 1500:
+                    body = body[:1500] + "…"
+                lines.append(f"{role}: {body}")
+            if lines:
+                parts.append("Recent turns:\n" + "\n".join(lines))
+
+        snapshot = "\n\n".join(parts).strip()
+        if len(snapshot) > _SIDE_SNAPSHOT_MAX_CHARS:
+            snapshot = snapshot[-_SIDE_SNAPSHOT_MAX_CHARS:]
+        return snapshot
+
+    @staticmethod
+    def _merge_parent_taint(parent_session_id: str, child_session_id: str) -> None:
+        """Monotonically propagate parent taint sources into a side or promoted session."""
+        if not parent_session_id or not child_session_id:
+            return
+        try:
+            from common import config as common_config
+            from engine.safety.taint import SessionTaintStore
+
+            state_dir = common_config.PATHS.agent_dir
+            parent_taint = SessionTaintStore(state_dir=state_dir, session_id=parent_session_id)
+            if parent_taint.is_tainted:
+                child_taint = SessionTaintStore(state_dir=state_dir, session_id=child_session_id)
+                child_taint.merge_from(parent_taint.sources)
+        except Exception:
+            logger.warning(
+                "failed to propagate parent taint (parent=%s, child=%s)",
+                parent_session_id,
+                child_session_id,
+                exc_info=True,
+            )
+
+    async def create_side_session(
+        self,
+        agent_id: str,
+        parent_session_id: str | None = None,
+        *,
+        title: str = "Side chat",
+        reuse_existing: bool = True,
+    ) -> SessionOut:
+        """Create or reuse an isolated read-only /side session anchored to a parent main session."""
+        profile = await self.agent_profile_repo.get(agent_id)
+        if profile is None:
+            raise HTTPException(404, "Agent profile not found")
+
+        identity_id: str | None = None
+        model_profile: str | None = None
+        cutoff_message_id: str | None = None
+        if parent_session_id is not None:
+            parent = await self.session_repo.get_owned(parent_session_id, agent_id)
+            if parent is None:
+                raise HTTPException(404, "Parent session not found")
+            if parent.get("session_kind") == "side":
+                raise HTTPException(409, "Cannot create a side chat inside another side chat")
+            if reuse_existing:
+                existing = await self.session_repo.get_active_side(agent_id, parent_session_id)
+                if existing is not None:
+                    self._merge_parent_taint(parent_session_id, str(existing["id"]))
+                    return SessionOut(**existing)
+            identity_id = parent.get("identity_id")
+            model_profile = parent.get("model_profile")
+            recent = await self.session_repo.get_recent_messages(parent_session_id, 1)
+            if recent:
+                cutoff_message_id = str(recent[-1]["id"])
+
+        row = await self.session_repo.create_side(
+            agent_id,
+            parent_session_id=parent_session_id,
+            snapshot_cutoff_message_id=cutoff_message_id,
+            title=title or "Side chat",
+            identity_id=identity_id,
+            model_profile=model_profile,
+        )
+        if parent_session_id is not None:
+            self._merge_parent_taint(parent_session_id, str(row["id"]))
+        return SessionOut(**row)
+
+    async def promote_side_session(
+        self,
+        agent_id: str,
+        side_session_id: str,
+        *,
+        title: str | None = None,
+        keep_parent_context: bool = True,
+    ) -> SessionOut:
+        """Promote a /side session into a standalone main session with redacted context & taint monotonicity."""
+        side = await self.session_repo.get_owned(side_session_id, agent_id)
+        if side is None:
+            raise HTTPException(404, "Session not found")
+        if side.get("session_kind") != "side":
+            raise HTTPException(409, "Session is already a main session")
+
+        derived_title = title.strip() if isinstance(title, str) and title.strip() else None
+        if derived_title is None:
+            side_msgs = await self.session_repo.get_messages(side_session_id, limit=5)
+            first_user = next(
+                (
+                    m["content"]
+                    for m in side_msgs
+                    if m.get("role") == "user" and str(m.get("content", "")).strip()
+                ),
+                None,
+            )
+            if isinstance(first_user, str):
+                derived_title = _redact_snapshot_text(first_user).splitlines()[0][:40] or "Promoted session"
+            else:
+                derived_title = side.get("title") or "Promoted session"
+
+        parent_id = side.get("parent_session_id")
+        persisted_summary: str | None = None
+        if isinstance(parent_id, str) and parent_id:
+            # Always propagate parent taint on /promote regardless of
+            # keep_parent_context: prior turns in the side chat already saw
+            # the parent snapshot, so keep_parent_context=False cannot launder it.
+            self._merge_parent_taint(parent_id, side_session_id)
+            if keep_parent_context:
+                snapshot = await self._build_parent_snapshot(
+                    parent_id,
+                    cutoff_message_id=side.get("snapshot_cutoff_message_id"),
+                )
+                if snapshot:
+                    persisted_summary = snapshot
+
+        promoted = await self.session_repo.promote_side(
+            side_session_id,
+            agent_id,
+            title=derived_title,
+            context_summary=persisted_summary,
+        )
+        if promoted is None:
+            raise HTTPException(409, "Session could not be promoted")
+        return SessionOut(**promoted)
 
     async def compress_session(self, agent_id: str, session_id: str) -> ContextCompressionOut:
         session = await self.session_repo.get_owned(session_id, agent_id)
@@ -450,11 +680,25 @@ class SessionService:
         after_rows = await self.session_repo.get_messages_since(
             state.session_id, state.message_id, limit=20
         )
-        if any(row.get("role") == "user" for row in after_rows):
+        if any(
+            row.get("role") == "user" and row.get("kind", "normal") == "normal"
+            for row in after_rows
+        ):
             raise HTTPException(
                 409,
                 "Run has a newer user turn and cannot be resumed into this session safely",
             )
+        get_steering = getattr(self.session_repo, "get_steering_messages", None)
+        steering_rows = (
+            await get_steering(state.session_id, state.message_id)
+            if callable(get_steering)
+            else []
+        )
+        steering_history = tuple(
+            str(row["content"])
+            for row in steering_rows
+            if isinstance(row.get("content"), str) and row["content"].strip()
+        )
         history = await self._history_before_message(
             state.session_id,
             state.message_id,
@@ -473,6 +717,44 @@ class SessionService:
             _resume_run_id=run_id,
             _message_id=state.message_id,
             _execution_identity_id=state.identity_id,
+            _steering_history=steering_history,
+        )
+
+    async def steer_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        content: str,
+        *,
+        run_id: str | None = None,
+    ) -> SteerOut:
+        """Inject a mid-turn steering message into an active run without acquiring turn lock."""
+        if not await self.session_repo.exists(session_id, agent_id):
+            raise HTTPException(404, "Session not found")
+
+        active_id = STEERING_BROKER.active_run_id(session_id)
+        waiting_approval = False
+        if active_id and self.run_state_store is not None:
+            try:
+                state = self.run_state_store.get(active_id)
+                waiting_approval = (
+                    state is not None and state.status is RunStatus.WAITING_APPROVAL
+                )
+            except Exception:
+                waiting_approval = False
+
+        res = STEERING_BROKER.submit(
+            session_id=session_id,
+            content=content,
+            run_id=run_id,
+            waiting_approval=waiting_approval,
+        )
+        return SteerOut(
+            accepted=res.accepted,
+            status=res.status,
+            run_id=res.run_id,
+            steer_id=res.steer_id,
+            pending_count=res.pending_count,
         )
 
     async def prepare_stream_message(
@@ -489,6 +771,7 @@ class SessionService:
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
         _execution_identity_id: str | None = None,
+        _steering_history: tuple[str, ...] = (),
     ) -> AsyncGenerator[dict, None]:
         """Validate the session before an HTTP caller commits to an SSE 200."""
         selected_identity_id = await self._resolve_session_identity(
@@ -512,6 +795,7 @@ class SessionService:
             _resume_run_id=_resume_run_id,
             _message_id=_message_id,
             execution_identity_id=_execution_identity_id,
+            steering_history=_steering_history,
         )
 
     async def _stream_message(
@@ -529,6 +813,7 @@ class SessionService:
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
         execution_identity_id: str | None = None,
+        steering_history: tuple[str, ...] = (),
     ) -> AsyncGenerator[dict, None]:
         """Yield SSE event dicts. Streams text chunks as they arrive from the engine."""
         # Stream structured events from engine
@@ -557,6 +842,36 @@ class SessionService:
                 else:
                     history = list(_history_override or [])
                     message_id = _message_id
+            session_meta = await self.session_repo.get_owned(session_id, agent_id)
+            is_side = bool(session_meta and session_meta.get("session_kind") == "side")
+            if is_side:
+                parent_id = session_meta.get("parent_session_id") if session_meta else None
+                if isinstance(parent_id, str) and parent_id:
+                    # H2: Inherit parent taint on every side run before runtime
+                    # preparation loads SessionTaintStore, preventing a tainted
+                    # parent's snapshot from leaking through side web_fetch/web_search.
+                    self._merge_parent_taint(parent_id, session_id)
+                    # L4: Preserve the read-only parent snapshot on resume as well
+                    # as initial turns (avoiding duplication if already present).
+                    has_snapshot = bool(
+                        history
+                        and isinstance(history[0].get("content"), str)
+                        and history[0]["content"].startswith(_SIDE_SNAPSHOT_PREFIX)
+                    )
+                    if not has_snapshot:
+                        snapshot = await self._build_parent_snapshot(
+                            parent_id,
+                            cutoff_message_id=(
+                                session_meta.get("snapshot_cutoff_message_id")
+                                if session_meta
+                                else None
+                            ),
+                        )
+                        if snapshot:
+                            history = [
+                                {"role": "user", "content": f"{_SIDE_SNAPSHOT_PREFIX}{snapshot}"},
+                                *history,
+                            ]
             runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
             model_name = str(getattr(getattr(services, "llm", None), "model", "") or "")
             request = EngineRequest(
@@ -568,6 +883,9 @@ class SessionService:
                 execution_identity_id=execution_identity_id,
                 working_dir=working_dir,
                 message_id=message_id,
+                steering_history=steering_history,
+                ephemeral=is_side,
+                read_only_tools=is_side,
             )
             if _resume_run_id is None:
                 # RunStateStore.create() fsyncs; keep the blocking I/O off the
@@ -627,6 +945,37 @@ class SessionService:
                     full_reply.append(chunk)
                     if not ev.data.get("already_streamed"):
                         yield sse("message", {"text": chunk})
+                elif t == "steering_applied":
+                    items = ev.data.get("items")
+                    if isinstance(items, list):
+                        for item in items:
+                            item_content = item.get("content") if isinstance(item, dict) else None
+                            if isinstance(item_content, str) and item_content.strip():
+                                try:
+                                    await self.session_repo.add_message(
+                                        session_id,
+                                        "user",
+                                        item_content,
+                                        kind="steering",
+                                        parent_message_id=message_id,
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "failed to persist steering message (session=%s)",
+                                        session_id,
+                                        exc_info=True,
+                                    )
+                    yield sse("steering_applied", {
+                        "steer_ids": ev.data.get("steer_ids", []),
+                        "count": ev.data.get("count", 0),
+                        "items": ev.data.get("items", []),
+                        "iteration": ev.data.get("iteration", 0),
+                    })
+                elif t == "steering_deferred":
+                    yield sse("steering_deferred", {
+                        "steer_ids": ev.data.get("steer_ids", []),
+                        "items": ev.data.get("items", []),
+                    })
                 elif t == "thinking":
                     yield sse("thinking", {"text": ev.data.get("text", ""), "done": bool(ev.data.get("done"))})
                 elif t == "tool_call_start":

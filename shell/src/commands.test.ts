@@ -25,7 +25,23 @@ function skill(name: string) {
 test("slash filtering exposes one resume command", () => {
   const items = filterSlash(buildSlashItems(), "/");
 
-  assert.equal(items.length, 19);
+  assert.equal(items.length, 23);
+  assert.equal(
+    items.some((item) => item.command === "/doctor"),
+    true,
+  );
+  assert.equal(
+    items.some((item) => item.command === "/side"),
+    true,
+  );
+  assert.equal(
+    items.some((item) => item.command === "/back"),
+    true,
+  );
+  assert.equal(
+    items.some((item) => item.command === "/promote"),
+    true,
+  );
   assert.equal(
     items.some((item) => item.command === "/init"),
     true,

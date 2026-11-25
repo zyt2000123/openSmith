@@ -38,6 +38,8 @@ TOOL_META = {
     },
     "permission_level": "read",
     "network_access": True,
+    "egress": True,
+    "egress_target_arg": "query",
     "approval_policy": "never",
     "side_effect": "none",
     "execution_environment": "host",

@@ -39,8 +39,13 @@ const HELP_TEXT = [
   "- `/skill <name> [prompt]` — arm a skill, or run it straight away with a prompt",
   "- `/hooks` — inspect runtime lifecycle hooks",
   "- `/mcp` — inspect configured MCP servers and tools",
+  "- `/doctor` — run environment and live sandbox containment diagnostics",
   "- `/resume [session-id]` — recover the latest interrupted run, or open a session; use `/resume run <run-id>` for a specific run",
   "- `/compact` — switch to compact view; Ctrl+O toggles compact/transcript",
+  "- `/queue <msg>` — queue a follow-up message to run after the current task finishes",
+  "- `/side [question|close|promote]` — open or manage an isolated read-only side chat (Ctrl+\\ toggles)",
+  "- `/back` — return from side chat to the main conversation without interrupting either stream",
+  "- `/promote [title]` — promote the current side chat into a standalone main session",
   "- `/reconnect` — retry the local server connection after a failed boot",
   "- `/exit` — quit",
 ].join("\n");
@@ -113,6 +118,27 @@ export function buildSlashItems(): SlashItem[] {
       category: "Commands",
     },
     {
+      id: "side",
+      title: "/side",
+      command: "/side",
+      description: "Open a read-only side chat alongside the main conversation.",
+      category: "Commands",
+    },
+    {
+      id: "back",
+      title: "/back",
+      command: "/back",
+      description: "Return from side chat to the main conversation.",
+      category: "Commands",
+    },
+    {
+      id: "promote",
+      title: "/promote",
+      command: "/promote",
+      description: "Promote the current side chat into a standalone main session.",
+      category: "Commands",
+    },
+    {
       id: "token",
       title: "/token",
       command: "/token",
@@ -152,6 +178,13 @@ export function buildSlashItems(): SlashItem[] {
       title: "/hooks",
       command: "/hooks",
       description: "View runtime lifecycle hooks.",
+      category: "Commands",
+    },
+    {
+      id: "doctor",
+      title: "/doctor",
+      command: "/doctor",
+      description: "Run environment and live sandbox containment diagnostics.",
       category: "Commands",
     },
     {
@@ -338,6 +371,9 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
       statusLine: `${LIFECYCLE_HOOKS.length} built-in lifecycle hooks.`,
     });
   },
+  "/doctor": async (_args, context) => {
+    await context.bridge.runDoctor(context.workingDir ?? process.cwd());
+  },
   "/model": async (args, context) => {
     const state = context.getState();
     const requested = args[0];
@@ -361,6 +397,10 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
   },
   "/sessions": (_args, context) => {
     const state = context.getState();
+    if (state.activeChannel === "side") {
+      state.set({ statusLine: "Unavailable in side chat. Type /back to return to main first." });
+      return;
+    }
     state.set({ panel: "sessions", statusLine: `${state.sessions.length} session(s).` });
   },
   "/token": async (_args, context) => {
@@ -378,6 +418,41 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
   },
   "/compact": (_args, context) =>
     context.getState().set({ viewMode: "compact", panel: "chat", statusLine: "Compact view." }),
+  "/queue": async (args, context) => {
+    const prompt = args.join(" ").trim();
+    if (!prompt) {
+      context.getState().set({ statusLine: "Usage: /queue <message>" });
+      return;
+    }
+    if (context.getState().busy) {
+      context.bridge.enqueueMessage(prompt);
+    } else {
+      await context.bridge.sendMessage(prompt);
+    }
+  },
+  "/side": async (args, context) => {
+    const sub = args[0]?.toLowerCase();
+    // L3: Only treat exact `/side close` (no trailing words) as the close
+    // subcommand so questions like `/side close the loop how?` ask in side chat.
+    if (sub === "close" && args.length === 1) {
+      await context.bridge.closeSideChat();
+      return;
+    }
+    if (sub === "promote") {
+      const title = args.slice(1).join(" ").trim() || undefined;
+      await context.bridge.promoteSideChat(title);
+      return;
+    }
+    const question = args.join(" ").trim() || undefined;
+    await context.bridge.openSideChat(question);
+  },
+  "/back": (_args, context) => {
+    context.bridge.switchBackToMain();
+  },
+  "/promote": async (args, context) => {
+    const title = args.join(" ").trim() || undefined;
+    await context.bridge.promoteSideChat(title);
+  },
   "/reconnect": async (_args, context) => {
     context.getState().set({ statusLine: "Reconnecting…", welcomeNotice: null });
     await context.bridge.boot();

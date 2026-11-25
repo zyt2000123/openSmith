@@ -21,6 +21,7 @@ from .infrastructure.database import get_app_db
 from .routers import (
     agent,
     config,
+    vault,
 )
 from .services.auto_task_service import cancel_background_runs
 from .services.engine_runtime import close_shared_llm_clients, load_runtime_identity_catalog
@@ -111,6 +112,16 @@ async def _sync_token_stats() -> None:
 async def lifespan(app: FastAPI):
     get_local_token()
     await get_app_db()
+    try:
+        from .infrastructure.repositories.agent_profile_repo import AgentProfileRepo
+        from .infrastructure.repositories.session_repo import SessionRepo
+        from .services.session_service import SessionService
+
+        cleaned_sides = await SessionService(SessionRepo(), AgentProfileRepo()).cleanup_stale_sides()
+        if cleaned_sides:
+            logger.info("cleaned up %d stale side session(s) on startup", len(cleaned_sides))
+    except Exception:
+        logger.warning("failed to clean up stale side sessions during startup", exc_info=True)
     load_runtime_identity_catalog(force=True)
     try:
         state_store = RunStateStore(common_config.PATHS.agent_dir)
@@ -161,6 +172,7 @@ app.add_middleware(
 
 app.include_router(agent.router, dependencies=[Depends(require_auth)])
 app.include_router(config.router, dependencies=[Depends(require_auth)])
+app.include_router(vault.router, dependencies=[Depends(require_auth)])
 
 
 _STARTED_AT = time.time()

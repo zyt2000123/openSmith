@@ -48,6 +48,8 @@ TOOL_META = {
     "path_args": ["state_path"],
     "permission_level": "write",
     "network_access": True,
+    "egress": True,
+    "egress_target_arg": "url",
     "approval_policy": "policy",
     "side_effect": "write",
     "execution_environment": "host",
@@ -297,6 +299,7 @@ def _download(
     timeout: float,
     *,
     cancel_event: threading.Event | None = None,
+    allowed_egress_hosts: tuple[str, ...] | None = None,
 ) -> tuple[int, str, str, str]:
     """Fetch a text document through web_fetch's validated, pinned connection."""
     fetch = _web_fetch_module()
@@ -304,11 +307,17 @@ def _download(
     deadline = time.monotonic() + timeout
     for _ in range(6):
         _raise_if_cancelled(cancel_event)
+        parsed = urllib.parse.urlparse(current)
+        host = parsed.hostname
+        if allowed_egress_hosts:
+            if not host or not fetch._host_in_allowlist(host, allowed_egress_hosts):
+                raise ValueError(
+                    f"[taint-egress-001] host '{host or ''}' is not in the "
+                    "tainted egress allowlist"
+                )
         validation = fetch._validate_url(current)
         if validation:
             raise ValueError(validation)
-        parsed = urllib.parse.urlparse(current)
-        host = parsed.hostname
         assert host is not None
         port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
         remaining = deadline - time.monotonic()
@@ -324,7 +333,14 @@ def _download(
                 location = response.getheader("Location")
                 if not location:
                     raise ValueError(f"redirect {response.status} without Location")
-                current = fetch._validated_redirect_url(current, location)
+                if allowed_egress_hosts:
+                    current = fetch._validated_redirect_url(
+                        current,
+                        location,
+                        allowed_egress_hosts=allowed_egress_hosts,
+                    )
+                else:
+                    current = fetch._validated_redirect_url(current, location)
                 continue
             content_type = (response.getheader("Content-Type") or "").lower()
             data = response.read(MAX_DOCUMENT_BYTES + 1)
@@ -345,15 +361,18 @@ def _download_with_retries(
     *,
     retries: int,
     cancel_event: threading.Event | None = None,
+    allowed_egress_hosts: tuple[str, ...] | None = None,
 ) -> tuple[int, str, str, str]:
     """Retry only transient transport failures with a small bounded backoff."""
     for attempt in range(retries + 1):
         _raise_if_cancelled(cancel_event)
         try:
-            if cancel_event is None:
-                result = _download(url, timeout)
-            else:
-                result = _download(url, timeout, cancel_event=cancel_event)
+            kwargs: dict[str, Any] = {}
+            if cancel_event is not None:
+                kwargs["cancel_event"] = cancel_event
+            if allowed_egress_hosts:
+                kwargs["allowed_egress_hosts"] = allowed_egress_hosts
+            result = _download(url, timeout, **kwargs)
             _raise_if_cancelled(cancel_event)
             return result
         except _CrawlCancelled:
@@ -408,14 +427,33 @@ class _BrowserRenderer:
             self._playwright.stop()
             raise
 
-    def render(self, url: str, timeout: float = 30.0) -> str:
+    def render(
+        self,
+        url: str,
+        timeout: float = 30.0,
+        *,
+        allowed_egress_hosts: tuple[str, ...] | None = None,
+    ) -> str:
         """Render *url* in a request-filtered, short-lived browser context."""
         fetch = _web_fetch_module()
+        if allowed_egress_hosts:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if not host or not fetch._host_in_allowlist(host, allowed_egress_hosts):
+                raise ValueError(
+                    f"[taint-egress-001] host '{host}' is not in the "
+                    "tainted egress allowlist"
+                )
         validation = fetch._validate_url(url)
         if validation:
             raise ValueError(validation)
 
         def guard_request(route, request) -> None:
+            if allowed_egress_hosts:
+                req_host = (urllib.parse.urlparse(request.url).hostname or "").lower().rstrip(".")
+                if not req_host or not fetch._host_in_allowlist(req_host, allowed_egress_hosts):
+                    route.abort("blockedbyclient")
+                    return
             request_validation = fetch._validate_url(request.url)
             if request_validation:
                 route.abort("blockedbyclient")
@@ -534,12 +572,19 @@ def _crawl(
     render: str,
     *,
     cancel_event: threading.Event | None = None,
+    allowed_egress_hosts: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     _raise_if_cancelled(cancel_event)
     seed = _normalize_url(url)
     if not seed:
         raise ValueError("url must be a public http(s) URL")
     fetch = _web_fetch_module()
+    if allowed_egress_hosts:
+        seed_host = (urllib.parse.urlparse(seed).hostname or "").lower().rstrip(".")
+        if not seed_host or not fetch._host_in_allowlist(seed_host, allowed_egress_hosts):
+            raise ValueError(
+                f"[taint-egress-001] host '{seed_host}' is not in the tainted egress allowlist"
+            )
     validation = fetch._validate_url(seed)
     if validation:
         raise ValueError(validation)
@@ -548,9 +593,12 @@ def _crawl(
     previous = _read_state(state_path)
     _raise_if_cancelled(cancel_event)
     warnings: list[str] = []
+    dl_extra: dict[str, Any] = (
+        {"allowed_egress_hosts": allowed_egress_hosts} if allowed_egress_hosts else {}
+    )
     try:
         robots_status, _, _, robots_text = _download_with_retries(
-            f"{root}/robots.txt", 15, retries=max_retries, cancel_event=cancel_event
+            f"{root}/robots.txt", 15, retries=max_retries, cancel_event=cancel_event, **dl_extra
         )
         _raise_if_cancelled(cancel_event)
         policy = _parse_robots(robots_text) if robots_status == 200 else _RobotsPolicy((), None, ())
@@ -573,7 +621,7 @@ def _crawl(
                 continue
             try:
                 status, _, kind, body = _download_with_retries(
-                    sitemap, 15, retries=max_retries, cancel_event=cancel_event
+                    sitemap, 15, retries=max_retries, cancel_event=cancel_event, **dl_extra
                 )
                 _raise_if_cancelled(cancel_event)
                 if status == 200 and ("xml" in kind or body.lstrip().startswith("<")):
@@ -615,7 +663,7 @@ def _crawl(
                     time.sleep(pause)
             try:
                 status, final_url, content_type, body = _download_with_retries(
-                    current, 30, retries=max_retries, cancel_event=cancel_event
+                    current, 30, retries=max_retries, cancel_event=cancel_event, **dl_extra
                 )
                 _raise_if_cancelled(cancel_event)
                 last_request = time.monotonic()
@@ -634,7 +682,15 @@ def _crawl(
             if should_render:
                 try:
                     _raise_if_cancelled(cancel_event)
-                    body = ensure_renderer().render(final_url, timeout=30)
+                    body = (
+                        ensure_renderer().render(
+                            final_url,
+                            timeout=30,
+                            allowed_egress_hosts=allowed_egress_hosts,
+                        )
+                        if allowed_egress_hosts
+                        else ensure_renderer().render(final_url, timeout=30)
+                    )
                     _raise_if_cancelled(cancel_event)
                     content_type = "text/html"
                     is_xml = False
@@ -731,9 +787,19 @@ async def execute(
     state_path: str = "",
     render: str = "auto",
     output_format: str = "markdown",
+    _allowed_egress_hosts: tuple[str, ...] | None = None,
 ) -> str:
     if not isinstance(url, str):
         return "Error: url must be a string"
+    if _allowed_egress_hosts:
+        parsed_seed = urllib.parse.urlparse(url)
+        host = (parsed_seed.hostname or "").lower().rstrip(".")
+        fetch_mod = _web_fetch_module()
+        if not host or not fetch_mod._host_in_allowlist(host, _allowed_egress_hosts):
+            return (
+                f"Error: [taint-egress-001] host '{host}' is not in the "
+                "tainted egress allowlist"
+            )
     if isinstance(max_pages, bool) or not isinstance(max_pages, int):
         return "Error: max_pages must be an integer"
     if isinstance(max_depth, bool) or not isinstance(max_depth, int):
@@ -749,6 +815,9 @@ async def execute(
     max_pages = min(max(1, max_pages), MAX_PAGES)
     max_depth = min(max(0, max_depth), MAX_DEPTH)
     cancel_event = threading.Event()
+    crawl_kwargs: dict[str, Any] = {"cancel_event": cancel_event}
+    if _allowed_egress_hosts:
+        crawl_kwargs["allowed_egress_hosts"] = _allowed_egress_hosts
     worker = asyncio.create_task(
         asyncio.to_thread(
             _crawl,
@@ -760,7 +829,7 @@ async def execute(
             min(max(0, max_retries), 3),
             state_path,
             render,
-            cancel_event=cancel_event,
+            **crawl_kwargs,
         )
     )
     try:

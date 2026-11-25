@@ -54,6 +54,52 @@ export type Panel =
   | "runs";
 export type Mode = "boot" | "setup" | "chat";
 export type SetupFlow = "initial" | "advanced";
+export type ChatChannel = "main" | "side";
+
+export type ChatChannelState = {
+  session: Session | null;
+  transcript: TranscriptEntry[];
+  turnCount: number;
+  toolActivity: ToolActivity;
+  turnTokenUsage: TokenUsage;
+  tokenUsage: TokenUsage;
+  contextUsage: ContextUsage;
+  busy: boolean;
+  compressing: boolean;
+  runStartedAt: number | null;
+  recoverableRunId: string | null;
+  pendingApproval: PendingApproval | null;
+  approvalIndex: number;
+  approvalResolving: boolean;
+  lastToolCallId: string | null;
+  queuedMessages: QueuedMessage[];
+};
+
+export function createEmptyChannelState(session: Session | null = null): ChatChannelState {
+  return {
+    session,
+    transcript: [],
+    turnCount: 0,
+    toolActivity: createToolActivity(),
+    turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    tokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    contextUsage: {
+      context_tokens: 0,
+      context_window: CONTEXT_DISPLAY_WINDOW,
+      context_percent: 0,
+      estimated: true,
+    },
+    busy: false,
+    compressing: false,
+    runStartedAt: null,
+    recoverableRunId: null,
+    pendingApproval: null,
+    approvalIndex: 0,
+    approvalResolving: false,
+    lastToolCallId: null,
+    queuedMessages: [],
+  };
+}
 
 export type SetupDraft = {
   /** Human-readable company or relay name; it does not affect the wire protocol. */
@@ -75,6 +121,8 @@ export type SetupDraft = {
 export type AppState = {
   mode: Mode;
   panel: Panel;
+  activeChannel: ChatChannel;
+  backgroundChannel: ChatChannelState | null;
   baseUrl: string;
   config: LlmConfig | null;
   agent: AgentProfile | null;
@@ -136,6 +184,16 @@ export type AppActions = {
   applyEvent: (event: StreamEvent) => void;
   closeTurn: () => void;
   interruptTurn: (outcome: "cancelled" | "error") => void;
+  getChannelState: (channel: ChatChannel) => ChatChannelState | null;
+  updateChannel: (channel: ChatChannel, partial: Partial<ChatChannelState>) => void;
+  pushTurnForChannel: (channel: ChatChannel, userText: string) => void;
+  pushSystemLineForChannel: (channel: ChatChannel, text: string, tone?: "info" | "error") => void;
+  applyEventForChannel: (channel: ChatChannel, event: StreamEvent) => void;
+  closeTurnForChannel: (channel: ChatChannel) => void;
+  interruptTurnForChannel: (channel: ChatChannel, outcome: "cancelled" | "error") => void;
+  switchChannel: (target: ChatChannel, initialSide?: ChatChannelState) => void;
+  promoteSideToMain: (promotedSession: Session) => void;
+  closeSideChannel: () => void;
   resetChat: () => void;
   clearChat: () => void;
   startFreshSession: () => void;
@@ -352,10 +410,86 @@ function applyApprovalRequired(
   };
 }
 
+function snapshotActiveChannel(state: AppState): ChatChannelState {
+  return {
+    session: state.currentSession,
+    transcript: state.transcript,
+    turnCount: state.turnCount,
+    toolActivity: state.toolActivity,
+    turnTokenUsage: state.turnTokenUsage,
+    tokenUsage: state.tokenUsage,
+    contextUsage: state.contextUsage,
+    busy: state.busy,
+    compressing: state.compressing,
+    runStartedAt: state.runStartedAt,
+    recoverableRunId: state.recoverableRunId,
+    pendingApproval: state.pendingApproval,
+    approvalIndex: state.approvalIndex,
+    approvalResolving: state.approvalResolving,
+    lastToolCallId: state.lastToolCallId,
+    queuedMessages: state.queuedMessages,
+  };
+}
+
+function projectChannelToState(channel: ChatChannelState): Partial<AppState> {
+  return {
+    currentSession: channel.session,
+    transcript: channel.transcript,
+    turnCount: channel.turnCount,
+    toolActivity: channel.toolActivity,
+    turnTokenUsage: channel.turnTokenUsage,
+    tokenUsage: channel.tokenUsage,
+    contextUsage: channel.contextUsage,
+    busy: channel.busy,
+    compressing: channel.compressing,
+    runStartedAt: channel.runStartedAt,
+    recoverableRunId: channel.recoverableRunId,
+    pendingApproval: channel.pendingApproval,
+    approvalIndex: channel.approvalIndex,
+    approvalResolving: channel.approvalResolving,
+    lastToolCallId: channel.lastToolCallId,
+    queuedMessages: channel.queuedMessages,
+  };
+}
+
+function applyBackgroundStreamEvent(channel: ChatChannelState, event: StreamEvent): ChatChannelState {
+  // Reuse the exact same state machine against a synthetic AppState view of the background channel.
+  const synthetic = {
+    ...projectChannelToState(channel),
+    panel: "chat" as Panel,
+    transcriptEpoch: 0,
+    statusLine: "",
+  } as AppState;
+  const nextPartial = clearApprovalOnToolResult(synthetic, event, applyStreamState(synthetic, event));
+  const mergedTranscript =
+    nextPartial.transcript !== undefined
+      ? limitTranscript(nextPartial.transcript, TRANSCRIPT_LIMIT)
+      : channel.transcript;
+  return {
+    ...channel,
+    transcript: mergedTranscript,
+    toolActivity: nextPartial.toolActivity ?? channel.toolActivity,
+    turnTokenUsage: nextPartial.turnTokenUsage ?? channel.turnTokenUsage,
+    tokenUsage: nextPartial.tokenUsage ?? channel.tokenUsage,
+    contextUsage: nextPartial.contextUsage ?? channel.contextUsage,
+    compressing: nextPartial.compressing ?? channel.compressing,
+    recoverableRunId:
+      "recoverableRunId" in nextPartial ? (nextPartial.recoverableRunId ?? null) : channel.recoverableRunId,
+    pendingApproval:
+      "pendingApproval" in nextPartial ? (nextPartial.pendingApproval ?? null) : channel.pendingApproval,
+    approvalIndex: nextPartial.approvalIndex ?? channel.approvalIndex,
+    approvalResolving: nextPartial.approvalResolving ?? channel.approvalResolving,
+    lastToolCallId:
+      "lastToolCallId" in nextPartial ? (nextPartial.lastToolCallId ?? null) : channel.lastToolCallId,
+  };
+}
+
 export function createAppStore(initialHistory: string[] = []) {
-  return createStore<AppStore>((set) => ({
+  return createStore<AppStore>((set, get) => ({
     mode: "boot",
     panel: "welcome",
+    activeChannel: "main",
+    backgroundChannel: null,
     baseUrl: "",
     config: null,
     agent: null,
@@ -459,6 +593,179 @@ export function createAppStore(initialHistory: string[] = []) {
         toolActivity: cancelRunningToolActivity(s.toolActivity),
         transcript: interruptLatestTurn(s.transcript, outcome),
       })),
+
+    getChannelState: (channel) => {
+      const s = get();
+      if (channel === s.activeChannel) return snapshotActiveChannel(s);
+      return s.backgroundChannel;
+    },
+
+    updateChannel: (channel, partial) =>
+      set((s) => {
+        if (channel === s.activeChannel) {
+          const mapped: Partial<AppState> = {};
+          if ("session" in partial) mapped.currentSession = partial.session ?? null;
+          if ("transcript" in partial && partial.transcript) mapped.transcript = partial.transcript;
+          if ("turnCount" in partial && partial.turnCount !== undefined) mapped.turnCount = partial.turnCount;
+          if ("toolActivity" in partial && partial.toolActivity) mapped.toolActivity = partial.toolActivity;
+          if ("turnTokenUsage" in partial && partial.turnTokenUsage) mapped.turnTokenUsage = partial.turnTokenUsage;
+          if ("tokenUsage" in partial && partial.tokenUsage) mapped.tokenUsage = partial.tokenUsage;
+          if ("contextUsage" in partial && partial.contextUsage) mapped.contextUsage = partial.contextUsage;
+          if ("busy" in partial && partial.busy !== undefined) mapped.busy = partial.busy;
+          if ("compressing" in partial && partial.compressing !== undefined) mapped.compressing = partial.compressing;
+          if ("runStartedAt" in partial) mapped.runStartedAt = partial.runStartedAt ?? null;
+          if ("recoverableRunId" in partial) mapped.recoverableRunId = partial.recoverableRunId ?? null;
+          if ("pendingApproval" in partial) mapped.pendingApproval = partial.pendingApproval ?? null;
+          if ("approvalIndex" in partial && partial.approvalIndex !== undefined) mapped.approvalIndex = partial.approvalIndex;
+          if ("approvalResolving" in partial && partial.approvalResolving !== undefined) mapped.approvalResolving = partial.approvalResolving;
+          if ("lastToolCallId" in partial) mapped.lastToolCallId = partial.lastToolCallId ?? null;
+          if ("queuedMessages" in partial && partial.queuedMessages) mapped.queuedMessages = partial.queuedMessages;
+          return mapped;
+        }
+        if (!s.backgroundChannel) return {};
+        return { backgroundChannel: { ...s.backgroundChannel, ...partial } };
+      }),
+
+    pushTurnForChannel: (channel, userText) =>
+      set((s) => {
+        if (channel === s.activeChannel) {
+          return {
+            ...appendTranscript(s, createTurnEntry(userText)),
+            turnCount: s.turnCount + 1,
+            turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            toolActivity: { ...s.toolActivity, calls: {}, running: {} },
+          };
+        }
+        if (!s.backgroundChannel) return {};
+        const bg = s.backgroundChannel;
+        return {
+          backgroundChannel: {
+            ...bg,
+            transcript: limitTranscript([...bg.transcript, createTurnEntry(userText)], TRANSCRIPT_LIMIT),
+            turnCount: bg.turnCount + 1,
+            turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            toolActivity: { ...bg.toolActivity, calls: {}, running: {} },
+          },
+        };
+      }),
+
+    pushSystemLineForChannel: (channel, text, tone = "info") =>
+      set((s) => {
+        const safe = sanitizeTerminalText(text);
+        if (channel === s.activeChannel) {
+          return appendTranscript(s, createSystemEntry(safe, tone));
+        }
+        if (!s.backgroundChannel) return {};
+        return {
+          backgroundChannel: {
+            ...s.backgroundChannel,
+            transcript: limitTranscript([...s.backgroundChannel.transcript, createSystemEntry(safe, tone)], TRANSCRIPT_LIMIT),
+          },
+        };
+      }),
+
+    applyEventForChannel: (channel, event) =>
+      set((s) => {
+        if (channel === s.activeChannel) {
+          return clearApprovalOnToolResult(s, event, applyStreamState(s, event));
+        }
+        if (!s.backgroundChannel) return {};
+        return { backgroundChannel: applyBackgroundStreamEvent(s.backgroundChannel, event) };
+      }),
+
+    closeTurnForChannel: (channel) =>
+      set((s) => {
+        if (channel === s.activeChannel) {
+          return { transcript: closeLatestTurn(s.transcript) };
+        }
+        if (!s.backgroundChannel) return {};
+        return {
+          backgroundChannel: {
+            ...s.backgroundChannel,
+            transcript: closeLatestTurn(s.backgroundChannel.transcript),
+          },
+        };
+      }),
+
+    interruptTurnForChannel: (channel, outcome) =>
+      set((s) => {
+        if (channel === s.activeChannel) {
+          return {
+            toolActivity: cancelRunningToolActivity(s.toolActivity),
+            transcript: interruptLatestTurn(s.transcript, outcome),
+          };
+        }
+        if (!s.backgroundChannel) return {};
+        return {
+          backgroundChannel: {
+            ...s.backgroundChannel,
+            toolActivity: cancelRunningToolActivity(s.backgroundChannel.toolActivity),
+            transcript: interruptLatestTurn(s.backgroundChannel.transcript, outcome),
+          },
+        };
+      }),
+
+    switchChannel: (target, initialSide) =>
+      set((s) => {
+        if (target === s.activeChannel) return {};
+        const currentSnapshot = snapshotActiveChannel(s);
+        const nextActive =
+          target === "side"
+            ? (initialSide ?? s.backgroundChannel ?? createEmptyChannelState())
+            : (s.backgroundChannel ?? createEmptyChannelState());
+        return {
+          ...projectChannelToState(nextActive),
+          activeChannel: target,
+          backgroundChannel: currentSnapshot,
+          panel: "chat",
+          transcriptEpoch: s.transcriptEpoch + 1,
+          statusLine:
+            target === "side"
+              ? "Side chat (read-only). Type /back or Ctrl+\\ to return, /promote to make permanent."
+              : "Returned to main conversation.",
+        };
+      }),
+
+    promoteSideToMain: (promotedSession) =>
+      set((s) => {
+        if (s.activeChannel === "side") {
+          return {
+            currentSession: promotedSession,
+            activeChannel: "main",
+            backgroundChannel: null,
+            panel: "chat",
+            transcriptEpoch: s.transcriptEpoch + 1,
+            statusLine: `Promoted side chat to main session (${promotedSession.id}).`,
+          };
+        }
+        if (s.backgroundChannel) {
+          return {
+            ...projectChannelToState({ ...s.backgroundChannel, session: promotedSession }),
+            activeChannel: "main",
+            backgroundChannel: null,
+            panel: "chat",
+            transcriptEpoch: s.transcriptEpoch + 1,
+            statusLine: `Promoted side chat to main session (${promotedSession.id}).`,
+          };
+        }
+        return {};
+      }),
+
+    closeSideChannel: () =>
+      set((s) => {
+        if (s.activeChannel === "side") {
+          const mainState = s.backgroundChannel ?? createEmptyChannelState();
+          return {
+            ...projectChannelToState(mainState),
+            activeChannel: "main",
+            backgroundChannel: null,
+            panel: mainState.transcript.length > 0 ? "chat" : "welcome",
+            transcriptEpoch: s.transcriptEpoch + 1,
+            statusLine: "Side chat closed.",
+          };
+        }
+        return { backgroundChannel: null, statusLine: "Side chat closed." };
+      }),
 
     resetChat: () =>
       set((s) => ({

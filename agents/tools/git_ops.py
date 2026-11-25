@@ -77,20 +77,28 @@ _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 # Branch/tag name validation: alphanumeric, dash, underscore, dot, slash
 _SAFE_REF = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,200}$")
 
-# Patterns for sensitive files that should not be staged
+# Fallback sensitive rules aligned with common.sensitive_rules (overridden by
+# runtime-injected _sensitive_rules when running inside the engine).
+_SECRET_DIRS = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
+_SECRET_PATH_PAIRS = frozenset({
+    (".config", "gh"),
+    (".config", "gcloud"),
+    ("library", "keychains"),
+})
+_SECRET_CONFIG_FILES = frozenset({".npmrc", ".pypirc", ".netrc", ".git-credentials"})
+_SECRET_EXTENSIONS = (".pem", ".key", ".p12", ".pfx")
+_ENV_TEMPLATE_SUFFIXES = (".env.example", ".env.template", ".env.sample")
+_SSH_KEY_RE = re.compile(
+    r"^([^/]*[-_.])?id_(rsa|dsa|ecdsa|ed25519)([-_.][^/]*)?$",
+    re.IGNORECASE,
+)
+# Additional git-specific filenames that should not be accidentally staged.
 _SENSITIVE_PATTERNS = re.compile(
     r"(?i)"
-    r"(^|/)\.env($|\.)"
-    r"|(^|/)credentials"
+    r"(^|/)credentials"
     r"|(^|/)secrets?"
-    r"|(^|/).*\.pem$"
-    r"|(^|/).*\.key$"
     r"|(^|/).*_rsa$"
     r"|(^|/).*_dsa$"
-    r"|(^|/)\.aws/"
-    r"|(^|/)\.ssh/"
-    r"|(^|/)id_rsa"
-    r"|(^|/)id_ed25519"
 )
 
 
@@ -240,9 +248,53 @@ def _format_result(returncode: int, stdout: str, stderr: str) -> str:
     return f"[exit_code={returncode}]\n{body}"
 
 
-def _check_sensitive_files(files: list[str]) -> list[str]:
+def _is_sensitive_staged_path(
+    file_path: str,
+    sensitive_rules: dict | None = None,
+) -> bool:
+    """Return True if ``file_path`` matches any sensitive credential rule."""
+    rules = sensitive_rules if isinstance(sensitive_rules, dict) else {}
+    secret_dirs = rules.get("credential_dirs") or _SECRET_DIRS
+    path_pairs = rules.get("credential_path_pairs") or _SECRET_PATH_PAIRS
+    config_files = rules.get("credential_config_files") or _SECRET_CONFIG_FILES
+    extensions = rules.get("private_key_extensions") or _SECRET_EXTENSIONS
+    env_templates = rules.get("env_template_suffixes") or _ENV_TEMPLATE_SUFFIXES
+    ssh_pattern = rules.get("ssh_key_pattern")
+    ssh_re = (
+        re.compile(rf"^{ssh_pattern}$", re.IGNORECASE)
+        if isinstance(ssh_pattern, str)
+        else _SSH_KEY_RE
+    )
+
+    normalized = file_path.replace("\\", "/")
+    parts = [p.lower() for p in normalized.split("/") if p]
+    if not parts:
+        return False
+    if any(part in secret_dirs for part in parts):
+        return True
+    for idx in range(len(parts) - 1):
+        if (parts[idx], parts[idx + 1]) in path_pairs:
+            return True
+    name = parts[-1]
+    if name.endswith(".pub"):
+        return False
+    if name.startswith(".env"):
+        return not name.endswith(env_templates)
+    if name in config_files:
+        return True
+    if name.endswith(extensions):
+        return True
+    if ssh_re.fullmatch(name) is not None:
+        return True
+    return _SENSITIVE_PATTERNS.search(normalized) is not None
+
+
+def _check_sensitive_files(
+    files: list[str],
+    sensitive_rules: dict | None = None,
+) -> list[str]:
     """Return list of sensitive file paths that should not be staged."""
-    return [f for f in files if _SENSITIVE_PATTERNS.search(f)]
+    return [f for f in files if _is_sensitive_staged_path(f, sensitive_rules)]
 
 
 def _parse_add_dry_run(output: str) -> list[str]:
@@ -289,6 +341,7 @@ async def execute(
     staged: bool = False,
     path: str | None = None,
     environment=None,
+    _sensitive_rules: dict | None = None,
 ) -> str:
     repo_dir = _resolve_cwd(cwd)
     if not repo_dir:
@@ -365,7 +418,7 @@ async def execute(
         candidates = _parse_add_dry_run(dry_out)
         candidates.extend(path for path in staged_out.split("\0") if path)
 
-        sensitive = _check_sensitive_files(candidates)
+        sensitive = _check_sensitive_files(candidates, _sensitive_rules)
         if sensitive:
             return (
                 f"Error: refusing to stage sensitive files: {', '.join(sorted(set(sensitive)))}. "

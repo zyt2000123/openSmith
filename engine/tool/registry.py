@@ -124,12 +124,37 @@ class ToolRegistry:
         self._wants_environment: set[str] = set()
         self._serial_locks: dict[str, asyncio.Lock] = {}
         self._tool_guard: ToolGuard | None = None
+        self._active_tool_guard: ContextVar[ToolGuard | None] = ContextVar(
+            f"agent_smith_active_tool_guard_{id(self)}",
+            default=None,
+        )
+        self._vault_store: Any | None = None
         self._authorized_call: ContextVar[
             tuple[str, str | None, ApprovalScope | None] | None
         ] = ContextVar(
             f"agent_smith_authorized_tool_call_{id(self)}",
             default=None,
         )
+
+    def _effective_tool_guard(self) -> ToolGuard | None:
+        override = self._active_tool_guard.get()
+        return override if override is not None else self._tool_guard
+
+    @contextmanager
+    def use_tool_guard(self, guard: ToolGuard | None) -> Iterator[None]:
+        """Task-locally override the active ToolGuard (used by ScopedToolRegistry/subagents)."""
+        if guard is None:
+            yield
+            return
+        token = self._active_tool_guard.set(guard)
+        try:
+            yield
+        finally:
+            self._active_tool_guard.reset(token)
+
+    def bind_vault_store(self, vault_store: Any | None) -> None:
+        """Bind a VaultStore for boundary-only placeholder resolution & redaction."""
+        self._vault_store = vault_store
 
     def register(
         self,
@@ -141,6 +166,10 @@ class ToolRegistry:
         hidden: bool = False,
         opaque_command: bool = False,
         network_access: bool = False,
+        reads_private_data: bool = False,
+        egress: bool = False,
+        egress_target_arg: str = "",
+        accepts_vault_placeholders: bool = False,
         path_args: Sequence[str] = (),
         list_path_args: Sequence[str] = (),
         is_write_tool: bool = False,
@@ -162,6 +191,14 @@ class ToolRegistry:
             raise ValueError(f"Tool {name} opaque_command must be a boolean")
         if not isinstance(network_access, bool):
             raise ValueError(f"Tool {name} network_access must be a boolean")
+        if not isinstance(reads_private_data, bool):
+            raise ValueError(f"Tool {name} reads_private_data must be a boolean")
+        if not isinstance(egress, bool):
+            raise ValueError(f"Tool {name} egress must be a boolean")
+        if not isinstance(egress_target_arg, str):
+            raise ValueError(f"Tool {name} egress_target_arg must be a string")
+        if not isinstance(accepts_vault_placeholders, bool):
+            raise ValueError(f"Tool {name} accepts_vault_placeholders must be a boolean")
         if permission_level and permission_level not in _VALID_PERMISSION_LEVELS:
             raise ValueError(
                 f"Tool {name} has invalid permission_level: {permission_level!r} "
@@ -219,6 +256,12 @@ class ToolRegistry:
             hidden=hidden,
             opaque_command=opaque_command,
             network_access=network_access,
+            reads_private_data=reads_private_data,
+            # Force egress=True whenever network_access=True so future tools
+            # cannot silently omit egress declaration.
+            egress=bool(egress or network_access),
+            egress_target_arg=egress_target_arg,
+            accepts_vault_placeholders=accepts_vault_placeholders,
             path_args=tuple(path_args),
             list_path_args=tuple(list_path_args),
             is_write_tool=bool(is_write_tool or resolved_side_effect != "none"),
@@ -294,6 +337,10 @@ class ToolRegistry:
                         hidden=meta.get("hidden", False),
                         opaque_command=meta.get("opaque_command", False),
                         network_access=meta.get("network_access", False),
+                        reads_private_data=meta.get("reads_private_data", False),
+                        egress=meta.get("egress", False),
+                        egress_target_arg=meta.get("egress_target_arg", ""),
+                        accepts_vault_placeholders=meta.get("accepts_vault_placeholders", False),
                         path_args=_meta_str_tuple(meta, "path_args", py_file),
                         list_path_args=_meta_str_tuple(meta, "list_path_args", py_file),
                         is_write_tool=bool(meta.get("is_write_tool", False)),
@@ -632,15 +679,78 @@ class ToolRegistry:
                 return decision.result
             claimed = decision.claimed
 
-        arguments = call.arguments
+        arguments: dict[str, Any] = dict(call.arguments)
+        resolved_secrets: list[tuple[str, str]] = []
+        active_guard = self._effective_tool_guard()
+        vault_store = self._vault_store
+        if vault_store is None and active_guard is not None:
+            vault_store = getattr(active_guard, "vault_store", None)
+
+        all_vault_entries = None
+        if vault_store is not None:
+            from common.vault import VaultRedactor, extract_vault_placeholders
+
+            all_vault_entries = vault_store.all_entries()
+            if extract_vault_placeholders(arguments):
+                target_domain: str | None = None
+                url_val = arguments.get("url")
+                if isinstance(url_val, str) and url_val.strip():
+                    import urllib.parse
+
+                    parsed_url = urllib.parse.urlparse(url_val.strip())
+                    if parsed_url.hostname:
+                        target_domain = parsed_url.hostname.lower().rstrip(".")
+                try:
+                    arguments, resolved_secrets = vault_store.resolve_arguments(
+                        tool_name,
+                        arguments,
+                        target_domain=target_domain,
+                    )
+                except Exception as exc:
+                    result = ToolResult(
+                        call_id=call.id,
+                        content=f"[BLOCKED] {exc}",
+                        is_error=True,
+                        error_kind="policy_blocked",
+                    )
+                    return self._finalize_result(result, tool_name)
+
+        # When the session is tainted and calling web_fetch/web_crawl on an
+        # allowlisted host, pass the allowed host patterns so 3xx redirects are
+        # re-validated at every hop (blocking open-redirect exfiltration).
+        if (
+            active_guard is not None
+            and tool_name in {"web_fetch", "web_crawl"}
+            and getattr(active_guard, "taint_store", None) is not None
+            and active_guard.taint_store.is_tainted
+            and active_guard.safety_config.taint.enabled
+        ):
+            allowed_hosts = (
+                active_guard.safety_config.taint.allowlist.allowed_http_host_patterns()
+            )
+            if allowed_hosts:
+                arguments["_allowed_egress_hosts"] = allowed_hosts
+
         if tool_name in self._wants_environment:
             # Injected last so a model-supplied "environment" argument can
             # never smuggle a fake environment past the binding.
-            arguments = {**call.arguments, "environment": environment}
+            arguments["environment"] = environment
 
+        def _redact_text(raw_text: str) -> tuple[str, list[str]]:
+            if not resolved_secrets and not all_vault_entries:
+                return raw_text, []
+            from common.vault import VaultRedactor
+
+            return VaultRedactor.redact(
+                raw_text,
+                resolved_secrets=resolved_secrets,
+                all_entries=all_vault_entries,
+            )
+
+        redacted_keys: list[str] = []
         try:
             content = await self._invoke(func, arguments, defn.timeout_seconds)
-            content_text = str(content)
+            content_text, redacted_keys = _redact_text(str(content))
             is_error = _looks_like_tool_error(content_text)
             result = ToolResult(
                 call_id=call.id,
@@ -654,6 +764,17 @@ class ToolRegistry:
                     else "none"
                 ),
             )
+            last_cmd_result = getattr(environment, "last_result", None)
+            if defn.opaque_command:
+                result.metadata["sandbox_backend"] = (
+                    getattr(last_cmd_result, "sandbox_backend", None)
+                    or getattr(environment, "backend_id", environment.name)
+                )
+                result.metadata["network_used"] = bool(
+                    getattr(last_cmd_result, "network_used", False)
+                    if last_cmd_result is not None
+                    else call.arguments.get("network") is True
+                )
         except asyncio.TimeoutError:
             result = ToolResult(
                 call_id=call.id,
@@ -665,14 +786,24 @@ class ToolRegistry:
                 side_effect_status="unknown" if defn.side_effect != "none" else "none",
             )
         except Exception as exc:
+            err_text, redacted_keys = _redact_text(str(exc))
             result = ToolResult(
                 call_id=call.id,
-                content=str(exc),
+                content=err_text,
                 is_error=True,
                 error_kind="exception",
                 retryable=defn.retryable,
                 side_effect_status="unknown" if defn.side_effect != "none" else "none",
             )
+        finally:
+            # Drop resolved secret references promptly after invocation
+            arguments = {}
+
+        if resolved_secrets:
+            result.metadata["vault_keys_used"] = [k for k, _ in resolved_secrets]
+        if redacted_keys:
+            result.metadata["vault_redacted"] = True
+            result.metadata["vault_redacted_keys"] = redacted_keys
 
         # Plain string truncation: a thread hop costs more than the work.
         result = self._finalize_result(result, tool_name)
@@ -711,10 +842,11 @@ class ToolRegistry:
         defn, func = entry
         approval_granted = False
         approval_scope: ApprovalScope | None = None
-        if self._tool_guard is not None:
+        active_guard = self._effective_tool_guard()
+        if active_guard is not None:
             # The ReAct loop already evaluated and audited this call; this is a
             # backstop for internal callers, so it must not log a second time.
-            decision = self._tool_guard.check(call, audit=False)
+            decision = active_guard.check(call, audit=False)
             authorization = self._authorized_call.get()
             authorized = (
                 authorization is not None
@@ -727,18 +859,6 @@ class ToolRegistry:
             )
             approval_scope = decision.approval_scope
 
-            # Auto-whitelist: when a path approval is granted, remember the
-            # approved path so subsequent accesses to the same location don't
-            # require re-approval.  Inside the ordinary allowed directories
-            # every sibling is already accessible, so the parent directory may
-            # be whitelisted as a no-op.  For an EXTERNAL path, directory
-            # granularity would silently grant the model every sibling file in
-            # an arbitrary directory (/etc, ~/Library, ...) — including
-            # credential-bearing names the name-based sensitive checks do not
-            # cover (master.passwd, shadow).  External approvals therefore
-            # whitelist exactly one path.  HIGH/CRITICAL approvals are never
-            # cached: sensitive paths (.ssh, .aws, .env, .git/config) and
-            # destructive operations require approval each time regardless.
             if (
                 approval_granted
                 and approval_scope is not None
@@ -748,13 +868,12 @@ class ToolRegistry:
                 from pathlib import Path
                 try:
                     target_path = Path(approval_scope.target).expanduser().resolve()
-                    inside_allowed = self._tool_guard.file_guard.is_inside_allowed_dirs(target_path)
+                    inside_allowed = active_guard.file_guard.is_inside_allowed_dirs(target_path)
                     if inside_allowed and (target_path.is_file() or not target_path.exists()):
-                        self._tool_guard.whitelist.allow_path(str(target_path.parent))
+                        active_guard.whitelist.allow_path(str(target_path.parent))
                     else:
-                        self._tool_guard.whitelist.allow_file(str(target_path))
+                        active_guard.whitelist.allow_file(str(target_path))
                 except (ValueError, OSError):
-                    # Path resolution failed; skip whitelist addition
                     pass
             # A project-boundary result is intentionally ``allowed=False``
             # until the approval broker grants the exact normalized call.  Do
@@ -799,20 +918,24 @@ class ToolRegistry:
         if (
             approval_granted
             and approval_scope is not None
-            and approval_scope.grants_host_execution
+            and approval_scope.grants_sandbox_execution
         ):
             scoped_environment = getattr(environment, "with_approval_scope", None)
-            if not callable(scoped_environment):
+            if callable(scoped_environment):
+                environment = scoped_environment(approval_scope)
+            elif required_env == "sandbox" and (
+                approval_scope.grants_host_execution
+                or approval_scope.grants_network_execution
+            ):
                 return ToolResult(
                     call_id=call.id,
                     content=(
-                        "Error: the bound sandbox cannot apply the approved host "
-                        "access scope"
+                        "Error: the bound sandbox cannot apply the approved "
+                        f"{approval_scope.kind} access scope"
                     ),
                     is_error=True,
                     error_kind="environment_unavailable",
                 )
-            environment = scoped_environment(approval_scope)
         if defn.concurrency == "serial":
             lock = self._serial_locks.setdefault(tool_name, asyncio.Lock())
             async with lock:
@@ -844,8 +967,15 @@ class ToolRegistry:
 class ScopedToolRegistry:
     """A non-mutating view that narrows one ``ToolRegistry`` for a skill node."""
 
-    def __init__(self, registry: ToolRegistry, names: Iterable[str]) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        names: Iterable[str],
+        *,
+        tool_guard: ToolGuard | None = None,
+    ) -> None:
         self._registry = registry
+        self._tool_guard_override = tool_guard
         self._allowed = frozenset(
             _canonical_tool_name(name)
             for name in names
@@ -946,6 +1076,9 @@ class ScopedToolRegistry:
                 is_error=True,
                 error_kind="tool_disabled",
             )
+        if self._tool_guard_override is not None and hasattr(self._registry, "use_tool_guard"):
+            with self._registry.use_tool_guard(self._tool_guard_override):
+                return await self._registry.execute(call)
         return await self._registry.execute(call)
 
 

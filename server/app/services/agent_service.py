@@ -13,7 +13,7 @@ from ..infrastructure.repositories.session_repo import SessionRepo
 from ..schemas.agent_profile import AgentProfileOut
 from ..schemas.auto_task import AutoTaskCreate, AutoTaskRunOut, AutoTaskUpdate
 from ..schemas.memory import MemoryMaintenanceOut
-from ..schemas.session import ContextCompressionOut, MessageOut, SessionOut
+from ..schemas.session import ContextCompressionOut, MessageOut, SessionOut, SteerOut
 from ..schemas.run import ApprovalDecision
 from ..schemas.mcp import McpServerOut
 from .auto_task_service import AutoTaskService
@@ -126,8 +126,17 @@ class AgentService:
     async def compress_session(self, session_id: str) -> ContextCompressionOut:
         return await self.session_service.compress_session(await self._profile_id(), session_id)
 
-    async def delete_session(self, session_id: str) -> None:
-        await self.session_service.delete_session(await self._profile_id(), session_id)
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        expected_kind: str | None = None,
+    ) -> None:
+        await self.session_service.delete_session(
+            await self._profile_id(),
+            session_id,
+            expected_kind=expected_kind,
+        )
 
     def memory_maintenance(self) -> MemoryMaintenanceOut:
         """Report deferred memory maintenance so a client can show it.
@@ -182,6 +191,48 @@ class AgentService:
         return await self.session_service.prepare_resume_run(
             await self._profile_id(),
             run_id,
+        )
+
+    async def create_side_session(
+        self,
+        parent_session_id: str | None = None,
+        *,
+        title: str = "Side chat",
+        reuse_existing: bool = True,
+    ) -> SessionOut:
+        return await self.session_service.create_side_session(
+            await self._profile_id(),
+            parent_session_id,
+            title=title,
+            reuse_existing=reuse_existing,
+        )
+
+    async def promote_side_session(
+        self,
+        side_session_id: str,
+        *,
+        title: str | None = None,
+        keep_parent_context: bool = True,
+    ) -> SessionOut:
+        return await self.session_service.promote_side_session(
+            await self._profile_id(),
+            side_session_id,
+            title=title,
+            keep_parent_context=keep_parent_context,
+        )
+
+    async def steer_session(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        run_id: str | None = None,
+    ) -> SteerOut:
+        return await self.session_service.steer_session(
+            await self._profile_id(),
+            session_id,
+            content,
+            run_id=run_id,
         )
 
     async def list_skills(self):
@@ -261,3 +312,31 @@ class AgentService:
         return await self.auto_task_service.list_runs(
             await self._profile_id(), task_id
         )
+
+    async def run_doctor(
+        self,
+        *,
+        cwd: str | None = None,
+        run_probes: bool = True,
+    ) -> dict:
+        import asyncio
+        from fastapi import HTTPException
+
+        from common import config as common_config
+        from engine.sandbox.doctor import run_doctor_async
+
+        try:
+            report = await asyncio.wait_for(
+                run_doctor_async(
+                    cwd=cwd,
+                    run_probes=run_probes,
+                    data_dir=common_config.PATHS.data_dir,
+                ),
+                timeout=45.0,
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Doctor diagnostics timed out after 45 seconds",
+            ) from exc
+        return report.to_dict()

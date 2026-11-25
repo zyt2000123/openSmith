@@ -38,6 +38,8 @@ TOOL_META = {
     },
     "permission_level": "read",
     "network_access": True,
+    "egress": True,
+    "egress_target_arg": "url",
     "approval_policy": "never",
     "side_effect": "none",
     "execution_environment": "host",
@@ -201,8 +203,35 @@ def _safe_addresses(host: str, port: int) -> list[tuple[Any, Any, int, str, tupl
     return infos
 
 
-def _validated_redirect_url(current_url: str, location: str) -> str:
+def _host_in_allowlist(host: str, allowed_hosts: tuple[str, ...]) -> bool:
+    norm_host = host.strip().lower().rstrip(".")
+    for raw in allowed_hosts:
+        pat = raw.strip().lower().rstrip(".")
+        if not pat:
+            continue
+        if pat.startswith("*."):
+            suffix = pat[2:]
+            if "." in suffix and norm_host.endswith(f".{suffix}") and len(norm_host) > len(suffix) + 1:
+                return True
+        elif norm_host == pat:
+            return True
+    return False
+
+
+def _validated_redirect_url(
+    current_url: str,
+    location: str,
+    *,
+    allowed_egress_hosts: tuple[str, ...] | None = None,
+) -> str:
     target = urllib.parse.urljoin(current_url, location)
+    if allowed_egress_hosts:
+        parsed = urllib.parse.urlparse(target)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not host or not _host_in_allowlist(host, allowed_egress_hosts):
+            raise ValueError(
+                f"[taint-egress-001] redirect target host '{host}' is not in the tainted egress allowlist"
+            )
     validation_error = _validate_url(target)
     if validation_error:
         raise ValueError(validation_error)
@@ -225,7 +254,12 @@ def _html_to_text(raw: str) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
-async def execute(*, url: str, timeout: int = 30) -> str:
+async def execute(
+    *,
+    url: str,
+    timeout: int = 30,
+    _allowed_egress_hosts: tuple[str, ...] | None = None,
+) -> str:
     if not isinstance(url, str):
         return "Error: url must be a string"
     if isinstance(timeout, bool) or not isinstance(timeout, int):
@@ -236,18 +270,46 @@ async def execute(*, url: str, timeout: int = 30) -> str:
         validation_error = await asyncio.to_thread(_validate_url, url)
         if validation_error:
             return f"Error: {validation_error}"
+        if _allowed_egress_hosts:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if not host or not _host_in_allowlist(host, _allowed_egress_hosts):
+                return (
+                    f"Error: [taint-egress-001] host '{host}' is not in the "
+                    "tainted egress allowlist"
+                )
         try:
-            return await asyncio.wait_for(_fetch_plain(url, timeout), timeout=timeout)
+            coro = (
+                _fetch_plain(url, timeout, allowed_egress_hosts=_allowed_egress_hosts)
+                if _allowed_egress_hosts
+                else _fetch_plain(url, timeout)
+            )
+            return await asyncio.wait_for(coro, timeout=timeout)
         except asyncio.TimeoutError:
             return "URL Error: request timed out"
 
 
-async def _fetch_plain(url: str, timeout: int) -> str:
+async def _fetch_plain(
+    url: str,
+    timeout: int,
+    *,
+    allowed_egress_hosts: tuple[str, ...] | None = None,
+) -> str:
     """Fetch text without following unvalidated redirects or re-resolving DNS."""
-    return await asyncio.to_thread(_fetch_pinned, url, timeout)
+    return await asyncio.to_thread(
+        _fetch_pinned,
+        url,
+        timeout,
+        allowed_egress_hosts=allowed_egress_hosts,
+    )
 
 
-def _fetch_pinned(url: str, timeout: int) -> str:
+def _fetch_pinned(
+    url: str,
+    timeout: int,
+    *,
+    allowed_egress_hosts: tuple[str, ...] | None = None,
+) -> str:
     current_url = url
     deadline = time.monotonic() + timeout
     for _ in range(6):
@@ -255,6 +317,11 @@ def _fetch_pinned(url: str, timeout: int) -> str:
         host = parsed.hostname
         if host is None:
             return "URL Error: URL must include a hostname"
+        if allowed_egress_hosts and not _host_in_allowlist(host, allowed_egress_hosts):
+            return (
+                f"URL Error: [taint-egress-001] host '{host}' is not in the "
+                "tainted egress allowlist"
+            )
         try:
             port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
         except ValueError as exc:
@@ -274,7 +341,11 @@ def _fetch_pinned(url: str, timeout: int) -> str:
                 if not location:
                     return f"HTTP Error: {response.status} redirect without Location"
                 try:
-                    current_url = _validated_redirect_url(current_url, location)
+                    current_url = _validated_redirect_url(
+                        current_url,
+                        location,
+                        allowed_egress_hosts=allowed_egress_hosts,
+                    )
                 except ValueError as exc:
                     return f"URL Error: redirect blocked: {exc}"
                 continue

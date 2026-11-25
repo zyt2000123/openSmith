@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ({_ISO_NOW}),
     context_summary TEXT NOT NULL DEFAULT '',
-    context_summary_cutoff INTEGER NOT NULL DEFAULT 0
+    context_summary_cutoff INTEGER NOT NULL DEFAULT 0,
+    session_kind TEXT NOT NULL DEFAULT 'main' CHECK (session_kind IN ('main', 'side')),
+    parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    snapshot_cutoff_message_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -42,6 +45,8 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
     content TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'normal',
+    parent_message_id TEXT,
     created_at TEXT NOT NULL DEFAULT ({_ISO_NOW})
 );
 
@@ -260,10 +265,37 @@ async def _normalize_legacy_timestamps(db: aiosqlite.Connection) -> None:
         )
 
 
+async def _ensure_session_side_columns(db: aiosqlite.Connection) -> None:
+    """Add /side session metadata columns to existing sessions tables."""
+    async with db.execute("PRAGMA table_info(sessions)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    for name, definition in (
+        ("session_kind", "TEXT NOT NULL DEFAULT 'main'"),
+        ("parent_session_id", "TEXT"),
+        ("snapshot_cutoff_message_id", "TEXT"),
+    ):
+        if name not in columns:
+            await db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
+
+
+async def _ensure_message_steering_columns(db: aiosqlite.Connection) -> None:
+    """Add mid-turn steering provenance columns to existing messages tables."""
+    async with db.execute("PRAGMA table_info(messages)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    for name, definition in (
+        ("kind", "TEXT NOT NULL DEFAULT 'normal'"),
+        ("parent_message_id", "TEXT"),
+    ):
+        if name not in columns:
+            await db.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+
+
 async def ensure_schema(db: aiosqlite.Connection) -> None:
     await db.executescript(APP_SCHEMA)
     await _ensure_session_identity_column(db)
     await _ensure_session_context_columns(db)
+    await _ensure_session_side_columns(db)
+    await _ensure_message_steering_columns(db)
     await _ensure_unique_profile_index(db)
     await _ensure_auto_task_columns(db)
     await _ensure_token_usage_columns(db)

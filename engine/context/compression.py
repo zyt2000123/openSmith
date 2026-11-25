@@ -42,6 +42,7 @@ def _pruned_stub(char_count: int) -> str:
 # instruction into compactable history, where compaction replaced it with a
 # summary of itself.
 RUNTIME_USER_NOTE_PREFIX = "[Current time]\n"
+STEERING_USER_NOTE_PREFIX = "[Mid-turn user steering]\n"
 # 这是**内容前缀**判定，不是结构标记：用户真的粘贴一段以它开头的文本时，
 # is_request_turn 会把那条请求当成引擎注记，active_turn_bounds 因此找不到活动
 # 轮，compact_history 就把正在执行的指令压成了摘要。
@@ -71,7 +72,8 @@ def is_request_turn(message: dict) -> bool:
         return False
     content = message.get("content")
     return not (
-        isinstance(content, str) and content.startswith(RUNTIME_USER_NOTE_PREFIX)
+        isinstance(content, str)
+        and content.startswith((RUNTIME_USER_NOTE_PREFIX, STEERING_USER_NOTE_PREFIX))
     )
 
 

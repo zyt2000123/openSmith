@@ -37,6 +37,7 @@ from .orchestration.runtime import (
     RuntimeContext,
     RuntimeServices,
 )
+from .steering import STEERING_BROKER, SteerSubmitResult, SteeringMessage
 
 
 __all__ = (
@@ -56,6 +57,9 @@ __all__ = (
     "RunObservationFactory",
     "RuntimeContext",
     "RuntimeServices",
+    "STEERING_BROKER",
+    "SteerSubmitResult",
+    "SteeringMessage",
     "raw_text_delta",
     "reply_with_runtime",
     "resume_stream_with_runtime",

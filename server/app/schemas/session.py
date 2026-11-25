@@ -17,6 +17,19 @@ class SessionOut(BaseModel):
     last_message_preview: str | None = None
     last_message_at: str | None = None
     message_count: int = 0
+    session_kind: str = "main"
+    parent_session_id: str | None = None
+    snapshot_cutoff_message_id: str | None = None
+
+
+class SideSessionCreate(BaseModel):
+    title: str = "Side chat"
+    reuse_existing: bool = True
+
+
+class PromoteSideRequest(BaseModel):
+    title: str | None = None
+    keep_parent_context: bool = True
 
 
 class SessionModelUpdate(BaseModel):
@@ -50,4 +63,27 @@ class MessageOut(BaseModel):
     session_id: str
     role: str
     content: str
+    kind: str = "normal"
+    parent_message_id: str | None = None
     created_at: str
+
+
+class SteerCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=10_000)
+    run_id: str | None = None
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("content must not be blank")
+        return trimmed
+
+
+class SteerOut(BaseModel):
+    accepted: bool
+    status: str
+    run_id: str | None = None
+    steer_id: str | None = None
+    pending_count: int = 0

@@ -94,6 +94,22 @@ export function handleViewToggle(input: string, key: Key, options: ShellInputOpt
   return true;
 }
 
+export function handleChannelToggle(input: string, key: Key, options: ShellInputOptions): boolean {
+  const isCtrlBackslash = (key.ctrl && input === "\\") || input === "\x1c";
+  if (!isCtrlBackslash) return false;
+
+  const state = options.getState();
+  if (state.activeChannel === "side") {
+    options.bridge.switchBackToMain();
+    return true;
+  }
+  if (state.backgroundChannel !== null) {
+    void options.bridge.openSideChat();
+    return true;
+  }
+  return false;
+}
+
 function navigationFromKey(key: Key): ListNavigation | null {
   if (key.upArrow) return "up";
   if (key.downArrow) return "down";
@@ -410,7 +426,10 @@ export function handleHistoryNavigation(key: Key, options: ShellInputOptions): b
 function cyclePanel(key: Key, options: ShellInputOptions): void {
   if (!key.tab || options.slashMenuOpen) return;
 
-  const panels: Panel[] = ["welcome", "sessions", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"];
+  const isSide = options.getState().activeChannel === "side";
+  const panels: Panel[] = isSide
+    ? ["welcome", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"]
+    : ["welcome", "sessions", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"];
   const parentPanel: Partial<Record<Panel, Panel>> = {
     skills: "skill-actions",
     "skill-toggle": "skill-actions",
@@ -459,6 +478,7 @@ export function routeInput(input: string, key: Key, options: ShellInputOptions):
   }
   if (handleModelPickerInput(key, options)) return;
   if (handleApprovalInput(key, options)) return;
+  if (handleChannelToggle(input, key, options)) return;
   if (handleViewToggle(input, key, options)) return;
   if (handleQueuedEdit(key, options)) return;
   if (handlePickerInput(key, options)) return;

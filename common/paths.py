@@ -194,6 +194,10 @@ class AppPaths:
         return self.data_dir / "agent"
 
     @property
+    def vault_path(self) -> Path:
+        return self.data_dir / "vault.json"
+
+    @property
     def sqlite_path(self) -> Path:
         return self.data_dir / "sqlite" / "agent-smith.sqlite"
 

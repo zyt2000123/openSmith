@@ -10,6 +10,7 @@ import {
   CONTEXT_DISPLAY_WINDOW,
   compressSession,
   createSession,
+  createSideSession,
   deleteSession,
   ensureAgentProfile,
   getLlmConfig,
@@ -27,15 +28,18 @@ import {
   listRunIncidents,
   listSessions,
   listSkills,
+  promoteSideSession,
   type RunDiagnosis,
   type RunImprovementProposal,
   type RunState,
   resolveRunApproval,
+  runDoctorProbe,
   type Session,
   type StreamEvent,
   type StreamTerminalStatus,
   setLlmConfig,
   setSkillEnabled,
+  steerSession,
   streamMessage,
   streamRunResume,
   updateSessionModel,
@@ -45,9 +49,20 @@ import { createModelPicker, type ModelPickerTarget } from "./model-picker.js";
 import { MAX_QUEUED_MESSAGES, type QueuedMessage } from "./queue.js";
 import { sanitizeTerminalText } from "./sanitize.js";
 import { createSetupDraft, fieldValue, setupFieldAt } from "./setup.js";
-import { type AppStore, TRANSCRIPT_LIMIT } from "./store.js";
+import {
+  type AppStore,
+  type ChatChannel,
+  createEmptyChannelState,
+  TRANSCRIPT_LIMIT,
+} from "./store.js";
 import { clearTerminal } from "./term.js";
-import { limitTranscript, removeApprovalNotice, restartLatestTurn, restoreTranscript } from "./transcript-state.js";
+import {
+  appendQueuedSteering,
+  limitTranscript,
+  removeApprovalNotice,
+  restartLatestTurn,
+  restoreTranscript,
+} from "./transcript-state.js";
 
 /** Shown wherever a missing baseUrl blocks the action — always with the way back out. */
 const NOT_READY_STATUS = "Shell is not ready yet. Run /reconnect to retry the local server.";
@@ -189,24 +204,51 @@ function applyBatchedStreamEvent(
 }
 
 export class NodeBridge {
-  private activeRequest: AbortController | null = null;
+  private activeRequests: Record<ChatChannel, AbortController | null> = {
+    main: null,
+    side: null,
+  };
+  private steeringInFlight: Record<ChatChannel, boolean> = {
+    main: false,
+    side: false,
+  };
+  private pendingSteers: Record<ChatChannel, Array<{ steerId: string; content: string }>> = {
+    main: [],
+    side: [],
+  };
+  private settledSteerIds: Record<ChatChannel, Set<string>> = {
+    main: new Set(),
+    side: new Set(),
+  };
   private tokenStatsRequestId = 0;
   private observabilityRequestId = 0;
   private booting = false;
 
   constructor(private store: StoreApi<AppStore>) {}
 
+  private get activeRequest(): AbortController | null {
+    return this.activeRequests[this.s.activeChannel];
+  }
+
+  private set activeRequest(controller: AbortController | null) {
+    this.activeRequests[this.s.activeChannel] = controller;
+  }
+
   private get s() {
     return this.store.getState();
   }
 
-  enqueueMessage(text: string, skillName?: string): boolean {
+  enqueueMessage(text: string, skillName?: string, targetChannel?: ChatChannel): boolean {
     const normalized = text.trim();
     if (!normalized) return false;
 
-    const queuedMessages = this.s.queuedMessages;
+    const channel = targetChannel ?? this.s.activeChannel;
+    const chState = this.s.getChannelState(channel);
+    const queuedMessages = chState?.queuedMessages ?? this.s.queuedMessages;
     if (queuedMessages.length >= MAX_QUEUED_MESSAGES) {
-      this.s.set({ statusLine: `Queue is full (${MAX_QUEUED_MESSAGES}). Press Esc to remove the newest message.` });
+      if (channel === this.s.activeChannel) {
+        this.s.set({ statusLine: `Queue is full (${MAX_QUEUED_MESSAGES}). Press Esc to remove the newest message.` });
+      }
       return false;
     }
 
@@ -215,11 +257,107 @@ export class NodeBridge {
       text: normalized,
       ...(skillName ? { skillName } : {}),
     };
-    this.s.set({
-      queuedMessages: [...queuedMessages, item],
-      statusLine: `Queued ${queuedMessages.length + 1}/${MAX_QUEUED_MESSAGES}.`,
-    });
+    this.s.updateChannel(channel, { queuedMessages: [...queuedMessages, item] });
+    if (channel === this.s.activeChannel) {
+      this.s.set({ statusLine: `Queued ${queuedMessages.length + 1}/${MAX_QUEUED_MESSAGES}.` });
+    }
     return true;
+  }
+
+  private forceEnqueueMessage(text: string, channel: ChatChannel, skillName?: string): boolean {
+    const normalized = text.trim();
+    if (!normalized) return false;
+    const chState = this.s.getChannelState(channel);
+    const queuedMessages = chState?.queuedMessages ?? (channel === this.s.activeChannel ? this.s.queuedMessages : []);
+    const item: QueuedMessage = {
+      id: `queue-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text: normalized,
+      ...(skillName ? { skillName } : {}),
+    };
+    this.s.updateChannel(channel, { queuedMessages: [...queuedMessages, item] });
+    return true;
+  }
+
+  async steerMessage(text: string, skillName?: string): Promise<boolean> {
+    const normalized = text.trim();
+    if (!normalized) return false;
+
+    // M9: Pin the originating channel before any async boundary so switching
+    // between main and side mid-POST never cross-wires transcript or queue state.
+    const channel: ChatChannel = this.s.activeChannel;
+    if (this.steeringInFlight[channel]) {
+      return this.enqueueMessage(normalized, skillName, channel);
+    }
+
+    if (!this.activeRequests[channel]) {
+      // M7: Do not block the caller for the entire lifetime of the fallback run.
+      void this.sendMessage(normalized, skillName, channel);
+      return true;
+    }
+
+    const baseUrl = this.s.baseUrl;
+    const chState = this.s.getChannelState(channel);
+    const session = chState?.session ?? null;
+    const runId = chState?.recoverableRunId ?? null;
+    if (!baseUrl || !session) {
+      return this.enqueueMessage(normalized, skillName, channel);
+    }
+
+    this.steeringInFlight[channel] = true;
+    try {
+      const result = await steerSession(baseUrl, session.id, normalized, runId);
+      if (result.accepted) {
+        const steerId = result.steer_id ?? `st_${Date.now()}`;
+        // L2: If steering_applied or steering_deferred already arrived over SSE
+        // before the POST response returned, do not re-add it to pendingSteers
+        // or re-append a stuck "[Steer queued]" block.
+        if (!this.settledSteerIds[channel].has(steerId)) {
+          this.pendingSteers[channel].push({ steerId, content: normalized });
+          const latestState = this.s.getChannelState(channel);
+          if (latestState) {
+            this.s.updateChannel(channel, {
+              transcript: appendQueuedSteering(latestState.transcript, steerId, normalized),
+            });
+          }
+        }
+        if (channel === this.s.activeChannel) {
+          this.s.set({
+            statusLine:
+              result.status === "queued_while_waiting_approval"
+                ? "Steer queued; will apply after approval is resolved."
+                : "Steer injected; will apply before the next step.",
+          });
+        }
+        return true;
+      }
+
+      if (result.status === "no_active_run") {
+        // Race window where the run ended right as the user pressed Enter.
+        if (!this.activeRequests[channel]) {
+          void this.sendMessage(normalized, skillName, channel);
+          return true;
+        }
+        return this.enqueueMessage(normalized, skillName, channel);
+      }
+
+      if (result.status === "inbox_full") {
+        const queued = this.enqueueMessage(normalized, skillName, channel);
+        if (queued && channel === this.s.activeChannel) {
+          this.s.set({ statusLine: "Steering inbox full; queued for next turn." });
+        }
+        return queued;
+      }
+
+      return this.enqueueMessage(normalized, skillName, channel);
+    } catch (error) {
+      const queued = this.enqueueMessage(normalized, skillName, channel);
+      if (queued && channel === this.s.activeChannel) {
+        this.s.set({ statusLine: `Steer unavailable (${errorMessage(error)}); queued for next turn.` });
+      }
+      return queued;
+    } finally {
+      this.steeringInFlight[channel] = false;
+    }
   }
 
   removeQueuedMessage(index: number): QueuedMessage | null {
@@ -236,20 +374,40 @@ export class NodeBridge {
   }
 
   cancelRequest(): boolean {
-    const controller = this.activeRequest;
+    const channel: ChatChannel = this.s.activeChannel;
+    const controller = this.activeRequests[channel];
     if (!controller || controller.signal.aborted) return false;
 
     controller.abort();
-    this.s.interruptTurn("cancelled");
     const pendingApproval = this.s.pendingApproval;
-    this.s.set({
+    this.s.interruptTurnForChannel(channel, "cancelled");
+    const afterInterrupt = this.s.getChannelState(channel);
+    this.s.updateChannel(channel, {
       pendingApproval: null,
       approvalResolving: false,
       busy: false,
       compressing: false,
       runStartedAt: null,
-      statusLine: "Cancelled.",
-      ...(pendingApproval ? { transcript: removeApprovalNotice(this.s.transcript, pendingApproval.approvalId) } : {}),
+      ...(pendingApproval && afterInterrupt
+        ? { transcript: removeApprovalNotice(afterInterrupt.transcript, pendingApproval.approvalId) }
+        : {}),
+    });
+
+    // M10: Preserve accepted-but-unapplied steers by requeuing them on cancel
+    // so Esc behaves consistently with queued follow-up messages.
+    const unapplied = this.pendingSteers[channel];
+    this.pendingSteers[channel] = [];
+    let requeued = 0;
+    for (const steer of unapplied) {
+      if (this.forceEnqueueMessage(steer.content, channel)) {
+        requeued += 1;
+      }
+    }
+    this.s.set({
+      statusLine:
+        requeued > 0
+          ? `Cancelled. Moved ${requeued} pending steer(s) to queue.`
+          : "Cancelled.",
     });
     return true;
   }
@@ -425,6 +583,32 @@ export class NodeBridge {
     const { baseUrl } = this.s;
     if (!baseUrl) throw new Error("Shell is not ready yet.");
     return initializeProjectInstructions(baseUrl, workingDir);
+  }
+
+  async runDoctor(workingDir?: string): Promise<void> {
+    const { baseUrl } = this.s;
+    if (!baseUrl) {
+      this.s.set({ panel: "chat", statusLine: NOT_READY_STATUS });
+      return;
+    }
+    if (this.s.inputLocked) return;
+    this.s.set({ inputLocked: true, statusLine: "Running sandbox diagnostics…" });
+    try {
+      const report = await runDoctorProbe(baseUrl, workingDir);
+      const { formatDoctorReport } = await import("./doctor.js");
+      this.s.pushSystemLine(formatDoctorReport(report), report.ok ? "info" : "error");
+      this.s.set({
+        panel: "chat",
+        statusLine: report.ok
+          ? `Doctor OK (${report.sandbox_backend}, ${report.duration_ms}ms).`
+          : `Doctor found issues (${report.sandbox_backend}).`,
+      });
+    } catch (error) {
+      this.s.pushSystemLine(`Doctor failed: ${errorMessage(error)}`, "error");
+      this.s.set({ panel: "chat", statusLine: "Doctor failed." });
+    } finally {
+      this.s.set({ inputLocked: false });
+    }
   }
 
   async openTokenStats(): Promise<void> {
@@ -649,6 +833,10 @@ export class NodeBridge {
   }
 
   async compressCurrentSession(): Promise<void> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main, or /promote first." });
+      return;
+    }
     const { baseUrl, currentSession, busy } = this.s;
     if (busy) {
       this.s.set({ statusLine: "Wait for the current task to finish before compressing." });
@@ -675,6 +863,10 @@ export class NodeBridge {
   }
 
   startNewSession(): boolean {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main, or /side close." });
+      return false;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Cancel the current task before starting a new session." });
       return false;
@@ -692,6 +884,10 @@ export class NodeBridge {
   }
 
   async clearCurrentSession(): Promise<boolean> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Use /side close to discard it, or /back first." });
+      return false;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Cancel the current task before clearing the session." });
       return false;
@@ -722,6 +918,10 @@ export class NodeBridge {
   }
 
   async resumeSession(session: Session): Promise<void> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main before resuming a session." });
+      return;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Finish the current shell operation before resuming a session." });
       return;
@@ -770,6 +970,10 @@ export class NodeBridge {
   }
 
   async resumeRun(requestedRunId?: string): Promise<void> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main before recovering a run." });
+      return;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Finish the current shell operation before recovering a run." });
       return;
@@ -843,78 +1047,193 @@ export class NodeBridge {
     return null;
   }
 
-  async sendMessage(text: string, skillName?: string): Promise<boolean> {
-    if (this.s.inputLocked || this.s.compressing) {
+  async openSideChat(question?: string): Promise<boolean> {
+    const { baseUrl, agent, activeChannel, backgroundChannel, currentSession } = this.s;
+    if (!baseUrl || !agent) {
+      this.s.set({ statusLine: NOT_READY_STATUS });
+      return false;
+    }
+
+    if (activeChannel === "side") {
+      if (question?.trim()) {
+        return this.sendMessage(question.trim(), undefined, "side");
+      }
+      this.s.set({ statusLine: "Already in side chat. Type /back or Ctrl+\\ to return." });
+      return true;
+    }
+
+    if (backgroundChannel?.session) {
+      clearTerminal();
+      this.s.switchChannel("side");
+      if (question?.trim()) {
+        return this.sendMessage(question.trim(), undefined, "side");
+      }
+      return true;
+    }
+
+    try {
+      const sideSession = await createSideSession(baseUrl, currentSession?.id ?? null, {
+        title: question?.trim().split(/\n+/)[0]?.slice(0, 40) || "Side chat",
+        reuseExisting: true,
+      });
+      clearTerminal();
+      this.s.switchChannel("side", createEmptyChannelState(sideSession));
+      if (question?.trim()) {
+        return this.sendMessage(question.trim(), undefined, "side");
+      }
+      return true;
+    } catch (error) {
+      this.s.set({ statusLine: `Could not open side chat: ${errorMessage(error)}` });
+      return false;
+    }
+  }
+
+  switchBackToMain(): boolean {
+    if (this.s.activeChannel !== "side") {
+      this.s.set({ statusLine: "Already in main conversation." });
+      return false;
+    }
+    clearTerminal();
+    this.s.switchChannel("main");
+    return true;
+  }
+
+  async closeSideChat(): Promise<boolean> {
+    const sideState = this.s.getChannelState("side");
+    const sideController = this.activeRequests.side;
+    if (sideController && !sideController.signal.aborted) {
+      sideController.abort();
+      this.activeRequests.side = null;
+    }
+
+    const sideSession = sideState?.session;
+    if (sideSession && sideSession.session_kind === "side" && this.s.baseUrl) {
+      try {
+        await deleteSession(this.s.baseUrl, sideSession.id, { expectedKind: "side" });
+      } catch {
+        // Best-effort server cleanup
+      }
+    }
+    clearTerminal();
+    this.s.closeSideChannel();
+    return true;
+  }
+
+  async promoteSideChat(title?: string): Promise<boolean> {
+    const { baseUrl } = this.s;
+    const sideState = this.s.getChannelState("side");
+    const sideSession = sideState?.session;
+    if (!baseUrl || !sideSession) {
+      this.s.set({ statusLine: "No active side chat to promote. Open one with /side first." });
+      return false;
+    }
+    if (this.activeRequests.side && !this.activeRequests.side.signal.aborted) {
+      this.s.set({ statusLine: "Wait for the side chat reply to finish before promoting." });
+      return false;
+    }
+    if (this.activeRequests.main && !this.activeRequests.main.signal.aborted) {
+      this.s.set({ statusLine: "Wait for or cancel the running main task before promoting side chat to main." });
+      return false;
+    }
+
+    try {
+      const promoted = await promoteSideSession(baseUrl, sideSession.id, {
+        title: title?.trim() || undefined,
+        keepParentContext: true,
+      });
+      clearTerminal();
+      this.s.promoteSideToMain(promoted);
+      try {
+        const sessions = await listSessions(baseUrl);
+        this.s.set({ sessions });
+      } catch {
+        // Best-effort refresh
+      }
+      return true;
+    } catch (error) {
+      this.s.set({ statusLine: `Promote failed: ${errorMessage(error)}` });
+      return false;
+    }
+  }
+
+  async sendMessage(text: string, skillName?: string, targetChannel?: ChatChannel): Promise<boolean> {
+    const channel: ChatChannel = targetChannel ?? this.s.activeChannel;
+    const channelState = this.s.getChannelState(channel);
+    if (this.s.inputLocked || channelState?.compressing) {
       this.s.set({ statusLine: "Wait for the current shell operation to finish." });
       return false;
     }
-    if (this.activeRequest) return this.enqueueMessage(text, skillName);
+    if (this.activeRequests[channel]) return this.enqueueMessage(text, skillName, channel);
 
-    const ready = this.getReadySession();
+    const ready = this.getReadySession(channel);
     if (!ready) return false;
 
-    const controller = this.startRequest();
+    const controller = this.startRequest(channel);
     try {
-      // 回显先于建会话的网络往返：失败时该轮也留在转录里，由 reportRequestError 收尾。
-      // 放在 try 内：pushTurn 会在转录超限时 clearTerminal()，其 EPIPE 同步抛出
-      // 会成为未处理 rejection（两个调用方都没有 .catch），Node 22+ 直接终止进程。
-      this.s.pushTurn(text);
-      const session = await this.getOrCreateSession(ready.baseUrl, ready.currentSession, text, controller.signal);
+      this.s.pushTurnForChannel(channel, text);
+      const session = await this.getOrCreateSession(ready.baseUrl, ready.currentSession, text, controller.signal, channel);
       if (controller.signal.aborted) return true;
-      await this.streamResponse(ready.baseUrl, session, text, skillName, controller.signal);
+      await this.streamResponse(ready.baseUrl, session, text, skillName, controller.signal, channel);
       if (controller.signal.aborted) return true;
-      this.s.closeTurn();
-      await this.refreshSessions(ready.baseUrl, session, ready.currentSession === null, controller.signal);
+      this.s.closeTurnForChannel(channel);
+      if (channel === "main") {
+        await this.refreshSessions(ready.baseUrl, session, ready.currentSession === null, controller.signal);
+      }
     } catch (error) {
-      if (!controller.signal.aborted) this.reportRequestError(error);
+      if (!controller.signal.aborted) this.reportRequestError(error, channel);
     } finally {
-      this.finishRequest(controller);
+      this.finishRequest(controller, channel);
     }
     return true;
   }
 
-  private getReadySession(): { baseUrl: string; currentSession: Session | null } | null {
-    const { baseUrl, agent, currentSession } = this.s;
+  private getReadySession(channel: ChatChannel = this.s.activeChannel): { baseUrl: string; currentSession: Session | null } | null {
+    const { baseUrl, agent } = this.s;
+    const currentSession = this.s.getChannelState(channel)?.session ?? null;
     if (baseUrl && agent) return { baseUrl, currentSession };
 
-    // The only signal a user gets when a queued message cannot be handed off, so it
-    // has to name /reconnect: the message stays queued until something drives it.
     this.s.set({ statusLine: NOT_READY_STATUS });
     return null;
   }
 
-  private startRequest(): AbortController {
+  private startRequest(channel: ChatChannel = this.s.activeChannel): AbortController {
     const controller = new AbortController();
-    this.activeRequest = controller;
-    this.s.set({ busy: true, compressing: false, runStartedAt: Date.now(), panel: "chat", statusLine: "Processing…" });
+    this.activeRequests[channel] = controller;
+    this.pendingSteers[channel] = [];
+    this.settledSteerIds[channel].clear();
+    this.s.updateChannel(channel, {
+      busy: true,
+      compressing: false,
+      runStartedAt: Date.now(),
+    });
+    if (channel === this.s.activeChannel) {
+      this.s.set({ panel: "chat", statusLine: "Processing…" });
+    }
     return controller;
   }
 
-  private finishRequest(controller: AbortController): void {
-    if (this.activeRequest !== controller) return;
+  private finishRequest(controller: AbortController, channel: ChatChannel = this.s.activeChannel): void {
+    if (this.activeRequests[channel] !== controller) return;
 
-    this.activeRequest = null;
-    const next = this.takeQueuedMessage();
+    this.activeRequests[channel] = null;
+    this.pendingSteers[channel] = [];
+    this.settledSteerIds[channel].clear();
+    const next = this.takeQueuedMessage(channel);
     if (next) {
-      this.s.set({ pendingApproval: null, approvalResolving: false });
-      void this.sendMessage(next.text, next.skillName).then((accepted) => {
+      this.s.updateChannel(channel, { pendingApproval: null, approvalResolving: false });
+      void this.sendMessage(next.text, next.skillName, channel).then((accepted) => {
         if (accepted) return;
-        // The handoff was refused (a shell operation locked the input as the run ended).
-        // Requeue and go idle, otherwise the spinner would run forever with no request
-        // behind it. Push it back at the head, not through enqueueMessage: it already
-        // holds a queue slot, so re-entering the tail would reorder it behind whatever
-        // the user typed while the handoff was in flight — and if that filled the queue,
-        // the cap would drop it outright. Overshooting the cap by one beats losing it.
-        this.s.set({ queuedMessages: [next, ...this.s.queuedMessages] });
-        if (!this.activeRequest) this.goIdle();
+        const currentQueue = this.s.getChannelState(channel)?.queuedMessages ?? [];
+        this.s.updateChannel(channel, { queuedMessages: [next, ...currentQueue] });
+        if (!this.activeRequests[channel]) this.goIdle(channel);
       });
       return;
     }
-    this.goIdle();
+    this.goIdle(channel);
   }
 
-  private goIdle(): void {
-    this.s.set({
+  private goIdle(channel: ChatChannel = this.s.activeChannel): void {
+    this.s.updateChannel(channel, {
       pendingApproval: null,
       approvalResolving: false,
       busy: false,
@@ -923,11 +1242,12 @@ export class NodeBridge {
     });
   }
 
-  private takeQueuedMessage(): QueuedMessage | null {
-    const next = this.s.queuedMessages[0];
+  private takeQueuedMessage(channel: ChatChannel = this.s.activeChannel): QueuedMessage | null {
+    const chState = this.s.getChannelState(channel);
+    const next = chState?.queuedMessages[0];
     if (!next) return null;
 
-    this.s.set({ queuedMessages: this.s.queuedMessages.slice(1) });
+    this.s.updateChannel(channel, { queuedMessages: chState.queuedMessages.slice(1) });
     return next;
   }
 
@@ -936,26 +1256,28 @@ export class NodeBridge {
     currentSession: Session | null,
     text: string,
     signal: AbortSignal,
+    channel: ChatChannel = this.s.activeChannel,
   ): Promise<Session> {
     if (currentSession) return currentSession;
 
     const title = text.trim().split(/\n+/)[0]?.slice(0, 40) || "Smith Session";
-    const session = await createSession(baseUrl, title, this.s.selectedModelProfile, { signal });
+    const session =
+      channel === "side"
+        ? await createSideSession(baseUrl, this.s.getChannelState("main")?.session?.id ?? null, { title, signal })
+        : await createSession(baseUrl, title, this.s.selectedModelProfile, { signal });
     if (signal.aborted) {
       try {
         await deleteSession(baseUrl, session.id);
       } catch (error) {
-        // Best-effort cleanup of a cancelled first message. Swallowing it left
-        // an orphan session on the server that nothing ever mentioned; say so,
-        // because the user is the only one who can clear it.
-        this.s.pushSystemLine(
+        this.s.pushSystemLineForChannel(
+          channel,
           `Cancelled before the first reply; an empty session may remain on the server (${errorMessage(error)}).`,
           "error",
         );
       }
       throw signal.reason ?? new DOMException("The request was aborted.", "AbortError");
     }
-    this.s.set({ currentSession: session });
+    this.s.updateChannel(channel, { session });
     return session;
   }
 
@@ -965,6 +1287,7 @@ export class NodeBridge {
     text: string,
     skillName: string | undefined,
     signal: AbortSignal,
+    channel: ChatChannel = this.s.activeChannel,
   ): Promise<void> {
     const terminalStatus = await this.consumeStream(
       streamMessage(baseUrl, session.id, text, {
@@ -973,16 +1296,18 @@ export class NodeBridge {
         signal,
       }),
       signal,
+      channel,
     );
-    this.reportTerminalStatus(terminalStatus, signal);
+    this.reportTerminalStatus(terminalStatus, signal, channel);
   }
 
   private async streamResumedRun(baseUrl: string, runId: string, signal: AbortSignal): Promise<void> {
     const terminalStatus = await this.consumeStream(
       this.resetTranscriptWhenResumeStarts(streamRunResume(baseUrl, runId, { signal }), runId),
       signal,
+      "main",
     );
-    this.reportTerminalStatus(terminalStatus, signal);
+    this.reportTerminalStatus(terminalStatus, signal, "main");
   }
 
   private async *resetTranscriptWhenResumeStarts(
@@ -1015,20 +1340,47 @@ export class NodeBridge {
   private async consumeStream(
     events: AsyncIterable<StreamEvent>,
     signal: AbortSignal,
+    channel: ChatChannel = this.s.activeChannel,
   ): Promise<TerminalOutcome | null> {
     let terminalStatus: StreamTerminalStatus | null = null;
     let terminalReason: string | undefined;
-    const messageBatcher = createTextBatcher((batched) => this.s.applyEvent({ type: "message", text: batched }));
+    const messageBatcher = createTextBatcher((batched) =>
+      this.s.applyEventForChannel(channel, { type: "message", text: batched }),
+    );
     const provisionalBatcher = createProvisionalBatcher((provisionId, batched) =>
-      this.s.applyEvent({ type: "provisional_text_delta", provisionId, text: batched }),
+      this.s.applyEventForChannel(channel, { type: "provisional_text_delta", provisionId, text: batched }),
     );
 
     try {
       for await (const event of events) {
         if (signal.aborted) break;
         const status = applyBatchedStreamEvent(event, messageBatcher, provisionalBatcher, (next) =>
-          this.s.applyEvent(next),
+          this.s.applyEventForChannel(channel, next),
         );
+        if (event.type === "steering_applied" && event.steerIds.length > 0) {
+          const applied = new Set(event.steerIds);
+          for (const id of event.steerIds) this.settledSteerIds[channel].add(id);
+          this.pendingSteers[channel] = this.pendingSteers[channel].filter((item) => !applied.has(item.steerId));
+        }
+        if (event.type === "steering_deferred" && event.items.length > 0) {
+          const deferredIds = new Set(event.steerIds);
+          for (const id of event.steerIds) this.settledSteerIds[channel].add(id);
+          this.pendingSteers[channel] = this.pendingSteers[channel].filter((item) => !deferredIds.has(item.steerId));
+          let requeued = 0;
+          for (const item of event.items) {
+            if (this.forceEnqueueMessage(item.content, channel)) {
+              requeued += 1;
+            }
+          }
+          if (channel === this.s.activeChannel) {
+            this.s.set({
+              statusLine:
+                requeued > 0
+                  ? "Run finished before steer could apply; queued for next turn."
+                  : "Run finished before steer could apply; could not requeue empty steer.",
+            });
+          }
+        }
         if (status) {
           terminalStatus = status;
           terminalReason = event.type === "done" ? event.reason : undefined;
@@ -1050,22 +1402,32 @@ export class NodeBridge {
     return terminalStatus ? { status: terminalStatus, reason: terminalReason } : null;
   }
 
-  private reportTerminalStatus(terminal: TerminalOutcome | null, signal: AbortSignal): void {
+  private reportTerminalStatus(
+    terminal: TerminalOutcome | null,
+    signal: AbortSignal,
+    channel: ChatChannel = this.s.activeChannel,
+  ): void {
     if (signal.aborted) return;
     if (!terminal) throw new Error("SSE stream ended before completion.");
     if (terminal.status === "completed") {
-      this.s.set({ statusLine: "Ready. Type the next task or /help." });
+      if (channel === this.s.activeChannel) {
+        this.s.set({ statusLine: "Ready. Type the next task or /help." });
+      }
       return;
     }
 
     if (terminal.status === "incomplete" && terminal.reason === "awaiting_user_input") {
-      this.s.set({ statusLine: terminalStatusMessage(terminal.status, terminal.reason) });
+      if (channel === this.s.activeChannel) {
+        this.s.set({ statusLine: terminalStatusMessage(terminal.status, terminal.reason) });
+      }
       return;
     }
 
     const message = terminalStatusMessage(terminal.status, terminal.reason);
-    this.s.pushSystemLine(`[warning] ${message}`, "error");
-    this.s.set({ statusLine: message });
+    this.s.pushSystemLineForChannel(channel, `[warning] ${message}`, "error");
+    if (channel === this.s.activeChannel) {
+      this.s.set({ statusLine: message });
+    }
   }
 
   private async refreshSessions(
@@ -1081,23 +1443,31 @@ export class NodeBridge {
       if (!selectSession) return;
 
       const currentSession = sessions.find((item) => item.id === session.id);
-      if (currentSession) this.s.set({ currentSession });
+      if (currentSession) this.s.updateChannel("main", { session: currentSession });
     } catch (error) {
       if (signal.aborted) return;
-      this.s.pushSystemLine(`Session list unavailable: ${errorMessage(error)}`);
+      this.s.pushSystemLineForChannel("main", `Session list unavailable: ${errorMessage(error)}`);
     }
   }
 
-  private reportRequestError(error: unknown): void {
+  private reportRequestError(error: unknown, channel: ChatChannel = this.s.activeChannel): void {
     const message = errorMessage(error);
-    const pendingApproval = this.s.pendingApproval;
-    this.s.interruptTurn("error");
-    this.s.set({
+    const pendingApproval = this.s.getChannelState(channel)?.pendingApproval ?? null;
+    this.s.interruptTurnForChannel(channel, "error");
+    // M8: Read channel state AFTER interruptTurnForChannel so removing the
+    // approval notice does not overwrite the interrupted transcript with a
+    // stale pre-interrupt snapshot where tools still appear running.
+    const afterInterrupt = this.s.getChannelState(channel);
+    this.s.updateChannel(channel, {
       pendingApproval: null,
       approvalResolving: false,
-      ...(pendingApproval ? { transcript: removeApprovalNotice(this.s.transcript, pendingApproval.approvalId) } : {}),
+      ...(pendingApproval && afterInterrupt
+        ? { transcript: removeApprovalNotice(afterInterrupt.transcript, pendingApproval.approvalId) }
+        : {}),
     });
-    this.s.pushSystemLine(`[error] ${message}`, "error");
-    this.s.set({ statusLine: "Request failed. See the transcript for details." });
+    this.s.pushSystemLineForChannel(channel, `[error] ${message}`, "error");
+    if (channel === this.s.activeChannel) {
+      this.s.set({ statusLine: "Request failed. See the transcript for details." });
+    }
   }
 }

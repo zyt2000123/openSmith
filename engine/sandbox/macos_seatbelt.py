@@ -4,82 +4,70 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import os
-import re
-import stat
 import sys
 from collections.abc import Iterable
-from itertools import pairwise
 from pathlib import Path
 
-from .host import CommandResult, LocalExecutionEnvironment
+from .config import CacheMount, ResolvedSandboxProfile
+from .host import (
+    CommandResult,
+    LocalExecutionEnvironment,
+    detect_network_denied_hint,
+)
+from .policy import (
+    CREDENTIAL_CONFIG_FILES,
+    CREDENTIAL_DIRS,
+    PRIVATE_KEY_EXTENSIONS,
+    SANDBOX_EXTRA_CREDENTIAL_DIRS,
+    SSH_KEY_NAME_POSIX_ERE,
+    SSH_KEY_NAME_RE,
+    assert_no_control_characters,
+    build_sbpl_sensitive_deny_clauses,
+    is_hardlink_protected_path,
+    is_sensitive_path,
+    runtime_credential_paths,
+)
+from .preflight import HardlinkPreflightCache, check_hardlinks
 
 _SANDBOX_EXECUTABLE = "/usr/bin/sandbox-exec"
 _OPTIONAL_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
-_CREDENTIAL_DIRECTORIES = frozenset(
-    {".ssh", ".gnupg", ".aws", ".kube", ".agent-smith", ".docker"}
-)
-_CREDENTIAL_CONFIGS = frozenset({".npmrc", ".pypirc", ".netrc", ".git-credentials"})
-_PRIVATE_KEY_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx"})
-# An SSH-style private key keeps its shape when it is copied or rotated:
-# ``id_rsa_old``, ``backup-id_ed25519``.  Exact-name matching covered only the
-# pristine spelling, so the shell tool read a key that ``read_file`` refuses
-# without high-risk approval -- the weakest copy of a rule setting the real
-# security level, exactly as ``safety/tool_guard.py`` warns about this same
-# triplicated list.  Mirrors ``tool_guard._SENSITIVE_KEY_NAME_RE``; the sandbox
-# may not import the safety layer, so the shape is duplicated, not shared.
-#
-# Written as POSIX ERE (no ``(?:...)``): the identical source is embedded in
-# the Seatbelt profile below, which macOS compiles with regcomp.
-_PRIVATE_KEY_NAME_PATTERN = r"([^/]*[-_.])?id_(rsa|dsa|ecdsa|ed25519)([-_.][^/]*)?"
-_PRIVATE_KEY_NAME_RE = re.compile(rf"^{_PRIVATE_KEY_NAME_PATTERN}$")
-_PRIVATE_KEY_PROFILE_PLACEHOLDER = "__PRIVATE_KEY_NAME__"
-_DEFAULT_RUNTIME_SECRET_PATHS = (
-    Path.home() / ".agent-smith" / "config.yaml",
-    Path.home() / ".agent-smith" / "config.yml",
-    Path.home() / ".agent-smith" / "agent" / "config.yaml",
-    Path.home() / ".agent-smith" / "agent" / "config.yml",
-)
+_CREDENTIAL_DIRECTORIES = CREDENTIAL_DIRS | SANDBOX_EXTRA_CREDENTIAL_DIRS
+_CREDENTIAL_CONFIGS = CREDENTIAL_CONFIG_FILES
+_PRIVATE_KEY_SUFFIXES = frozenset(PRIVATE_KEY_EXTENSIONS)
+_PRIVATE_KEY_NAME_PATTERN = SSH_KEY_NAME_POSIX_ERE
+_PRIVATE_KEY_NAME_RE = SSH_KEY_NAME_RE
+_DEFAULT_RUNTIME_SECRET_PATHS = runtime_credential_paths()
 
 
 def _is_sensitive_data_path(path: Path) -> bool:
     """Whether shell access to this workspace-relative path is always denied."""
-    lowered_parts = tuple(part.lower() for part in path.parts)
-    name = path.name.lower()
-    pairs = tuple(pairwise(lowered_parts))
-    return (
-        any(part in _CREDENTIAL_DIRECTORIES for part in lowered_parts)
-        or any(
-            parent == ".config" and child in {"gh", "gcloud"} for parent, child in pairs
-        )
-        or ("library", "keychains") in pairs
-        or name == ".env"
-        or name.startswith(".env.")
-        or name in _CREDENTIAL_CONFIGS
-        or _PRIVATE_KEY_NAME_RE.fullmatch(name) is not None
-        or path.suffix.lower() in _PRIVATE_KEY_SUFFIXES
+    return is_sensitive_path(
+        path,
+        include_sandbox_extra=True,
+        include_env_templates=True,
     )
 
 
 def _is_hardlink_protected_path(path: Path) -> bool:
-    lowered_parts = tuple(part.lower() for part in path.parts)
-    return _is_sensitive_data_path(path) or ".git" in lowered_parts
+    return is_hardlink_protected_path(path)
 
 
 class MacOSSeatbeltEnvironment:
     """Run commands under a deny-by-default Seatbelt profile.
 
-    By default the workspace is the only writable location, credential data
-    and Git metadata remain protected, and network access is denied. A matching
-    approved host-command capability creates a copy with temporary host access
-    while still denying Agent-Smith runtime credential paths and inherited
-    service credentials. A preflight rejects hard-link aliases that a
-    path-based profile cannot distinguish. This backend fails closed on a
-    non-macOS host or when ``sandbox-exec`` is unavailable.
+    By default the workspace (plus any validated ``extra_roots`` and
+    ``cache_mounts``) are the only writable locations, credential data and Git
+    metadata remain protected, and outbound network access is denied. A
+    matching approved scope creates a copy with temporary elevated access while
+    still denying Agent-Smith runtime credential paths and non-delegable write
+    roots. A preflight rejects hard-link aliases that a path-based profile
+    cannot distinguish. This backend fails closed on a non-macOS host or when
+    ``sandbox-exec`` is unavailable.
     """
 
     name = "sandbox"
+    backend_id = "seatbelt"
 
     def __init__(
         self,
@@ -88,55 +76,78 @@ class MacOSSeatbeltEnvironment:
         runtime_secret_paths: Iterable[str | Path] | None = None,
         non_delegable_write_paths: Iterable[str | Path] = (),
         approved_host_access: bool = False,
+        profile: ResolvedSandboxProfile | None = None,
     ) -> None:
-        self._workspace = Path(workspace).expanduser().resolve()
-        if any(
-            ord(character) < 32 or ord(character) == 127
-            for character in str(self._workspace)
-        ):
-            raise ValueError("sandbox workspace path contains control characters")
+        if profile is not None:
+            self._workspace = profile.workspace
+            self._extra_roots: tuple[Path, ...] = profile.extra_roots
+            self._share_read_only: tuple[Path, ...] = profile.share_read_only
+            self._toolchain_read_only: frozenset[Path] = frozenset(
+                profile.toolchain_read_only
+            )
+            self._cache_mounts: tuple[CacheMount, ...] = profile.cache_mounts
+            self._path_entries: tuple[Path, ...] = profile.path_entries
+            self._default_network = profile.default_network
+            configured_secrets = (
+                profile.runtime_secret_paths
+                if runtime_secret_paths is None
+                else tuple(Path(p).expanduser().resolve() for p in runtime_secret_paths)
+            )
+            configured_non_delegable = (
+                tuple(non_delegable_write_paths)
+                if non_delegable_write_paths
+                else profile.non_delegable_write_paths
+            )
+        else:
+            self._workspace = Path(workspace).expanduser().resolve()
+            self._extra_roots = ()
+            self._share_read_only = ()
+            self._toolchain_read_only = frozenset()
+            self._cache_mounts = ()
+            self._path_entries = ()
+            self._default_network = "none"
+            configured_secrets = (
+                _DEFAULT_RUNTIME_SECRET_PATHS
+                if runtime_secret_paths is None
+                else tuple(Path(p).expanduser().resolve() for p in runtime_secret_paths)
+            )
+            configured_non_delegable = tuple(non_delegable_write_paths)
+
+        assert_no_control_characters(self._workspace, label="sandbox workspace path")
         if _is_hardlink_protected_path(self._workspace):
             raise ValueError(
                 f"sandbox workspace is inside a protected directory: {self._workspace}"
             )
-        configured_secrets = (
-            _DEFAULT_RUNTIME_SECRET_PATHS
-            if runtime_secret_paths is None
-            else tuple(runtime_secret_paths)
-        )
-        self._runtime_secret_paths = tuple(
-            Path(path).expanduser().resolve() for path in configured_secrets
-        )
-        if any(
-            ord(character) < 32 or ord(character) == 127
-            for path in self._runtime_secret_paths
-            for character in str(path)
-        ):
-            raise ValueError("runtime secret path contains control characters")
+        self._runtime_secret_paths = tuple(configured_secrets)
+        for path in self._runtime_secret_paths:
+            assert_no_control_characters(path, label="runtime secret path")
         self._non_delegable_write_paths = self._resolve_non_delegable_write_paths(
-            non_delegable_write_paths
+            configured_non_delegable
         )
         self._approved_host_access = approved_host_access
+        self._approved_network = approved_host_access
         self._host = LocalExecutionEnvironment()
-        # Cache of the last hardlink preflight, keyed by a cheap workspace
-        # fingerprint so unchanged workspaces skip the per-file walk.  The
-        # non-delegable write paths are part of the key because they change
-        # the preflight outcome independently of the filesystem.
-        self._hardlink_preflight_cache: (
-            tuple[str, tuple[Path, ...], str | None] | None
-        ) = None
+        self._preflight_cache = HardlinkPreflightCache()
+        self.last_result: CommandResult | None = None
+
+    @property
+    def _rw_workspace_roots(self) -> tuple[Path, ...]:
+        return (self._workspace, *self._extra_roots)
+
+    @property
+    def _all_writable_roots(self) -> tuple[Path, ...]:
+        return (
+            *self._rw_workspace_roots,
+            *(mount.host_path for mount in self._cache_mounts),
+        )
 
     @staticmethod
     def _resolve_non_delegable_write_paths(
         paths: Iterable[str | Path],
     ) -> tuple[Path, ...]:
         resolved = tuple(Path(path).expanduser().resolve() for path in paths)
-        if any(
-            ord(character) < 32 or ord(character) == 127
-            for path in resolved
-            for character in str(path)
-        ):
-            raise ValueError("non-delegable write path contains control characters")
+        for path in resolved:
+            assert_no_control_characters(path, label="non-delegable write path")
         return resolved
 
     def with_non_delegable_write_paths(
@@ -152,36 +163,43 @@ class MacOSSeatbeltEnvironment:
         scoped._non_delegable_write_paths = self._resolve_non_delegable_write_paths(
             paths
         )
+        scoped._preflight_cache = HardlinkPreflightCache()
         return scoped
 
     def with_approval_scope(self, scope: object) -> MacOSSeatbeltEnvironment:
-        """Return a one-call environment matching an exact approved host scope.
+        """Return a one-call environment matching an exact approved scope.
 
-        ToolRegistry calls this only after binding *scope* to a normalized call
-        and a broker-issued approval id. This method turns that verified
-        capability into an OS profile without mutating the default sandbox.
+        - ``sandbox_command``: keeps full filesystem isolation and loopback-only network.
+        - ``sandbox_network``: enables outbound network while keeping full filesystem
+          isolation, credential denies, and non-delegable write protection intact.
+        - ``host_command``: temporary host access while still denying runtime secrets
+          and non-delegable write paths.
         """
-        if not bool(getattr(scope, "grants_host_execution", False)):
-            return self
-        # Preserve subclasses used by alternate backends and contract tests.
-        # Reconstructing ``MacOSSeatbeltEnvironment`` directly would silently
-        # discard their instrumentation or additional execution controls.
         scoped = copy.copy(self)
-        scoped._approved_host_access = True
+        if bool(getattr(scope, "grants_host_execution", False)):
+            scoped._approved_host_access = True
+            scoped._approved_network = True
+        elif bool(getattr(scope, "grants_network_execution", False)):
+            scoped._approved_host_access = False
+            scoped._approved_network = True
+        else:
+            scoped._approved_host_access = False
+            scoped._approved_network = False
         return scoped
 
-    def _profile(self) -> str:
+    def _profile(self, *, network: bool = False) -> str:
+        allow_outbound = bool(network or self._approved_host_access)
+        runtime_denies = "\n".join(
+            "(deny file-read* file-write* "
+            f'(literal (param "RUNTIME_SECRET_{index}")))'
+            for index, _ in enumerate(self._runtime_secret_paths)
+        )
         protected_write_denies = "\n".join(
             "(deny file-write* "
-            f"(subpath (param \"NON_DELEGABLE_WRITE_{index}\")))"
+            f'(subpath (param "NON_DELEGABLE_WRITE_{index}")))'
             for index, _ in enumerate(self._non_delegable_write_paths)
         )
         if self._approved_host_access:
-            runtime_denies = "\n".join(
-                "(deny file-read* file-write* "
-                f"(literal (param \"RUNTIME_SECRET_{index}\")))"
-                for index, _ in enumerate(self._runtime_secret_paths)
-            )
             return f"""(version 1)
 (deny default)
 (import "system.sb")
@@ -191,105 +209,117 @@ class MacOSSeatbeltEnvironment:
 {runtime_denies}
 {protected_write_denies}
 """
-        # ``system.sb`` supplies the narrow macOS runtime grants needed by
-        # dynamically linked command-line programs.  The enclosing default
-        # deny still blocks arbitrary files, writes, and networking; the
-        # workspace grants below are the only project-data exception.
-        #
-        # WORKSPACE is passed with ``sandbox-exec -D`` rather than interpolated
-        # into this source.  ``regex-quote`` keeps every user-controlled path
-        # character out of the SBPL grammar and regex language.
-        profile = r"""(version 1)
-(deny default)
-(import "system.sb")
-(deny network*)
-(allow process*)
-(allow file-read* (literal "/private/var/select/sh"))
-(allow file-read-metadata (subpath "/bin"))
-(allow file-read-metadata (subpath "/usr/bin"))
-(allow file-read* (subpath "/Applications/Xcode.app"))
-(allow file-read* (subpath "/Library/Developer"))
-(allow file-read* (literal "/private/var/db/xcode_select_link"))
-(allow file-read-metadata (path-ancestors (param "WORKSPACE")))
-(allow file-read* (subpath (param "WORKSPACE")))
-(allow file-write* (subpath (param "WORKSPACE")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?\.env($|\..*)")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?\.(ssh|gnupg|aws|kube|agent-smith|docker)(/|$)")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?\.config/(gh|gcloud)(/|$)")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?Library/Keychains(/|$)")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/.*\.(pem|key|p12|pfx)$")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?__PRIVATE_KEY_NAME__$")))
-; Git metadata can embed credentials (e.g. URL-embedded in .git/config or a
-; repo-local credential store) and object files can contain committed
-; secrets, so every .git read except plain .gitignore files is denied.  The
-; explicit config/credentials rules keep the intent visible even though the
-; catch-all below subsumes them; .gitignore never matches "\.git(/|$)".
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?\.git/config$")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?\.git/credentials$")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?\.git(/|$)")))
-(deny file-read* file-write*
-    (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-        #"/(.*/)?\.(npmrc|pypirc|netrc|git-credentials)$")))
-"""
-        # One source for the private-key name shape: the Python check above and
-        # this profile drifted apart once already, and only the profile decides
-        # what the shell can actually open.
-        profile = profile.replace(
-            _PRIVATE_KEY_PROFILE_PLACEHOLDER, _PRIVATE_KEY_NAME_PATTERN
-        )
-        if protected_write_denies:
-            return f"{profile}{protected_write_denies}\n"
-        return profile
+        network_clauses: list[str]
+        if allow_outbound:
+            network_clauses = [
+                "(allow network*)",
+                # Restrict unix-socket connections away from host sockets outside workspace
+                "(deny network-outbound (remote unix-socket))",
+                '(allow network-outbound (remote unix-socket (subpath (param "WORKSPACE"))))',
+                '(allow network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")))',
+            ]
+        elif self._default_network == "none":
+            network_clauses = ["(deny network*)"]
+        else:
+            network_clauses = [
+                "(deny network*)",
+                '(allow network-bind (local ip "localhost:*"))',
+                '(allow network-inbound (local ip "localhost:*"))',
+                '(allow network-outbound (remote ip "localhost:*"))',
+                '(allow network-bind (local unix-socket (subpath (param "WORKSPACE"))))',
+                '(allow network-outbound (remote unix-socket (subpath (param "WORKSPACE"))))',
+            ]
 
-    def _is_non_delegable_write_path(self, path: Path) -> bool:
-        """Whether a workspace path is a protected runtime provider path."""
-        folded_path = Path(str(path).lower())
-        for root in self._non_delegable_write_paths:
-            try:
-                if folded_path.is_relative_to(Path(str(root).lower())):
-                    return True
-            except ValueError:
+        parts: list[str] = [
+            "(version 1)",
+            "(deny default)",
+            '(import "system.sb")',
+            *network_clauses,
+            "(allow process*)",
+            '(allow file-read* (literal "/private/var/select/sh"))',
+            '(allow file-read-metadata (subpath "/bin"))',
+            '(allow file-read-metadata (subpath "/usr/bin"))',
+            '(allow file-read* (subpath "/Applications/Xcode.app"))',
+            '(allow file-read* (subpath "/Library/Developer"))',
+            '(allow file-read* (literal "/private/var/db/xcode_select_link"))',
+            '(allow file-read-metadata (path-ancestors (param "WORKSPACE")))',
+            '(allow file-read* (subpath (param "WORKSPACE")))',
+            '(allow file-write* (subpath (param "WORKSPACE")))',
+        ]
+        if allow_outbound:
+            # Allow standard macOS TLS trust/resolver config reads when outbound
+            # network is explicitly approved, without exposing user $HOME.
+            parts.append('(allow file-read* (literal "/private/etc/resolv.conf"))')
+            parts.append('(allow file-read* (subpath "/private/etc/ssl"))')
+        for index, _ in enumerate(self._extra_roots):
+            param = f"EXTRA_ROOT_{index}"
+            parts.append(f'(allow file-read-metadata (path-ancestors (param "{param}")))')
+            parts.append(f'(allow file-read* (subpath (param "{param}")))')
+            parts.append(f'(allow file-write* (subpath (param "{param}")))')
+        for index, _ in enumerate(self._share_read_only):
+            param = f"SHARE_RO_{index}"
+            parts.append(f'(allow file-read-metadata (path-ancestors (param "{param}")))')
+            parts.append(f'(allow file-read* (subpath (param "{param}")))')
+        for index, _ in enumerate(self._cache_mounts):
+            param = f"CACHE_ROOT_{index}"
+            parts.append(f'(allow file-read-metadata (path-ancestors (param "{param}")))')
+            parts.append(f'(allow file-read* (subpath (param "{param}")))')
+            parts.append(f'(allow file-write* (subpath (param "{param}")))')
+
+        parts.append(build_sbpl_sensitive_deny_clauses("WORKSPACE").rstrip("\n"))
+        for index, _ in enumerate(self._extra_roots):
+            parts.append(
+                build_sbpl_sensitive_deny_clauses(f"EXTRA_ROOT_{index}").rstrip("\n")
+            )
+        for index, ro_path in enumerate(self._share_read_only):
+            # Apply sensitive-file deny rules only to user-configured share_read_only
+            # directories, NOT to auto-detected toolchain trees (/opt/homebrew, uv,
+            # pyenv, sys.prefix) which ship public CA bundles (*.pem) needed for TLS.
+            if ro_path in self._toolchain_read_only:
                 continue
-        return False
+            parts.append(
+                build_sbpl_sensitive_deny_clauses(f"SHARE_RO_{index}").rstrip("\n")
+            )
+        for index, _ in enumerate(self._cache_mounts):
+            parts.append(
+                build_sbpl_sensitive_deny_clauses(f"CACHE_ROOT_{index}").rstrip("\n")
+            )
+        if runtime_denies:
+            parts.append(runtime_denies)
+        if protected_write_denies:
+            parts.append(protected_write_denies)
+        return "\n".join(parts) + "\n"
 
     def _validate_cwd(self, cwd: str | None) -> tuple[str | None, str | None]:
         resolved = Path(cwd).expanduser().resolve() if cwd else self._workspace
         if self._approved_host_access:
             return str(resolved), None
-        try:
-            resolved.relative_to(self._workspace)
-        except ValueError:
-            return None, f"sandbox working directory escapes workspace: {resolved}"
-        return str(resolved), None
+        for root in self._rw_workspace_roots:
+            try:
+                resolved.relative_to(root)
+                return str(resolved), None
+            except ValueError:
+                continue
+        return None, f"sandbox working directory escapes workspace: {resolved}"
 
     def _safe_environment(self, requested: dict[str, str] | None) -> dict[str, str]:
         """Build the complete child environment; never inherit server secrets."""
+        path_value = (
+            os.pathsep.join(str(p) for p in self._path_entries)
+            if self._path_entries
+            else os.defpath
+        )
         environment = {
-            "PATH": os.defpath,
+            "PATH": path_value,
             "HOME": str(Path.home() if self._approved_host_access else self._workspace),
             "TMPDIR": str(self._workspace),
             "GIT_CONFIG_GLOBAL": os.devnull,
             "PIP_CONFIG_FILE": os.devnull,
             "NPM_CONFIG_USERCONFIG": os.devnull,
         }
+        for mount in self._cache_mounts:
+            for key, value in mount.env_vars:
+                environment[key] = value
         if requested:
             for key in _OPTIONAL_ENV_KEYS:
                 value = requested.get(key)
@@ -297,116 +327,14 @@ class MacOSSeatbeltEnvironment:
                     environment[key] = value
         return environment
 
-    def _workspace_fingerprint(self) -> str | None:
-        """Cheap digest of the workspace directory layout.
-
-        The hardlink preflight's outcome can only change when directory
-        entries change, which on APFS bumps the parent directory's mtime and
-        size (and ctime, which user code cannot forge).  Hashing those per
-        scanned directory costs one ``scandir`` plus one ``lstat`` per
-        directory instead of the preflight's ``lstat`` on every regular file,
-        and still invalidates the cache on any entry addition or removal.
-        Returns None when the workspace cannot be fully inspected, forcing the
-        full preflight to re-run (fail closed).
-        """
-        digest = hashlib.sha256()
-        pending = [self._workspace]
-        while pending:
-            root = pending.pop()
-            try:
-                metadata = os.lstat(root)
-            except OSError:
-                return None
-            digest.update(os.fsencode(root))
-            digest.update(str(metadata.st_mtime_ns).encode("ascii"))
-            digest.update(str(metadata.st_ctime_ns).encode("ascii"))
-            digest.update(str(metadata.st_size).encode("ascii"))
-            try:
-                with os.scandir(root) as entries:
-                    # Sort so traversal order does not leak into the digest.
-                    child_dirs = sorted(
-                        entry.path
-                        for entry in entries
-                        if entry.is_dir(follow_symlinks=False)
-                    )
-            except OSError:
-                return None
-            pending.extend(child_dirs)
-        return digest.hexdigest()
-
     def _sensitive_hardlink_error(self) -> str | None:
-        """Reject path aliases that a path-based Seatbelt profile cannot identify.
-
-        Two distinct aliases matter, and only these two:
-
-        * A link inside the workspace whose inode is also reachable at a
-          protected path (``.env``, ``.git/…``).  The profile denies the
-          protected *path*, but the alias reaches the same *inode*.
-        * A link whose inode has more references than the workspace accounts
-          for.  The extra reference is outside, and nothing here can prove what
-          it points at, so it fails closed.
-
-        A file with several plain links entirely inside the workspace is left
-        alone — that is what package stores and build caches produce, and
-        refusing it would disable shell for the whole workspace.
-        """
-        walk_errors: list[OSError] = []
-        # inode -> (paths seen inside the workspace, declared link count)
-        seen: dict[int, tuple[list[Path], int]] = {}
-
-        for root, directories, files in os.walk(
-            self._workspace,
-            followlinks=False,
-            onerror=walk_errors.append,
-        ):
-            root_path = Path(root)
-            directories[:] = [
-                name for name in directories if not (root_path / name).is_symlink()
-            ]
-            for name in files:
-                path = root_path / name
-                try:
-                    relative = path.relative_to(self._workspace)
-                    metadata = path.lstat()
-                except (OSError, ValueError):
-                    return (
-                        "sandbox protected-path preflight could not inspect workspace"
-                    )
-                if (
-                    stat.S_ISLNK(metadata.st_mode)
-                    or not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink <= 1
-                ):
-                    continue
-                paths, _ = seen.setdefault(metadata.st_ino, ([], metadata.st_nlink))
-                paths.append(relative)
-
-        if walk_errors:
-            return "sandbox protected-path preflight could not inspect workspace"
-
-        for paths, link_count in seen.values():
-            aliases = ", ".join(str(path) for path in sorted(paths, key=str))
-            protected = next(
-                (
-                    path
-                    for path in paths
-                    if _is_hardlink_protected_path(path)
-                    or self._is_non_delegable_write_path(self._workspace / path)
-                ),
-                None,
-            )
-            if protected is not None:
-                return (
-                    "sandbox refuses files with hard links to a protected path "
-                    f"({protected}): {aliases}"
-                )
-            if link_count > len(paths):
-                return (
-                    "sandbox refuses files with hard links reaching outside the "
-                    f"workspace: {aliases} (copy the file, or re-create it "
-                    "without hard links, to run shell here)"
-                )
-        return None
+        """Inspect all writable roots for unsafe hardlink aliases."""
+        return check_hardlinks(
+            self._rw_workspace_roots,
+            self._non_delegable_write_paths,
+            cache_roots=tuple(m.host_path for m in self._cache_mounts),
+            runtime_secret_paths=self._runtime_secret_paths,
+        )
 
     async def run_command(
         self,
@@ -416,76 +344,98 @@ class MacOSSeatbeltEnvironment:
         cwd: str | None = None,
         timeout_seconds: float = 30.0,
         env: dict[str, str] | None = None,
+        network: bool = False,
     ) -> CommandResult:
         if sys.platform != "darwin":
             return CommandResult(
-                exit_code=None, error="macOS Seatbelt is unavailable on this platform"
+                exit_code=None,
+                error="macOS Seatbelt is unavailable on this platform",
+                sandbox_backend="seatbelt",
             )
         if not os.path.isfile(_SANDBOX_EXECUTABLE) or not os.access(
             _SANDBOX_EXECUTABLE, os.X_OK
         ):
             return CommandResult(
-                exit_code=None, error="macOS sandbox-exec is unavailable"
+                exit_code=None,
+                error="macOS sandbox-exec is unavailable",
+                sandbox_backend="seatbelt",
             )
         if (command is None) == (argv is None):
             return CommandResult(
-                exit_code=None, error="exactly one of command or argv is required"
+                exit_code=None,
+                error="exactly one of command or argv is required",
+                sandbox_backend="seatbelt",
+            )
+        if not isinstance(network, bool):
+            return CommandResult(
+                exit_code=None,
+                error="network parameter must be a boolean",
+                sandbox_backend="seatbelt",
+            )
+        if network and not self._approved_network:
+            return CommandResult(
+                exit_code=None,
+                error="outbound network access requires an approved sandbox_network scope",
+                sandbox_backend="seatbelt",
             )
         resolved_cwd, error = self._validate_cwd(cwd)
         if error:
-            return CommandResult(exit_code=None, error=error)
-        # The preflight walks the whole workspace; on a large repository that
-        # is hundreds of milliseconds of stat calls, which must not block the
-        # event loop and stall every other request in the process.  Reuse the
-        # last result while a cheap directory-layout fingerprint is unchanged;
-        # any entry change (or an uninspectable workspace) re-runs the full
-        # walk, so the cache never weakens the fail-closed guarantee.
-        fingerprint = await asyncio.to_thread(self._workspace_fingerprint)
-        cached = self._hardlink_preflight_cache
-        if (
-            cached is not None
-            and fingerprint is not None
-            and cached[0] == fingerprint
-            and cached[1] == self._non_delegable_write_paths
-        ):
-            hardlink_error = cached[2]
-        else:
-            hardlink_error = await asyncio.to_thread(self._sensitive_hardlink_error)
-            if fingerprint is not None:
-                self._hardlink_preflight_cache = (
-                    fingerprint,
-                    self._non_delegable_write_paths,
-                    hardlink_error,
-                )
-        if hardlink_error:
-            return CommandResult(exit_code=None, error=hardlink_error)
+            return CommandResult(
+                exit_code=None,
+                error=error,
+                sandbox_backend="seatbelt",
+            )
 
+        hardlink_error = await asyncio.to_thread(
+            self._preflight_cache.check,
+            self._all_writable_roots,
+            self._non_delegable_write_paths,
+            walk_fn=self._sensitive_hardlink_error,
+        )
+        if hardlink_error:
+            return CommandResult(
+                exit_code=None,
+                error=hardlink_error,
+                sandbox_backend="seatbelt",
+            )
+
+        define_args: list[str] = ["-D", f"WORKSPACE={self._workspace}"]
+        for index, extra_root in enumerate(self._extra_roots):
+            define_args.extend(["-D", f"EXTRA_ROOT_{index}={extra_root}"])
+        for index, ro_root in enumerate(self._share_read_only):
+            define_args.extend(["-D", f"SHARE_RO_{index}={ro_root}"])
+        for index, mount in enumerate(self._cache_mounts):
+            define_args.extend(["-D", f"CACHE_ROOT_{index}={mount.host_path}"])
+        for index, runtime_secret_path in enumerate(self._runtime_secret_paths):
+            define_args.extend(["-D", f"RUNTIME_SECRET_{index}={runtime_secret_path}"])
+        for index, protected_path in enumerate(self._non_delegable_write_paths):
+            define_args.extend(
+                ["-D", f"NON_DELEGABLE_WRITE_{index}={protected_path}"]
+            )
+
+        effective_network = bool(network or self._approved_host_access)
         wrapped_argv = [
             _SANDBOX_EXECUTABLE,
-            "-D",
-            f"WORKSPACE={self._workspace}",
+            *define_args,
             "-p",
-            self._profile(),
+            self._profile(network=effective_network),
         ]
-        for index, runtime_secret_path in enumerate(self._runtime_secret_paths):
-            wrapped_argv[1:1] = ["-D", f"RUNTIME_SECRET_{index}={runtime_secret_path}"]
-        for index, protected_path in enumerate(self._non_delegable_write_paths):
-            wrapped_argv[1:1] = [
-                "-D",
-                f"NON_DELEGABLE_WRITE_{index}={protected_path}",
-            ]
         if command is not None:
-            # The execution environment is already constructed explicitly in
-            # ``_safe_environment``.  A login shell tries to load host startup
-            # files such as /etc/profile, which Seatbelt correctly denies and
-            # can also replace the minimal PATH before the command runs.
             wrapped_argv.extend(["/bin/sh", "-c", command])
         else:
             assert argv is not None
             wrapped_argv.extend(argv)
-        return await self._host.run_command(
+        result = await self._host.run_command(
             argv=wrapped_argv,
             cwd=resolved_cwd,
             timeout_seconds=timeout_seconds,
             env=self._safe_environment(env),
         )
+        result.sandbox_backend = "seatbelt"
+        result.network_used = effective_network
+        if not effective_network and result.exit_code not in (None, 0):
+            result.network_denied_hint = detect_network_denied_hint(
+                result.stdout, result.stderr
+            )
+        self.last_result = result
+        return result

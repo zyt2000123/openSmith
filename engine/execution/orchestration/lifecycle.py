@@ -28,6 +28,12 @@ from engine.execution.react.react_loop import (
     FailedAgentRunError,
     IncompleteAgentRunError,
 )
+from engine.execution.steering import (
+    STEERING_BROKER,
+    SteeringMessage,
+    format_steering_message,
+    use_steering_inbox,
+)
 from engine.llm.contracts import LLMResponseError
 from engine.llm.observability import generation_context, llm_purpose
 from engine.safety.approval import APPROVAL_BROKER, use_approval_context
@@ -617,6 +623,7 @@ async def _run_events_with_runtime(
     """Produce one complete run, including persistence and cleanup."""
     boundary = event_boundary or _RunEventBoundary(state_store, run_id)
     full_text: list[str] = []
+    applied_steering_texts: list[str] = list(request.steering_history or ())
     had_tools = False
     run_token_usage: dict[str, int] = {}
     terminal_status = "completed"
@@ -626,6 +633,7 @@ async def _run_events_with_runtime(
     state_dir: Path | None = None
     memory_persist_failed = False
     execution_stage = "runtime_prepare"
+    steering_inbox = STEERING_BROKER.open_run(run_id, runtime.session_id)
 
     def _terminal_event() -> ExecutionEvent:
         terminal_data: dict[str, object] = {"run_id": run_id, "status": terminal_status}
@@ -659,12 +667,27 @@ async def _run_events_with_runtime(
         if hasattr(s, "prompt_manifest"):
             await boundary.append_prompt_manifest(s.prompt_manifest)
         guard = FailureLoopGuard()
-        with use_fact_gate(_fact_gate_for_request(request, runtime, services)), use_approval_context(
-            APPROVAL_BROKER, run_id
-        ), generation_context(run_id=run_id, session_id=runtime.session_id), llm_purpose("main"):
+        initial_message = _merge_context(request.message, request.context)
+        if request.steering_history:
+            prior_steers = [
+                SteeringMessage(steer_id=f"resume_{i}", content=text, created_at="")
+                for i, text in enumerate(request.steering_history)
+                if isinstance(text, str) and text.strip()
+            ]
+            if prior_steers:
+                initial_message = (
+                    f"{initial_message}\n\n{format_steering_message(prior_steers)}"
+                )
+        with (
+            use_fact_gate(_fact_gate_for_request(request, runtime, services)),
+            use_approval_context(APPROVAL_BROKER, run_id),
+            use_steering_inbox(steering_inbox),
+            generation_context(run_id=run_id, session_id=runtime.session_id),
+            llm_purpose("main"),
+        ):
             async for event in run_agent_stream(
                 services.llm, s.system_prompt,
-                _merge_context(request.message, request.context),
+                initial_message,
                 services.tool_registry, services.skill_registry,
                 s.route, s.chain, guard,
                 tool_guard=services.tool_guard,
@@ -680,6 +703,12 @@ async def _run_events_with_runtime(
             ):
                 if event.type == EventType.TEXT_DELTA:
                     full_text.append(str(event.data.get("text", "")))
+                elif event.type == EventType.STEERING_APPLIED:
+                    items = event.data.get("items")
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict) and isinstance(item.get("content"), str):
+                                applied_steering_texts.append(item["content"])
                 elif event.type == EventType.INCOMPLETE:
                     terminal_status = "incomplete"
                     terminal_reason = str(event.data.get("reason", "agent_incomplete"))
@@ -708,9 +737,31 @@ async def _run_events_with_runtime(
                     had_tools = True
                 await boundary.record(event)
                 yield event
+        undrained = STEERING_BROKER.close_run(run_id)
+        if undrained:
+            deferred_event = ExecutionEvent(EventType.STEERING_DEFERRED, {
+                "steer_ids": [item.steer_id for item in undrained],
+                "items": [
+                    {"steer_id": item.steer_id, "content": item.content}
+                    for item in undrained
+                ],
+            })
+            await boundary.record(deferred_event)
+            yield deferred_event
         drained = True
     except Exception as exc:
         logger.exception("agent execution failed (agent=%s)", runtime.agent_id)
+        undrained = STEERING_BROKER.close_run(run_id)
+        if undrained:
+            deferred_event = ExecutionEvent(EventType.STEERING_DEFERRED, {
+                "steer_ids": [item.steer_id for item in undrained],
+                "items": [
+                    {"steer_id": item.steer_id, "content": item.content}
+                    for item in undrained
+                ],
+            })
+            await boundary.record(deferred_event)
+            yield deferred_event
         terminal_status = "failed"
         terminal_reason = "execution_error"
         terminal_error = _execution_error_details(
@@ -737,9 +788,19 @@ async def _run_events_with_runtime(
         cancellation: asyncio.CancelledError | None = None
         if (
             drained
+            and not request.ephemeral
             and state_dir is not None
             and terminal_status in {"completed", "incomplete", "failed"}
         ):
+            effective_user_message = request.message
+            if applied_steering_texts:
+                steering_suffix = "\n".join(
+                    f"- {text}" for text in applied_steering_texts if text.strip()
+                )
+                if steering_suffix:
+                    effective_user_message = (
+                        f"{request.message}\n\n[Mid-turn steering]\n{steering_suffix}"
+                    )
             try:
                 # This finally block runs after the stream's generation_context
                 # has exited, so re-enter it: memory compilation issues its own
@@ -748,7 +809,7 @@ async def _run_events_with_runtime(
                 with generation_context(run_id=run_id, session_id=runtime.session_id):
                     memory_persist_failed = not await asyncio.wait_for(
                         _persist_runtime_learning(
-                            state_dir, request.message, "".join(full_text), had_tools, services,
+                            state_dir, effective_user_message, "".join(full_text), had_tools, services,
                             terminal_status=terminal_status,
                             terminal_reason=terminal_reason,
                         ),
@@ -819,6 +880,7 @@ async def _run_events_with_runtime(
         finally:
             if ledger is not None:
                 services.tool_registry.bind_execution_ledger(None)
+            STEERING_BROKER.close_run(run_id)
             APPROVAL_BROKER.cancel_run(run_id)
         if cancellation is not None:
             if drained:

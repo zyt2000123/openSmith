@@ -544,6 +544,8 @@ function ShellContent({
 type ShellFooterProps = {
   mode: AppStore["mode"];
   panel: AppStore["panel"];
+  activeChannel: AppStore["activeChannel"];
+  backgroundChannel: AppStore["backgroundChannel"];
   busy: boolean;
   compressing: boolean;
   inputLocked: boolean;
@@ -735,10 +737,12 @@ function FooterInput(props: ShellFooterProps) {
   }
 
   const placeholder = footerPlaceholder(props);
+  const isSide = props.activeChannel === "side";
+  const borderColor = isSide ? INFO : props.busy ? ACCENT : BORDER;
   return (
     <>
-      <Box borderColor={props.busy ? ACCENT : BORDER} borderStyle="round" paddingX={1}>
-        <Text color={ACCENT}>{"❯ "}</Text>
+      <Box borderColor={borderColor} borderStyle="round" paddingX={1}>
+        <Text color={isSide ? INFO : ACCENT}>{isSide ? "side❯ " : "❯ "}</Text>
         <Composer
           value={props.inputValue}
           placeholder={placeholder}
@@ -757,11 +761,49 @@ function FooterInput(props: ShellFooterProps) {
   );
 }
 
+function SideChannelBanner({
+  activeChannel,
+  backgroundChannel,
+}: Pick<ShellFooterProps, "activeChannel" | "backgroundChannel">) {
+  if (activeChannel === "side") {
+    const mainApproval = Boolean(backgroundChannel?.pendingApproval);
+    const mainBusy = Boolean(backgroundChannel?.busy);
+    return (
+      <Box paddingX={1}>
+        <Text color={INFO} bold>
+          {"[SIDE · read-only"}
+        </Text>
+        {mainApproval ? (
+          <Text color={ERROR} bold>
+            {" · Main: ⚠ Approval needed (/back)"}
+          </Text>
+        ) : mainBusy ? (
+          <Text color={ACCENT}>{" · Main: ● running"}</Text>
+        ) : (
+          <Text color={MUTED}>{" · Main: idle"}</Text>
+        )}
+        <Text color={MUTED}>{" · /back | /promote]"}</Text>
+      </Box>
+    );
+  }
+  if (backgroundChannel !== null) {
+    return (
+      <Box paddingX={1}>
+        <Text color={INFO}>
+          {backgroundChannel.busy ? "[Side chat: ● running · /side or Ctrl+\\]" : "[Side chat open · /side or Ctrl+\\]"}
+        </Text>
+      </Box>
+    );
+  }
+  return null;
+}
+
 function ShellFooter(props: ShellFooterProps) {
   if (props.mode === "boot") return null;
 
   return (
     <>
+      <SideChannelBanner activeChannel={props.activeChannel} backgroundChannel={props.backgroundChannel} />
       <FooterStatus compressing={props.compressing} busy={props.busy} statusLine={props.statusLine} />
       <SkillIndicator skill={props.pendingSkill} />
       <QueuePreview items={props.queuedMessages} />
@@ -837,17 +879,45 @@ async function submitWhileBusy(
   slashMenuOpen: boolean,
   slashItems: SlashItem[],
   slashIndex: number,
+  exit: () => void,
 ): Promise<void> {
+  if (input === "/back" || input === "/side" || input.startsWith("/side ") || input === "/promote" || input.startsWith("/promote ")) {
+    rememberSubmittedInput(input);
+    await runShellCommand(input, { bridge, exit, getState, workingDir: PROJECT_CWD });
+    return;
+  }
+  if (input.startsWith("/queue")) {
+    const queuedPrompt = input.slice("/queue".length).trim();
+    if (!queuedPrompt) {
+      getState().set({ statusLine: "Usage: /queue <message>" });
+      return;
+    }
+    if (!bridge.enqueueMessage(queuedPrompt, skill?.name)) return;
+    rememberSubmittedInput(input);
+    if (skill) getState().set({ pendingSkill: null });
+    return;
+  }
   if (input.startsWith("/")) {
     if (!completeSlashSelection(input, slashMenuOpen, slashItems, slashIndex)) {
       getState().set({ statusLine: `${input} is unavailable while Smith is working. Press Esc to cancel the run.` });
     }
     return;
   }
-  if (!bridge.enqueueMessage(payload, skill?.name)) return;
+  if (skill) {
+    if (!bridge.enqueueMessage(payload, skill.name)) return;
+    rememberSubmittedInput(input);
+    getState().set({ pendingSkill: null });
+    return;
+  }
 
+  // M7: Clear composer and record history BEFORE awaiting the steer network
+  // round-trip so pressing Enter again or falling back to sendMessage cannot
+  // duplicate or stall clearing the input.
   rememberSubmittedInput(input);
-  if (skill) getState().set({ pendingSkill: null });
+  const accepted = await bridge.steerMessage(payload);
+  if (!accepted && !getState().inputValue) {
+    getState().set({ inputValue: input });
+  }
 }
 
 async function submitSlashCommand(
@@ -906,7 +976,7 @@ async function submitChat(
   }
 
   if (busy) {
-    await submitWhileBusy(input, payload, skill, slashMenuOpen, slashItems, slashIndex);
+    await submitWhileBusy(input, payload, skill, slashMenuOpen, slashItems, slashIndex, exit);
     return;
   }
 
@@ -969,6 +1039,8 @@ function SmithApp() {
 
   const mode = useS((state) => state.mode);
   const panel = useS((state) => state.panel);
+  const activeChannel = useS((state) => state.activeChannel);
+  const backgroundChannel = useS((state) => state.backgroundChannel);
   const busy = useS((state) => state.busy);
   const compressing = useS((state) => state.compressing);
   const inputLocked = useS((state) => state.inputLocked);
@@ -1168,6 +1240,8 @@ function SmithApp() {
       {panel !== "tokens" && panel !== "runs" ? (
         <Box flexDirection="column" paddingBottom={1} paddingX={2}>
           <ShellFooter
+            activeChannel={activeChannel}
+            backgroundChannel={backgroundChannel}
             activeSetupField={activeSetupField}
             approvalIndex={approvalIndex}
             baseUrl={baseUrl}

@@ -112,6 +112,8 @@ async def run_pipeline(
     # mapping survives a gate-driven retry of that node, but is discarded when
     # a backtrack re-runs an earlier portion of the chain.
     fallback_reasons: dict[int, str] = {}
+    from engine.execution.steering import SteeringMessage, format_steering_message
+    accumulated_steers: list[SteeringMessage] = []
 
     while node_idx < len(chain.nodes):
         node = chain.nodes[node_idx]
@@ -169,6 +171,14 @@ async def run_pipeline(
                     skill_context[CTX_RUBRIC_FEEDBACK] = skill_context[CTX_RETRY_HINT]
                 elif attempt == 2:
                     skill_context[CTX_RUBRIC_FEEDBACK] = "Switch strategy: try a completely different approach."
+                node_messages = (
+                    [
+                        *base_messages,
+                        {"role": "user", "content": format_steering_message(accumulated_steers)},
+                    ]
+                    if accumulated_steers
+                    else base_messages
+                )
                 if fallback_reason is not None:
                     event_stream = execute_react_fallback_events(
                         node.skill_name,
@@ -176,7 +186,7 @@ async def run_pipeline(
                         node.instructions,
                         llm,
                         node_tool_registry,
-                        base_messages,
+                        node_messages,
                         skill_context,
                         max_react_iters,
                         tool_guard=tool_guard,
@@ -200,7 +210,7 @@ async def run_pipeline(
                             ),
                         )
                     event_stream = execute_skill_events(
-                        skill, llm, node_tool_registry, base_messages, skill_context,
+                        skill, llm, node_tool_registry, node_messages, skill_context,
                         max_react_iters, tool_guard=tool_guard, provisional_lifecycle=False,
                         react_event_loop_fn=react_event_loop,
                         prefix_cache_key=prefix_cache_key,
@@ -216,6 +226,18 @@ async def run_pipeline(
                         if isinstance(event, _NodeResult):
                             result = event
                         else:
+                            if event.type is EventType.STEERING_APPLIED:
+                                raw_items = event.data.get("items")
+                                if isinstance(raw_items, list):
+                                    for item in raw_items:
+                                        if isinstance(item, dict) and isinstance(item.get("content"), str) and item["content"].strip():
+                                            accumulated_steers.append(
+                                                SteeringMessage(
+                                                    steer_id=str(item.get("steer_id") or ""),
+                                                    content=item["content"],
+                                                    created_at="",
+                                                )
+                                            )
                             yield event
                 except Exception as exc:
                     if fallback_reason is not None:

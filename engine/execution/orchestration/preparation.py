@@ -24,11 +24,16 @@ from engine.execution.routing.task_router import route_task
 from engine.execution.runtime_control import initial_runtime_control_prompt
 from engine.identity import IdentityCatalog, IdentitySpec, RouteDecision
 from engine.safety.eval_guard import EVAL_SENSITIVE_GUIDANCE, detect_eval_sensitive
-from engine.sandbox import MacOSSeatbeltEnvironment
+from engine.sandbox import (
+    SandboxProfileConfig,
+    create_sandbox_environment,
+    resolve_sandbox_profile,
+)
 from engine.tool.registry import ToolRegistry
 
 from .builtin_tools import (
     bind_memory_ops_tool,
+    bind_sensitive_rule_tools,
     bind_skill_load_tool,
     bind_skill_manage_tool,
     bind_snapshot_tools,
@@ -227,6 +232,22 @@ def _route_grill_me_entry(
     return None
 
 
+async def _load_global_sandbox_config(runtime: RuntimeContext) -> SandboxProfileConfig:
+    """Load user-level ``sandbox:`` config exclusively from ``~/.agent-smith/config.yaml``.
+
+    Never loads sandbox mounts from the project working directory so an
+    untrusted repository cannot widen its own sandbox boundaries.
+    """
+    from common.yaml_utils import load_yaml
+
+    data_dir = runtime.profile_dir.parent
+    global_cfg = load_yaml(data_dir / "config.yaml")
+    if not isinstance(global_cfg, dict):
+        return SandboxProfileConfig()
+    raw_sandbox = global_cfg.get("sandbox")
+    return SandboxProfileConfig.from_mapping(raw_sandbox)
+
+
 async def _load_profile_config(runtime: RuntimeContext) -> dict:
     from common.yaml_utils import load_yaml
 
@@ -239,6 +260,8 @@ async def _register_mcp_tools(
     profile_config: dict,
     runtime: RuntimeContext,
     services: RuntimeServices,
+    *,
+    vault_store=None,
 ) -> None:
     from engine.mcp.config import register_configured_mcp_tools
 
@@ -248,6 +271,7 @@ async def _register_mcp_tools(
         agent_id=runtime.agent_id,
         tool_registry=services.tool_registry,
         session_pool=services.mcp_session_pool,
+        vault_store=vault_store,
     )
     services.mcp_clients.extend(registration.clients)
 
@@ -306,26 +330,60 @@ async def prepare_runtime(
     identity = route.identity
 
     provider_dir = runtime.agents_dir / "tools"
+    sandbox_config = await _load_global_sandbox_config(runtime)
+    sandbox_profile = resolve_sandbox_profile(
+        working_dir,
+        sandbox_config,
+        non_delegable_write_paths=[provider_dir],
+        data_dir=runtime.profile_dir.parent,
+    )
+    if sandbox_profile.warnings:
+        for warning in sandbox_profile.warnings:
+            logger.warning("sandbox profile warning: %s", warning)
+
     if services.tool_guard is not None:
-        services.tool_guard.set_working_directory(working_dir)
+        services.tool_guard.set_working_directory(
+            working_dir, extra_roots=sandbox_profile.extra_roots
+        )
         services.tool_guard.set_non_delegable_write_roots([provider_dir])
 
     services.tool_registry.load_builtin_providers(provider_dir)
     services.tool_registry.bind_working_directory(working_dir)
-    if sys.platform == "darwin":
-        environment = MacOSSeatbeltEnvironment(workspace=working_dir)
-        services.tool_registry.bind_execution_environment(
-            environment.with_non_delegable_write_paths([provider_dir])
+    sandbox_env = create_sandbox_environment(sandbox_profile)
+    services.tool_registry.bind_execution_environment(sandbox_env)
+    if services.tool_guard is not None:
+        services.tool_guard.set_sandbox_degraded(
+            bool(getattr(sandbox_env, "is_degraded", False))
+        )
+        services.tool_guard.set_sandbox_host_loopback(
+            getattr(sandbox_env, "backend_id", "") == "seatbelt"
+            and sandbox_profile.default_network == "loopback_only"
         )
     bind_snapshot_tools(services, runtime.session_id)
     bind_memory_ops_tool(services, state_dir)
     bind_todo_tool(services, state_dir, runtime.session_id)
+    bind_sensitive_rule_tools(services)
     # Bound before the enabled-tools allowlist is computed: an empty or
     # malformed catalog hides the tool, and a hidden tool must not then be
     # re-enabled by config.
     bind_sub_agent_tool(services, runtime.agents_dir)
     profile_config = await _load_profile_config(runtime)
-    await _register_mcp_tools(profile_config, runtime, services)
+
+    # Load declarative safety rules, session taint store, and local vault store.
+    # Invalid safety rules fail closed here before any tool can execute.
+    from common.vault import VaultStore
+    from engine.safety.rules import SafetyConfig
+    from engine.safety.taint import SessionTaintStore
+
+    safety_config = SafetyConfig.from_profile_config(profile_config)
+    taint_store = SessionTaintStore(
+        state_dir=state_dir,
+        session_id=runtime.session_id,
+    )
+    vault_store = VaultStore(runtime.profile_dir.parent / "vault.json")
+    services.tool_registry.bind_vault_store(vault_store)
+
+    await _register_mcp_tools(profile_config, runtime, services, vault_store=vault_store)
 
     unknown_tools = services.tool_registry.set_enabled(
         enabled_tools_from_config(profile_config, services.tool_registry, identity)
@@ -336,9 +394,24 @@ async def prepare_runtime(
             runtime.agent_id,
             ", ".join(sorted(set(unknown_tools))),
         )
+    if request.read_only_tools:
+        read_only_names = [
+            defn.name
+            for defn in services.tool_registry.list_tools()
+            if defn.permission_level == "read"
+            and defn.side_effect == "none"
+            and not defn.is_write_tool
+            and not defn.hidden
+        ]
+        services.tool_registry.set_enabled(read_only_names)
 
     if services.tool_guard is not None:
         services.tool_guard.bind_definitions(services.tool_registry.definitions())
+        services.tool_guard.configure_safety(
+            safety_config,
+            taint_store=taint_store,
+            vault_store=vault_store,
+        )
     services.tool_registry.bind_tool_guard(services.tool_guard)
 
     profile_skills = runtime.profile_dir / "skills"
@@ -401,11 +474,15 @@ async def prepare_runtime(
     eval_guidance = (
         EVAL_SENSITIVE_GUIDANCE if detect_eval_sensitive(request.message) else ""
     )
+    runtime_ctx = _runtime_prompt_context(runtime, identity)
+    vault_summary = vault_store.prompt_summary()
+    if vault_summary:
+        runtime_ctx["Available vault keys"] = vault_summary
     prompt_assembly = PromptAssembler().assemble_detailed(
         runtime.profile_dir,
         services.tool_registry,
         services.skill_registry,
-        _runtime_prompt_context(runtime, identity),
+        runtime_ctx,
         working_dir=working_dir,
         memory_text=memory_text,
         runtime_guidance=identity.prompt,

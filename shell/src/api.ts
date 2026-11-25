@@ -65,6 +65,9 @@ export type Session = {
   last_message_at?: string | null;
   message_count: number;
   model_profile?: string | null;
+  session_kind?: "main" | "side";
+  parent_session_id?: string | null;
+  snapshot_cutoff_message_id?: string | null;
 };
 
 export type SkillSummary = {
@@ -166,6 +169,33 @@ export type ApprovalPresentation = {
   reason: string;
 };
 
+export type DoctorCheck = {
+  id: string;
+  category: string;
+  status: "pass" | "warn" | "fail" | "skip";
+  summary: string;
+  detail?: string;
+  code?: string;
+  remediation?: string;
+};
+
+export type DoctorReport = {
+  ok: boolean;
+  platform: string;
+  cwd: string;
+  sandbox_backend: string;
+  fallback_policy: string;
+  checks: DoctorCheck[];
+  duration_ms: number;
+};
+
+export type ApprovalScope = {
+  kind: string;
+  target: string;
+  access: string[];
+  high_risk?: boolean;
+};
+
 export type PendingApproval = {
   runId: string;
   approvalId: string;
@@ -174,6 +204,31 @@ export type PendingApproval = {
   reason: string;
   arguments: Record<string, unknown>;
   presentation?: ApprovalPresentation;
+  risk?: string;
+  ruleId?: string;
+  taintSources?: string[];
+  repeatCount?: number;
+  scope?: ApprovalScope;
+};
+
+export type SteerItem = {
+  steerId: string;
+  content: string;
+};
+
+export type SteerStatus =
+  | "injected"
+  | "queued_while_waiting_approval"
+  | "no_active_run"
+  | "run_mismatch"
+  | "inbox_full";
+
+export type SteerResult = {
+  accepted: boolean;
+  status: SteerStatus;
+  run_id: string | null;
+  steer_id: string | null;
+  pending_count: number;
 };
 
 export type StreamEvent =
@@ -185,6 +240,8 @@ export type StreamEvent =
   | { type: "provisional_text_delta"; provisionId: string; text: string }
   | { type: "provisional_commit"; provisionId: string }
   | { type: "provisional_retract"; provisionId: string; reason: string }
+  | { type: "steering_applied"; steerIds: string[]; count: number; items: SteerItem[]; iteration: number }
+  | { type: "steering_deferred"; steerIds: string[]; items: SteerItem[] }
   | { type: "thinking"; text: string; done: boolean }
   | { type: "tool_call"; id: string; name: string; hint: string }
   | { type: "tool_result"; id: string; error: boolean; blocked: boolean; preflight: boolean; summary: string }
@@ -450,6 +507,14 @@ export type RunImprovementProposal = {
   approval_required: boolean;
 };
 
+export async function runDoctorProbe(baseUrl: string, cwd?: string): Promise<DoctorReport> {
+  const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+  return request<DoctorReport>(baseUrl, `/api/agent/doctor/probe${query}`, {
+    method: "POST",
+    timeoutMs: 60_000,
+  });
+}
+
 export async function getObservabilityHealth(baseUrl: string): Promise<AgentHealth> {
   return request<AgentHealth>(baseUrl, "/api/agent/observability/health");
 }
@@ -479,6 +544,39 @@ export async function createSession(
   return request<Session>(baseUrl, "/api/agent/sessions", {
     method: "POST",
     body: { title, ...(modelProfile ? { model_profile: modelProfile } : {}) },
+    signal: options.signal,
+  });
+}
+
+export async function createSideSession(
+  baseUrl: string,
+  parentSessionId?: string | null,
+  options: { title?: string; reuseExisting?: boolean; signal?: AbortSignal } = {},
+): Promise<Session> {
+  const pathname = parentSessionId
+    ? `/api/agent/sessions/${encodeURIComponent(parentSessionId)}/side`
+    : "/api/agent/sessions/side";
+  return request<Session>(baseUrl, pathname, {
+    method: "POST",
+    body: {
+      ...(options.title ? { title: options.title } : {}),
+      reuse_existing: options.reuseExisting ?? true,
+    },
+    signal: options.signal,
+  });
+}
+
+export async function promoteSideSession(
+  baseUrl: string,
+  sideSessionId: string,
+  options: { title?: string; keepParentContext?: boolean; signal?: AbortSignal } = {},
+): Promise<Session> {
+  return request<Session>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sideSessionId)}/promote`, {
+    method: "POST",
+    body: {
+      ...(options.title ? { title: options.title } : {}),
+      keep_parent_context: options.keepParentContext ?? true,
+    },
     signal: options.signal,
   });
 }
@@ -610,10 +708,53 @@ export async function getRun(baseUrl: string, runId: string): Promise<RunState> 
   return request<RunState>(baseUrl, `/api/agent/runs/${encodeURIComponent(runId)}`);
 }
 
-export async function deleteSession(baseUrl: string, sessionId: string): Promise<void> {
-  await request<void>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}`, {
+export async function deleteSession(
+  baseUrl: string,
+  sessionId: string,
+  options: { expectedKind?: "main" | "side" } = {},
+): Promise<void> {
+  const query = options.expectedKind ? `?expected_kind=${encodeURIComponent(options.expectedKind)}` : "";
+  await request<void>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}${query}`, {
     method: "DELETE",
   });
+}
+
+export async function steerSession(
+  baseUrl: string,
+  sessionId: string,
+  content: string,
+  runId?: string | null,
+): Promise<SteerResult> {
+  const authHeaders = await localAuthHeaders();
+  const timeout = createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(buildUrl(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}/steer`), {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...authHeaders,
+      },
+      signal: timeout.signal,
+      body: JSON.stringify({ content, ...(runId ? { run_id: runId } : {}) }),
+    });
+
+    if (response.status === 409) {
+      return (await response.json()) as SteerResult;
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HTTP ${response.status}: ${terminalText(text || response.statusText)}`);
+    }
+
+    return (await response.json()) as SteerResult;
+  } catch (error) {
+    if (timeout.didTimeout()) throw timeoutError(DEFAULT_REQUEST_TIMEOUT_MS);
+    throw error;
+  } finally {
+    timeout.dispose();
+  }
 }
 
 type StreamOptions = {
@@ -753,6 +894,33 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
   run_started: (payload) => ({ type: "run_started", runId: String(payload.run_id ?? "") }),
   approval_required: (payload) => {
     const presentation = approvalPresentation(payload);
+    const rawRisk = typeof payload.risk === "string" && payload.risk ? sanitizeTerminalText(payload.risk) : undefined;
+    const rawRuleId =
+      typeof payload.rule_id === "string" && payload.rule_id ? sanitizeTerminalText(payload.rule_id) : undefined;
+    const rawTaint = Array.isArray(payload.taint_sources)
+      ? payload.taint_sources
+          .filter((item): item is string => typeof item === "string" && item.length > 0)
+          .map((item) => sanitizeTerminalText(item))
+      : undefined;
+    const rawRepeat =
+      typeof payload.repeat_count === "number" && Number.isFinite(payload.repeat_count) && payload.repeat_count >= 2
+        ? payload.repeat_count
+        : undefined;
+    const rawScope =
+      payload.scope && typeof payload.scope === "object" && !Array.isArray(payload.scope)
+        ? (payload.scope as Record<string, unknown>)
+        : undefined;
+    const scope: ApprovalScope | undefined =
+      rawScope && typeof rawScope.kind === "string"
+        ? {
+            kind: sanitizeTerminalText(rawScope.kind),
+            target: sanitizeUnknownText(rawScope.target),
+            access: Array.isArray(rawScope.access)
+              ? rawScope.access.filter((a): a is string => typeof a === "string").map(sanitizeTerminalText)
+              : [],
+            ...(typeof rawScope.high_risk === "boolean" ? { high_risk: rawScope.high_risk } : {}),
+          }
+        : undefined;
     return {
       type: "approval_required",
       runId: String(payload.run_id ?? ""),
@@ -762,6 +930,11 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
       reason: sanitizeUnknownText(payload.reason).slice(0, 500) || "Approval required",
       arguments: objectPayload(payload.arguments),
       ...(presentation ? { presentation } : {}),
+      ...(rawRisk ? { risk: rawRisk } : {}),
+      ...(rawRuleId ? { ruleId: rawRuleId } : {}),
+      ...(rawTaint?.length ? { taintSources: rawTaint } : {}),
+      ...(rawRepeat !== undefined ? { repeatCount: rawRepeat } : {}),
+      ...(scope ? { scope } : {}),
     };
   },
   provisional_text_delta: (payload) => ({
@@ -778,6 +951,42 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     provisionId: String(payload.provision_id ?? ""),
     reason: sanitizeUnknownText(payload.reason),
   }),
+  steering_applied: (payload) => {
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    const items: SteerItem[] = rawItems.flatMap((entry) => {
+      const item = objectPayload(entry);
+      const steerId = String(item.steer_id ?? "");
+      const content = sanitizeUnknownText(item.content).trim();
+      return content ? [{ steerId, content }] : [];
+    });
+    const steerIds = Array.isArray(payload.steer_ids)
+      ? payload.steer_ids.map((id) => String(id))
+      : items.map((item) => item.steerId);
+    return {
+      type: "steering_applied",
+      steerIds,
+      count: finiteNumber(payload.count, items.length),
+      items,
+      iteration: finiteNumber(payload.iteration, 0),
+    };
+  },
+  steering_deferred: (payload) => {
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    const items: SteerItem[] = rawItems.flatMap((entry) => {
+      const item = objectPayload(entry);
+      const steerId = String(item.steer_id ?? "");
+      const content = sanitizeUnknownText(item.content).trim();
+      return content ? [{ steerId, content }] : [];
+    });
+    const steerIds = Array.isArray(payload.steer_ids)
+      ? payload.steer_ids.map((id) => String(id))
+      : items.map((item) => item.steerId);
+    return {
+      type: "steering_deferred",
+      steerIds,
+      items,
+    };
+  },
   thinking: (payload) => ({
     type: "thinking",
     text: sanitizeUnknownText(payload.text),

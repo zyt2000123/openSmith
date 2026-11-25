@@ -553,3 +553,76 @@ class ConfigService:
         result = self.get_llm_config()
         result["status"] = "ok"
         return result
+
+    def get_sandbox_config(self) -> dict[str, Any]:
+        """Return the validated user-level sandbox configuration."""
+        from engine.sandbox import SandboxProfileConfig
+
+        cfg = self._load_config()
+        raw = cfg.get("sandbox")
+        try:
+            parsed = SandboxProfileConfig.from_mapping(raw)
+        except ValueError as exc:
+            self._invalid(str(exc))
+        return parsed.to_dict()
+
+    def set_sandbox_config(self, *, updates: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate and persist patch updates to the user-level ``sandbox:`` block."""
+        from engine.sandbox import SandboxProfileConfig
+        from engine.sandbox.policy import validate_configured_root
+
+        cfg = self._load_config()
+        existing = self._mapping(cfg.get("sandbox"), "sandbox configuration")
+        merged = dict(existing)
+        for key, value in updates.items():
+            if value is None:
+                merged.pop(key, None)
+            elif key == "cache_roots" and isinstance(value, Mapping):
+                current_caches = dict(
+                    self._mapping(merged.get("cache_roots"), "sandbox.cache_roots")
+                )
+                for ck, cv in value.items():
+                    if cv is None:
+                        current_caches.pop(ck, None)
+                    else:
+                        current_caches[ck] = cv
+                merged["cache_roots"] = current_caches
+            else:
+                merged[key] = value
+        try:
+            validated = SandboxProfileConfig.from_mapping(merged)
+        except ValueError as exc:
+            self._invalid(str(exc))
+
+        # L7: Pre-validate configured roots before saving so broad/credential
+        # paths (e.g. '/', '~', '~/.ssh', '~/.agent-smith') return 422 instead
+        # of persisting and being silently skipped at runtime.
+        data_dir = self._resolved_config_path().parent
+        path_checks: list[tuple[str, str]] = [
+            *((p, "extra_root") for p in validated.extra_roots),
+            *((p, "share_read_only") for p in validated.share_read_only),
+        ]
+        for raw_val in validated.cache_roots.values():
+            items = raw_val if isinstance(raw_val, list) else [raw_val]
+            for p in items:
+                path_checks.append((p, "cache_root"))
+        for raw_path, role in path_checks:
+            try:
+                _, err = validate_configured_root(
+                    raw_path,
+                    role=role,
+                    data_dir=data_dir,
+                )
+            except ValueError as exc:
+                self._invalid(str(exc))
+            if err and "[SANDBOX_CONFIG_PATH_REJECTED]" in err:
+                self._invalid(err)
+
+        cfg["sandbox"] = validated.to_dict()
+        try:
+            save_yaml(self._resolved_config_path(), cfg)
+        except YamlConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result = validated.to_dict()
+        result["status"] = "ok"
+        return result

@@ -19,6 +19,7 @@ from typing import Any
 TOOL_META = {
     "name": "memory_ops",
     "hidden": True,
+    "reads_private_data": True,
     "description": (
         "Memory operations: search memories, record structured evidence candidates, "
         "Plans and Todo items are session state, not memory."

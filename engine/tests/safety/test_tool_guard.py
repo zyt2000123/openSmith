@@ -624,7 +624,7 @@ def test_dangerous_command_becomes_high_risk_approval_not_a_policy_denial():
     assert result.needs_confirmation
     assert result.level is PermissionLevel.DESTRUCTIVE
     assert result.approval_scope is not None
-    assert result.approval_scope.kind == "host_command"
+    assert result.approval_scope.kind == "sandbox_command"
     assert result.approval_scope.high_risk
 
 

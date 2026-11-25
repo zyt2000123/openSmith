@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
 from uuid import uuid4
@@ -22,6 +23,11 @@ from engine.context.compression import (
 from engine.execution.evidence import tool_result_hash
 from engine.execution.events import EventType, ExecutionEvent
 from engine.execution.runtime_control import repeated_success_prompt, tool_blocked_prompt
+from engine.execution.steering import (
+    MAX_STEERING_CONTINUATIONS,
+    current_steering_inbox,
+    format_steering_message,
+)
 from engine.llm.contracts import (
     ChatResponse,
     LLMContextLengthError,
@@ -61,6 +67,14 @@ from .budget import (
     trim_conversation_to_message_cap,
 )
 from .smith_ui import smith_ui_fallback, validate_smith_ui_call
+from .tool_batch import (
+    BatchExecutionOutcome,
+    MAX_PARALLEL_READ_TOOLS,
+    PreparedReadCall,
+    execute_read_batch,
+    is_network_or_egress_tool,
+    is_statically_parallel_readable,
+)
 
 if TYPE_CHECKING:
     from engine.execution.hooks import HookRegistry
@@ -568,6 +582,7 @@ async def react_event_loop(
     had_successful_tool = False
     incomplete_final_repairs = 0
     length_continuations = 0
+    steering_continuations = 0
     # (fragment, was_streamed) per fragment, not one flag for the join: a reply
     # can mix a non-streamed fallback fragment with a streamed continuation,
     # and a single flag then mislabels one of them — see _final_text_delivery.
@@ -602,6 +617,26 @@ async def react_event_loop(
     compaction_failures = 0
 
     while productive_iters < max_iters:
+        # Drain point A: fold any mid-turn user steering BEFORE fit_request()
+        # so the injected note counts toward the model's context budget.
+        steering_inbox = current_steering_inbox()
+        if steering_inbox is not None and steering_inbox.has_pending():
+            steered = steering_inbox.drain()
+            if steered:
+                conversation.append({
+                    "role": "user",
+                    "content": format_steering_message(steered),
+                })
+                yield ExecutionEvent(EventType.STEERING_APPLIED, {
+                    "steer_ids": [item.steer_id for item in steered],
+                    "count": len(steered),
+                    "items": [
+                        {"steer_id": item.steer_id, "content": item.content}
+                        for item in steered
+                    ],
+                    "iteration": productive_iters,
+                })
+
         conversation = trim_conversation_to_message_cap(conversation)
 
         pre_fit_receipt = measure_request(conversation, tools, llm)
@@ -947,6 +982,42 @@ async def react_event_loop(
                 )
                 final_text_parts.clear()
                 continue
+            # Drain point B: if a steering message arrived while the model was
+            # generating its final answer, fold it in and continue (up to cap)
+            # instead of silently dropping it.
+            steering_inbox = current_steering_inbox()
+            if (
+                steering_inbox is not None
+                and steering_inbox.has_pending()
+                and steering_continuations < MAX_STEERING_CONTINUATIONS
+            ):
+                steered = steering_inbox.drain()
+                if steered:
+                    steering_continuations += 1
+                    for provision_id in active_provision_ids:
+                        yield _provisional_retract_event(provision_id, "steering_redirect")
+                    active_provision_ids.clear()
+                    # Append only this round's fragment (response.text): any
+                    # earlier length-continuation fragments were already written
+                    # to conversation by _append_length_continuation.
+                    if response.text:
+                        conversation.append(_assistant_turn(response.text, response.reasoning))
+                    final_text_parts.clear()
+                    conversation.append({
+                        "role": "user",
+                        "content": format_steering_message(steered),
+                    })
+                    yield ExecutionEvent(EventType.STEERING_APPLIED, {
+                        "steer_ids": [item.steer_id for item in steered],
+                        "count": len(steered),
+                        "items": [
+                            {"steer_id": item.steer_id, "content": item.content}
+                            for item in steered
+                        ],
+                        "iteration": productive_iters,
+                    })
+                    continue
+
             if final_text:
                 for event in _final_text_events(
                     final_text,
@@ -977,8 +1048,219 @@ async def react_event_loop(
         round_had_success = False
         round_had_failure = False
         round_had_preflight = False
-        for tc in response.tool_calls:
+        deferred_round_notes: list[dict[str, str]] = []
+        pending_batch: list[PreparedReadCall] = []
+        pending_batch_has_local = False
+        pending_bucket_counts: dict[tuple[str, str], int] = {}
+        early_stop_reason: str | None = None
+
+        def _build_result_event(
+            *,
+            raw_id: str,
+            call: ToolCall,
+            result,
+            granted_approval_id: str | None = None,
+            batch_id: str | None = None,
+        ) -> dict[str, object]:
+            event_payload: dict[str, object] = {
+                "id": raw_id,
+                "name": call.name,
+                "error": result.is_error,
+                "blocked": False,
+                "preflight": False,
+                # Evidence binding: hash the FULL result (content is truncated
+                # below for transport) so a gate verdict can be checked against
+                # the exact output this call produced.  Only the hash is stored.
+                "result_hash": tool_result_hash(
+                    tool_name=call.name,
+                    call_id=result.call_id,
+                    arguments=call.arguments,
+                    content=result.content,
+                    is_error=result.is_error,
+                ),
+                "content": result.content[:200],
+                "error_kind": result.error_kind,
+                "retryable": result.retryable,
+                "timed_out": result.timed_out,
+                "side_effect_status": result.side_effect_status,
+                "metadata": result.metadata,
+            }
+            if granted_approval_id is not None:
+                event_payload["approval_outcome"] = "granted"
+                event_payload["approval_id"] = granted_approval_id
+            if batch_id is not None:
+                event_payload["batch_id"] = batch_id
+                event_payload["parallel"] = True
+            return event_payload
+
+        async def _flush_pending_batch() -> AsyncGenerator[ExecutionEvent, None]:
+            nonlocal pending_batch, pending_batch_has_local
+            nonlocal round_had_success, round_had_failure, had_successful_tool
+            nonlocal consecutive_errors, last_error_key, identical_error_count
+            nonlocal early_stop_reason
+
+            if not pending_batch:
+                return
+
+            batch = pending_batch
+            pending_batch = []
+            pending_batch_has_local = False
+            pending_bucket_counts.clear()
+
+            is_parallel = len(batch) > 1
+            batch_id = uuid4().hex[:12] if is_parallel else None
+
+            for item in batch:
+                start_data: dict[str, object] = {
+                    "name": item.raw_name,
+                    "id": item.raw_id,
+                    "arguments": item.call.arguments,
+                }
+                if batch_id is not None:
+                    start_data["batch_id"] = batch_id
+                    start_data["parallel"] = True
+                yield ExecutionEvent(EventType.TOOL_CALL_START, start_data)
+
+            outcomes_by_slot: dict[int, BatchExecutionOutcome] = {}
+            recorded_slots: set[int] = set()
+            active_ctx = current_approval_context()
+            active_run_id = active_ctx[1] if active_ctx is not None else ""
+
+            def _record_post_exec_for_slot(slot: int, outcome: BatchExecutionOutcome) -> None:
+                if slot in recorded_slots:
+                    return
+                recorded_slots.add(slot)
+                if tool_guard is not None and hasattr(tool_guard, "record_post_execution"):
+                    tool_guard.record_post_execution(
+                        outcome.item.call,
+                        outcome.result,
+                        run_id=active_run_id,
+                    )
+
+            try:
+                if not is_parallel:
+                    item = batch[0]
+                    with tool_registry.authorize_execution(
+                        item.call,
+                        approval_id=None,
+                        approval_scope=item.decision.approval_scope,
+                    ):
+                        result = await tool_registry.execute(item.call)
+                    warnings = (
+                        await hook_registry.run_post_hooks(
+                            item.call.name,
+                            item.call.arguments,
+                            result,
+                        )
+                        if hook_registry is not None
+                        else []
+                    )
+                    outcome = BatchExecutionOutcome(
+                        slot=item.slot,
+                        item=item,
+                        result=result,
+                        warnings=warnings,
+                    )
+                    outcomes_by_slot[outcome.slot] = outcome
+                    yield ExecutionEvent(
+                        EventType.TOOL_CALL_RESULT,
+                        _build_result_event(
+                            raw_id=item.raw_id,
+                            call=item.call,
+                            result=result,
+                        ),
+                    )
+                else:
+                    async with aclosing(
+                        execute_read_batch(
+                            batch,
+                            tool_registry=tool_registry,
+                            hook_registry=hook_registry,
+                            max_parallel=MAX_PARALLEL_READ_TOOLS,
+                        )
+                    ) as batch_outcomes:
+                        async for outcome in batch_outcomes:
+                            outcomes_by_slot[outcome.slot] = outcome
+                            yield ExecutionEvent(
+                                EventType.TOOL_CALL_RESULT,
+                                _build_result_event(
+                                    raw_id=outcome.item.raw_id,
+                                    call=outcome.item.call,
+                                    result=outcome.result,
+                                    batch_id=batch_id,
+                                ),
+                            )
+
+                for slot in sorted(outcomes_by_slot):
+                    outcome = outcomes_by_slot[slot]
+                    item = outcome.item
+                    result = outcome.result
+
+                    # Update repeat-sensitive counters and SessionTaintStore in
+                    # deterministic slot order (including is_error=True paths).
+                    _record_post_exec_for_slot(slot, outcome)
+
+                    if outcome.warnings:
+                        deferred_round_notes.append({
+                            "role": "system",
+                            "content": "\n\n".join(outcome.warnings),
+                        })
+
+                    tool_msgs = _tool_result_messages(
+                        item.call.name, result.call_id, result.content, is_error=result.is_error,
+                    )
+                    conversation.append(tool_msgs[0])
+                    deferred_round_notes.extend(tool_msgs[1:])
+
+                    if result.is_error:
+                        round_had_failure = True
+                        consecutive_errors += 1
+                        if early_stop_reason is None:
+                            if _repeats_of(f"{item.raw_name}:{result.content[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
+                                early_stop_reason = "identical_tool_error_loop"
+                            elif consecutive_errors >= 3:
+                                deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                                consecutive_errors = 0
+                    else:
+                        round_had_success = True
+                        had_successful_tool = True
+                        consecutive_errors = 0
+                        last_error_key = None
+                        identical_error_count = 0
+                        repeat_key = _repeat_key(item.raw_name, item.call.arguments)
+                        repeat_counts[repeat_key] = repeat_counts.get(repeat_key, 0) + 1
+                        if (
+                            repeat_counts[repeat_key] >= REPEATED_SUCCESS_WARN_THRESHOLD
+                            and repeat_key not in repeat_warned
+                        ):
+                            repeat_warned.add(repeat_key)
+                            deferred_round_notes.append({
+                                "role": "system",
+                                "content": repeated_success_prompt(
+                                    item.raw_name, repeat_counts[repeat_key]
+                                ),
+                            })
+            finally:
+                # M2: If the batch is cancelled or raises mid-way, still record
+                # post-execution taint/repeat state for any already-completed
+                # reads in deterministic slot order so taint is never dropped.
+                for slot in sorted(outcomes_by_slot):
+                    _record_post_exec_for_slot(slot, outcomes_by_slot[slot])
+
+            if early_stop_reason is not None:
+                yield ExecutionEvent(
+                    EventType.TEXT_DELTA,
+                    {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
+                )
+                yield ExecutionEvent(EventType.INCOMPLETE, {"reason": early_stop_reason})
+
+        for slot_index, tc in enumerate(response.tool_calls):
             if lazy_tool_schemas and tc.name == _TOOL_SCHEMA_LOADER:
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
+                if early_stop_reason is not None:
+                    return
                 requested_name, schema, error = _requested_tool_schema(
                     tool_registry, tc.arguments,
                 )
@@ -1065,6 +1347,11 @@ async def react_event_loop(
             # client-side component tree. The validated event is sent only to
             # clients that explicitly understand the smith-ui contract.
             if call.name == "render_ui":
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
+                if early_stop_reason is not None:
+                    return
                 if call.name not in visible_tool_names:
                     conversation.append({
                         "role": "tool",
@@ -1137,6 +1424,11 @@ async def react_event_loop(
             # never turn into an approval request merely because it exists in
             # the broader identity-level registry.
             if call.name not in visible_tool_names:
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
+                if early_stop_reason is not None:
+                    return
                 unavailable_message = getattr(
                     tool_registry,
                     "unavailable_tool_message",
@@ -1181,14 +1473,135 @@ async def react_event_loop(
                     })
                     return
                 if consecutive_errors >= 3:
-                    conversation.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                    deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
                     consecutive_errors = 0
                 continue
+
+            defn = tool_registry.definitions().get(call.name)
+            parallel_candidate = is_statically_parallel_readable(call.name, defn)
+            is_net = is_network_or_egress_tool(defn)
+
+            # Barrier 1: any non-parallel-readable tool (write, execute, serial,
+            # private-data reader) flushes pending reads BEFORE policy.evaluate().
+            if not parallel_candidate:
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
+                if early_stop_reason is not None:
+                    return
+            # Barrier 2 (Cross-tool taint race protection): local read batches
+            # MUST flush and complete record_post_execution (including is_error)
+            # BEFORE any network/egress tool or taint-dependent declarative rule
+            # is preflight-evaluated.
+            elif pending_batch and pending_batch_has_local and (
+                is_net
+                or (
+                    tool_guard is not None
+                    and hasattr(tool_guard, "is_taint_sensitive_if_tainted")
+                    and tool_guard.is_taint_sensitive_if_tainted(call)
+                )
+            ):
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
+                if early_stop_reason is not None:
+                    return
+            # Barrier 3 (RepeatGuard accuracy): flush pending batch before a
+            # call that could reach or cross repeat_guard.threshold.
+            elif pending_batch and tool_guard is not None and hasattr(tool_guard, "repeat_guard_headroom"):
+                headroom_info = tool_guard.repeat_guard_headroom(call)
+                if headroom_info is not None:
+                    bucket_key, headroom = headroom_info
+                    if pending_bucket_counts.get(bucket_key, 0) >= headroom:
+                        async with aclosing(_flush_pending_batch()) as batch_events:
+                            async for ev in batch_events:
+                                yield ev
+                        if early_stop_reason is not None:
+                            return
+
+            preflight_decision = None
+            if parallel_candidate:
+                preflight_decision = policy.evaluate(call)
+                if preflight_decision.allowed:
+                    pre_allowed = True
+                    pre_denial_reason: str | None = None
+                    if hook_registry is not None:
+                        pre_allowed, pre_denial_reason = await hook_registry.run_pre_hooks(
+                            call.name,
+                            call.arguments,
+                        )
+                    if pre_allowed:
+                        pending_batch.append(
+                            PreparedReadCall(
+                                slot=slot_index,
+                                raw_id=tc.id,
+                                raw_name=tc.name,
+                                call=call,
+                                decision=preflight_decision,
+                                is_network=is_net,
+                            )
+                        )
+                        if not is_net:
+                            pending_batch_has_local = True
+                        if tool_guard is not None and hasattr(tool_guard, "repeat_guard_headroom"):
+                            headroom_info = tool_guard.repeat_guard_headroom(call)
+                            if headroom_info is not None:
+                                bk = headroom_info[0]
+                                pending_bucket_counts[bk] = pending_bucket_counts.get(bk, 0) + 1
+                        continue
+                    # PreToolHook denied a parallel-readable call: flush prior
+                    # batch first, then report denial in deterministic order.
+                    async with aclosing(_flush_pending_batch()) as batch_events:
+                        async for ev in batch_events:
+                            yield ev
+                    if early_stop_reason is not None:
+                        return
+                    yield ExecutionEvent(EventType.TOOL_CALL_START, {
+                        "name": tc.name,
+                        "id": tc.id,
+                        "arguments": call.arguments,
+                    })
+                    denial = pre_denial_reason or "Blocked by pre-tool hook"
+                    conversation.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": f"[BLOCKED] {denial}",
+                    })
+                    deferred_round_notes.append({"role": "system", "content": tool_blocked_prompt()})
+                    yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                        "id": tc.id,
+                        "error": True,
+                        "blocked": True,
+                        "preflight": False,
+                        "reason": denial,
+                    })
+                    round_had_failure = True
+                    consecutive_errors += 1
+                    if _repeats_of(f"{tc.name}:{denial[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
+                        yield ExecutionEvent(
+                            EventType.TEXT_DELTA,
+                            {"text": budget_exhausted_message(TOOL_FAILURE_BUDGET_MESSAGE)},
+                        )
+                        yield ExecutionEvent(EventType.INCOMPLETE, {
+                            "reason": "identical_tool_error_loop",
+                        })
+                        return
+                    if consecutive_errors >= 3:
+                        deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                        consecutive_errors = 0
+                    continue
+                # Policy blocked/challenged/approval_required: flush prior reads
+                # before handling this barrier call serially.
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
+                if early_stop_reason is not None:
+                    return
 
             granted_approval_id: str | None = None
             yield ExecutionEvent(EventType.TOOL_CALL_START, {"name": tc.name, "id": tc.id, "arguments": call.arguments})
 
-            decision = policy.evaluate(call)
+            decision = preflight_decision if preflight_decision is not None else policy.evaluate(call)
             if not decision.allowed:
                 if decision.challenged:
                     conversation.append({"role": "tool", "tool_call_id": call.id, "content": decision.observation})
@@ -1215,6 +1628,9 @@ async def react_event_loop(
                             arguments_summary,
                             tool_description=definition.description if definition else "",
                             scope=decision.approval_scope,
+                            taint_sources=decision.taint_sources,
+                            repeat_count=decision.repeat_count,
+                            rule_id=decision.rule_id,
                         )
                         approval_request = broker.open(
                             ApprovalRequest(
@@ -1227,9 +1643,12 @@ async def react_event_loop(
                                 scope=decision.approval_scope,
                                 risk=decision.risk,
                                 presentation=presentation,
+                                rule_id=decision.rule_id,
+                                taint_sources=decision.taint_sources,
+                                repeat_count=decision.repeat_count,
                             )
                         )
-                        yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                        approval_event_data: dict[str, object] = {
                             "id": tc.id,
                             "error": False,
                             "blocked": True,
@@ -1248,7 +1667,14 @@ async def react_event_loop(
                                 if approval_request.scope is not None
                                 else None
                             ),
-                        })
+                        }
+                        if decision.rule_id:
+                            approval_event_data["rule_id"] = decision.rule_id
+                        if decision.taint_sources:
+                            approval_event_data["taint_sources"] = list(decision.taint_sources)
+                        if decision.repeat_count >= 2:
+                            approval_event_data["repeat_count"] = decision.repeat_count
+                        yield ExecutionEvent(EventType.TOOL_CALL_RESULT, approval_event_data)
                         try:
                             approved = await broker.wait(approval_request)
                             denial = "User denied approval"
@@ -1268,7 +1694,7 @@ async def react_event_loop(
                                 "tool_call_id": call.id,
                                 "content": f"[BLOCKED] {denial}",
                             })
-                            conversation.append({"role": "system", "content": tool_blocked_prompt()})
+                            deferred_round_notes.append({"role": "system", "content": tool_blocked_prompt()})
                             yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
                                 "id": tc.id,
                                 "error": False,
@@ -1303,7 +1729,7 @@ async def react_event_loop(
                             continue
                     else:
                         conversation.append({"role": "tool", "tool_call_id": call.id, "content": decision.observation})
-                        conversation.append({"role": "system", "content": tool_blocked_prompt()})
+                        deferred_round_notes.append({"role": "system", "content": tool_blocked_prompt()})
                         yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
                             "id": tc.id,
                             "error": False,
@@ -1319,7 +1745,7 @@ async def react_event_loop(
                         continue
                 else:
                     conversation.append({"role": "tool", "tool_call_id": call.id, "content": decision.observation})
-                    conversation.append({"role": "system", "content": tool_blocked_prompt()})
+                    deferred_round_notes.append({"role": "system", "content": tool_blocked_prompt()})
                     yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
                         "id": tc.id,
                         "error": False,
@@ -1333,7 +1759,7 @@ async def react_event_loop(
                     round_had_failure = True
                     consecutive_errors += 1
                     if consecutive_errors >= 3:
-                        conversation.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                        deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
                         consecutive_errors = 0
                     continue
 
@@ -1357,7 +1783,7 @@ async def react_event_loop(
                         "tool_call_id": call.id,
                         "content": f"[BLOCKED] {denial}",
                     })
-                    conversation.append({"role": "system", "content": tool_blocked_prompt()})
+                    deferred_round_notes.append({"role": "system", "content": tool_blocked_prompt()})
                     blocked_event: dict[str, object] = {
                         "id": tc.id,
                         "error": True,
@@ -1388,7 +1814,7 @@ async def react_event_loop(
                         })
                         return
                     if consecutive_errors >= 3:
-                        conversation.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                        deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
                         consecutive_errors = 0
                     continue
 
@@ -1398,6 +1824,13 @@ async def react_event_loop(
                 approval_scope=decision.approval_scope,
             ):
                 result = await tool_registry.execute(call)
+
+            # Immediately update repeat-sensitive counters and SessionTaintStore
+            # BEFORE evaluating the next tool call in this same assistant turn.
+            if tool_guard is not None and hasattr(tool_guard, "record_post_execution"):
+                active_ctx = current_approval_context()
+                active_run_id = active_ctx[1] if active_ctx is not None else ""
+                tool_guard.record_post_execution(call, result, run_id=active_run_id)
 
             # ========== PostToolUse Hook 检查 ==========
             if hook_registry is not None:
@@ -1409,38 +1842,22 @@ async def react_event_loop(
                 if warnings:
                     # 将警告注入到对话中（作为 system 消息）
                     warning_text = "\n\n".join(warnings)
-                    conversation.append({"role": "system", "content": warning_text})
+                    deferred_round_notes.append({"role": "system", "content": warning_text})
 
-            conversation.extend(_tool_result_messages(
+            tool_msgs = _tool_result_messages(
                 call.name, result.call_id, result.content, is_error=result.is_error,
-            ))
-            result_event = {
-                "id": tc.id,
-                "name": call.name,
-                "error": result.is_error,
-                "blocked": False,
-                "preflight": False,
-                # Evidence binding: hash the FULL result (content is truncated
-                # below for transport) so a gate verdict can be checked against
-                # the exact output this call produced.  Only the hash is stored.
-                "result_hash": tool_result_hash(
-                    tool_name=call.name,
-                    call_id=result.call_id,
-                    arguments=call.arguments,
-                    content=result.content,
-                    is_error=result.is_error,
+            )
+            conversation.append(tool_msgs[0])
+            deferred_round_notes.extend(tool_msgs[1:])
+            yield ExecutionEvent(
+                EventType.TOOL_CALL_RESULT,
+                _build_result_event(
+                    raw_id=tc.id,
+                    call=call,
+                    result=result,
+                    granted_approval_id=granted_approval_id,
                 ),
-                "content": result.content[:200],
-                "error_kind": result.error_kind,
-                "retryable": result.retryable,
-                "timed_out": result.timed_out,
-                "side_effect_status": result.side_effect_status,
-                "metadata": result.metadata,
-            }
-            if granted_approval_id is not None:
-                result_event["approval_outcome"] = "granted"
-                result_event["approval_id"] = granted_approval_id
-            yield ExecutionEvent(EventType.TOOL_CALL_RESULT, result_event)
+            )
             if result.is_error:
                 round_had_failure = True
                 consecutive_errors += 1
@@ -1452,7 +1869,7 @@ async def react_event_loop(
                     yield ExecutionEvent(EventType.INCOMPLETE, {"reason": "identical_tool_error_loop"})
                     return
                 if consecutive_errors >= 3:
-                    conversation.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                    deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
                     consecutive_errors = 0
             else:
                 round_had_success = True
@@ -1469,12 +1886,20 @@ async def react_event_loop(
                     # Warn once per call shape: re-appending every round would
                     # itself flood the context this guard exists to protect.
                     repeat_warned.add(repeat_key)
-                    conversation.append({
+                    deferred_round_notes.append({
                         "role": "system",
                         "content": repeated_success_prompt(
                             tc.name, repeat_counts[repeat_key]
                         ),
                     })
+
+        async with aclosing(_flush_pending_batch()) as batch_events:
+            async for ev in batch_events:
+                yield ev
+        if early_stop_reason is not None:
+            return
+        if deferred_round_notes:
+            conversation.extend(deferred_round_notes)
 
         if round_had_preflight:
             preflight_iters += 1

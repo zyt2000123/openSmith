@@ -21,6 +21,7 @@ import type {
   SkillBlock,
   SmithUiBlock,
   SmithUiFallbackBlock,
+  SteeringBlock,
   SystemEntry,
   ThinkingBlock,
   ToolBlock,
@@ -194,6 +195,7 @@ type RenderBlock =
   | SkillBlock
   | SmithUiBlock
   | SmithUiFallbackBlock
+  | SteeringBlock
   | ToolGroupBlock
   | ToolSummaryBlock;
 
@@ -597,6 +599,15 @@ function TurnView({
             return <SmithUiView key={block.id} payload={block.payload} />;
           case "smith_ui_fallback":
             return <SmithUiFallbackMessage key={block.id} block={block} />;
+          case "steering":
+            return (
+              <Box key={block.id} marginTop={1} paddingLeft={2}>
+                <Text color={block.state === "applied" ? SUCCESS : WARNING}>
+                  {block.state === "applied" ? "↳ [Steered] " : "↳ [Steer queued] "}
+                </Text>
+                <Text color={INFO}>{truncate(block.content, 100)}</Text>
+              </Box>
+            );
           default:
             return null;
         }

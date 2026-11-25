@@ -69,12 +69,20 @@ export type SmithUiFallbackBlock = {
   code: string;
 };
 
+export type SteeringBlock = {
+  id: string;
+  type: "steering";
+  steerId: string;
+  content: string;
+  state: "queued" | "applied";
+};
+
 export type ProvisionalText = {
   provisionId: string;
   text: string;
 };
 
-export type TurnBlock = ThinkingBlock | ToolBlock | SkillBlock | SmithUiBlock | SmithUiFallbackBlock;
+export type TurnBlock = ThinkingBlock | ToolBlock | SkillBlock | SmithUiBlock | SmithUiFallbackBlock | SteeringBlock;
 
 export type TurnEntry = {
   id: string;
@@ -337,6 +345,35 @@ export function removeApprovalNotice(entries: TranscriptEntry[], approvalId: str
   return entries.filter((entry) => entry.kind !== "system" || entry.approvalId !== approvalId);
 }
 
+export function appendQueuedSteering(
+  entries: TranscriptEntry[],
+  steerId: string,
+  content: string,
+): TranscriptEntry[] {
+  const trimmed = content.trim();
+  if (!trimmed) return entries;
+  return updateLastTurn(entries, (turn) => {
+    // L2: If steering_applied already arrived before the POST response,
+    // never append a duplicate queued block or downgrade "applied" -> "queued".
+    if (turn.blocks.some((block) => block.type === "steering" && block.steerId === steerId)) {
+      return turn;
+    }
+    return {
+      ...turn,
+      blocks: [
+        ...finishThinkingBlocks(turn.blocks),
+        {
+          id: createId(),
+          type: "steering",
+          steerId,
+          content: trimmed,
+          state: "queued",
+        },
+      ],
+    };
+  });
+}
+
 export function createTurnEntry(userText: string): TurnEntry {
   return {
     id: createId(),
@@ -460,6 +497,38 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
       return updateLastTurn(entries, (turn) => {
         const provisional = turn.provisional.filter((item) => item.provisionId !== event.provisionId);
         return provisional.length === turn.provisional.length ? turn : { ...turn, provisional };
+      });
+
+    case "steering_applied":
+      return updateLastTurn(entries, (turn) => {
+        const appliedIds = new Set(event.steerIds);
+        const seenIds = new Set<string>();
+        const blocks: TurnBlock[] = finishThinkingBlocks(turn.blocks).map((block) => {
+          if (block.type === "steering" && appliedIds.has(block.steerId)) {
+            seenIds.add(block.steerId);
+            return { ...block, state: "applied" };
+          }
+          return block;
+        });
+        for (const item of event.items) {
+          if (!seenIds.has(item.steerId)) {
+            blocks.push({
+              id: createId(),
+              type: "steering",
+              steerId: item.steerId,
+              content: item.content,
+              state: "applied",
+            });
+          }
+        }
+        return { ...turn, blocks };
+      });
+
+    case "steering_deferred":
+      return updateLastTurn(entries, (turn) => {
+        const deferredIds = new Set(event.steerIds);
+        const blocks = turn.blocks.filter((block) => !(block.type === "steering" && deferredIds.has(block.steerId)));
+        return blocks.length === turn.blocks.length ? turn : { ...turn, blocks };
       });
 
     case "message":

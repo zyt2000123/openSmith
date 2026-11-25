@@ -659,6 +659,9 @@ async def register_mcp_tools_with_prefix(
     prefix: str,
     tools: list[MCPTool] | None = None,
     on_connection_failure: Any | None = None,
+    reads_private_data: bool = False,
+    egress: bool = True,
+    accepts_vault_placeholders: bool = False,
 ) -> int:
     """Discover MCP tools and register them into a ToolRegistry.
 
@@ -694,12 +697,17 @@ async def register_mcp_tools_with_prefix(
         if registered_name is None:
             log.warning("Skipping MCP tool with empty/invalid name: %r", tool.name)
             continue
+        server_marker = prefix[4:] if prefix.startswith("mcp_") else prefix
         try:
             registry.register(
                 name=registered_name,
                 description=tool.description,
                 parameters=tool.input_schema,
                 func=_execute,
+                reads_private_data=bool(reads_private_data),
+                egress=bool(egress),
+                egress_target_arg=f"mcp:{server_marker}",
+                accepts_vault_placeholders=bool(accepts_vault_placeholders),
                 # A remote MCP tool's real side effect cannot be inferred
                 # safely from server-supplied metadata.  Default to explicit
                 # approval and serialize calls until a trusted integration
