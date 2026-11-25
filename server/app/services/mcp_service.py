@@ -29,17 +29,19 @@ _QUERY_FRAGMENT_RE = re.compile(r"[?#].*$")
 _ERROR_MAX_LENGTH = 300
 
 
-def _safe_error_text(message: str) -> str:
-    """Strip URL credentials/query strings and cap the length of an error body.
-
-    Transport exceptions are str()'d directly by httpx, which embeds the full
-    request URL.  Redact anything that looks like userinfo or a query/fragment so
-    a token-carrying MCP URL can never be returned by the API, then bound the size.
-    """
+def _safe_error_text(message: str, *, vault_store: Any | None = None) -> str:
+    """Strip URL credentials/query strings, redact vault values, and cap error length."""
     if not message:
         return ""
     text = _URL_CREDENTIAL_RE.sub(r"\g<scheme><redacted>@", message)
     text = _QUERY_FRAGMENT_RE.sub("", text)
+    if vault_store is not None:
+        try:
+            from common.vault import VaultRedactor
+
+            text, _ = VaultRedactor.redact(text, all_entries=vault_store.all_entries())
+        except Exception:
+            pass
     if len(text) <= _ERROR_MAX_LENGTH:
         return text
     return text[:_ERROR_MAX_LENGTH] + "…"
@@ -105,8 +107,14 @@ class McpService:
             "url": safe_url,
             "command": safe_command,
         }
+        from common.vault import VaultStore, extract_vault_placeholders
+
+        vault_store = VaultStore(_agent_dir().parent / "vault.json")
         try:
-            transport = mcp_transport_from_config(config)
+            if extract_vault_placeholders(config):
+                transport = mcp_transport_from_config(config, vault_store=vault_store)
+            else:
+                transport = mcp_transport_from_config(config)
             if transport is None:
                 return McpServerOut(**common, status="error", error="invalid MCP transport configuration")
             client = MCPClient(transport=transport)
@@ -142,4 +150,8 @@ class McpService:
                 error=f"MCP server {name} connect/list_tools timed out",
             )
         except Exception as exc:
-            return McpServerOut(**common, status="error", error=_safe_error_text(str(exc)))
+            return McpServerOut(
+                **common,
+                status="error",
+                error=_safe_error_text(str(exc), vault_store=vault_store),
+            )

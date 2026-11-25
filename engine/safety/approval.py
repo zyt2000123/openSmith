@@ -250,6 +250,9 @@ class ApprovalRequest:
     # Risk tier triaging this approval (see engine.safety.risk).  Carried so
     # the consumer can render/route the flow without re-deriving it.
     risk: "RiskTier | None" = None
+    rule_id: str | None = None
+    taint_sources: tuple[str, ...] = ()
+    repeat_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -266,6 +269,12 @@ class ApprovalRequest:
             payload["scope"] = self.scope.to_dict()
         if self.presentation is not None:
             payload["presentation"] = self.presentation.to_dict()
+        if self.rule_id:
+            payload["rule_id"] = self.rule_id
+        if self.taint_sources:
+            payload["taint_sources"] = list(self.taint_sources)
+        if self.repeat_count >= 2:
+            payload["repeat_count"] = self.repeat_count
         return payload
 
 
@@ -548,6 +557,9 @@ def _approval_details(
     arguments: dict[str, object],
     *,
     scope: ApprovalScope | None = None,
+    taint_sources: tuple[str, ...] = (),
+    repeat_count: int = 0,
+    rule_id: str | None = None,
 ) -> tuple[ApprovalDetail, ...]:
     order = {key: index for index, key in enumerate(_DETAIL_ORDER.get(tool_name, ()))}
     entries = [
@@ -557,6 +569,22 @@ def _approval_details(
     ]
     entries.sort(key=lambda item: (order.get(item[0], len(order)), item[0]))
     details: list[ApprovalDetail] = []
+    if taint_sources:
+        details.append(
+            ApprovalDetail(
+                label="Taint warning",
+                value=f"Session read private data: {', '.join(taint_sources)}",
+            )
+        )
+    if repeat_count >= 2:
+        details.append(
+            ApprovalDetail(
+                label="Repeat guard",
+                value=f"Attempt #{repeat_count} in this run",
+            )
+        )
+    if rule_id:
+        details.append(ApprovalDetail(label="Rule", value=rule_id))
     for key, value in entries:
         label = _DETAIL_LABELS.get(key, _humanize_name(key))
         details.append(ApprovalDetail(label=label, value=_display_value(value)))
@@ -573,6 +601,9 @@ def build_approval_presentation(
     *,
     tool_description: str = "",
     scope: ApprovalScope | None = None,
+    taint_sources: tuple[str, ...] = (),
+    repeat_count: int = 0,
+    rule_id: str | None = None,
 ) -> ApprovalPresentation:
     """Build a user-facing description from safe, bounded tool arguments."""
     action = str(arguments.get("action") or "").strip().lower()
@@ -631,7 +662,14 @@ def build_approval_presentation(
     return ApprovalPresentation(
         title=title,
         summary=summary,
-        details=_approval_details(tool_name, arguments, scope=scope),
+        details=_approval_details(
+            tool_name,
+            arguments,
+            scope=scope,
+            taint_sources=taint_sources,
+            repeat_count=repeat_count,
+            rule_id=rule_id,
+        ),
         reason=_specific_reason(reason, fallback_reason),
     )
 

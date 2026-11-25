@@ -260,6 +260,8 @@ async def _register_mcp_tools(
     profile_config: dict,
     runtime: RuntimeContext,
     services: RuntimeServices,
+    *,
+    vault_store=None,
 ) -> None:
     from engine.mcp.config import register_configured_mcp_tools
 
@@ -269,6 +271,7 @@ async def _register_mcp_tools(
         agent_id=runtime.agent_id,
         tool_registry=services.tool_registry,
         session_pool=services.mcp_session_pool,
+        vault_store=vault_store,
     )
     services.mcp_clients.extend(registration.clients)
 
@@ -361,7 +364,22 @@ async def prepare_runtime(
     # re-enabled by config.
     bind_sub_agent_tool(services, runtime.agents_dir)
     profile_config = await _load_profile_config(runtime)
-    await _register_mcp_tools(profile_config, runtime, services)
+
+    # Load declarative safety rules, session taint store, and local vault store.
+    # Invalid safety rules fail closed here before any tool can execute.
+    from common.vault import VaultStore
+    from engine.safety.rules import SafetyConfig
+    from engine.safety.taint import SessionTaintStore
+
+    safety_config = SafetyConfig.from_profile_config(profile_config)
+    taint_store = SessionTaintStore(
+        state_dir=state_dir,
+        session_id=runtime.session_id,
+    )
+    vault_store = VaultStore(runtime.profile_dir.parent / "vault.json")
+    services.tool_registry.bind_vault_store(vault_store)
+
+    await _register_mcp_tools(profile_config, runtime, services, vault_store=vault_store)
 
     unknown_tools = services.tool_registry.set_enabled(
         enabled_tools_from_config(profile_config, services.tool_registry, identity)
@@ -375,6 +393,11 @@ async def prepare_runtime(
 
     if services.tool_guard is not None:
         services.tool_guard.bind_definitions(services.tool_registry.definitions())
+        services.tool_guard.configure_safety(
+            safety_config,
+            taint_store=taint_store,
+            vault_store=vault_store,
+        )
     services.tool_registry.bind_tool_guard(services.tool_guard)
 
     profile_skills = runtime.profile_dir / "skills"
@@ -437,11 +460,15 @@ async def prepare_runtime(
     eval_guidance = (
         EVAL_SENSITIVE_GUIDANCE if detect_eval_sensitive(request.message) else ""
     )
+    runtime_ctx = _runtime_prompt_context(runtime, identity)
+    vault_summary = vault_store.prompt_summary()
+    if vault_summary:
+        runtime_ctx["Available vault keys"] = vault_summary
     prompt_assembly = PromptAssembler().assemble_detailed(
         runtime.profile_dir,
         services.tool_registry,
         services.skill_registry,
-        _runtime_prompt_context(runtime, identity),
+        runtime_ctx,
         working_dir=working_dir,
         memory_text=memory_text,
         runtime_guidance=identity.prompt,

@@ -224,6 +224,11 @@ async def _run_one(
     if batch.exhausted:
         return outcome(False, error="batch token budget exhausted before start")
 
+    child_guard = tool_guard
+    child_taint = None
+    if tool_guard is not None and hasattr(tool_guard, "fork_for_subagent"):
+        child_guard, child_taint = tool_guard.fork_for_subagent()
+
     try:
         # ``use_fact_gate`` also displaces the parent's gate for anything in
         # this task that reads the ContextVar directly.
@@ -237,7 +242,7 @@ async def _run_one(
                         llm,
                         _conversation(spec, task),
                         scoped,
-                        tool_guard,
+                        child_guard,
                         spec.max_iters,
                         # A sub-agent's text never reaches the user's screen,
                         # so the provisional commit/retract machinery has
@@ -286,6 +291,16 @@ async def _run_one(
         # One task must not sink the batch.
         logger.warning("sub-agent %s failed", label, exc_info=True)
         return outcome(False, error=f"{type(exc).__name__}: {exc}")
+    finally:
+        # Monotonically propagate any taint accumulated during the subagent run
+        # back up to the parent session (even on timeout/failure).
+        if (
+            tool_guard is not None
+            and child_taint is not None
+            and child_taint.is_tainted
+            and getattr(tool_guard, "taint_store", None) is not None
+        ):
+            tool_guard.taint_store.merge_from(child_taint.sources, as_subagent=True)
 
     if not "".join(text_parts).strip():
         # A sub-agent whose only product is a summary and that produced none

@@ -48,6 +48,8 @@ TOOL_META = {
     "path_args": ["state_path"],
     "permission_level": "write",
     "network_access": True,
+    "egress": True,
+    "egress_target_arg": "url",
     "approval_policy": "policy",
     "side_effect": "write",
     "execution_environment": "host",
@@ -731,9 +733,19 @@ async def execute(
     state_path: str = "",
     render: str = "auto",
     output_format: str = "markdown",
+    _allowed_egress_hosts: tuple[str, ...] | None = None,
 ) -> str:
     if not isinstance(url, str):
         return "Error: url must be a string"
+    if _allowed_egress_hosts:
+        parsed_seed = urllib.parse.urlparse(url)
+        host = (parsed_seed.hostname or "").lower().rstrip(".")
+        fetch_mod = _web_fetch_module()
+        if not host or not fetch_mod._host_in_allowlist(host, _allowed_egress_hosts):
+            return (
+                f"Error: [taint-egress-001] host '{host}' is not in the "
+                "tainted egress allowlist"
+            )
     if isinstance(max_pages, bool) or not isinstance(max_pages, int):
         return "Error: max_pages must be an integer"
     if isinstance(max_depth, bool) or not isinstance(max_depth, int):

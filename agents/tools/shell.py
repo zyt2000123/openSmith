@@ -51,6 +51,7 @@ TOOL_META = {
     },
     "path_args": ["cwd"],
     "opaque_command": True,
+    "accepts_vault_placeholders": False,
     "permission_level": "execute",
     "approval_policy": "always",
     "side_effect": "external",

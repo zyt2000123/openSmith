@@ -32,6 +32,9 @@ class ToolPolicyDecision:
     challenged: bool = False
     approval_scope: ApprovalScope | None = None
     risk: RiskTier = RiskTier.ROUTINE
+    rule_id: str | None = None
+    taint_sources: tuple[str, ...] = ()
+    repeat_count: int = 0
 
     @property
     def observation(self) -> str:
@@ -71,6 +74,9 @@ class _ToolGuardAdapter:
                 approval_required=True,
                 approval_scope=result.approval_scope,
                 risk=result.risk,
+                rule_id=result.rule_id,
+                taint_sources=result.taint_sources,
+                repeat_count=result.repeat_count,
             )
         return ToolPolicyDecision(
             allowed=result.allowed,
@@ -79,6 +85,9 @@ class _ToolGuardAdapter:
             needs_confirmation=result.needs_confirmation,
             approval_scope=result.approval_scope,
             risk=result.risk,
+            rule_id=result.rule_id,
+            taint_sources=result.taint_sources,
+            repeat_count=result.repeat_count,
         )
 
 
@@ -128,9 +137,18 @@ class ToolPolicy:
     def evaluate(self, call: ToolCall) -> ToolPolicyDecision:
         level = PermissionLevel.READ
         risk = RiskTier.ROUTINE
+        rule_id: str | None = None
+        taint_sources: tuple[str, ...] = ()
+        repeat_count = 0
         deferred_approval: ToolPolicyDecision | None = None
         for checker in self._checkers:
             decision = checker.check_policy(call)
+            if decision.rule_id and rule_id is None:
+                rule_id = decision.rule_id
+            if decision.taint_sources and not taint_sources:
+                taint_sources = decision.taint_sources
+            if decision.repeat_count > repeat_count:
+                repeat_count = decision.repeat_count
             if not decision.allowed:
                 # Fact-forcing challenges deliberately take precedence over a
                 # later user approval.  The first attempt must establish the
@@ -145,6 +163,9 @@ class ToolPolicy:
                         challenged=decision.challenged,
                         approval_scope=decision.approval_scope,
                         risk=RiskTier.max(risk, decision.risk),
+                        rule_id=decision.rule_id or rule_id,
+                        taint_sources=decision.taint_sources or taint_sources,
+                        repeat_count=max(repeat_count, decision.repeat_count),
                     )
                     continue
                 return ToolPolicyDecision(
@@ -156,6 +177,9 @@ class ToolPolicy:
                     challenged=decision.challenged,
                     approval_scope=decision.approval_scope,
                     risk=RiskTier.max(risk, decision.risk),
+                    rule_id=decision.rule_id or rule_id,
+                    taint_sources=decision.taint_sources or taint_sources,
+                    repeat_count=max(repeat_count, decision.repeat_count),
                 )
             # Carry forward the most specific permission level seen so far.
             if _LEVEL_ORDER.get(decision.level, 0) > _LEVEL_ORDER.get(level, 0):
@@ -163,7 +187,14 @@ class ToolPolicy:
             risk = RiskTier.max(risk, decision.risk)
         if deferred_approval is not None:
             return deferred_approval
-        return ToolPolicyDecision(allowed=True, level=level, risk=risk)
+        return ToolPolicyDecision(
+            allowed=True,
+            level=level,
+            risk=risk,
+            rule_id=rule_id,
+            taint_sources=taint_sources,
+            repeat_count=repeat_count,
+        )
 
     def begin_round(self) -> None:
         for checker in self._checkers:

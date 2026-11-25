@@ -25,6 +25,15 @@ class ToolDefinition:
     # A provider that opens network connections. Network capability is always
     # approved even when the operation otherwise looks read-only.
     network_access: bool = False
+    # Taint & vault declarations (all backwards-compatible defaults):
+    # - reads_private_data: calling this tool taints the session.
+    # - egress: tool can exfiltrate data externally (auto-derived from network_access).
+    # - egress_target_arg: argument name or scoped marker (e.g. "url", "query", "mcp:github").
+    # - accepts_vault_placeholders: opt-in flag allowing {{vault:NAME}} arguments.
+    reads_private_data: bool = False
+    egress: bool = False
+    egress_target_arg: str = ""
+    accepts_vault_placeholders: bool = False
     # Security metadata — the runtime policy resolves permissions and approval
     # from these declarations. Path-policy compatibility fallbacks remain in
     # the guard only for legacy direct callers that have not bound a registry.

@@ -124,12 +124,17 @@ class ToolRegistry:
         self._wants_environment: set[str] = set()
         self._serial_locks: dict[str, asyncio.Lock] = {}
         self._tool_guard: ToolGuard | None = None
+        self._vault_store: Any | None = None
         self._authorized_call: ContextVar[
             tuple[str, str | None, ApprovalScope | None] | None
         ] = ContextVar(
             f"agent_smith_authorized_tool_call_{id(self)}",
             default=None,
         )
+
+    def bind_vault_store(self, vault_store: Any | None) -> None:
+        """Bind a VaultStore for boundary-only placeholder resolution & redaction."""
+        self._vault_store = vault_store
 
     def register(
         self,
@@ -141,6 +146,10 @@ class ToolRegistry:
         hidden: bool = False,
         opaque_command: bool = False,
         network_access: bool = False,
+        reads_private_data: bool = False,
+        egress: bool = False,
+        egress_target_arg: str = "",
+        accepts_vault_placeholders: bool = False,
         path_args: Sequence[str] = (),
         list_path_args: Sequence[str] = (),
         is_write_tool: bool = False,
@@ -162,6 +171,14 @@ class ToolRegistry:
             raise ValueError(f"Tool {name} opaque_command must be a boolean")
         if not isinstance(network_access, bool):
             raise ValueError(f"Tool {name} network_access must be a boolean")
+        if not isinstance(reads_private_data, bool):
+            raise ValueError(f"Tool {name} reads_private_data must be a boolean")
+        if not isinstance(egress, bool):
+            raise ValueError(f"Tool {name} egress must be a boolean")
+        if not isinstance(egress_target_arg, str):
+            raise ValueError(f"Tool {name} egress_target_arg must be a string")
+        if not isinstance(accepts_vault_placeholders, bool):
+            raise ValueError(f"Tool {name} accepts_vault_placeholders must be a boolean")
         if permission_level and permission_level not in _VALID_PERMISSION_LEVELS:
             raise ValueError(
                 f"Tool {name} has invalid permission_level: {permission_level!r} "
@@ -219,6 +236,12 @@ class ToolRegistry:
             hidden=hidden,
             opaque_command=opaque_command,
             network_access=network_access,
+            reads_private_data=reads_private_data,
+            # Force egress=True whenever network_access=True so future tools
+            # cannot silently omit egress declaration.
+            egress=bool(egress or network_access),
+            egress_target_arg=egress_target_arg,
+            accepts_vault_placeholders=accepts_vault_placeholders,
             path_args=tuple(path_args),
             list_path_args=tuple(list_path_args),
             is_write_tool=bool(is_write_tool or resolved_side_effect != "none"),
@@ -294,6 +317,10 @@ class ToolRegistry:
                         hidden=meta.get("hidden", False),
                         opaque_command=meta.get("opaque_command", False),
                         network_access=meta.get("network_access", False),
+                        reads_private_data=meta.get("reads_private_data", False),
+                        egress=meta.get("egress", False),
+                        egress_target_arg=meta.get("egress_target_arg", ""),
+                        accepts_vault_placeholders=meta.get("accepts_vault_placeholders", False),
                         path_args=_meta_str_tuple(meta, "path_args", py_file),
                         list_path_args=_meta_str_tuple(meta, "list_path_args", py_file),
                         is_write_tool=bool(meta.get("is_write_tool", False)),
@@ -632,15 +659,77 @@ class ToolRegistry:
                 return decision.result
             claimed = decision.claimed
 
-        arguments = call.arguments
+        arguments: dict[str, Any] = dict(call.arguments)
+        resolved_secrets: list[tuple[str, str]] = []
+        vault_store = self._vault_store
+        if vault_store is None and self._tool_guard is not None:
+            vault_store = getattr(self._tool_guard, "vault_store", None)
+
+        all_vault_entries = None
+        if vault_store is not None:
+            from common.vault import VaultRedactor, extract_vault_placeholders
+
+            all_vault_entries = vault_store.all_entries()
+            if extract_vault_placeholders(arguments):
+                target_domain: str | None = None
+                url_val = arguments.get("url")
+                if isinstance(url_val, str) and url_val.strip():
+                    import urllib.parse
+
+                    parsed_url = urllib.parse.urlparse(url_val.strip())
+                    if parsed_url.hostname:
+                        target_domain = parsed_url.hostname.lower().rstrip(".")
+                try:
+                    arguments, resolved_secrets = vault_store.resolve_arguments(
+                        tool_name,
+                        arguments,
+                        target_domain=target_domain,
+                    )
+                except Exception as exc:
+                    result = ToolResult(
+                        call_id=call.id,
+                        content=f"[BLOCKED] {exc}",
+                        is_error=True,
+                        error_kind="policy_blocked",
+                    )
+                    return self._finalize_result(result, tool_name)
+
+        # When the session is tainted and calling web_fetch/web_crawl on an
+        # allowlisted host, pass the allowed host patterns so 3xx redirects are
+        # re-validated at every hop (blocking open-redirect exfiltration).
+        if (
+            self._tool_guard is not None
+            and tool_name in {"web_fetch", "web_crawl"}
+            and getattr(self._tool_guard, "taint_store", None) is not None
+            and self._tool_guard.taint_store.is_tainted
+            and self._tool_guard.safety_config.taint.enabled
+        ):
+            allowed_hosts = (
+                self._tool_guard.safety_config.taint.allowlist.allowed_http_host_patterns()
+            )
+            if allowed_hosts:
+                arguments["_allowed_egress_hosts"] = allowed_hosts
+
         if tool_name in self._wants_environment:
             # Injected last so a model-supplied "environment" argument can
             # never smuggle a fake environment past the binding.
-            arguments = {**call.arguments, "environment": environment}
+            arguments["environment"] = environment
 
+        def _redact_text(raw_text: str) -> tuple[str, list[str]]:
+            if not resolved_secrets and not all_vault_entries:
+                return raw_text, []
+            from common.vault import VaultRedactor
+
+            return VaultRedactor.redact(
+                raw_text,
+                resolved_secrets=resolved_secrets,
+                all_entries=all_vault_entries,
+            )
+
+        redacted_keys: list[str] = []
         try:
             content = await self._invoke(func, arguments, defn.timeout_seconds)
-            content_text = str(content)
+            content_text, redacted_keys = _redact_text(str(content))
             is_error = _looks_like_tool_error(content_text)
             result = ToolResult(
                 call_id=call.id,
@@ -676,14 +765,24 @@ class ToolRegistry:
                 side_effect_status="unknown" if defn.side_effect != "none" else "none",
             )
         except Exception as exc:
+            err_text, redacted_keys = _redact_text(str(exc))
             result = ToolResult(
                 call_id=call.id,
-                content=str(exc),
+                content=err_text,
                 is_error=True,
                 error_kind="exception",
                 retryable=defn.retryable,
                 side_effect_status="unknown" if defn.side_effect != "none" else "none",
             )
+        finally:
+            # Drop resolved secret references promptly after invocation
+            arguments = {}
+
+        if resolved_secrets:
+            result.metadata["vault_keys_used"] = [k for k, _ in resolved_secrets]
+        if redacted_keys:
+            result.metadata["vault_redacted"] = True
+            result.metadata["vault_redacted_keys"] = redacted_keys
 
         # Plain string truncation: a thread hop costs more than the work.
         result = self._finalize_result(result, tool_name)

@@ -1215,6 +1215,9 @@ async def react_event_loop(
                             arguments_summary,
                             tool_description=definition.description if definition else "",
                             scope=decision.approval_scope,
+                            taint_sources=decision.taint_sources,
+                            repeat_count=decision.repeat_count,
+                            rule_id=decision.rule_id,
                         )
                         approval_request = broker.open(
                             ApprovalRequest(
@@ -1227,9 +1230,12 @@ async def react_event_loop(
                                 scope=decision.approval_scope,
                                 risk=decision.risk,
                                 presentation=presentation,
+                                rule_id=decision.rule_id,
+                                taint_sources=decision.taint_sources,
+                                repeat_count=decision.repeat_count,
                             )
                         )
-                        yield ExecutionEvent(EventType.TOOL_CALL_RESULT, {
+                        approval_event_data: dict[str, object] = {
                             "id": tc.id,
                             "error": False,
                             "blocked": True,
@@ -1248,7 +1254,14 @@ async def react_event_loop(
                                 if approval_request.scope is not None
                                 else None
                             ),
-                        })
+                        }
+                        if decision.rule_id:
+                            approval_event_data["rule_id"] = decision.rule_id
+                        if decision.taint_sources:
+                            approval_event_data["taint_sources"] = list(decision.taint_sources)
+                        if decision.repeat_count >= 2:
+                            approval_event_data["repeat_count"] = decision.repeat_count
+                        yield ExecutionEvent(EventType.TOOL_CALL_RESULT, approval_event_data)
                         try:
                             approved = await broker.wait(approval_request)
                             denial = "User denied approval"
@@ -1398,6 +1411,13 @@ async def react_event_loop(
                 approval_scope=decision.approval_scope,
             ):
                 result = await tool_registry.execute(call)
+
+            # Immediately update repeat-sensitive counters and SessionTaintStore
+            # BEFORE evaluating the next tool call in this same assistant turn.
+            if tool_guard is not None and hasattr(tool_guard, "record_post_execution"):
+                active_ctx = current_approval_context()
+                active_run_id = active_ctx[1] if active_ctx is not None else ""
+                tool_guard.record_post_execution(call, result, run_id=active_run_id)
 
             # ========== PostToolUse Hook 检查 ==========
             if hook_registry is not None:
