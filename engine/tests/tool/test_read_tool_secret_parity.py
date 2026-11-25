@@ -137,3 +137,91 @@ def test_glob_files_does_not_enumerate_secrets(tmp_path) -> None:
     assert "id_rsa_old" not in everything
     assert "prod.key" not in explicit, explicit
     assert "id_rsa" not in ssh_probe, ssh_probe
+
+
+def test_six_layer_sensitive_rules_ssot_parity(tmp_path: Path) -> None:
+    """All 6 sensitive-rule consumers agree on every SSoT rule category."""
+    from common.sensitive_rules import (
+        CREDENTIAL_CONFIG_FILES,
+        CREDENTIAL_DIRS,
+        CREDENTIAL_PATH_PAIRS,
+        export_tool_rule_bundle,
+        is_sensitive_read_name,
+    )
+    from engine.safety.tool_guard import FileGuard
+    from engine.sandbox.macos_seatbelt import _is_sensitive_data_path
+
+    grep = _load_tool("grep")
+    glob_files = _load_tool("glob_files")
+    list_dir = _load_tool("list_dir")
+    git_ops = _load_tool("git_ops")
+    bundle = export_tool_rule_bundle()
+
+    # Every credential directory & config file is aligned across fallback sets.
+    assert FileGuard._ALWAYS_BLOCKED == CREDENTIAL_DIRS
+    assert glob_files._SECRET_DIRS == set(CREDENTIAL_DIRS)
+    assert list_dir._SECRET_DIRS == set(CREDENTIAL_DIRS)
+    assert git_ops._SECRET_DIRS == CREDENTIAL_DIRS
+
+    assert glob_files._SECRET_FILES == set(CREDENTIAL_CONFIG_FILES)
+    assert list_dir._SECRET_FILES == set(CREDENTIAL_CONFIG_FILES)
+    assert git_ops._SECRET_CONFIG_FILES == CREDENTIAL_CONFIG_FILES
+
+    assert glob_files._SECRET_PATH_PAIRS == set(CREDENTIAL_PATH_PAIRS)
+    assert list_dir._SECRET_PATH_PAIRS == set(CREDENTIAL_PATH_PAIRS)
+    assert git_ops._SECRET_PATH_PAIRS == CREDENTIAL_PATH_PAIRS
+
+    # Workspace fixture covering previously-drifted entries: .docker, .git-credentials,
+    # .config/gh, .config/gcloud, Library/Keychains, .npmrc, .p12, .pfx, .kube.
+    ws = tmp_path / "parity"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "safe.py").write_text(f"safe = '{_SHARED_TOKEN}'\n")
+    drifted_paths = [
+        ".docker/config.json",
+        ".git-credentials",
+        ".config/gh/hosts.yml",
+        ".config/gcloud/credentials.db",
+        "Library/Keychains/login.keychain-db",
+        ".npmrc",
+        ".kube/config",
+        ".gnupg/secring.gpg",
+        "certs/bundle.p12",
+        "certs/bundle.pfx",
+    ]
+    for rel in drifted_paths:
+        p = ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"SECRET {_SHARED_TOKEN}\n")
+        assert _is_sensitive_data_path(Path(rel)), f"seatbelt missed {rel}"
+        assert git_ops._is_sensitive_staged_path(rel), f"git_ops fallback missed {rel}"
+        assert git_ops._is_sensitive_staged_path(rel, bundle), f"git_ops injected missed {rel}"
+
+    # Verify grep, list_dir, glob_files hide every drifted entry (both fallback and injected)
+    for injected in (None, bundle):
+        grep_out = asyncio.run(
+            grep.execute(pattern=_SHARED_TOKEN, path=str(ws), _sensitive_rules=injected)
+        )
+        assert "safe.py" in grep_out, grep_out
+        for rel in drifted_paths:
+            assert Path(rel).name not in grep_out, f"grep leaked {rel} (injected={bool(injected)}): {grep_out}"
+
+        list_out = asyncio.run(
+            list_dir.execute(path=str(ws), max_depth=5, _sensitive_rules=injected)
+        )
+        assert "safe.py" in list_out, list_out
+        for rel in (".docker", ".git-credentials", "hosts.yml", "credentials.db", "login.keychain-db", ".npmrc", "bundle.p12"):
+            assert rel not in list_out, f"list_dir leaked {rel}: {list_out}"
+
+        glob_out = asyncio.run(
+            glob_files.execute(pattern="**/*", path=str(ws), _sensitive_rules=injected)
+        )
+        assert "src/safe.py" in glob_out, glob_out
+        for rel in ("hosts.yml", "credentials.db", "login.keychain-db", "bundle.p12", "bundle.pfx"):
+            assert rel not in glob_out, f"glob_files leaked {rel}: {glob_out}"
+
+    # Public keys and .env templates remain allowed in read/staging tools
+    for benign in ("id_rsa.pub", ".env.example", ".env.template", ".env.sample"):
+        assert not is_sensitive_read_name(benign)
+        assert not git_ops._is_sensitive_staged_path(benign)
+        assert not glob_files._is_secret_name(benign)
+        assert not list_dir._is_secret_name(benign)

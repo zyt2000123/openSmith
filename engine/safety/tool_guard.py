@@ -8,13 +8,27 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from itertools import pairwise
 from pathlib import Path
 from typing import Optional
 
 from common.hash_chain import ChainVerification, HashChainLog, verify_chain
+from common.sensitive_rules import (
+    CREDENTIAL_CONFIG_FILES,
+    CREDENTIAL_DIRS,
+    CREDENTIAL_PATH_PAIRS,
+    ENV_TEMPLATE_SUFFIXES,
+    GIT_CREDENTIAL_FILES,
+    PRIVATE_KEY_EXTENSIONS,
+    SENSITIVE_WRITE_FILES,
+    SSH_KEY_NAME_RE,
+    is_sensitive_read_name,
+    is_sensitive_write_name,
+    match_credential_pair,
+    runtime_credential_paths,
+)
 from engine.safety.approval import (
     ApprovalScope,
     _SECRET_FLAG_RE,
@@ -207,77 +221,32 @@ def _shares_inode_with_protected_file(
     return False
 
 
-_SENSITIVE_READ_EXTENSIONS = (".pem", ".key", ".p12", ".pfx")
-_ENV_TEMPLATE_SUFFIXES = (".env.example", ".env.template", ".env.sample")
-# A basename matching this (with word boundaries) is an SSH-style private key
-# even when it has been copied away from ``.ssh`` — ``id_rsa_old``,
-# ``backup-id_ed25519`` and the like.
-_SENSITIVE_KEY_NAME_RE = re.compile(
-    r"(?:^|[-_.])(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:[-_.]|$)"
-)
-# Files inside any ``.git`` directory whose read warrants high-risk approval:
-# ``config`` embeds remote URLs (often ``https://user:token@host``), the
-# ``credentials`` file stores passwords verbatim, ``config.worktree`` the same.
-_GIT_CREDENTIAL_FILES = frozenset({"config", "config.worktree", "credentials"})
-# Package-manager and VCS credential stores.  These live as ordinary files with
-# ordinary-looking names, so no extension or key-name rule below reaches them.
-#
-# This set is deliberately identical to ``macos_seatbelt._CREDENTIAL_CONFIGS``
-# and to the file entries of ``agents/tools/grep.py``'s ``SECRET_EXCLUDED``.
-# The three copies exist because the sandbox may not import the safety layer
-# and ``agents/`` may not import the engine at all; they had already drifted
-# apart, and the weakest copy set the real security level: the shell tool was
-# denied ``~/.npmrc`` by the Seatbelt profile while ``read_file`` returned the
-# same npm token with no approval at all.  Change all three together.
-_CREDENTIAL_CONFIG_NAMES = frozenset({".npmrc", ".pypirc", ".netrc", ".git-credentials"})
-# Credential stores identified by a parent/child directory pair rather than by a
-# single component, so ``_ALWAYS_BLOCKED`` cannot express them.
-_CREDENTIAL_PATH_PAIRS = frozenset(
-    {(".config", "gh"), (".config", "gcloud"), ("library", "keychains")}
-)
+_SENSITIVE_READ_EXTENSIONS = PRIVATE_KEY_EXTENSIONS
+_ENV_TEMPLATE_SUFFIXES = ENV_TEMPLATE_SUFFIXES
+_SENSITIVE_KEY_NAME_RE = SSH_KEY_NAME_RE
+_GIT_CREDENTIAL_FILES = GIT_CREDENTIAL_FILES
+_CREDENTIAL_CONFIG_NAMES = CREDENTIAL_CONFIG_FILES
+_CREDENTIAL_PATH_PAIRS = CREDENTIAL_PATH_PAIRS
 
 
 def _credential_pair(path: Path) -> str | None:
     """Return the ``parent/child`` credential directory this path enters, if any."""
-    folded = tuple(part.lower() for part in path.parts)
-    for parent, child in pairwise(folded):
-        if (parent, child) in _CREDENTIAL_PATH_PAIRS:
-            return f"{parent}/{child}"
-    return None
+    return match_credential_pair(path)
 
 
 def _is_sensitive_read_name(name: str) -> bool:
-    """Whether a case-folded basename warrants high-risk approval when read.
-
-    The read path has no write-branch equivalent: ``read_file`` declares
-    ``approval_policy="never"``, so the only protection is the case-sensitive
-    regex rules, which miss ``.ENV``, ``.env.staging``, ``key.PEM`` and a
-    stray ``id_rsa`` — all reachable on a case-insensitive APFS filesystem.
-    This mirrors the write branch (any ``.env*``) plus the private-key rule
-    set, matched case-insensitively.  Documented env templates and public keys
-    stay ordinary reads.
-    """
-    folded = name.lower()
-    if folded.endswith(".pub"):
-        return False
-    if folded.startswith(".env"):
-        return not folded.endswith(_ENV_TEMPLATE_SUFFIXES)
-    if folded in _CREDENTIAL_CONFIG_NAMES:
-        return True
-    if folded.endswith(_SENSITIVE_READ_EXTENSIONS):
-        return True
-    return bool(_SENSITIVE_KEY_NAME_RE.search(folded))
+    """Whether a case-folded basename warrants high-risk approval when read."""
+    return is_sensitive_read_name(name)
 
 
 class FileGuard:
-    # Mirrors ``macos_seatbelt._CREDENTIAL_DIRECTORIES`` minus ``.agent-smith``,
-    # which has its own dedicated platform-state and runtime-credential rules.
-    _ALWAYS_BLOCKED = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
-    _SENSITIVE_WRITE = frozenset({".env", ".env.local", ".env.production", ".npmrc", ".pypirc"})
+    _ALWAYS_BLOCKED = CREDENTIAL_DIRS
+    _SENSITIVE_WRITE = SENSITIVE_WRITE_FILES
     _SENSITIVE_DIRS = frozenset({".git"})
 
     def __init__(self, allowed_dirs: list[Path] | None = None):
         self._working_dir: Path | None = None
+        self._extra_roots: tuple[Path, ...] = ()
         self._non_delegable_write_roots: tuple[Path, ...] = ()
         self.set_allowed_dirs(allowed_dirs)
 
@@ -295,12 +264,23 @@ class FileGuard:
         else:
             self._allowed = [p.resolve() for p in allowed_dirs]
 
-    def set_working_directory(self, working_dir: Path) -> None:
+    def set_working_directory(
+        self,
+        working_dir: Path,
+        *,
+        extra_roots: Iterable[Path] = (),
+    ) -> None:
         root = Path(working_dir).expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"working directory does not exist: {working_dir}")
         self._working_dir = root
-        self.set_allowed_dirs([root])
+        resolved_extra: list[Path] = []
+        for extra in extra_roots:
+            resolved = Path(extra).expanduser().resolve()
+            if resolved != root and resolved.is_dir() and resolved not in resolved_extra:
+                resolved_extra.append(resolved)
+        self._extra_roots = tuple(resolved_extra)
+        self.set_allowed_dirs([root, *self._extra_roots])
 
     def set_non_delegable_write_roots(self, roots: list[Path]) -> None:
         """Configure paths that model tools may read but never modify.
@@ -511,7 +491,7 @@ class FileGuard:
             # innocuous name, and the write it authorizes is a git hook — code
             # that runs on the next git operation.
             for name in _ordered_unique(target.name.lower(), lexical.name.lower()):
-                if name in self._SENSITIVE_WRITE or name.startswith(".env"):
+                if is_sensitive_write_name(name):
                     return self._path_approval(
                         target,
                         writing=True,
@@ -864,12 +844,7 @@ _REDIRECT_RE = re.compile(r"(?:>>?|[12]>>?|&>>?)\s*([^\s;|&]+)")
 _PLATFORM_DATA_ROOT = (Path.home() / ".agent-smith").resolve()
 _MEMORY_WRITE_ROOT = _PLATFORM_DATA_ROOT / "agent" / "memory"
 _MEMORY_WRITE_FILES = frozenset({"recent.jsonl", "recent.md", "durable.md"})
-_RUNTIME_CREDENTIAL_PATHS = frozenset({
-    _PLATFORM_DATA_ROOT / "config.yaml",
-    _PLATFORM_DATA_ROOT / "config.yml",
-    _PLATFORM_DATA_ROOT / "agent" / "config.yaml",
-    _PLATFORM_DATA_ROOT / "agent" / "config.yml",
-})
+_RUNTIME_CREDENTIAL_PATHS = frozenset(runtime_credential_paths(_PLATFORM_DATA_ROOT))
 
 
 def _is_runtime_credential_path(*paths: Path) -> bool:
@@ -993,9 +968,14 @@ class ToolGuard:
         self.whitelist.allow_file(str(target))
         return target
 
-    def set_working_directory(self, working_dir: Path) -> None:
-        """Constrain project-facing file tools to one resolved workspace."""
-        self.file_guard.set_working_directory(working_dir)
+    def set_working_directory(
+        self,
+        working_dir: Path,
+        *,
+        extra_roots: Iterable[Path] = (),
+    ) -> None:
+        """Constrain project-facing file tools to one resolved workspace (plus extra_roots)."""
+        self.file_guard.set_working_directory(working_dir, extra_roots=extra_roots)
 
     def set_non_delegable_write_roots(self, roots: list[Path]) -> None:
         """Block model writes to runtime-owned executable provider roots."""

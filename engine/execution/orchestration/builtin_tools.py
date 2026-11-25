@@ -147,6 +147,24 @@ def bind_todo_tool(
 
 
 
+def bind_sensitive_rule_tools(services: RuntimeServices) -> None:
+    """Inject plain-data sensitive-rule snapshots into zero-import tools."""
+    from common.sensitive_rules import export_tool_rule_bundle
+
+    bundle = export_tool_rule_bundle()
+
+    def wrapper(func):
+        async def execute_with_sensitive_rules(**kwargs):
+            kwargs["_sensitive_rules"] = bundle
+            result = func(**kwargs)
+            return await result if inspect.isawaitable(result) else result
+
+        return execute_with_sensitive_rules
+
+    for tool_name in ("grep", "glob_files", "list_dir", "git_ops"):
+        services.tool_registry.wrap_tool(tool_name, wrapper)
+
+
 def bind_sub_agent_tool(services: RuntimeServices, agents_dir: Path) -> None:
     """Give the generic sub-agent provider the engine's spawn capability.
 
@@ -233,6 +251,7 @@ def bind_sub_agent_tool(services: RuntimeServices, agents_dir: Path) -> None:
 __all__ = (
     "MemoryToolApi",
     "bind_memory_ops_tool",
+    "bind_sensitive_rule_tools",
     "bind_skill_load_tool",
     "bind_skill_manage_tool",
     "bind_snapshot_tools",

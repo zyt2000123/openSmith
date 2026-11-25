@@ -29,6 +29,7 @@ from engine.tool.registry import ToolRegistry
 
 from .builtin_tools import (
     bind_memory_ops_tool,
+    bind_sensitive_rule_tools,
     bind_skill_load_tool,
     bind_skill_manage_tool,
     bind_snapshot_tools,
@@ -320,6 +321,7 @@ async def prepare_runtime(
     bind_snapshot_tools(services, runtime.session_id)
     bind_memory_ops_tool(services, state_dir)
     bind_todo_tool(services, state_dir, runtime.session_id)
+    bind_sensitive_rule_tools(services)
     # Bound before the enabled-tools allowlist is computed: an empty or
     # malformed catalog hides the tool, and a hidden tool must not then be
     # re-enabled by config.

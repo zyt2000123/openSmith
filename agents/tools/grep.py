@@ -59,36 +59,34 @@ SECRET_EXCLUDED = [
     ".git-credentials",                             # git credential store
     "*.pem", "*.key", "*.p12", "*.pfx",             # private keys and certs
     # SSH keys outside ~/.ssh, including copies and rotations that keep the
-    # shape but not the exact name (id_rsa_old, backup-id_ed25519).  Exact
-    # names alone let grep return a private key that read_file refuses without
-    # high-risk approval; keep aligned with the same widening in
-    # engine/safety/tool_guard.py and engine/sandbox/macos_seatbelt.py.
+    # shape but not the exact name (id_rsa_old, backup-id_ed25519).
     "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
     "*[-_.]id_rsa*", "*[-_.]id_dsa*", "*[-_.]id_ecdsa*", "*[-_.]id_ed25519*",
 ]
-# A caller-supplied file filter WINS over the exclusions above in both engines:
-# BSD/GNU grep applies --include before --exclude, and ripgrep gives precedence
-# to the last matching glob (ours are emitted first).  So `include='*'` — or any
-# glob that can name an excluded file — turned SECRET_EXCLUDED off entirely and
-# returned .env / *.pem / .npmrc contents from a plain directory search, with no
-# approval anywhere in the path.  Reordering the flags cannot fix this: grep's
-# precedence is order-independent.  Reject such a filter instead.
-#
-# Only the FILE entries above need this.  --exclude-dir is not overridden by
-# --include, so the credential directories stay protected either way.
+_SECRET_PATH_PAIRS = (
+    (".config", "gh"),
+    (".config", "gcloud"),
+    ("library", "keychains"),
+)
+_SECRET_PAIR_GLOBS = (
+    ".config/gh/**",
+    ".config/gcloud/**",
+    "library/keychains/**",
+)
 _SECRET_PROBE_NAMES = (
     ".env", ".env.local", ".env.production",
-    ".npmrc", ".pypirc", ".netrc", ".git-credentials",
-    "server.pem", "server.key", "cert.p12", "cert.pfx",
+    ".git-credentials", ".netrc", ".npmrc", ".pypirc",
+    "secret.pem", "secret.key", "secret.p12", "secret.pfx",
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
-    # Copies and rotations must be probed too, or a filter naming one of them
-    # would slip past the reachability check that guards SECRET_EXCLUDED.
     "id_rsa_old", "backup-id_ed25519",
 )
 _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 
 
-def _include_reaches_secret(include: str) -> bool:
+def _include_reaches_secret(
+    include: str,
+    probe_names: tuple[str, ...] = _SECRET_PROBE_NAMES,
+) -> bool:
     """Whether a caller's file filter can name a SECRET_EXCLUDED file.
 
     Matched case-insensitively because both engines exclude case-insensitively
@@ -101,9 +99,23 @@ def _include_reaches_secret(include: str) -> bool:
     tail = lowered.replace("\\", "/").rsplit("/", 1)[-1]
     return any(
         fnmatch.fnmatchcase(name, candidate)
-        for name in _SECRET_PROBE_NAMES
+        for name in probe_names
         for candidate in {lowered, tail}
     )
+
+
+def _line_hits_secret_pair(
+    line: str,
+    path_pairs: tuple[tuple[str, str], ...] | frozenset[tuple[str, str]],
+) -> bool:
+    """True when a grep result line references a file inside a credential pair."""
+    # Result format is `<path>:<lineno>:<text>` or `<path>` (files_only).
+    path_part = line.split(":", 1)[0].replace("\\", "/").lower()
+    parts = [p for p in path_part.split("/") if p]
+    for idx in range(len(parts) - 1):
+        if (parts[idx], parts[idx + 1]) in path_pairs:
+            return True
+    return False
 
 
 def _casefold_glob(pattern: str) -> str:
@@ -157,6 +169,7 @@ def _has_rg() -> bool:
 def _execute_sync(
     *, pattern: str, path: str = ".", include: str = "",
     ignore_case: bool = False, context_lines: int = 0, files_only: bool = False,
+    _sensitive_rules: dict | None = None,
 ) -> str:
     # Argument types are validated before use: every one of these reaches either
     # a string method or an `argv` list, so a wrong type raised deep inside the
@@ -177,12 +190,19 @@ def _execute_sync(
     if not os.path.exists(resolved):
         return f"Error: path not found: {resolved}"
 
+    is_dir_walk = os.path.isdir(resolved)
+    rules = _sensitive_rules if isinstance(_sensitive_rules, dict) else {}
+    configured_globs = list(rules.get("grep_secret_globs") or SECRET_EXCLUDED)
+    pair_globs = list(rules.get("grep_secret_pair_globs") or _SECRET_PAIR_GLOBS)
+    path_pairs = rules.get("credential_path_pairs") or _SECRET_PATH_PAIRS
+    probe_names = tuple(rules.get("probe_names") or _SECRET_PROBE_NAMES)
+
     # Secrets are excluded only when walking a directory.  A file the model
     # names is a different case: ToolGuard sees that basename and gates it, so
     # excluding it here would block a search the user already approved.
-    secret_globs = SECRET_EXCLUDED if os.path.isdir(resolved) else []
+    secret_globs = configured_globs if is_dir_walk else []
 
-    if secret_globs and include and _include_reaches_secret(include):
+    if secret_globs and include and _include_reaches_secret(include, probe_names):
         return (
             f"Error: the include filter '{include}' can match credential files "
             "that a directory search must never return. Narrow it to the file "
@@ -197,6 +217,9 @@ def _execute_sync(
             # --iglob, not --glob: on a case-insensitive filesystem the exclusion
             # list should suppress the directory however it happens to be typed.
             args.extend(["--iglob", f"!{e}"])
+        if is_dir_walk:
+            for pair_glob in pair_globs:
+                args.extend(["--iglob", f"!{pair_glob}", "--iglob", f"!**/{pair_glob}"])
         if ignore_case: args.append("-i")
         if files_only: args.append("-l")
         else:
@@ -206,17 +229,10 @@ def _execute_sync(
         args.extend(["-e", pattern] if pattern.startswith("-") else [pattern])
         args.append(resolved)
     else:
-        # -E is not optional.  Without it BSD/GNU grep defaults to POSIX BRE,
-        # where `|` is a literal character, so an alternation like `cat|dog`
-        # reports "no matches" against text containing both — a confidently
-        # wrong answer, in a dialect other than the one ripgrep (this tool's
-        # primary engine) would have used.
         args = ["grep", "-r", "-E", "--binary-files=without-match"]
         for e in EXCLUDED:
             args.extend(["--exclude-dir", _casefold_glob(e)])
         for e in secret_globs:
-            # --exclude-dir skips a matching directory, --exclude a matching
-            # file; the secret list holds both kinds, so every entry gets both.
             folded = _casefold_glob(e)
             args.extend(["--exclude-dir", folded, "--exclude", folded])
         if ignore_case: args.append("-i")
@@ -239,9 +255,6 @@ def _execute_sync(
     except subprocess.TimeoutExpired:
         return "Error: search timed out. Try a more specific pattern or path."
 
-    # Both engines use exit 1 for "ran fine, matched nothing" and >=2 for a real
-    # failure.  Reading only stdout made an invalid pattern indistinguishable
-    # from an empty result set, so a rejected search read as "not in the codebase".
     if result.returncode >= 2:
         detail = (result.stderr or "").strip().splitlines()
         reason = detail[0][:300] if detail else f"search exited with code {result.returncode}"
@@ -251,8 +264,13 @@ def _execute_sync(
     if not output:
         return f"No matches found for: {pattern}"
 
-    engine = "rg" if use_rg else "grep -E"
     lines = output.split("\n")
+    if is_dir_walk and path_pairs:
+        lines = [line for line in lines if not _line_hits_secret_pair(line, path_pairs)]
+        if not lines:
+            return f"No matches found for: {pattern}"
+
+    engine = "rg" if use_rg else "grep -E"
     total = len(lines)
     lines = [l[:MAX_LINE_LEN] + "…" if len(l) > MAX_LINE_LEN else l for l in lines[:MAX_RESULTS]]
     header = f"# grep ({engine}): {min(total, MAX_RESULTS)} results"
@@ -264,6 +282,7 @@ def _execute_sync(
 async def execute(
     *, pattern: str, path: str = ".", include: str = "",
     ignore_case: bool = False, context_lines: int = 0, files_only: bool = False,
+    _sensitive_rules: dict | None = None,
 ) -> str:
     return await asyncio.to_thread(
         _execute_sync,
@@ -273,4 +292,5 @@ async def execute(
         ignore_case=ignore_case,
         context_lines=context_lines,
         files_only=files_only,
+        _sensitive_rules=_sensitive_rules,
     )

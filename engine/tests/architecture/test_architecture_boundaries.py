@@ -174,3 +174,30 @@ def test_setuptools_uses_package_discovery() -> None:
     assert packages["find"]["exclude"] == ["engine.tests*"]
     assert packages["find"]["namespaces"] is False
     assert setuptools["package-dir"] == {"": ".."}
+
+
+def test_common_layer_does_not_import_engine_or_server() -> None:
+    imports = [
+        item
+        for item in _python_imports(REPO_ROOT / "common")
+        if item[2].startswith(("engine", "server"))
+    ]
+    assert not imports, _relative_imports(imports, root=REPO_ROOT)
+
+
+def test_sandbox_package_does_not_import_safety_or_server() -> None:
+    imports = [
+        item
+        for item in _python_imports(ENGINE_ROOT / "sandbox")
+        if item[2].startswith(("engine.safety", "server", "fastapi"))
+    ]
+    assert not imports, _relative_imports(imports, root=REPO_ROOT)
+
+
+def test_agents_tools_remain_zero_cross_layer_import() -> None:
+    imports = [
+        item
+        for item in _python_imports(REPO_ROOT / "agents" / "tools")
+        if item[2].startswith(("common", "engine", "server"))
+    ]
+    assert not imports, _relative_imports(imports, root=REPO_ROOT)
