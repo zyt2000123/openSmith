@@ -18,12 +18,13 @@ from engine.safety.taint import EgressAllowlist, EgressTarget
 from engine.tool.interface import ToolCall, ToolDefinition
 
 TaintEgressAction = Literal["deny", "ask", "audit"]
-RepeatWindow = Literal["run", "session"]
+RepeatWindow = Literal["run"]
 RepeatTriggerAction = Literal["confirm", "deny"]
 RuleAction = Literal["deny", "ask", "allow"]
 
 _VALID_TAINT_ACTIONS = frozenset({"deny", "ask", "audit"})
-_VALID_REPEAT_WINDOWS = frozenset({"run", "session"})
+# Only per-run windowing is implemented; reject unimplemented values fail-closed (L1).
+_VALID_REPEAT_WINDOWS = frozenset({"run"})
 _VALID_REPEAT_TRIGGERS = frozenset({"confirm", "deny"})
 _VALID_RULE_ACTIONS = frozenset({"deny", "ask", "allow"})
 _VALID_RISK_MAP: dict[str, RiskTier] = {

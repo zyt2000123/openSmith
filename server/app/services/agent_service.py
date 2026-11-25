@@ -268,12 +268,24 @@ class AgentService:
         cwd: str | None = None,
         run_probes: bool = True,
     ) -> dict:
+        import asyncio
+        from fastapi import HTTPException
+
         from common import config as common_config
         from engine.sandbox.doctor import run_doctor_async
 
-        report = await run_doctor_async(
-            cwd=cwd,
-            run_probes=run_probes,
-            data_dir=common_config.PATHS.data_dir,
-        )
+        try:
+            report = await asyncio.wait_for(
+                run_doctor_async(
+                    cwd=cwd,
+                    run_probes=run_probes,
+                    data_dir=common_config.PATHS.data_dir,
+                ),
+                timeout=45.0,
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Doctor diagnostics timed out after 45 seconds",
+            ) from exc
         return report.to_dict()

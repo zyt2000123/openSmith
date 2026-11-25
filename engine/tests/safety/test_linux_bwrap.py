@@ -247,6 +247,58 @@ def test_bwrap_handles_ubuntu_resolv_conf_symlink_and_smoke_test_uses_real_mount
     assert find_seq(smoke, "--ro-bind", "/etc", "/etc") < find_seq(smoke, "--tmpfs", "/run")
     assert find_seq(smoke, "--tmpfs", "/run") < find_seq(smoke, "--ro-bind", "/dev/null", str(stub_target))
 
+    # L3: no sys.executable loopback bootstrap, always --cap-drop ALL, direct inner_argv
+    assert sys.executable not in argv_off
+    assert "--cap-drop" in argv_off and "ALL" in argv_off
+    assert argv_off[-2:] == ["--", "/bin/true"]
+
+
+def test_bwrap_sensitive_scan_is_fingerprint_cached_and_skips_cache_mounts(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """M6: sensitive-path scan caches by directory fingerprint and skips cache_mounts."""
+    from engine.sandbox import linux_bwrap as lb_module
+
+    fake_home = tmp_path / "home"
+    ws = fake_home / "ws"
+    cache = fake_home / "uv-cache"
+    for d in (ws, cache):
+        d.mkdir(parents=True)
+    (ws / ".env").write_text("WS_SECRET=1\n", encoding="utf-8")
+    (cache / ".env").write_text("CACHE_NOT_SCANNED=1\n", encoding="utf-8")
+
+    cfg = SandboxProfileConfig(
+        auto_detect_toolchains=False,
+        auto_detect_caches=False,
+        cache_roots={"uv": str(cache)},
+    )
+    profile = resolve_sandbox_profile(
+        ws, cfg, home=fake_home, data_dir=fake_home / ".agent-smith", platform="linux"
+    )
+    env = LinuxBwrapEnvironment(workspace=ws, profile=profile, host_home=fake_home)
+
+    scan_calls = {"count": 0}
+    real_scan = lb_module._find_sensitive_paths_under
+
+    def counting_scan(roots, secrets):
+        scan_calls["count"] += 1
+        return real_scan(roots, secrets)
+
+    monkeypatch.setattr(lb_module, "_find_sensitive_paths_under", counting_scan)
+
+    first = env._cached_sensitive_paths()
+    second = env._cached_sensitive_paths()
+    assert scan_calls["count"] == 1
+    assert any(p == (ws / ".env").resolve() for p, _ in first)
+    assert not any(p == (cache / ".env").resolve() for p, _ in first)
+    assert first == second
+
+    # Mutating workspace invalidates fingerprint cache
+    (ws / "new.txt").write_text("x\n", encoding="utf-8")
+    env._cached_sensitive_paths()
+    assert scan_calls["count"] == 2
+
 
 def test_bwrap_availability_detects_missing_apparmor_and_userns_disabled() -> None:
     missing = probe_bwrap_availability(bwrap_path="")

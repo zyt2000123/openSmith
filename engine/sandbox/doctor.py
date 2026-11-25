@@ -232,14 +232,34 @@ def _check_audit_chain(data_dir: Path) -> DoctorCheck:
 def check_sandbox_health(
     *,
     platform: str | None = None,
+    backend: str = "auto",
     bwrap_availability: BwrapAvailability | None = None,
     seatbelt_available: bool | None = None,
 ) -> SandboxHealthReport:
-    """Inspect OS sandbox backend readiness without running containment probes."""
+    """Inspect OS sandbox backend readiness honoring configured ``sandbox.backend`` (L4)."""
     active_platform = platform or sys.platform
     checks: list[DoctorCheck] = []
 
-    if active_platform == "darwin":
+    if backend == "seatbelt" or (backend == "auto" and active_platform == "darwin"):
+        if active_platform != "darwin":
+            checks.append(
+                DoctorCheck(
+                    id="sandbox.seatbelt.platform",
+                    category="sandbox",
+                    status="fail",
+                    summary=f"Configured sandbox.backend='seatbelt' is unsupported on '{active_platform}'",
+                    code="SEATBELT_UNSUPPORTED_PLATFORM",
+                    remediation="Set sandbox.backend: auto or bwrap in ~/.agent-smith/config.yaml",
+                )
+            )
+            return SandboxHealthReport(
+                platform=active_platform,
+                backend="unavailable",
+                ready=False,
+                binary_path=None,
+                binary_version=None,
+                checks=tuple(checks),
+            )
         sb_ok = (
             (os.path.isfile(_SANDBOX_EXECUTABLE) and os.access(_SANDBOX_EXECUTABLE, os.X_OK))
             if seatbelt_available is None
@@ -281,7 +301,26 @@ def check_sandbox_health(
             checks=tuple(checks),
         )
 
-    if active_platform == "linux":
+    if backend == "bwrap" or (backend == "auto" and active_platform == "linux"):
+        if active_platform != "linux":
+            checks.append(
+                DoctorCheck(
+                    id="sandbox.bwrap.platform",
+                    category="sandbox",
+                    status="fail",
+                    summary=f"Configured sandbox.backend='bwrap' is unsupported on '{active_platform}'",
+                    code="BWRAP_UNSUPPORTED_PLATFORM",
+                    remediation="Set sandbox.backend: auto or seatbelt in ~/.agent-smith/config.yaml",
+                )
+            )
+            return SandboxHealthReport(
+                platform=active_platform,
+                backend="unavailable",
+                ready=False,
+                binary_path=None,
+                binary_version=None,
+                checks=tuple(checks),
+            )
         avail = (
             bwrap_availability
             if bwrap_availability is not None
@@ -296,6 +335,18 @@ def check_sandbox_health(
                     summary=(
                         f"Linux bubblewrap ready ({avail.binary_path}"
                         f"{f' v{avail.version}' if avail.version else ''})"
+                    ),
+                )
+            )
+            # M5: document residual shared-netns risk when network=true is approved
+            checks.append(
+                DoctorCheck(
+                    id="sandbox.bwrap.network_netns_note",
+                    category="sandbox",
+                    status="warn",
+                    summary=(
+                        "Linux shell(network=true) shares the host network namespace "
+                        "(abstract AF_UNIX sockets like X11/D-Bus remain reachable while online)"
                     ),
                 )
             )
@@ -359,6 +410,7 @@ def check_sandbox_health(
 async def _run_live_probes(
     *,
     platform: str,
+    sandbox_cfg: SandboxProfileConfig | None = None,
     bwrap_availability: BwrapAvailability | None = None,
     seatbelt_available: bool | None = None,
 ) -> list[DoctorCheck]:
@@ -366,6 +418,7 @@ async def _run_live_probes(
     checks: list[DoctorCheck] = []
     canary_secret = "SMITH_DOCTOR_CANARY_982341"
     canary_env_key = "SMITH_DOCTOR_CANARY_SECRET"
+    effective_cfg = sandbox_cfg if sandbox_cfg is not None else SandboxProfileConfig()
 
     with tempfile.TemporaryDirectory(prefix="smith-doctor-probe-") as tmp_str:
         tmp = Path(tmp_str).resolve()
@@ -391,13 +444,15 @@ async def _run_live_probes(
         nd_file.write_text("ORIGINAL_TOOL_CODE\n", encoding="utf-8")
         (ro_tools / "probe.txt").write_text("TOOLCHAIN_RO_OK\n", encoding="utf-8")
 
+        # L4: exercise the user's configured backend & default_network inside the
+        # disposable sandbox directory (while keeping real user roots untouched).
         probe_cfg = SandboxProfileConfig(
-            backend="auto",
+            backend=effective_cfg.backend,
             fallback_policy="deny",
-            auto_detect_toolchains=True,
+            auto_detect_toolchains=effective_cfg.auto_detect_toolchains,
             auto_detect_caches=False,
             share_read_only=(str(ro_tools),),
-            default_network="none",
+            default_network=effective_cfg.default_network,
         )
         profile = resolve_sandbox_profile(
             ws,
@@ -718,16 +773,50 @@ async def _run_live_probes(
     return checks
 
 
+def _check_llm_config(raw_cfg: dict) -> DoctorCheck:
+    """Check configured LLM section (without exposing api_key) when --check-llm is set."""
+    llm = raw_cfg.get("llm")
+    if not isinstance(llm, dict) or not llm:
+        return DoctorCheck(
+            id="llm.config",
+            category="config",
+            status="warn",
+            summary="No LLM configuration found in config.yaml (run /config to set up)",
+        )
+    routes = llm.get("routes") if isinstance(llm.get("routes"), dict) else {}
+    interactive = routes.get("interactive") if isinstance(routes.get("interactive"), dict) else {}
+    provider = str(interactive.get("provider") or llm.get("provider") or "openai")
+    model = str(interactive.get("model") or llm.get("model") or "")
+    base_url = str(interactive.get("base_url") or llm.get("base_url") or "")
+    has_key = bool(interactive.get("api_key") or llm.get("api_key"))
+    if not (model and base_url and has_key):
+        return DoctorCheck(
+            id="llm.config",
+            category="config",
+            status="fail",
+            summary="LLM configuration is incomplete (provider/base_url/model/api_key required)",
+            code="LLM_CONFIG_INCOMPLETE",
+            remediation="Run `smith` and use `/config` to configure your LLM endpoint.",
+        )
+    return DoctorCheck(
+        id="llm.config",
+        category="config",
+        status="pass",
+        summary=f"LLM configured (provider={provider}, model={model}, base_url={base_url})",
+    )
+
+
 async def run_doctor_async(
     cwd: str | Path | None = None,
     *,
     run_probes: bool = True,
+    check_llm: bool = False,
     data_dir: Path | None = None,
     platform: str | None = None,
     bwrap_availability: BwrapAvailability | None = None,
     seatbelt_available: bool | None = None,
 ) -> DoctorReport:
-    """Run all static checks and (optionally) 8 live sandbox containment probes."""
+    """Run all static checks (off-event-loop) and optionally 8 live sandbox probes."""
     started = time.monotonic()
     active_platform = platform or sys.platform
     resolved_cwd = Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
@@ -736,24 +825,34 @@ async def run_doctor_async(
     ).expanduser()
 
     checks: list[DoctorCheck] = []
-    checks.extend(_check_permissions(resolved_data))
+    # M7: offload filesystem stat, YAML parsing, audit-chain walk, and bwrap smoke
+    # test off the event loop via asyncio.to_thread.
+    checks.extend(await asyncio.to_thread(_check_permissions, resolved_data))
 
-    # Load and validate ~/.agent-smith/config.yaml sandbox configuration
     sandbox_cfg = SandboxProfileConfig()
-    profile: ResolvedSandboxProfile | None = None
+    raw_cfg: dict = {}
     config_path = resolved_data / "config.yaml"
-    try:
-        raw_cfg = load_yaml(config_path) if config_path.is_file() else {}
-        if not isinstance(raw_cfg, dict):
+
+    def _load_and_resolve_config() -> tuple[dict, SandboxProfileConfig, ResolvedSandboxProfile | None]:
+        loaded = load_yaml(config_path) if config_path.is_file() else {}
+        if not isinstance(loaded, dict):
             raise ValueError("config.yaml root must be a YAML mapping")
-        sandbox_cfg = SandboxProfileConfig.from_mapping(raw_cfg.get("sandbox"))
-        if resolved_cwd.is_dir():
-            profile = resolve_sandbox_profile(
+        parsed_cfg = SandboxProfileConfig.from_mapping(loaded.get("sandbox"))
+        resolved_profile = (
+            resolve_sandbox_profile(
                 resolved_cwd,
-                sandbox_cfg,
+                parsed_cfg,
                 data_dir=resolved_data,
                 platform=active_platform,
             )
+            if resolved_cwd.is_dir()
+            else None
+        )
+        return loaded, parsed_cfg, resolved_profile
+
+    try:
+        raw_cfg, sandbox_cfg, profile = await asyncio.to_thread(_load_and_resolve_config)
+        if profile is not None:
             if profile.rejected_paths:
                 checks.append(
                     DoctorCheck(
@@ -785,6 +884,7 @@ async def run_doctor_async(
                         summary=(
                             f"Sandbox config valid (backend={sandbox_cfg.backend}, "
                             f"fallback={sandbox_cfg.fallback_policy}, "
+                            f"default_network={sandbox_cfg.default_network}, "
                             f"extra_roots={len(profile.extra_roots)}, "
                             f"share_ro={len(profile.share_read_only)}, "
                             f"caches={len(profile.cache_mounts)})"
@@ -804,10 +904,15 @@ async def run_doctor_async(
             )
         )
 
-    checks.append(_check_audit_chain(resolved_data))
+    if check_llm:
+        checks.append(_check_llm_config(raw_cfg))
 
-    health = check_sandbox_health(
+    checks.append(await asyncio.to_thread(_check_audit_chain, resolved_data))
+
+    health = await asyncio.to_thread(
+        check_sandbox_health,
         platform=active_platform,
+        backend=sandbox_cfg.backend,
         bwrap_availability=bwrap_availability,
         seatbelt_available=seatbelt_available,
     )
@@ -829,6 +934,7 @@ async def run_doctor_async(
         if health.ready:
             probe_checks = await _run_live_probes(
                 platform=active_platform,
+                sandbox_cfg=sandbox_cfg,
                 bwrap_availability=bwrap_availability,
                 seatbelt_available=seatbelt_available,
             )
@@ -860,6 +966,7 @@ def run_doctor(
     cwd: str | Path | None = None,
     *,
     run_probes: bool = True,
+    check_llm: bool = False,
     data_dir: Path | None = None,
     platform: str | None = None,
     bwrap_availability: BwrapAvailability | None = None,
@@ -870,6 +977,7 @@ def run_doctor(
         run_doctor_async(
             cwd=cwd,
             run_probes=run_probes,
+            check_llm=check_llm,
             data_dir=data_dir,
             platform=platform,
             bwrap_availability=bwrap_availability,
@@ -918,9 +1026,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cwd", default=None, help="Workspace directory to validate")
     parser.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON output")
     parser.add_argument("--no-probe", action="store_true", help="Skip live sandbox containment probes")
+    parser.add_argument("--check-llm", action="store_true", help="Verify configured LLM settings")
     args = parser.parse_args(argv)
 
-    report = run_doctor(cwd=args.cwd, run_probes=not args.no_probe)
+    report = run_doctor(cwd=args.cwd, run_probes=not args.no_probe, check_llm=args.check_llm)
     if args.as_json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
     else:

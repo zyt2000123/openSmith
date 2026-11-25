@@ -66,3 +66,13 @@ def test_mcp_safe_error_text_redacts_vault_secrets(tmp_path: Path) -> None:
     )
     assert "tok_live_secret_value_99999" not in msg
     assert "[REDACTED:vault:MCP_TOKEN]" in msg
+
+    # L2: Secret containing '#' must be redacted BEFORE stripping query/fragment
+    store.set_secret("HASH_SECRET", "prefixSecret#tailFragment99")
+    msg_hash = _safe_error_text(
+        "Request failed with token prefixSecret#tailFragment99 in error body",
+        vault_store=store,
+    )
+    assert "prefixSecret" not in msg_hash
+    assert "tailFragment99" not in msg_hash
+    assert "[REDACTED:vault:HASH_SECRET]" in msg_hash

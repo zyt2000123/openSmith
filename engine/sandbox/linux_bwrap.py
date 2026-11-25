@@ -33,7 +33,11 @@ from .policy import (
     is_hardlink_protected_path,
     runtime_credential_paths,
 )
-from .preflight import HardlinkPreflightCache, check_hardlinks
+from .preflight import (
+    HardlinkPreflightCache,
+    check_hardlinks,
+    compute_roots_fingerprint,
+)
 
 _OPTIONAL_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
 _APPARMOR_BWRAP_PROFILE_REMEDIATION = """\
@@ -47,25 +51,6 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
 }
 EOF
 sudo systemctl reload apparmor"""
-
-# Inline zero-dependency loopback bring-up snippet run inside bwrap's isolated
-# userns + netns so `127.0.0.1` / `::1` work while outbound networking remains
-# completely absent (no external NIC, empty routing table, /dev/null resolv.conf).
-_LOOPBACK_UP_BOOTSTRAP = (
-    "import fcntl, os, socket, struct, sys\n"
-    "try:\n"
-    "    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
-    "    try:\n"
-    "        ifr = struct.pack('16sH', b'lo', 0)\n"
-    "        flags = struct.unpack('16sH', fcntl.ioctl(s.fileno(), 0x8913, ifr))[1]\n"
-    "        fcntl.ioctl(s.fileno(), 0x8914, struct.pack('16sH', b'lo', flags | 0x1 | 0x40))\n"
-    "    finally:\n"
-    "        s.close()\n"
-    "except OSError:\n"
-    "    pass\n"
-    "argv = sys.argv[1:]\n"
-    "os.execvp(argv[0], argv)\n"
-)
 
 _SENTINEL_ROOT: Path | None = None
 _SENTINEL_FILE: Path | None = None
@@ -458,7 +443,18 @@ def _find_sensitive_paths_under(
 
 
 class LinuxBwrapEnvironment:
-    """Linux sandbox backend powered by bubblewrap (``bwrap``)."""
+    """Linux sandbox backend powered by bubblewrap (``bwrap``).
+
+    Known residual limitation (M5): when an operator approves ``shell(network=true)``
+    (``ApprovalScope.sandbox_network``), ``bwrap`` omits ``--unshare-net`` and
+    shares the host network namespace so outbound TCP/UDP/DNS work without an
+    external slirp4netns/pasta daemon.  In that approved online mode, abstract
+    ``AF_UNIX`` sockets (such as X11 or D-Bus) in the host network namespace are
+    reachable; filesystem isolation (``$HOME`` tmpfs shield, sensitive-path
+    blackholing, non-delegable write roots) and PID/IPC/UTS isolation remain
+    active.  This residual is surfaced in both ``smith doctor`` and the
+    approval prompt.
+    """
 
     name = "sandbox"
     backend_id = "bwrap"
@@ -497,7 +493,7 @@ class LinuxBwrapEnvironment:
             self._share_read_only = ()
             self._cache_mounts = ()
             self._path_entries = ()
-            self._default_network = "loopback_only"
+            self._default_network = "none"
             configured_secrets = (
                 runtime_credential_paths()
                 if runtime_secret_paths is None
@@ -525,6 +521,10 @@ class LinuxBwrapEnvironment:
         self._approved_network = approved_host_access
         self._host = LocalExecutionEnvironment()
         self._preflight_cache = HardlinkPreflightCache()
+        # M6: cache sensitive-path blackhole scan keyed by directory-layout fingerprint
+        self._sensitive_scan_cache: (
+            tuple[str, tuple[Path, ...], list[tuple[Path, bool]]] | None
+        ) = None
         self.last_result: CommandResult | None = None
 
     @property
@@ -626,10 +626,7 @@ class LinuxBwrapEnvironment:
         ]
         if not network:
             args.append("--unshare-net")
-            if self._default_network == "none":
-                args.extend(["--cap-drop", "ALL"])
-        else:
-            args.extend(["--cap-drop", "ALL"])
+        args.extend(["--cap-drop", "ALL"])
 
         # Stage 1: Base read-only OS skeleton & isolated /proc, /dev, /tmp, /run.
         # Mount --tmpfs /run BEFORE handling /etc/resolv.conf so Ubuntu's
@@ -695,13 +692,25 @@ class LinuxBwrapEnvironment:
         for key, value in sorted(env.items()):
             args.extend(["--setenv", key, value])
 
-        args.extend(["--chdir", resolved_cwd, "--"])
-
-        if not network and self._default_network == "loopback_only":
-            args.extend([sys.executable, "-c", _LOOPBACK_UP_BOOTSTRAP, *inner_argv])
-        else:
-            args.extend(inner_argv)
+        args.extend(["--chdir", resolved_cwd, "--", *inner_argv])
         return args
+
+    def _cached_sensitive_paths(self) -> list[tuple[Path, bool]]:
+        """Compute sensitive paths to blackhole, cached by directory fingerprint (M6)."""
+        scan_roots = (*self._rw_workspace_roots, *self._share_read_only)
+        fingerprint = compute_roots_fingerprint(scan_roots)
+        cached = self._sensitive_scan_cache
+        if (
+            cached is not None
+            and fingerprint is not None
+            and cached[0] == fingerprint
+            and cached[1] == self._runtime_secret_paths
+        ):
+            return cached[2]
+        paths = _find_sensitive_paths_under(scan_roots, self._runtime_secret_paths)
+        if fingerprint is not None:
+            self._sensitive_scan_cache = (fingerprint, self._runtime_secret_paths, paths)
+        return paths
 
     def _sensitive_hardlink_error(self) -> str | None:
         return check_hardlinks(
@@ -780,6 +789,7 @@ class LinuxBwrapEnvironment:
         inner_argv = ["/bin/sh", "-c", command] if command is not None else list(argv or [])
         effective_network = bool(network or self._approved_host_access)
         safe_env = self._safe_environment(env)
+        sensitive_paths = await asyncio.to_thread(self._cached_sensitive_paths)
         bwrap_argv = self._build_bwrap_argv(
             bwrap_bin=bwrap_bin,
             resolved_cwd=resolved_cwd,
@@ -788,6 +798,7 @@ class LinuxBwrapEnvironment:
             network=effective_network,
             sentinel_file=sentinel_file,
             sentinel_dir=sentinel_dir,
+            sensitive_paths=sensitive_paths,
         )
         result = await self._host.run_command(
             argv=bwrap_argv,

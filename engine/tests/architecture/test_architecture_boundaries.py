@@ -16,15 +16,42 @@ ENGINE_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = ENGINE_ROOT.parent
 
 
-def _python_imports(root: Path) -> list[tuple[Path, int, str]]:
+def _resolve_import_from(path: Path, node: ast.ImportFrom, *, repo_root: Path = REPO_ROOT) -> list[str]:
+    """Resolve both absolute and relative ``from ... import ...`` statements (L8)."""
+    if node.level == 0:
+        return [node.module] if node.module else []
+    try:
+        rel_parts = list(path.relative_to(repo_root).with_suffix("").parts)
+    except ValueError:
+        return [node.module] if node.module else []
+    if rel_parts and rel_parts[-1] == "__init__":
+        package_parts = rel_parts[:-1]
+    else:
+        package_parts = rel_parts[:-1]
+    ascend = node.level - 1
+    if ascend > len(package_parts):
+        base_parts: list[str] = []
+    else:
+        base_parts = package_parts[: len(package_parts) - ascend]
+    if node.module:
+        return [".".join([*base_parts, node.module])]
+    resolved: list[str] = []
+    for alias in node.names:
+        resolved.append(".".join([*base_parts, alias.name]))
+    return resolved
+
+
+def _python_imports(root: Path, *, repo_root: Path = REPO_ROOT) -> list[tuple[Path, int, str]]:
     imports: list[tuple[Path, int, str]] = []
     for path in sorted(root.rglob("*.py")):
         if any(part in {".venv", "__pycache__"} for part in path.parts):
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                imports.append((path, node.lineno, node.module))
+            if isinstance(node, ast.ImportFrom):
+                for module in _resolve_import_from(path, node, repo_root=repo_root):
+                    if module:
+                        imports.append((path, node.lineno, module))
             elif isinstance(node, ast.Import):
                 imports.extend((path, node.lineno, alias.name) for alias in node.names)
     return imports
@@ -201,3 +228,16 @@ def test_agents_tools_remain_zero_cross_layer_import() -> None:
         if item[2].startswith(("common", "engine", "server"))
     ]
     assert not imports, _relative_imports(imports, root=REPO_ROOT)
+
+
+def test_python_imports_resolves_relative_cross_package_imports(tmp_path: Path) -> None:
+    """L8: Relative imports like ``from ..safety import tool_guard`` must be caught."""
+    sandbox_dir = tmp_path / "engine" / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    probe = sandbox_dir / "leak.py"
+    probe.write_text(
+        "from ..safety import tool_guard\nfrom .. import safety\n",
+        encoding="utf-8",
+    )
+    resolved = [mod for _, _, mod in _python_imports(sandbox_dir, repo_root=tmp_path)]
+    assert "engine.safety" in resolved

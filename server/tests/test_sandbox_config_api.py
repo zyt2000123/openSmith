@@ -54,3 +54,11 @@ def test_sandbox_config_api_get_patch_and_validation(
             json={"extra_roots": ["/tmp/bad\npath"]},
         )
         assert bad_path.status_code == 422
+
+        # L7: Broad/credential roots ('/', '~', '~/.ssh') rejected with 422 before saving
+        for forbidden in ("/", "~", "~/.ssh"):
+            rejected = client.patch(
+                "/api/config/sandbox",
+                json={"extra_roots": [forbidden]},
+            )
+            assert rejected.status_code == 422, f"{forbidden} should be 422, got {rejected.status_code}"

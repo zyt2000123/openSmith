@@ -30,11 +30,10 @@ _ERROR_MAX_LENGTH = 300
 
 
 def _safe_error_text(message: str, *, vault_store: Any | None = None) -> str:
-    """Strip URL credentials/query strings, redact vault values, and cap error length."""
+    """Redact vault secrets FIRST, then strip URL credentials/query strings and cap length (L2)."""
     if not message:
         return ""
-    text = _URL_CREDENTIAL_RE.sub(r"\g<scheme><redacted>@", message)
-    text = _QUERY_FRAGMENT_RE.sub("", text)
+    text = message
     if vault_store is not None:
         try:
             from common.vault import VaultRedactor
@@ -42,6 +41,8 @@ def _safe_error_text(message: str, *, vault_store: Any | None = None) -> str:
             text, _ = VaultRedactor.redact(text, all_entries=vault_store.all_entries())
         except Exception:
             pass
+    text = _URL_CREDENTIAL_RE.sub(r"\g<scheme><redacted>@", text)
+    text = _QUERY_FRAGMENT_RE.sub("", text)
     if len(text) <= _ERROR_MAX_LENGTH:
         return text
     return text[:_ERROR_MAX_LENGTH] + "…"

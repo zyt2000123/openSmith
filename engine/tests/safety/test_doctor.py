@@ -128,3 +128,44 @@ def test_doctor_cli_json_output_and_exit_code(tmp_path: Path, capsys) -> None:
     assert payload["platform"] == "darwin"
     assert isinstance(payload["checks"], list)
     assert exit_code in (0, 1)
+
+
+def test_doctor_honors_configured_backend_reports_m5_note_and_check_llm(
+    tmp_path: Path,
+) -> None:
+    """M5 & L4 & L5: doctor honors sandbox.backend, surfaces Linux shared-netns note, and runs --check-llm."""
+    data_dir = tmp_path / ".agent-smith"
+    data_dir.mkdir(mode=0o700)
+    os.chmod(data_dir, 0o700)
+
+    # L4: Explicit sandbox.backend='bwrap' on macOS must fail with BWRAP_UNSUPPORTED_PLATFORM
+    (data_dir / "config.yaml").write_text(
+        "sandbox:\n  backend: bwrap\nllm:\n  provider: openai\n  model: gpt-5\n  base_url: https://api.example.com/v1\n  api_key: sk-123\n",
+        encoding="utf-8",
+    )
+    mismatch = run_doctor(
+        cwd=tmp_path,
+        run_probes=False,
+        check_llm=True,
+        data_dir=data_dir,
+        platform="darwin",
+        seatbelt_available=True,
+    )
+    assert not mismatch.ok
+    by_id = {c.id: c for c in mismatch.checks}
+    assert by_id["sandbox.bwrap.platform"].code == "BWRAP_UNSUPPORTED_PLATFORM"
+    assert by_id["llm.config"].status == "pass"
+
+    # M5: Ready Linux bwrap surfaces shared host netns warning for network=true
+    (data_dir / "config.yaml").write_text("sandbox:\n  backend: auto\n", encoding="utf-8")
+    linux_ok = run_doctor(
+        cwd=tmp_path,
+        run_probes=False,
+        data_dir=data_dir,
+        platform="linux",
+        bwrap_availability=BwrapAvailability(ready=True, binary_path="/usr/bin/bwrap", version="0.8.0"),
+    )
+    assert linux_ok.ok
+    linux_ids = {c.id: c for c in linux_ok.checks}
+    assert "sandbox.bwrap.network_netns_note" in linux_ids
+    assert linux_ids["sandbox.bwrap.network_netns_note"].status == "warn"

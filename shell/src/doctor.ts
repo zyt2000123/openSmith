@@ -150,24 +150,53 @@ function checkLocalDataPermissions(): DoctorCheck[] {
   return checks;
 }
 
+export function buildPythonDoctorInvocation(
+  repoRoot: string,
+  engineDir: string,
+  serverDir: string,
+  options: DoctorCliOptions,
+  uvAvailable: boolean,
+): { cmd: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv } {
+  const pythonArgs = ["-m", "engine.sandbox.doctor", "--cwd", options.cwd, "--json"];
+  if (options.noProbe) pythonArgs.push("--no-probe");
+  if (options.checkLlm) pythonArgs.push("--check-llm");
+
+  if (uvAvailable) {
+    const projectDir = existsSync(path.join(serverDir, ".venv")) ? serverDir : engineDir;
+    return {
+      cmd: "uv",
+      args: ["run", "--project", projectDir, "python", ...pythonArgs],
+      cwd: projectDir,
+      env: { ...process.env },
+    };
+  }
+  // L5: Without uv, run python3 from repoRoot with PYTHONPATH=repoRoot so
+  // `engine.sandbox.doctor` and `common.*` resolve cleanly instead of failing
+  // with ModuleNotFoundError inside engine/ or server/.
+  const existingPyPath = process.env.PYTHONPATH;
+  const pythonPath = existingPyPath ? `${repoRoot}${path.delimiter}${existingPyPath}` : repoRoot;
+  return {
+    cmd: "python3",
+    args: pythonArgs,
+    cwd: repoRoot,
+    env: { ...process.env, PYTHONPATH: pythonPath },
+  };
+}
+
 function runPythonDoctor(
+  repoRoot: string,
   engineDir: string,
   serverDir: string,
   options: DoctorCliOptions,
   uvAvailable: boolean,
 ): { report: DoctorReport | null; errorCheck?: DoctorCheck } {
-  const pythonArgs = ["-m", "engine.sandbox.doctor", "--cwd", options.cwd, "--json"];
-  if (options.noProbe) pythonArgs.push("--no-probe");
+  const invocation = buildPythonDoctorInvocation(repoRoot, engineDir, serverDir, options, uvAvailable);
 
-  const projectDir = existsSync(path.join(serverDir, ".venv")) ? serverDir : engineDir;
-  const cmd = uvAvailable ? "uv" : "python3";
-  const args = uvAvailable ? ["run", "--project", projectDir, "python", ...pythonArgs] : pythonArgs;
-
-  const res = spawnSync(cmd, args, {
-    cwd: projectDir,
+  const res = spawnSync(invocation.cmd, invocation.args, {
+    cwd: invocation.cwd,
     encoding: "utf8",
     timeout: 60_000,
-    env: { ...process.env },
+    env: invocation.env,
   });
 
   if (res.error) {
@@ -177,7 +206,7 @@ function runPythonDoctor(
         id: "engine.doctor",
         category: "runtime",
         status: "fail",
-        summary: `Failed to execute engine doctor (${cmd}): ${res.error.message}`,
+        summary: `Failed to execute engine doctor (${invocation.cmd}): ${res.error.message}`,
         code: "ENGINE_DOCTOR_EXEC_FAILED",
       },
     };
@@ -258,7 +287,7 @@ export async function runDoctorCli(argv: string[]): Promise<number> {
 
   const engineResult =
     layout.check.status === "pass"
-      ? runPythonDoctor(layout.engineDir, layout.serverDir, parsed, uv.available)
+      ? runPythonDoctor(repoRoot, layout.engineDir, layout.serverDir, parsed, uv.available)
       : { report: null };
 
   const checks: DoctorCheck[] = [...nodeChecks];

@@ -486,7 +486,7 @@ export async function runDoctorProbe(baseUrl: string, cwd?: string): Promise<Doc
   const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
   return request<DoctorReport>(baseUrl, `/api/agent/doctor/probe${query}`, {
     method: "POST",
-    timeoutMs: 30_000,
+    timeoutMs: 60_000,
   });
 }
 

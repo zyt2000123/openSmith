@@ -149,9 +149,12 @@ class ApprovalScope:
     @property
     def description(self) -> str:
         if self.kind == "sandbox_command":
-            return "Sandboxed workspace execution (loopback-only network)"
+            return "Sandboxed workspace execution (no outbound network)"
         if self.kind == "sandbox_network":
-            return "Sandboxed workspace execution with outbound network access"
+            return (
+                "Sandboxed workspace execution with outbound network access "
+                "(filesystem sandbox active; on Linux, shares host network namespace)"
+            )
         if self.kind == "host_command":
             return "Host filesystem, network, and process access for this exact command"
         if self.kind == "network":

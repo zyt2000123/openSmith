@@ -569,6 +569,7 @@ class ConfigService:
     def set_sandbox_config(self, *, updates: Mapping[str, Any]) -> dict[str, Any]:
         """Validate and persist patch updates to the user-level ``sandbox:`` block."""
         from engine.sandbox import SandboxProfileConfig
+        from engine.sandbox.policy import validate_configured_root
 
         cfg = self._load_config()
         existing = self._mapping(cfg.get("sandbox"), "sandbox configuration")
@@ -592,6 +593,31 @@ class ConfigService:
             validated = SandboxProfileConfig.from_mapping(merged)
         except ValueError as exc:
             self._invalid(str(exc))
+
+        # L7: Pre-validate configured roots before saving so broad/credential
+        # paths (e.g. '/', '~', '~/.ssh', '~/.agent-smith') return 422 instead
+        # of persisting and being silently skipped at runtime.
+        data_dir = self._resolved_config_path().parent
+        path_checks: list[tuple[str, str]] = [
+            *((p, "extra_root") for p in validated.extra_roots),
+            *((p, "share_read_only") for p in validated.share_read_only),
+        ]
+        for raw_val in validated.cache_roots.values():
+            items = raw_val if isinstance(raw_val, list) else [raw_val]
+            for p in items:
+                path_checks.append((p, "cache_root"))
+        for raw_path, role in path_checks:
+            try:
+                _, err = validate_configured_root(
+                    raw_path,
+                    role=role,
+                    data_dir=data_dir,
+                )
+            except ValueError as exc:
+                self._invalid(str(exc))
+            if err and "[SANDBOX_CONFIG_PATH_REJECTED]" in err:
+                self._invalid(err)
+
         cfg["sandbox"] = validated.to_dict()
         try:
             save_yaml(self._resolved_config_path(), cfg)

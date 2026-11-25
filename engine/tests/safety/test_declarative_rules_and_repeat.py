@@ -93,6 +93,11 @@ def test_malformed_safety_config_fails_closed() -> None:
         SafetyConfig.from_profile_config({
             "safety": {"taint": {"egress_allowlist": ["*"]}}
         })
+    # Unimplemented repeat_guard window='session' rejected fail-closed (L1)
+    with pytest.raises(ValueError, match="safety.repeat_guard.window"):
+        SafetyConfig.from_profile_config({
+            "safety": {"repeat_guard": {"window": "session"}}
+        })
 
 
 def test_declarative_rules_deny_allow_ask_and_l0_l2_cannot_be_bypassed(
