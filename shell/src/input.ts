@@ -94,6 +94,22 @@ export function handleViewToggle(input: string, key: Key, options: ShellInputOpt
   return true;
 }
 
+export function handleChannelToggle(input: string, key: Key, options: ShellInputOptions): boolean {
+  const isCtrlBackslash = (key.ctrl && input === "\\") || input === "\x1c";
+  if (!isCtrlBackslash) return false;
+
+  const state = options.getState();
+  if (state.activeChannel === "side") {
+    options.bridge.switchBackToMain();
+    return true;
+  }
+  if (state.backgroundChannel !== null) {
+    void options.bridge.openSideChat();
+    return true;
+  }
+  return false;
+}
+
 function navigationFromKey(key: Key): ListNavigation | null {
   if (key.upArrow) return "up";
   if (key.downArrow) return "down";
@@ -459,6 +475,7 @@ export function routeInput(input: string, key: Key, options: ShellInputOptions):
   }
   if (handleModelPickerInput(key, options)) return;
   if (handleApprovalInput(key, options)) return;
+  if (handleChannelToggle(input, key, options)) return;
   if (handleViewToggle(input, key, options)) return;
   if (handleQueuedEdit(key, options)) return;
   if (handlePickerInput(key, options)) return;

@@ -17,6 +17,19 @@ class SessionOut(BaseModel):
     last_message_preview: str | None = None
     last_message_at: str | None = None
     message_count: int = 0
+    session_kind: str = "main"
+    parent_session_id: str | None = None
+    snapshot_cutoff_message_id: str | None = None
+
+
+class SideSessionCreate(BaseModel):
+    title: str = "Side chat"
+    reuse_existing: bool = True
+
+
+class PromoteSideRequest(BaseModel):
+    title: str | None = None
+    keep_parent_context: bool = True
 
 
 class SessionModelUpdate(BaseModel):

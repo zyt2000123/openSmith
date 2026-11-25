@@ -13,9 +13,11 @@ from ..schemas.session import (
     ContextCompressionOut,
     MessageCreate,
     MessageOut,
+    PromoteSideRequest,
     SessionCreate,
     SessionModelUpdate,
     SessionOut,
+    SideSessionCreate,
     SteerCreate,
     SteerOut,
 )
@@ -61,6 +63,47 @@ async def create_session(
     svc: AgentService = Depends(get_agent_service),
 ):
     return await svc.create_session(body.title, body.identity_id, body.model_profile)
+
+
+@router.post("/sessions/side", response_model=SessionOut, status_code=201)
+async def create_standalone_side_session(
+    body: SideSessionCreate | None = None,
+    svc: AgentService = Depends(get_agent_service),
+):
+    payload = body or SideSessionCreate()
+    return await svc.create_side_session(
+        None,
+        title=payload.title,
+        reuse_existing=payload.reuse_existing,
+    )
+
+
+@router.post("/sessions/{session_id}/side", response_model=SessionOut)
+async def create_or_get_side_session(
+    session_id: str,
+    body: SideSessionCreate | None = None,
+    svc: AgentService = Depends(get_agent_service),
+):
+    payload = body or SideSessionCreate()
+    return await svc.create_side_session(
+        session_id,
+        title=payload.title,
+        reuse_existing=payload.reuse_existing,
+    )
+
+
+@router.post("/sessions/{side_id}/promote", response_model=SessionOut)
+async def promote_side_session(
+    side_id: str,
+    body: PromoteSideRequest | None = None,
+    svc: AgentService = Depends(get_agent_service),
+):
+    payload = body or PromoteSideRequest()
+    return await svc.promote_side_session(
+        side_id,
+        title=payload.title,
+        keep_parent_context=payload.keep_parent_context,
+    )
 
 
 @router.patch("/sessions/{session_id}/model", response_model=SessionOut)

@@ -65,6 +65,9 @@ export type Session = {
   last_message_at?: string | null;
   message_count: number;
   model_profile?: string | null;
+  session_kind?: "main" | "side";
+  parent_session_id?: string | null;
+  snapshot_cutoff_message_id?: string | null;
 };
 
 export type SkillSummary = {
@@ -541,6 +544,39 @@ export async function createSession(
   return request<Session>(baseUrl, "/api/agent/sessions", {
     method: "POST",
     body: { title, ...(modelProfile ? { model_profile: modelProfile } : {}) },
+    signal: options.signal,
+  });
+}
+
+export async function createSideSession(
+  baseUrl: string,
+  parentSessionId?: string | null,
+  options: { title?: string; reuseExisting?: boolean; signal?: AbortSignal } = {},
+): Promise<Session> {
+  const pathname = parentSessionId
+    ? `/api/agent/sessions/${encodeURIComponent(parentSessionId)}/side`
+    : "/api/agent/sessions/side";
+  return request<Session>(baseUrl, pathname, {
+    method: "POST",
+    body: {
+      ...(options.title ? { title: options.title } : {}),
+      reuse_existing: options.reuseExisting ?? true,
+    },
+    signal: options.signal,
+  });
+}
+
+export async function promoteSideSession(
+  baseUrl: string,
+  sideSessionId: string,
+  options: { title?: string; keepParentContext?: boolean; signal?: AbortSignal } = {},
+): Promise<Session> {
+  return request<Session>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sideSessionId)}/promote`, {
+    method: "POST",
+    body: {
+      ...(options.title ? { title: options.title } : {}),
+      keep_parent_context: options.keepParentContext ?? true,
+    },
     signal: options.signal,
   });
 }

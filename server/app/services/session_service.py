@@ -109,6 +109,27 @@ async def _session_turn_lock(session_id: str) -> AsyncIterator[None]:
 # lost sight of its own opening question long before the work was done.  The
 # engine's context fitter still compacts whatever does not fit the window.
 _HISTORY_LIMIT = 40
+_SIDE_SNAPSHOT_MESSAGE_LIMIT = 16
+_SIDE_SNAPSHOT_MAX_CHARS = 12_000
+_SIDE_SNAPSHOT_PREFIX = "[Read-only snapshot of main conversation]\n"
+
+
+def _redact_snapshot_text(text: str) -> str:
+    """Redact both pattern-matched secrets and configured Vault literals."""
+    if not text:
+        return ""
+    redacted = _redact_secrets_in_text(text)
+    try:
+        from common import config as common_config
+        from common.vault import VaultRedactor, VaultStore
+
+        vault = VaultStore(common_config.PATHS.data_dir / "vault.json")
+        entries = vault.all_entries()
+        if entries:
+            redacted, _ = VaultRedactor.redact(redacted, all_entries=entries)
+    except Exception:
+        logger.warning("vault redaction skipped for snapshot", exc_info=True)
+    return redacted
 # Upper bound for one compress call; far beyond any real session while still
 # bounding the row count (compression already loads the conversation into memory).
 _COMPRESS_MESSAGE_CAP = 50_000
@@ -336,6 +357,164 @@ class SessionService:
             if _SESSION_STREAM_LOCK_USERS.get(session_id, 0) == 0:
                 _SESSION_STREAM_LOCKS.pop(session_id, None)
                 _SESSION_STREAM_LOCK_USERS.pop(session_id, None)
+
+    async def _build_parent_snapshot(
+        self,
+        parent_session_id: str,
+        cutoff_message_id: str | None = None,
+    ) -> str:
+        """Build a bounded, secret- and vault-redacted read-only snapshot of the parent session."""
+        parts: list[str] = []
+        context_reader = getattr(self.session_repo, "get_context", None)
+        context = await context_reader(parent_session_id) if context_reader is not None else {}
+        summary = context.get("context_summary") if isinstance(context, dict) else ""
+        if isinstance(summary, str) and summary.strip():
+            parts.append(f"Summary:\n{_redact_snapshot_text(summary.strip())}")
+
+        rows: list[dict] = []
+        if cutoff_message_id:
+            cutoff_msg = await self.session_repo.get_message(parent_session_id, cutoff_message_id)
+            if cutoff_msg is not None:
+                prior = await self.session_repo.get_messages_before(
+                    parent_session_id,
+                    cutoff_message_id,
+                    limit=_SIDE_SNAPSHOT_MESSAGE_LIMIT - 1,
+                )
+                rows = [*prior, cutoff_msg]
+        if not rows:
+            rows = await self.session_repo.get_recent_messages(
+                parent_session_id,
+                _SIDE_SNAPSHOT_MESSAGE_LIMIT,
+            )
+
+        if rows:
+            lines: list[str] = []
+            for row in rows:
+                role = str(row.get("role") or "user")
+                body = _redact_snapshot_text(str(row.get("content") or "")).strip()
+                if not body:
+                    continue
+                if len(body) > 1500:
+                    body = body[:1500] + "…"
+                lines.append(f"{role}: {body}")
+            if lines:
+                parts.append("Recent turns:\n" + "\n".join(lines))
+
+        snapshot = "\n\n".join(parts).strip()
+        if len(snapshot) > _SIDE_SNAPSHOT_MAX_CHARS:
+            snapshot = snapshot[-_SIDE_SNAPSHOT_MAX_CHARS:]
+        return snapshot
+
+    async def create_side_session(
+        self,
+        agent_id: str,
+        parent_session_id: str | None = None,
+        *,
+        title: str = "Side chat",
+        reuse_existing: bool = True,
+    ) -> SessionOut:
+        """Create or reuse an isolated read-only /side session anchored to a parent main session."""
+        profile = await self.agent_profile_repo.get(agent_id)
+        if profile is None:
+            raise HTTPException(404, "Agent profile not found")
+
+        identity_id: str | None = None
+        model_profile: str | None = None
+        cutoff_message_id: str | None = None
+        if parent_session_id is not None:
+            parent = await self.session_repo.get_owned(parent_session_id, agent_id)
+            if parent is None:
+                raise HTTPException(404, "Parent session not found")
+            if parent.get("session_kind") == "side":
+                raise HTTPException(409, "Cannot create a side chat inside another side chat")
+            if reuse_existing:
+                existing = await self.session_repo.get_active_side(agent_id, parent_session_id)
+                if existing is not None:
+                    return SessionOut(**existing)
+            identity_id = parent.get("identity_id")
+            model_profile = parent.get("model_profile")
+            recent = await self.session_repo.get_recent_messages(parent_session_id, 1)
+            if recent:
+                cutoff_message_id = str(recent[-1]["id"])
+
+        row = await self.session_repo.create_side(
+            agent_id,
+            parent_session_id=parent_session_id,
+            snapshot_cutoff_message_id=cutoff_message_id,
+            title=title or "Side chat",
+            identity_id=identity_id,
+            model_profile=model_profile,
+        )
+        return SessionOut(**row)
+
+    async def promote_side_session(
+        self,
+        agent_id: str,
+        side_session_id: str,
+        *,
+        title: str | None = None,
+        keep_parent_context: bool = True,
+    ) -> SessionOut:
+        """Promote a /side session into a standalone main session with redacted context & taint monotonicity."""
+        side = await self.session_repo.get_owned(side_session_id, agent_id)
+        if side is None:
+            raise HTTPException(404, "Session not found")
+        if side.get("session_kind") != "side":
+            raise HTTPException(409, "Session is already a main session")
+
+        derived_title = title.strip() if isinstance(title, str) and title.strip() else None
+        if derived_title is None:
+            side_msgs = await self.session_repo.get_messages(side_session_id, limit=5)
+            first_user = next(
+                (
+                    m["content"]
+                    for m in side_msgs
+                    if m.get("role") == "user" and str(m.get("content", "")).strip()
+                ),
+                None,
+            )
+            if isinstance(first_user, str):
+                derived_title = _redact_snapshot_text(first_user).splitlines()[0][:40] or "Promoted session"
+            else:
+                derived_title = side.get("title") or "Promoted session"
+
+        parent_id = side.get("parent_session_id")
+        persisted_summary: str | None = None
+        if keep_parent_context and isinstance(parent_id, str) and parent_id:
+            snapshot = await self._build_parent_snapshot(
+                parent_id,
+                cutoff_message_id=side.get("snapshot_cutoff_message_id"),
+            )
+            if snapshot:
+                persisted_summary = snapshot
+            # Monotonic taint propagation: if parent session was tainted and we
+            # carry its context summary into the promoted session, preserve the
+            # parent's taint sources so /promote cannot launder tainted data.
+            try:
+                from common import config as common_config
+                from engine.safety.taint import SessionTaintStore
+
+                state_dir = common_config.PATHS.agent_dir
+                parent_taint = SessionTaintStore(state_dir=state_dir, session_id=parent_id)
+                if parent_taint.is_tainted:
+                    side_taint = SessionTaintStore(state_dir=state_dir, session_id=side_session_id)
+                    side_taint.merge_from(parent_taint.sources)
+            except Exception:
+                logger.warning(
+                    "failed to propagate parent taint on /promote (side=%s)",
+                    side_session_id,
+                    exc_info=True,
+                )
+
+        promoted = await self.session_repo.promote_side(
+            side_session_id,
+            agent_id,
+            title=derived_title,
+            context_summary=persisted_summary,
+        )
+        if promoted is None:
+            raise HTTPException(409, "Session could not be promoted")
+        return SessionOut(**promoted)
 
     async def compress_session(self, agent_id: str, session_id: str) -> ContextCompressionOut:
         session = await self.session_repo.get_owned(session_id, agent_id)
@@ -617,6 +796,24 @@ class SessionService:
                 else:
                     history = list(_history_override or [])
                     message_id = _message_id
+            session_meta = await self.session_repo.get_owned(session_id, agent_id)
+            is_side = bool(session_meta and session_meta.get("session_kind") == "side")
+            if is_side and _resume_run_id is None:
+                parent_id = session_meta.get("parent_session_id") if session_meta else None
+                if isinstance(parent_id, str) and parent_id:
+                    snapshot = await self._build_parent_snapshot(
+                        parent_id,
+                        cutoff_message_id=(
+                            session_meta.get("snapshot_cutoff_message_id")
+                            if session_meta
+                            else None
+                        ),
+                    )
+                    if snapshot:
+                        history = [
+                            {"role": "user", "content": f"{_SIDE_SNAPSHOT_PREFIX}{snapshot}"},
+                            *history,
+                        ]
             runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
             model_name = str(getattr(getattr(services, "llm", None), "model", "") or "")
             request = EngineRequest(
@@ -629,6 +826,8 @@ class SessionService:
                 working_dir=working_dir,
                 message_id=message_id,
                 steering_history=steering_history,
+                ephemeral=is_side,
+                read_only_tools=is_side,
             )
             if _resume_run_id is None:
                 # RunStateStore.create() fsyncs; keep the blocking I/O off the

@@ -184,6 +184,34 @@ class AgentService:
             run_id,
         )
 
+    async def create_side_session(
+        self,
+        parent_session_id: str | None = None,
+        *,
+        title: str = "Side chat",
+        reuse_existing: bool = True,
+    ) -> SessionOut:
+        return await self.session_service.create_side_session(
+            await self._profile_id(),
+            parent_session_id,
+            title=title,
+            reuse_existing=reuse_existing,
+        )
+
+    async def promote_side_session(
+        self,
+        side_session_id: str,
+        *,
+        title: str | None = None,
+        keep_parent_context: bool = True,
+    ) -> SessionOut:
+        return await self.session_service.promote_side_session(
+            await self._profile_id(),
+            side_session_id,
+            title=title,
+            keep_parent_context=keep_parent_context,
+        )
+
     async def steer_session(
         self,
         session_id: str,

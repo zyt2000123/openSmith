@@ -394,6 +394,16 @@ async def prepare_runtime(
             runtime.agent_id,
             ", ".join(sorted(set(unknown_tools))),
         )
+    if request.read_only_tools:
+        read_only_names = [
+            defn.name
+            for defn in services.tool_registry.list_tools()
+            if defn.permission_level == "read"
+            and defn.side_effect == "none"
+            and not defn.is_write_tool
+            and not defn.hidden
+        ]
+        services.tool_registry.set_enabled(read_only_names)
 
     if services.tool_guard is not None:
         services.tool_guard.bind_definitions(services.tool_registry.definitions())
