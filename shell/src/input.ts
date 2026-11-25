@@ -426,7 +426,10 @@ export function handleHistoryNavigation(key: Key, options: ShellInputOptions): b
 function cyclePanel(key: Key, options: ShellInputOptions): void {
   if (!key.tab || options.slashMenuOpen) return;
 
-  const panels: Panel[] = ["welcome", "sessions", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"];
+  const isSide = options.getState().activeChannel === "side";
+  const panels: Panel[] = isSide
+    ? ["welcome", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"]
+    : ["welcome", "sessions", "skill-actions", "mcp", "hooks", "tokens", "runs", "chat"];
   const parentPanel: Partial<Record<Panel, Panel>> = {
     skills: "skill-actions",
     "skill-toggle": "skill-actions",

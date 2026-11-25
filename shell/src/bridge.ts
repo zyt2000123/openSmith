@@ -761,6 +761,10 @@ export class NodeBridge {
   }
 
   async compressCurrentSession(): Promise<void> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main, or /promote first." });
+      return;
+    }
     const { baseUrl, currentSession, busy } = this.s;
     if (busy) {
       this.s.set({ statusLine: "Wait for the current task to finish before compressing." });
@@ -787,6 +791,10 @@ export class NodeBridge {
   }
 
   startNewSession(): boolean {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main, or /side close." });
+      return false;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Cancel the current task before starting a new session." });
       return false;
@@ -804,6 +812,10 @@ export class NodeBridge {
   }
 
   async clearCurrentSession(): Promise<boolean> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Use /side close to discard it, or /back first." });
+      return false;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Cancel the current task before clearing the session." });
       return false;
@@ -834,6 +846,10 @@ export class NodeBridge {
   }
 
   async resumeSession(session: Session): Promise<void> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main before resuming a session." });
+      return;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Finish the current shell operation before resuming a session." });
       return;
@@ -882,6 +898,10 @@ export class NodeBridge {
   }
 
   async resumeRun(requestedRunId?: string): Promise<void> {
+    if (this.s.activeChannel === "side") {
+      this.s.set({ statusLine: "Unavailable in side chat. Type /back to return to main before recovering a run." });
+      return;
+    }
     if ((this.activeRequest && !this.activeRequest.signal.aborted) || this.s.compressing || this.s.inputLocked) {
       this.s.set({ statusLine: "Finish the current shell operation before recovering a run." });
       return;
@@ -1015,9 +1035,9 @@ export class NodeBridge {
     }
 
     const sideSession = sideState?.session;
-    if (sideSession && this.s.baseUrl) {
+    if (sideSession && sideSession.session_kind === "side" && this.s.baseUrl) {
       try {
-        await deleteSession(this.s.baseUrl, sideSession.id);
+        await deleteSession(this.s.baseUrl, sideSession.id, { expectedKind: "side" });
       } catch {
         // Best-effort server cleanup
       }

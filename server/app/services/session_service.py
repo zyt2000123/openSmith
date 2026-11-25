@@ -339,7 +339,22 @@ class SessionService:
             raise HTTPException(404, "Session not found")
         return SessionOut(**row)
 
-    async def delete_session(self, agent_id: str, session_id: str) -> None:
+    async def delete_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        *,
+        expected_kind: str | None = None,
+    ) -> None:
+        if expected_kind is not None:
+            owned = await self.session_repo.get_owned(session_id, agent_id)
+            if owned is None:
+                raise HTTPException(404, "Session not found")
+            if owned.get("session_kind", "main") != expected_kind:
+                raise HTTPException(
+                    409,
+                    f"Refused to delete {owned.get('session_kind', 'main')} session as {expected_kind}",
+                )
         deleted = await self.session_repo.delete_owned(session_id, agent_id)
         if not deleted:
             raise HTTPException(404, "Session not found")
@@ -405,6 +420,28 @@ class SessionService:
             snapshot = snapshot[-_SIDE_SNAPSHOT_MAX_CHARS:]
         return snapshot
 
+    @staticmethod
+    def _merge_parent_taint(parent_session_id: str, child_session_id: str) -> None:
+        """Monotonically propagate parent taint sources into a side or promoted session."""
+        if not parent_session_id or not child_session_id:
+            return
+        try:
+            from common import config as common_config
+            from engine.safety.taint import SessionTaintStore
+
+            state_dir = common_config.PATHS.agent_dir
+            parent_taint = SessionTaintStore(state_dir=state_dir, session_id=parent_session_id)
+            if parent_taint.is_tainted:
+                child_taint = SessionTaintStore(state_dir=state_dir, session_id=child_session_id)
+                child_taint.merge_from(parent_taint.sources)
+        except Exception:
+            logger.warning(
+                "failed to propagate parent taint (parent=%s, child=%s)",
+                parent_session_id,
+                child_session_id,
+                exc_info=True,
+            )
+
     async def create_side_session(
         self,
         agent_id: str,
@@ -430,6 +467,7 @@ class SessionService:
             if reuse_existing:
                 existing = await self.session_repo.get_active_side(agent_id, parent_session_id)
                 if existing is not None:
+                    self._merge_parent_taint(parent_session_id, str(existing["id"]))
                     return SessionOut(**existing)
             identity_id = parent.get("identity_id")
             model_profile = parent.get("model_profile")
@@ -445,6 +483,8 @@ class SessionService:
             identity_id=identity_id,
             model_profile=model_profile,
         )
+        if parent_session_id is not None:
+            self._merge_parent_taint(parent_session_id, str(row["id"]))
         return SessionOut(**row)
 
     async def promote_side_session(
@@ -480,31 +520,18 @@ class SessionService:
 
         parent_id = side.get("parent_session_id")
         persisted_summary: str | None = None
-        if keep_parent_context and isinstance(parent_id, str) and parent_id:
-            snapshot = await self._build_parent_snapshot(
-                parent_id,
-                cutoff_message_id=side.get("snapshot_cutoff_message_id"),
-            )
-            if snapshot:
-                persisted_summary = snapshot
-            # Monotonic taint propagation: if parent session was tainted and we
-            # carry its context summary into the promoted session, preserve the
-            # parent's taint sources so /promote cannot launder tainted data.
-            try:
-                from common import config as common_config
-                from engine.safety.taint import SessionTaintStore
-
-                state_dir = common_config.PATHS.agent_dir
-                parent_taint = SessionTaintStore(state_dir=state_dir, session_id=parent_id)
-                if parent_taint.is_tainted:
-                    side_taint = SessionTaintStore(state_dir=state_dir, session_id=side_session_id)
-                    side_taint.merge_from(parent_taint.sources)
-            except Exception:
-                logger.warning(
-                    "failed to propagate parent taint on /promote (side=%s)",
-                    side_session_id,
-                    exc_info=True,
+        if isinstance(parent_id, str) and parent_id:
+            # Always propagate parent taint on /promote regardless of
+            # keep_parent_context: prior turns in the side chat already saw
+            # the parent snapshot, so keep_parent_context=False cannot launder it.
+            self._merge_parent_taint(parent_id, side_session_id)
+            if keep_parent_context:
+                snapshot = await self._build_parent_snapshot(
+                    parent_id,
+                    cutoff_message_id=side.get("snapshot_cutoff_message_id"),
                 )
+                if snapshot:
+                    persisted_summary = snapshot
 
         promoted = await self.session_repo.promote_side(
             side_session_id,
@@ -798,22 +825,27 @@ class SessionService:
                     message_id = _message_id
             session_meta = await self.session_repo.get_owned(session_id, agent_id)
             is_side = bool(session_meta and session_meta.get("session_kind") == "side")
-            if is_side and _resume_run_id is None:
+            if is_side:
                 parent_id = session_meta.get("parent_session_id") if session_meta else None
                 if isinstance(parent_id, str) and parent_id:
-                    snapshot = await self._build_parent_snapshot(
-                        parent_id,
-                        cutoff_message_id=(
-                            session_meta.get("snapshot_cutoff_message_id")
-                            if session_meta
-                            else None
-                        ),
-                    )
-                    if snapshot:
-                        history = [
-                            {"role": "user", "content": f"{_SIDE_SNAPSHOT_PREFIX}{snapshot}"},
-                            *history,
-                        ]
+                    # H2: Inherit parent taint on every side run before runtime
+                    # preparation loads SessionTaintStore, preventing a tainted
+                    # parent's snapshot from leaking through side web_fetch/web_search.
+                    self._merge_parent_taint(parent_id, session_id)
+                    if _resume_run_id is None:
+                        snapshot = await self._build_parent_snapshot(
+                            parent_id,
+                            cutoff_message_id=(
+                                session_meta.get("snapshot_cutoff_message_id")
+                                if session_meta
+                                else None
+                            ),
+                        )
+                        if snapshot:
+                            history = [
+                                {"role": "user", "content": f"{_SIDE_SNAPSHOT_PREFIX}{snapshot}"},
+                                *history,
+                            ]
             runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
             model_name = str(getattr(getattr(services, "llm", None), "model", "") or "")
             request = EngineRequest(

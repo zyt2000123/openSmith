@@ -1743,6 +1743,15 @@ class ToolGuard:
         )
         return candidate
 
+    def is_taint_sensitive_if_tainted(self, tool_call: ToolCall) -> bool:
+        """Whether a pending local read flipping session taint could alter policy for *tool_call*."""
+        if not self._safety_config.taint.enabled or self._taint_store is None:
+            return False
+        if self._taint_store.is_tainted:
+            # Already tainted; taint is monotonic so another read cannot untaint.
+            return False
+        return self._safety_config.has_taint_sensitive_rule_for(tool_call.name)
+
     def repeat_guard_headroom(self, tool_call: ToolCall) -> tuple[BucketKey, int] | None:
         """Return ``(bucket_key, remaining_before_trigger)`` if RepeatGuard tracks this call.
 

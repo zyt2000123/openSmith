@@ -195,9 +195,10 @@ async def test_promote_side_redacts_vault_propagates_taint_and_lists_in_sessions
         side_id = side_resp.json()["id"]
         await repo.add_message(side_id, "user", "Let's turn this into a real task")
 
-        # Before promote, side taint is isolated (clean)
+        # H2: Side session inherits parent taint immediately on creation!
         side_taint_before = SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=side_id)
-        assert side_taint_before.is_tainted is False
+        assert side_taint_before.is_tainted is True
+        assert "file:.env" in side_taint_before.labels()
 
         # Promote side -> main with keep_parent_context=True
         prom_resp = await client.post(
@@ -222,6 +223,97 @@ async def test_promote_side_redacts_vault_propagates_taint_and_lists_in_sessions
         side_taint_after = SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=side_id)
         assert side_taint_after.is_tainted is True
         assert "file:.env" in side_taint_after.labels()
+
+
+@pytest.mark.asyncio
+async def test_side_inherits_late_parent_taint_on_run_and_promote_false_cannot_launder(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """H2: Even if parent gets tainted AFTER side creation, running side inherits taint;
+    promoting with keep_parent_context=False also merges parent taint."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", headers=_auth_headers()) as client:
+        main_resp = await client.post("/api/agent/sessions", json={"title": "Clean Parent"})
+        main_id = main_resp.json()["id"]
+        agent_id = main_resp.json()["agent_id"]
+
+        # Create side while parent is clean
+        side_resp = await client.post(f"/api/agent/sessions/{main_id}/side", json={})
+        side_id = side_resp.json()["id"]
+        assert SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=side_id).is_tainted is False
+
+        # Parent later becomes tainted
+        parent_taint = SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=main_id)
+        parent_taint.record("secret_output", "read_file", "secret:prod.env")
+
+        # Running side MUST inherit parent taint before engine_run_stream_with_runtime runs
+        repo = SessionRepo()
+        service = SessionService(repo, AgentProfileRepo(), run_state_store=RunStateStore(common_config.PATHS.agent_dir))
+        tainted_at_runtime: list[bool] = []
+
+        class _StubStream:
+            run_id = "run-side-taint"
+
+            async def stream_events(self):
+                yield ExecutionEvent(EventType.RUN_STARTED, {"run_id": self.run_id})
+                yield ExecutionEvent(EventType.TEXT_DELTA, {"text": "ok"})
+                yield ExecutionEvent(EventType.RUN_FINISHED, {"run_id": self.run_id, "status": "completed"})
+
+            async def aclose(self):
+                return None
+
+        async def fake_build_runtime(self_svc, _a, _p, sid):
+            tainted_at_runtime.append(
+                SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=sid).is_tainted
+            )
+            return SimpleNamespace(session_id=sid), SimpleNamespace(llm=SimpleNamespace(model="m"))
+
+        monkeypatch.setattr(SessionService, "_build_runtime", fake_build_runtime)
+        monkeypatch.setattr("app.services.session_service.engine_run_stream_with_runtime", lambda r, rt, s: _StubStream())
+
+        gen = await service.prepare_stream_message(agent_id, side_id, "fetch something", working_dir=str(tmp_path))
+        _ = await _drain(gen)
+        assert tainted_at_runtime == [True]
+
+        # Now test a second side promoted with keep_parent_context=False directly after parent taint
+        side2_resp = await client.post(
+            f"/api/agent/sessions/{main_id}/side",
+            json={"reuse_existing": False},
+        )
+        side2_id = side2_resp.json()["id"]
+        # Even if side2's taint file were cleared before promote, promote(keep_parent_context=False) merges parent taint
+        from engine.safety.taint import delete_session_taint
+        delete_session_taint(common_config.PATHS.agent_dir, side2_id)
+        prom = await client.post(
+            f"/api/agent/sessions/{side2_id}/promote",
+            json={"keep_parent_context": False},
+        )
+        assert prom.status_code == 200
+        assert SessionTaintStore(state_dir=common_config.PATHS.agent_dir, session_id=side2_id).is_tainted is True
+
+
+@pytest.mark.asyncio
+async def test_delete_session_expected_kind_guards_main_from_side_close():
+    """H1 server-side guard: DELETE ?expected_kind=side rejects deleting a main session with 409."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", headers=_auth_headers()) as client:
+        main_resp = await client.post("/api/agent/sessions", json={"title": "Precious Main"})
+        main_id = main_resp.json()["id"]
+        side_resp = await client.post(f"/api/agent/sessions/{main_id}/side", json={})
+        side_id = side_resp.json()["id"]
+
+        # Refused when trying to delete main as side
+        bad_del = await client.delete(f"/api/agent/sessions/{main_id}?expected_kind=side")
+        assert bad_del.status_code == 409
+
+        # Main still exists
+        listed = await client.get("/api/agent/sessions")
+        assert main_id in [s["id"] for s in listed.json()]
+
+        # Allowed when deleting actual side as side
+        ok_del = await client.delete(f"/api/agent/sessions/{side_id}?expected_kind=side")
+        assert ok_del.status_code == 204
 
 
 async def _drain(gen):

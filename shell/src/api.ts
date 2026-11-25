@@ -708,8 +708,13 @@ export async function getRun(baseUrl: string, runId: string): Promise<RunState> 
   return request<RunState>(baseUrl, `/api/agent/runs/${encodeURIComponent(runId)}`);
 }
 
-export async function deleteSession(baseUrl: string, sessionId: string): Promise<void> {
-  await request<void>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}`, {
+export async function deleteSession(
+  baseUrl: string,
+  sessionId: string,
+  options: { expectedKind?: "main" | "side" } = {},
+): Promise<void> {
+  const query = options.expectedKind ? `?expected_kind=${encodeURIComponent(options.expectedKind)}` : "";
+  await request<void>(baseUrl, `/api/agent/sessions/${encodeURIComponent(sessionId)}${query}`, {
     method: "DELETE",
   });
 }

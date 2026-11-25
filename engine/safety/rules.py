@@ -306,6 +306,15 @@ class SafetyConfig:
                 return rule
         return None
 
+    def has_taint_sensitive_rule_for(self, tool_name: str) -> bool:
+        """Whether evaluating *tool_name* could change if session taint flips False -> True."""
+        for rule in self.rules:
+            if not any(fnmatch.fnmatch(tool_name, pat) for pat in rule.tools):
+                continue
+            if rule.when.tainted is not None or rule.action == "allow":
+                return True
+        return False
+
 
 BucketKey = tuple[str, str]
 

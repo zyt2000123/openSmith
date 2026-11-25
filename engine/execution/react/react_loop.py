@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
 from uuid import uuid4
@@ -1118,109 +1119,130 @@ async def react_event_loop(
                 yield ExecutionEvent(EventType.TOOL_CALL_START, start_data)
 
             outcomes_by_slot: dict[int, BatchExecutionOutcome] = {}
-            if not is_parallel:
-                item = batch[0]
-                with tool_registry.authorize_execution(
-                    item.call,
-                    approval_id=None,
-                    approval_scope=item.decision.approval_scope,
-                ):
-                    result = await tool_registry.execute(item.call)
-                warnings = (
-                    await hook_registry.run_post_hooks(
-                        item.call.name,
-                        item.call.arguments,
-                        result,
+            recorded_slots: set[int] = set()
+            active_ctx = current_approval_context()
+            active_run_id = active_ctx[1] if active_ctx is not None else ""
+
+            def _record_post_exec_for_slot(slot: int, outcome: BatchExecutionOutcome) -> None:
+                if slot in recorded_slots:
+                    return
+                recorded_slots.add(slot)
+                if tool_guard is not None and hasattr(tool_guard, "record_post_execution"):
+                    tool_guard.record_post_execution(
+                        outcome.item.call,
+                        outcome.result,
+                        run_id=active_run_id,
                     )
-                    if hook_registry is not None
-                    else []
-                )
-                outcome = BatchExecutionOutcome(
-                    slot=item.slot,
-                    item=item,
-                    result=result,
-                    warnings=warnings,
-                )
-                outcomes_by_slot[outcome.slot] = outcome
-                yield ExecutionEvent(
-                    EventType.TOOL_CALL_RESULT,
-                    _build_result_event(
-                        raw_id=item.raw_id,
-                        call=item.call,
+
+            try:
+                if not is_parallel:
+                    item = batch[0]
+                    with tool_registry.authorize_execution(
+                        item.call,
+                        approval_id=None,
+                        approval_scope=item.decision.approval_scope,
+                    ):
+                        result = await tool_registry.execute(item.call)
+                    warnings = (
+                        await hook_registry.run_post_hooks(
+                            item.call.name,
+                            item.call.arguments,
+                            result,
+                        )
+                        if hook_registry is not None
+                        else []
+                    )
+                    outcome = BatchExecutionOutcome(
+                        slot=item.slot,
+                        item=item,
                         result=result,
-                    ),
-                )
-            else:
-                async for outcome in execute_read_batch(
-                    batch,
-                    tool_registry=tool_registry,
-                    hook_registry=hook_registry,
-                    max_parallel=MAX_PARALLEL_READ_TOOLS,
-                ):
+                        warnings=warnings,
+                    )
                     outcomes_by_slot[outcome.slot] = outcome
                     yield ExecutionEvent(
                         EventType.TOOL_CALL_RESULT,
                         _build_result_event(
-                            raw_id=outcome.item.raw_id,
-                            call=outcome.item.call,
-                            result=outcome.result,
-                            batch_id=batch_id,
+                            raw_id=item.raw_id,
+                            call=item.call,
+                            result=result,
                         ),
                     )
-
-            active_ctx = current_approval_context()
-            active_run_id = active_ctx[1] if active_ctx is not None else ""
-
-            for slot in sorted(outcomes_by_slot):
-                outcome = outcomes_by_slot[slot]
-                item = outcome.item
-                result = outcome.result
-
-                # Update repeat-sensitive counters and SessionTaintStore in
-                # deterministic slot order (including is_error=True paths).
-                if tool_guard is not None and hasattr(tool_guard, "record_post_execution"):
-                    tool_guard.record_post_execution(item.call, result, run_id=active_run_id)
-
-                if outcome.warnings:
-                    deferred_round_notes.append({
-                        "role": "system",
-                        "content": "\n\n".join(outcome.warnings),
-                    })
-
-                tool_msgs = _tool_result_messages(
-                    item.call.name, result.call_id, result.content, is_error=result.is_error,
-                )
-                conversation.append(tool_msgs[0])
-                deferred_round_notes.extend(tool_msgs[1:])
-
-                if result.is_error:
-                    round_had_failure = True
-                    consecutive_errors += 1
-                    if early_stop_reason is None:
-                        if _repeats_of(f"{item.raw_name}:{result.content[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
-                            early_stop_reason = "identical_tool_error_loop"
-                        elif consecutive_errors >= 3:
-                            deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
-                            consecutive_errors = 0
                 else:
-                    round_had_success = True
-                    had_successful_tool = True
-                    consecutive_errors = 0
-                    last_error_key = None
-                    identical_error_count = 0
-                    repeat_key = _repeat_key(item.raw_name, item.call.arguments)
-                    repeat_counts[repeat_key] = repeat_counts.get(repeat_key, 0) + 1
-                    if (
-                        repeat_counts[repeat_key] >= REPEATED_SUCCESS_WARN_THRESHOLD
-                        and repeat_key not in repeat_warned
-                    ):
-                        repeat_warned.add(repeat_key)
+                    async with aclosing(
+                        execute_read_batch(
+                            batch,
+                            tool_registry=tool_registry,
+                            hook_registry=hook_registry,
+                            max_parallel=MAX_PARALLEL_READ_TOOLS,
+                        )
+                    ) as batch_outcomes:
+                        async for outcome in batch_outcomes:
+                            outcomes_by_slot[outcome.slot] = outcome
+                            yield ExecutionEvent(
+                                EventType.TOOL_CALL_RESULT,
+                                _build_result_event(
+                                    raw_id=outcome.item.raw_id,
+                                    call=outcome.item.call,
+                                    result=outcome.result,
+                                    batch_id=batch_id,
+                                ),
+                            )
+
+                for slot in sorted(outcomes_by_slot):
+                    outcome = outcomes_by_slot[slot]
+                    item = outcome.item
+                    result = outcome.result
+
+                    # Update repeat-sensitive counters and SessionTaintStore in
+                    # deterministic slot order (including is_error=True paths).
+                    _record_post_exec_for_slot(slot, outcome)
+
+                    if outcome.warnings:
                         deferred_round_notes.append({
                             "role": "system",
-                            "content": repeated_success_prompt(
-                                item.raw_name, repeat_counts[repeat_key]
-                            ),
+                            "content": "\n\n".join(outcome.warnings),
                         })
+
+                    tool_msgs = _tool_result_messages(
+                        item.call.name, result.call_id, result.content, is_error=result.is_error,
+                    )
+                    conversation.append(tool_msgs[0])
+                    deferred_round_notes.extend(tool_msgs[1:])
+
+                    if result.is_error:
+                        round_had_failure = True
+                        consecutive_errors += 1
+                        if early_stop_reason is None:
+                            if _repeats_of(f"{item.raw_name}:{result.content[:120]}") >= MAX_IDENTICAL_TOOL_ERRORS:
+                                early_stop_reason = "identical_tool_error_loop"
+                            elif consecutive_errors >= 3:
+                                deferred_round_notes.append({"role": "system", "content": TOOL_FAILURE_HINT})
+                                consecutive_errors = 0
+                    else:
+                        round_had_success = True
+                        had_successful_tool = True
+                        consecutive_errors = 0
+                        last_error_key = None
+                        identical_error_count = 0
+                        repeat_key = _repeat_key(item.raw_name, item.call.arguments)
+                        repeat_counts[repeat_key] = repeat_counts.get(repeat_key, 0) + 1
+                        if (
+                            repeat_counts[repeat_key] >= REPEATED_SUCCESS_WARN_THRESHOLD
+                            and repeat_key not in repeat_warned
+                        ):
+                            repeat_warned.add(repeat_key)
+                            deferred_round_notes.append({
+                                "role": "system",
+                                "content": repeated_success_prompt(
+                                    item.raw_name, repeat_counts[repeat_key]
+                                ),
+                            })
+            finally:
+                # M2: If the batch is cancelled or raises mid-way, still record
+                # post-execution taint/repeat state for any already-completed
+                # reads in deterministic slot order so taint is never dropped.
+                for slot in sorted(outcomes_by_slot):
+                    _record_post_exec_for_slot(slot, outcomes_by_slot[slot])
 
             if early_stop_reason is not None:
                 yield ExecutionEvent(
@@ -1231,8 +1253,9 @@ async def react_event_loop(
 
         for slot_index, tc in enumerate(response.tool_calls):
             if lazy_tool_schemas and tc.name == _TOOL_SCHEMA_LOADER:
-                async for ev in _flush_pending_batch():
-                    yield ev
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
                 if early_stop_reason is not None:
                     return
                 requested_name, schema, error = _requested_tool_schema(
@@ -1321,8 +1344,9 @@ async def react_event_loop(
             # client-side component tree. The validated event is sent only to
             # clients that explicitly understand the smith-ui contract.
             if call.name == "render_ui":
-                async for ev in _flush_pending_batch():
-                    yield ev
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
                 if early_stop_reason is not None:
                     return
                 if call.name not in visible_tool_names:
@@ -1397,8 +1421,9 @@ async def react_event_loop(
             # never turn into an approval request merely because it exists in
             # the broader identity-level registry.
             if call.name not in visible_tool_names:
-                async for ev in _flush_pending_batch():
-                    yield ev
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
                 if early_stop_reason is not None:
                     return
                 unavailable_message = getattr(
@@ -1456,16 +1481,26 @@ async def react_event_loop(
             # Barrier 1: any non-parallel-readable tool (write, execute, serial,
             # private-data reader) flushes pending reads BEFORE policy.evaluate().
             if not parallel_candidate:
-                async for ev in _flush_pending_batch():
-                    yield ev
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
                 if early_stop_reason is not None:
                     return
             # Barrier 2 (Cross-tool taint race protection): local read batches
             # MUST flush and complete record_post_execution (including is_error)
-            # BEFORE any network/egress tool is preflight-evaluated.
-            elif is_net and pending_batch and pending_batch_has_local:
-                async for ev in _flush_pending_batch():
-                    yield ev
+            # BEFORE any network/egress tool or taint-dependent declarative rule
+            # is preflight-evaluated.
+            elif pending_batch and pending_batch_has_local and (
+                is_net
+                or (
+                    tool_guard is not None
+                    and hasattr(tool_guard, "is_taint_sensitive_if_tainted")
+                    and tool_guard.is_taint_sensitive_if_tainted(call)
+                )
+            ):
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
                 if early_stop_reason is not None:
                     return
             # Barrier 3 (RepeatGuard accuracy): flush pending batch before a
@@ -1475,8 +1510,9 @@ async def react_event_loop(
                 if headroom_info is not None:
                     bucket_key, headroom = headroom_info
                     if pending_bucket_counts.get(bucket_key, 0) >= headroom:
-                        async for ev in _flush_pending_batch():
-                            yield ev
+                        async with aclosing(_flush_pending_batch()) as batch_events:
+                            async for ev in batch_events:
+                                yield ev
                         if early_stop_reason is not None:
                             return
 
@@ -1512,8 +1548,9 @@ async def react_event_loop(
                         continue
                     # PreToolHook denied a parallel-readable call: flush prior
                     # batch first, then report denial in deterministic order.
-                    async for ev in _flush_pending_batch():
-                        yield ev
+                    async with aclosing(_flush_pending_batch()) as batch_events:
+                        async for ev in batch_events:
+                            yield ev
                     if early_stop_reason is not None:
                         return
                     yield ExecutionEvent(EventType.TOOL_CALL_START, {
@@ -1552,8 +1589,9 @@ async def react_event_loop(
                     continue
                 # Policy blocked/challenged/approval_required: flush prior reads
                 # before handling this barrier call serially.
-                async for ev in _flush_pending_batch():
-                    yield ev
+                async with aclosing(_flush_pending_batch()) as batch_events:
+                    async for ev in batch_events:
+                        yield ev
                 if early_stop_reason is not None:
                     return
 
@@ -1852,8 +1890,9 @@ async def react_event_loop(
                         ),
                     })
 
-        async for ev in _flush_pending_batch():
-            yield ev
+        async with aclosing(_flush_pending_batch()) as batch_events:
+            async for ev in batch_events:
+                yield ev
         if early_stop_reason is not None:
             return
         if deferred_round_notes:

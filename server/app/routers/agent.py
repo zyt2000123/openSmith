@@ -1,3 +1,5 @@
+from typing import Literal
+
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
@@ -126,9 +128,10 @@ async def compress_session(
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_session(
     session_id: str,
+    expected_kind: Literal["main", "side"] | None = Query(default=None),
     svc: AgentService = Depends(get_agent_service),
 ):
-    await svc.delete_session(session_id)
+    await svc.delete_session(session_id, expected_kind=expected_kind)
 
 
 @router.get("/sessions/{session_id}/messages", response_model=list[MessageOut])

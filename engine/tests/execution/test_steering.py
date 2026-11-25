@@ -228,3 +228,82 @@ async def test_without_steering_inbox_isolates_subagent():
         # Parent's steering message is still untouched!
         assert inbox.pending_count() == 1
         assert inbox.drain()[0].content == "parent only steer"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_steering_reaches_active_and_subsequent_nodes():
+    """H3: Steering pushed before node 0 and between node 0 -> node 1 is delivered to the LLM
+    (never drained and dropped in pipeline.py) and accumulated across nodes."""
+    from engine.execution.pipeline.backtrack import FailureLoopGuard
+    from engine.execution.pipeline.gate import Gate, GateResult
+    from engine.execution.pipeline.pipeline import run_pipeline
+    from engine.execution.pipeline.skill_chain import SkillChain, SkillNode
+    from engine.skill.loader import SkillBody, SkillMeta
+    from engine.skill.registry import SkillRegistry
+
+    inbox = SteeringInbox()
+    inbox.push("keep functions under 20 lines")
+
+    class _StepOneGate(Gate):
+        async def check(self, output: str, context: dict) -> GateResult:
+            # Push a second steer right between node 0 and node 1
+            inbox.push("add docstring to output")
+            return GateResult("pass", "ok")
+
+    class _PassGate(Gate):
+        async def check(self, output: str, context: dict) -> GateResult:
+            return GateResult("pass", "ok")
+
+    skill_registry = SkillRegistry()
+    for name in ("step_one", "step_two"):
+        skill_registry._skills[name] = SkillBody(
+            meta=SkillMeta(name=name, description=f"Skill {name}"),
+            content=f"Perform {name}.",
+        )
+
+    chain = SkillChain(
+        nodes=[
+            SkillNode(skill_name="step_one", gate=_StepOneGate()),
+            SkillNode(skill_name="step_two", gate=_PassGate()),
+        ],
+    )
+
+    llm = _ScriptedLLM([
+        ChatResponse(text="step one output", tool_calls=[]),
+        ChatResponse(text="step two output", tool_calls=[]),
+    ])
+    registry = ToolRegistry()
+    base_messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "implement feature"},
+    ]
+
+    with use_steering_inbox(inbox):
+        events = [
+            ev
+            async for ev in run_pipeline(
+                chain,
+                llm,
+                "implement feature",
+                base_messages,
+                registry,
+                skill_registry,
+                None,
+                FailureLoopGuard(),
+                5,
+                {},
+            )
+        ]
+
+    # Exactly two STEERING_APPLIED events: one in step_one, one in step_two
+    applied = [ev for ev in events if ev.type is EventType.STEERING_APPLIED]
+    assert len(applied) == 2
+
+    # Node 0 LLM call MUST actually contain the first steering note
+    node0_text = "\n".join(str(m.get("content", "")) for m in llm.calls[0])
+    assert "keep functions under 20 lines" in node0_text
+
+    # Node 1 LLM call MUST contain BOTH accumulated steering from node 0 AND the new steer!
+    node1_text = "\n".join(str(m.get("content", "")) for m in llm.calls[1])
+    assert "keep functions under 20 lines" in node1_text
+    assert "add docstring to output" in node1_text

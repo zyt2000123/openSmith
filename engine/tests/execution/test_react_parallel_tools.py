@@ -615,62 +615,139 @@ async def test_preflight_approval_and_hook_denial_flush_prior_reads(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_parallel_cancellation_cancels_child_tasks_cleanly(tmp_path: Path):
-    """Closing the generator mid-batch cancels all running tool tasks with no leaks."""
+async def test_parallel_cancellation_cancels_child_tasks_and_records_completed_taint(tmp_path: Path):
+    """M2 + M3: Closing the generator after one read completes deterministically cancels
+    remaining slow tasks AND still records taint for the already-completed read."""
     registry = ToolRegistry()
     registry.bind_working_directory(tmp_path)
-    guard = ToolGuard(tmp_path / "audit.jsonl")
+    taint_store = SessionTaintStore()
+    safety_cfg = SafetyConfig.from_profile_config({"safety": {"taint": {"enabled": True}}})
+    guard = ToolGuard(tmp_path / "rules.json")
     guard.file_guard.set_working_directory(tmp_path)
-    registry.bind_tool_guard(guard)
+    guard.configure_safety(safety_config=safety_cfg, taint_store=taint_store)
 
-    cancelled_count = 0
-    started = asyncio.Event()
-    started_count = 0
+    secret_file = tmp_path / "fast_secret.txt"
+    slow_file = tmp_path / "slow.txt"
+    secret_file.write_text("token = sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", encoding="utf-8")
+    slow_file.write_text("slow", encoding="utf-8")
 
-    async def slow_read(**_kwargs) -> str:
-        nonlocal cancelled_count, started_count
-        started_count += 1
-        if started_count >= 2:
-            started.set()
-        try:
-            await asyncio.sleep(10)
-            return "never"
-        except asyncio.CancelledError:
-            cancelled_count += 1
-            raise
+    slow_cancelled = False
+    slow_still_running = False
 
-    _register(registry, _make_read_def("read_file", path_args=()), slow_read)
+    async def exec_read(path: str, **_kwargs) -> str:
+        nonlocal slow_cancelled, slow_still_running
+        p = Path(path)
+        if p.name == "slow.txt":
+            slow_still_running = True
+            try:
+                await asyncio.sleep(10)
+                return "never"
+            except asyncio.CancelledError:
+                slow_cancelled = True
+                raise
+            finally:
+                slow_still_running = False
+        await asyncio.sleep(0.01)
+        return p.read_text(encoding="utf-8")
 
+    _register(registry, _make_read_def("read_file"), exec_read)
     registry.bind_tool_guard(guard)
 
     llm = _ScriptedLLM([
         ChatResponse(
             text="",
             tool_calls=[
-                ToolCallData(id="tc-1", name="read_file", arguments={}),
-                ToolCallData(id="tc-2", name="read_file", arguments={}),
+                ToolCallData(id="tc-fast", name="read_file", arguments={"path": str(secret_file)}),
+                ToolCallData(id="tc-slow", name="read_file", arguments={"path": str(slow_file)}),
             ],
         ),
     ])
 
     gen = react_event_loop(
         llm,
-        [{"role": "user", "content": "slow reads"}],
+        [{"role": "user", "content": "fast secret and slow read"}],
         registry,
         tool_guard=guard,
     )
-    # Consume until both TOOL_CALL_START events have been yielded and tasks started
-    seen_starts = 0
+    # Advance until the fast secret read yields its TOOL_CALL_RESULT (both tasks are now running)
     async for ev in gen:
-        if ev.type is EventType.TOOL_CALL_START:
-            seen_starts += 1
-            if seen_starts == 2:
-                break
+        if ev.type is EventType.TOOL_CALL_RESULT and ev.data.get("id") == "tc-fast":
+            break
 
-    # Wait briefly for tasks to start, then close the generator
-    await asyncio.sleep(0.02)
     await gen.aclose()
-    assert cancelled_count <= 2
+    # M3: slow task MUST have been deterministically cancelled before aclose() returned
+    assert slow_cancelled is True
+    assert slow_still_running is False
+    # M2: taint from the already-completed fast read MUST have been recorded
+    assert taint_store.is_tainted is True
+
+
+@pytest.mark.asyncio
+async def test_taint_conditional_declarative_rule_flushes_pending_local_reads(tmp_path: Path):
+    """M1: [read_file(secret), read_file(x)] with a when.tainted=True deny rule MUST flush
+    the first read before evaluating the second so the rule sees updated session taint."""
+    registry = ToolRegistry()
+    registry.bind_working_directory(tmp_path)
+    taint_store = SessionTaintStore()
+    safety_cfg = SafetyConfig.from_profile_config({
+        "safety": {
+            "taint": {"enabled": True},
+            "rules": [
+                {
+                    "id": "deny-read-when-tainted",
+                    "action": "deny",
+                    "tools": ["read_file"],
+                    "when": {"tainted": True},
+                    "reason": "no further reads once tainted",
+                },
+            ],
+        }
+    })
+    guard = ToolGuard(tmp_path / "rules.json")
+    guard.file_guard.set_working_directory(tmp_path)
+    guard.configure_safety(safety_config=safety_cfg, taint_store=taint_store)
+
+    secret_file = tmp_path / "secret.txt"
+    other_file = tmp_path / "other.txt"
+    secret_file.write_text("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", encoding="utf-8")
+    other_file.write_text("public", encoding="utf-8")
+
+    executed: list[str] = []
+
+    async def exec_read(path: str, **_kwargs) -> str:
+        p = Path(path)
+        executed.append(p.name)
+        return p.read_text(encoding="utf-8")
+
+    _register(registry, _make_read_def("read_file"), exec_read)
+    registry.bind_tool_guard(guard)
+
+    llm = _ScriptedLLM([
+        ChatResponse(
+            text="",
+            tool_calls=[
+                ToolCallData(id="tc-1", name="read_file", arguments={"path": str(secret_file)}),
+                ToolCallData(id="tc-2", name="read_file", arguments={"path": str(other_file)}),
+            ],
+        ),
+        ChatResponse(text="stopped", tool_calls=[]),
+    ])
+
+    events = [
+        ev
+        async for ev in react_event_loop(
+            llm,
+            [{"role": "user", "content": "read both"}],
+            registry,
+            tool_guard=guard,
+        )
+    ]
+
+    assert taint_store.is_tainted is True
+    assert executed == ["secret.txt"]
+    tc2 = [ev.data for ev in events if ev.type is EventType.TOOL_CALL_RESULT and ev.data.get("id") == "tc-2"][0]
+    assert tc2["blocked"] is True
+    assert "deny-read-when-tainted" in str(tc2["reason"])
 
 
 @pytest.mark.asyncio

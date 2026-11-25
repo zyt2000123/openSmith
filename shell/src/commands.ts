@@ -397,6 +397,10 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
   },
   "/sessions": (_args, context) => {
     const state = context.getState();
+    if (state.activeChannel === "side") {
+      state.set({ statusLine: "Unavailable in side chat. Type /back to return to main first." });
+      return;
+    }
     state.set({ panel: "sessions", statusLine: `${state.sessions.length} session(s).` });
   },
   "/token": async (_args, context) => {

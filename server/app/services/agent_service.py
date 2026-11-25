@@ -126,8 +126,17 @@ class AgentService:
     async def compress_session(self, session_id: str) -> ContextCompressionOut:
         return await self.session_service.compress_session(await self._profile_id(), session_id)
 
-    async def delete_session(self, session_id: str) -> None:
-        await self.session_service.delete_session(await self._profile_id(), session_id)
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        expected_kind: str | None = None,
+    ) -> None:
+        await self.session_service.delete_session(
+            await self._profile_id(),
+            session_id,
+            expected_kind=expected_kind,
+        )
 
     def memory_maintenance(self) -> MemoryMaintenanceOut:
         """Report deferred memory maintenance so a client can show it.

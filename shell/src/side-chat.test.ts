@@ -166,3 +166,75 @@ test("/promote elevates side chat to main channel and clears background side sta
     globalThis.fetch = originalFetch;
   }
 });
+
+test("H1: side channel blocks /resume, /new, /clear, /sessions and closeSideChat verifies session_kind", async () => {
+  const store = createAppStore();
+  const mainSession = {
+    id: "main-1",
+    agent_id: "agent-1",
+    title: "Main",
+    created_at: "2026-11-25T00:00:00Z",
+    message_count: 2,
+    session_kind: "main" as const,
+  };
+  const sideSession = {
+    id: "side-9",
+    agent_id: "agent-1",
+    title: "Side chat",
+    created_at: "2026-11-25T00:00:01Z",
+    message_count: 0,
+    session_kind: "side" as const,
+    parent_session_id: "main-1",
+  };
+  store.getState().set({
+    baseUrl: "http://127.0.0.1:9999",
+    agent: { id: "agent-1", name: "Smith", role: "personal-assistant", description: "" },
+    currentSession: mainSession,
+    sessions: [mainSession],
+  });
+  store.getState().switchChannel("side", {
+    ...store.getState().getChannelState("main")!,
+    session: sideSession,
+    transcript: [],
+    turnCount: 0,
+  });
+
+  const bridge = new NodeBridge(store);
+  const deletedUrls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "DELETE") deletedUrls.push(String(input));
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+
+  try {
+    // /resume, /new, /clear, /sessions must all be blocked in side chat
+    await bridge.resumeSession(mainSession);
+    assert.equal(store.getState().currentSession?.id, "side-9");
+    await bridge.resumeRun("run-1");
+    assert.equal(store.getState().currentSession?.id, "side-9");
+    assert.equal(bridge.startNewSession(), false);
+    assert.equal(await bridge.clearCurrentSession(), false);
+    await runShellCommand("/sessions", { bridge, exit: () => {}, getState: () => store.getState() });
+    assert.notEqual(store.getState().panel, "sessions");
+    assert.equal(deletedUrls.length, 0);
+
+    // Even if side session somehow held a main session, closeSideChat MUST NOT delete it
+    store.getState().updateChannel("side", { session: mainSession });
+    await bridge.closeSideChat();
+    assert.equal(deletedUrls.length, 0);
+
+    // Deleting a real side session passes expected_kind=side
+    store.getState().switchChannel("side", {
+      ...store.getState().getChannelState("main")!,
+      session: sideSession,
+      transcript: [],
+      turnCount: 0,
+    });
+    await bridge.closeSideChat();
+    assert.equal(deletedUrls.length, 1);
+    assert.match(deletedUrls[0] ?? "", /\/api\/agent\/sessions\/side-9\?expected_kind=side$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
