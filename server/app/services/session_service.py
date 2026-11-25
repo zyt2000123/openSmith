@@ -851,7 +851,14 @@ class SessionService:
                     # preparation loads SessionTaintStore, preventing a tainted
                     # parent's snapshot from leaking through side web_fetch/web_search.
                     self._merge_parent_taint(parent_id, session_id)
-                    if _resume_run_id is None:
+                    # L4: Preserve the read-only parent snapshot on resume as well
+                    # as initial turns (avoiding duplication if already present).
+                    has_snapshot = bool(
+                        history
+                        and isinstance(history[0].get("content"), str)
+                        and history[0]["content"].startswith(_SIDE_SNAPSHOT_PREFIX)
+                    )
+                    if not has_snapshot:
                         snapshot = await self._build_parent_snapshot(
                             parent_id,
                             cutoff_message_id=(

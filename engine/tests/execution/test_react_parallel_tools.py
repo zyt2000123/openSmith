@@ -525,6 +525,81 @@ async def test_repeat_guard_not_bypassed_by_parallel_network_reads(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_clean_allow_ruled_network_reads_execute_in_parallel(tmp_path: Path):
+    """L1: When a clean session explicitly allows web_fetch (effective risk ROUTINE),
+    repeat_guard_headroom agrees with check() and multiple web_fetch calls run in parallel."""
+    registry = ToolRegistry()
+    registry.bind_working_directory(tmp_path)
+    safety_cfg = SafetyConfig.from_profile_config({
+        "safety": {
+            "taint": {"enabled": True},
+            "repeat_guard": {
+                "enabled": True,
+                "threshold": 2,
+                "min_risk": "high",
+                "on_trigger": "deny",
+            },
+            "rules": [
+                {
+                    "id": "allow-web-fetch",
+                    "action": "allow",
+                    "tools": ["web_fetch"],
+                },
+            ],
+        }
+    })
+    guard = ToolGuard(tmp_path / "rules.json")
+    guard.file_guard.set_working_directory(tmp_path)
+    guard.configure_safety(safety_config=safety_cfg, taint_store=SessionTaintStore())
+
+    timeline: list[str] = []
+
+    async def exec_fetch(url: str, **_kwargs) -> str:
+        timeline.append(f"start:{url}")
+        await asyncio.sleep(0.05)
+        timeline.append(f"end:{url}")
+        return f"ok:{url}"
+
+    _register(
+        registry,
+        _make_read_def(
+            "web_fetch",
+            path_args=(),
+            network_access=True,
+            egress=True,
+            egress_target_arg="url",
+        ),
+        exec_fetch,
+    )
+    registry.bind_tool_guard(guard)
+
+    llm = _ScriptedLLM([
+        ChatResponse(
+            text="",
+            tool_calls=[
+                ToolCallData(id="tc-1", name="web_fetch", arguments={"url": "https://a.example.com"}),
+                ToolCallData(id="tc-2", name="web_fetch", arguments={"url": "https://b.example.com"}),
+            ],
+        ),
+        ChatResponse(text="both fetched", tool_calls=[]),
+    ])
+
+    events = [
+        ev
+        async for ev in react_event_loop(
+            llm,
+            [{"role": "user", "content": "fetch both"}],
+            registry,
+            tool_guard=guard,
+        )
+    ]
+
+    assert any(ev.type is EventType.TEXT_DELTA for ev in events)
+    # Both started before either finished -> real parallel execution!
+    assert timeline.index("start:https://b.example.com") < timeline.index("end:https://a.example.com")
+
+
+@pytest.mark.asyncio
 async def test_preflight_approval_and_hook_denial_flush_prior_reads(tmp_path: Path):
     """Prior pure reads finish before an outside-workspace approval or PreToolHook denial."""
     workspace = tmp_path / "ws"

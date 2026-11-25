@@ -372,5 +372,70 @@ async def test_delete_parent_cascades_side_and_cleanup_stale_sides_releases_tain
         assert await repo.get_owned(fresh_side, agent_id) is not None
 
 
+@pytest.mark.asyncio
+async def test_resume_side_session_preserves_parent_snapshot(monkeypatch, tmp_path: Path):
+    """L4: Resuming an interrupted run on a side session still injects the parent snapshot."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", headers=_auth_headers()) as client:
+        main_resp = await client.post("/api/agent/sessions", json={"title": "Main Context"})
+        main_id = main_resp.json()["id"]
+        agent_id = main_resp.json()["agent_id"]
+
+        repo = SessionRepo()
+        await repo.add_message(main_id, "user", "Important parent architectural decision")
+        side_resp = await client.post(f"/api/agent/sessions/{main_id}/side", json={})
+        side_id = side_resp.json()["id"]
+        user_msg = await repo.add_message(side_id, "user", "Explain parent decision")
+
+    store = RunStateStore(common_config.PATHS.agent_dir)
+    run_id = "run-side-resume-1"
+    store.create(
+        run_id,
+        agent_id=agent_id,
+        session_id=side_id,
+        message_id=user_msg["id"],
+        identity_id="smith",
+        working_dir=str(tmp_path),
+    )
+    from engine.execution import RunStatus
+
+    store.transition(run_id, RunStatus.RUNNING)
+    store.transition(run_id, RunStatus.INCOMPLETE, reason="disconnected")
+
+    captured_requests = []
+
+    class _FakeStream:
+        def __init__(self, rid: str) -> None:
+            self.run_id = rid
+
+        async def stream_events(self):
+            yield ExecutionEvent(EventType.RUN_STARTED, {"run_id": self.run_id})
+            yield ExecutionEvent(EventType.TEXT_DELTA, {"text": "resumed side reply"})
+            yield ExecutionEvent(EventType.RUN_FINISHED, {"run_id": self.run_id, "status": "completed"})
+
+        async def aclose(self):
+            return None
+
+    async def fake_build_runtime(self_svc, _a, _p, sid):
+        return SimpleNamespace(session_id=sid), SimpleNamespace(llm=SimpleNamespace(model="m"))
+
+    def fake_resume(request, runtime, services, rid):
+        captured_requests.append(request)
+        return _FakeStream(rid)
+
+    monkeypatch.setattr(SessionService, "_build_runtime", fake_build_runtime)
+    monkeypatch.setattr("app.services.session_service.engine_resume_stream_with_runtime", fake_resume)
+
+    service = SessionService(repo, AgentProfileRepo(), run_state_store=store)
+    gen = await service.prepare_resume_run(agent_id, run_id)
+    events = await _drain(gen)
+    assert any(ev["event"] == "done" for ev in events)
+    assert len(captured_requests) == 1
+    assert captured_requests[0].ephemeral is True
+    assert captured_requests[0].read_only_tools is True
+    assert captured_requests[0].history[0]["content"].startswith("[Read-only snapshot of main conversation]\n")
+    assert "Important parent architectural decision" in captured_requests[0].history[0]["content"]
+
+
 async def _drain(gen):
     return [ev async for ev in gen]

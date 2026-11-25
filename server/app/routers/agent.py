@@ -131,7 +131,10 @@ async def delete_session(
     expected_kind: Literal["main", "side"] | None = Query(default=None),
     svc: AgentService = Depends(get_agent_service),
 ):
-    await svc.delete_session(session_id, expected_kind=expected_kind)
+    if expected_kind is None:
+        await svc.delete_session(session_id)
+    else:
+        await svc.delete_session(session_id, expected_kind=expected_kind)
 
 
 @router.get("/sessions/{session_id}/messages", response_model=list[MessageOut])

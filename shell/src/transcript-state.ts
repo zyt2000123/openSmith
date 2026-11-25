@@ -352,19 +352,26 @@ export function appendQueuedSteering(
 ): TranscriptEntry[] {
   const trimmed = content.trim();
   if (!trimmed) return entries;
-  return updateLastTurn(entries, (turn) => ({
-    ...turn,
-    blocks: [
-      ...finishThinkingBlocks(turn.blocks),
-      {
-        id: createId(),
-        type: "steering",
-        steerId,
-        content: trimmed,
-        state: "queued",
-      },
-    ],
-  }));
+  return updateLastTurn(entries, (turn) => {
+    // L2: If steering_applied already arrived before the POST response,
+    // never append a duplicate queued block or downgrade "applied" -> "queued".
+    if (turn.blocks.some((block) => block.type === "steering" && block.steerId === steerId)) {
+      return turn;
+    }
+    return {
+      ...turn,
+      blocks: [
+        ...finishThinkingBlocks(turn.blocks),
+        {
+          id: createId(),
+          type: "steering",
+          steerId,
+          content: trimmed,
+          state: "queued",
+        },
+      ],
+    };
+  });
 }
 
 export function createTurnEntry(userText: string): TurnEntry {

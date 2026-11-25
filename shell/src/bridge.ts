@@ -216,6 +216,10 @@ export class NodeBridge {
     main: [],
     side: [],
   };
+  private settledSteerIds: Record<ChatChannel, Set<string>> = {
+    main: new Set(),
+    side: new Set(),
+  };
   private tokenStatsRequestId = 0;
   private observabilityRequestId = 0;
   private booting = false;
@@ -304,12 +308,17 @@ export class NodeBridge {
       const result = await steerSession(baseUrl, session.id, normalized, runId);
       if (result.accepted) {
         const steerId = result.steer_id ?? `st_${Date.now()}`;
-        this.pendingSteers[channel].push({ steerId, content: normalized });
-        const latestState = this.s.getChannelState(channel);
-        if (latestState) {
-          this.s.updateChannel(channel, {
-            transcript: appendQueuedSteering(latestState.transcript, steerId, normalized),
-          });
+        // L2: If steering_applied or steering_deferred already arrived over SSE
+        // before the POST response returned, do not re-add it to pendingSteers
+        // or re-append a stuck "[Steer queued]" block.
+        if (!this.settledSteerIds[channel].has(steerId)) {
+          this.pendingSteers[channel].push({ steerId, content: normalized });
+          const latestState = this.s.getChannelState(channel);
+          if (latestState) {
+            this.s.updateChannel(channel, {
+              transcript: appendQueuedSteering(latestState.transcript, steerId, normalized),
+            });
+          }
         }
         if (channel === this.s.activeChannel) {
           this.s.set({
@@ -1190,6 +1199,8 @@ export class NodeBridge {
   private startRequest(channel: ChatChannel = this.s.activeChannel): AbortController {
     const controller = new AbortController();
     this.activeRequests[channel] = controller;
+    this.pendingSteers[channel] = [];
+    this.settledSteerIds[channel].clear();
     this.s.updateChannel(channel, {
       busy: true,
       compressing: false,
@@ -1206,6 +1217,7 @@ export class NodeBridge {
 
     this.activeRequests[channel] = null;
     this.pendingSteers[channel] = [];
+    this.settledSteerIds[channel].clear();
     const next = this.takeQueuedMessage(channel);
     if (next) {
       this.s.updateChannel(channel, { pendingApproval: null, approvalResolving: false });
@@ -1347,10 +1359,12 @@ export class NodeBridge {
         );
         if (event.type === "steering_applied" && event.steerIds.length > 0) {
           const applied = new Set(event.steerIds);
+          for (const id of event.steerIds) this.settledSteerIds[channel].add(id);
           this.pendingSteers[channel] = this.pendingSteers[channel].filter((item) => !applied.has(item.steerId));
         }
         if (event.type === "steering_deferred" && event.items.length > 0) {
           const deferredIds = new Set(event.steerIds);
+          for (const id of event.steerIds) this.settledSteerIds[channel].add(id);
           this.pendingSteers[channel] = this.pendingSteers[channel].filter((item) => !deferredIds.has(item.steerId));
           let requeued = 0;
           for (const item of event.items) {

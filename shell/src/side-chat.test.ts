@@ -337,3 +337,34 @@ test("dual concurrent streams on main and side run independently without cross-w
     globalThis.fetch = originalFetch;
   }
 });
+
+test("L3: /side close with trailing words asks a question instead of closing side chat", async () => {
+  const store = createAppStore();
+  let openedQuestion: string | undefined;
+  let closedCalled = false;
+  const fakeBridge = {
+    openSideChat: async (question?: string) => {
+      openedQuestion = question;
+      return true;
+    },
+    closeSideChat: async () => {
+      closedCalled = true;
+      return true;
+    },
+  } as unknown as NodeBridge;
+
+  await runShellCommand("/side close the loop how?", {
+    bridge: fakeBridge,
+    exit: () => {},
+    getState: () => store.getState(),
+  });
+  assert.equal(closedCalled, false);
+  assert.equal(openedQuestion, "close the loop how?");
+
+  await runShellCommand("/side close", {
+    bridge: fakeBridge,
+    exit: () => {},
+    getState: () => store.getState(),
+  });
+  assert.equal(closedCalled, true);
+});

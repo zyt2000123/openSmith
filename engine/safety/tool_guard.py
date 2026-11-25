@@ -1752,6 +1752,58 @@ class ToolGuard:
             return False
         return self._safety_config.has_taint_sensitive_rule_for(tool_call.name)
 
+    def _effective_eval_risk(
+        self,
+        tool_call: ToolCall,
+        definition: ToolDefinition | None,
+        *,
+        file_result: GuardResult | None,
+        dangerous_hit: bool,
+        egress_target: EgressTarget | None,
+        is_tainted: bool,
+    ) -> RiskTier:
+        """Mirror ``check()``'s effective risk so RepeatGuard bucketing and headroom agree."""
+        if dangerous_hit or (
+            definition is not None
+            and definition.opaque_command
+            and self._sandbox_is_degraded
+        ):
+            return RiskTier.CRITICAL
+        matched_rule = self._safety_config.match_non_deny(tool_call, tainted=is_tainted)
+        if file_result is not None:
+            file_risk = self._risk_for_file_result(file_result)
+            if (
+                file_result.boundary_block
+                and matched_rule is not None
+                and matched_rule.action == "allow"
+                and not is_tainted
+            ):
+                return RiskTier.ROUTINE
+            if (
+                not file_result.boundary_block
+                and matched_rule is not None
+                and matched_rule.action == "allow"
+                and matched_rule.override_builtin_approval
+                and not is_tainted
+                and file_risk is not RiskTier.CRITICAL
+            ):
+                return RiskTier.ROUTINE
+            return file_risk
+        if (
+            is_tainted
+            and egress_target is not None
+            and not self._safety_config.taint.allowlist.allows(egress_target)
+        ):
+            return RiskTier.CRITICAL
+        if matched_rule is not None:
+            if matched_rule.action == "allow":
+                return RiskTier.ROUTINE
+            if matched_rule.action == "ask":
+                return matched_rule.risk
+        if call_requests_network_egress(tool_call, definition):
+            return RiskTier.HIGH
+        return RiskTier.ROUTINE
+
     def repeat_guard_headroom(self, tool_call: ToolCall) -> tuple[BucketKey, int] | None:
         """Return ``(bucket_key, remaining_before_trigger)`` if RepeatGuard tracks this call.
 
@@ -1776,17 +1828,14 @@ class ToolGuard:
             and self._taint_store is not None
             and self._taint_store.is_tainted
         )
-        eval_risk = RiskTier.ROUTINE
-        if file_result is not None:
-            eval_risk = self._risk_for_file_result(file_result)
-        elif dangerous_hit or (
-            definition is not None
-            and definition.opaque_command
-            and self._sandbox_is_degraded
-        ):
-            eval_risk = RiskTier.CRITICAL
-        elif call_requests_network_egress(tool_call, definition):
-            eval_risk = RiskTier.HIGH
+        eval_risk = self._effective_eval_risk(
+            tool_call,
+            definition,
+            file_result=file_result,
+            dangerous_hit=dangerous_hit,
+            egress_target=egress_target,
+            is_tainted=is_tainted,
+        )
 
         bucket_info = self._classify_call_bucket(
             tool_call,
@@ -1843,17 +1892,14 @@ class ToolGuard:
             was_tainted = bool(
                 self._taint_store is not None and self._taint_store.is_tainted
             )
-            eval_risk = RiskTier.ROUTINE
-            if file_result is not None:
-                eval_risk = self._risk_for_file_result(file_result)
-            elif dangerous_hit or (
-                definition is not None
-                and definition.opaque_command
-                and self._sandbox_is_degraded
-            ):
-                eval_risk = RiskTier.CRITICAL
-            elif call_requests_network_egress(tool_call, definition):
-                eval_risk = RiskTier.HIGH
+            eval_risk = self._effective_eval_risk(
+                tool_call,
+                definition,
+                file_result=file_result,
+                dangerous_hit=dangerous_hit,
+                egress_target=egress_target,
+                is_tainted=was_tainted,
+            )
 
             bucket_info = self._classify_call_bucket(
                 tool_call,

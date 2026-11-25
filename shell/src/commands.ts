@@ -432,7 +432,9 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
   },
   "/side": async (args, context) => {
     const sub = args[0]?.toLowerCase();
-    if (sub === "close") {
+    // L3: Only treat exact `/side close` (no trailing words) as the close
+    // subcommand so questions like `/side close the loop how?` ask in side chat.
+    if (sub === "close" && args.length === 1) {
       await context.bridge.closeSideChat();
       return;
     }

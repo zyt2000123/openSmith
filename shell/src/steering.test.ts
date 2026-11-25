@@ -364,3 +364,23 @@ test("M10: cancelRequest requeues unapplied steers and steering_deferred bypasse
   assert.equal(store2.getState().queuedMessages.length, 4);
   assert.equal(store2.getState().queuedMessages[3]?.text, "late steer must not drop");
 });
+
+test("L2: steering_applied arriving before POST response does not duplicate or leave a stuck queued block", () => {
+  let entries: TranscriptEntry[] = [createTurnEntry("task")];
+  // SSE steering_applied arrives first
+  entries = applyStreamEvent(entries, {
+    type: "steering_applied",
+    steerIds: ["st_race"],
+    count: 1,
+    items: [{ steerId: "st_race", content: "fast steer" }],
+    iteration: 1,
+  });
+  // POST response arrives second and calls appendQueuedSteering
+  entries = appendQueuedSteering(entries, "st_race", "fast steer");
+
+  const turn = entries[0];
+  assert.ok(turn?.kind === "turn");
+  const steeringBlocks = turn.blocks.filter((b) => b.type === "steering");
+  assert.equal(steeringBlocks.length, 1);
+  assert.equal(steeringBlocks[0]?.type === "steering" && steeringBlocks[0].state, "applied");
+});
