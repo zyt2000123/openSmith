@@ -397,7 +397,7 @@ async def _run_live_probes(
             auto_detect_toolchains=True,
             auto_detect_caches=False,
             share_read_only=(str(ro_tools),),
-            default_network="loopback_only",
+            default_network="none",
         )
         profile = resolve_sandbox_profile(
             ws,
@@ -571,60 +571,110 @@ async def _run_live_probes(
                 )
             )
 
-        # Probe 7: network loopback-only (127.0.0.1 works, RFC 5737 192.0.2.1:80 blocked)
-        net_script = (
-            "import socket, threading\n"
-            "srv = socket.socket()\n"
-            "srv.bind(('127.0.0.1', 0))\n"
-            "port = srv.getsockname()[1]\n"
-            "srv.listen(1)\n"
-            "def accept():\n"
-            "    c, _ = srv.accept()\n"
-            "    c.sendall(b'ok')\n"
-            "    c.close()\n"
-            "t = threading.Thread(target=accept)\n"
-            "t.start()\n"
-            "cli = socket.create_connection(('127.0.0.1', port), timeout=2)\n"
-            "assert cli.recv(2) == b'ok'\n"
-            "cli.close(); t.join(); srv.close()\n"
-            "print('LOOPBACK_OK')\n"
-            "try:\n"
-            "    ext = socket.create_connection(('192.0.2.1', 80), timeout=1)\n"
-            "    ext.close()\n"
-            "    print('OUTBOUND_LEAKED')\n"
-            "except OSError as exc:\n"
-            "    print(f'OUTBOUND_BLOCKED:{exc.errno}')\n"
-        )
-        r7 = await env.run_command(
-            argv=[sys.executable, "-c", net_script],
-            cwd=str(ws),
-            timeout_seconds=10,
-        )
-        if (
-            r7.exit_code == 0
-            and "LOOPBACK_OK" in r7.stdout
-            and "OUTBOUND_BLOCKED" in r7.stdout
-            and "OUTBOUND_LEAKED" not in r7.stdout
-        ):
-            checks.append(
-                DoctorCheck(
-                    "probe.network_loopback_only",
-                    "probe",
-                    "pass",
-                    "Loopback networking works while outbound network is blocked",
-                )
+        # Probe 7: network isolation (default_network="none" denies both loopback
+        # and outbound; "loopback_only" allows loopback while blocking outbound).
+        if probe_cfg.default_network == "none":
+            net_script = (
+                "import socket\n"
+                "try:\n"
+                "    srv = socket.socket()\n"
+                "    srv.bind(('127.0.0.1', 0))\n"
+                "    srv.close()\n"
+                "    print('LOOPBACK_LEAKED')\n"
+                "except OSError as exc:\n"
+                "    print(f'LOOPBACK_BLOCKED:{exc.errno}')\n"
+                "try:\n"
+                "    ext = socket.create_connection(('192.0.2.1', 80), timeout=1)\n"
+                "    ext.close()\n"
+                "    print('OUTBOUND_LEAKED')\n"
+                "except OSError as exc:\n"
+                "    print(f'OUTBOUND_BLOCKED:{exc.errno}')\n"
             )
+            r7 = await env.run_command(
+                argv=[sys.executable, "-c", net_script],
+                cwd=str(ws),
+                timeout_seconds=10,
+            )
+            if (
+                r7.exit_code == 0
+                and "LOOPBACK_BLOCKED" in r7.stdout
+                and "OUTBOUND_BLOCKED" in r7.stdout
+                and "LOOPBACK_LEAKED" not in r7.stdout
+                and "OUTBOUND_LEAKED" not in r7.stdout
+            ):
+                checks.append(
+                    DoctorCheck(
+                        "probe.network_loopback_only",
+                        "probe",
+                        "pass",
+                        "Default network=none blocks both host loopback and outbound network",
+                    )
+                )
+            else:
+                checks.append(
+                    DoctorCheck(
+                        "probe.network_loopback_only",
+                        "probe",
+                        "fail",
+                        "Default network=none isolation probe failed",
+                        detail=(r7.error or r7.stderr or r7.stdout or f"exit={r7.exit_code}")[:300],
+                        code="PROBE_NETWORK_FAILED",
+                    )
+                )
         else:
-            checks.append(
-                DoctorCheck(
-                    "probe.network_loopback_only",
-                    "probe",
-                    "fail",
-                    "Loopback-only network isolation probe failed",
-                    detail=(r7.error or r7.stderr or r7.stdout or f"exit={r7.exit_code}")[:300],
-                    code="PROBE_NETWORK_FAILED",
-                )
+            net_script = (
+                "import socket, threading\n"
+                "srv = socket.socket()\n"
+                "srv.bind(('127.0.0.1', 0))\n"
+                "port = srv.getsockname()[1]\n"
+                "srv.listen(1)\n"
+                "def accept():\n"
+                "    c, _ = srv.accept()\n"
+                "    c.sendall(b'ok')\n"
+                "    c.close()\n"
+                "t = threading.Thread(target=accept)\n"
+                "t.start()\n"
+                "cli = socket.create_connection(('127.0.0.1', port), timeout=2)\n"
+                "assert cli.recv(2) == b'ok'\n"
+                "cli.close(); t.join(); srv.close()\n"
+                "print('LOOPBACK_OK')\n"
+                "try:\n"
+                "    ext = socket.create_connection(('192.0.2.1', 80), timeout=1)\n"
+                "    ext.close()\n"
+                "    print('OUTBOUND_LEAKED')\n"
+                "except OSError as exc:\n"
+                "    print(f'OUTBOUND_BLOCKED:{exc.errno}')\n"
             )
+            r7 = await env.run_command(
+                argv=[sys.executable, "-c", net_script],
+                cwd=str(ws),
+                timeout_seconds=10,
+            )
+            if (
+                r7.exit_code == 0
+                and "LOOPBACK_OK" in r7.stdout
+                and "OUTBOUND_BLOCKED" in r7.stdout
+                and "OUTBOUND_LEAKED" not in r7.stdout
+            ):
+                checks.append(
+                    DoctorCheck(
+                        "probe.network_loopback_only",
+                        "probe",
+                        "pass",
+                        "Loopback networking works while outbound network is blocked",
+                    )
+                )
+            else:
+                checks.append(
+                    DoctorCheck(
+                        "probe.network_loopback_only",
+                        "probe",
+                        "fail",
+                        "Loopback-only network isolation probe failed",
+                        detail=(r7.error or r7.stderr or r7.stdout or f"exit={r7.exit_code}")[:300],
+                        code="PROBE_NETWORK_FAILED",
+                    )
+                )
 
         # Probe 8: share_read_only readable & non-writable
         ro_target = ro_tools / "probe.txt"

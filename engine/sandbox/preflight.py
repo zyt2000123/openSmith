@@ -172,9 +172,7 @@ def check_hardlinks(
                 "sandbox refuses files with hard links to a protected path "
                 f"({protected}): {aliases}"
             )
-        has_workspace_alias = any(not is_cache for _, _, is_cache in items)
-        has_cache_alias = any(is_cache for _, _, is_cache in items)
-        if has_workspace_alias and not has_cache_alias and link_count > len(items):
+        if link_count > len(items):
             return (
                 "sandbox refuses files with hard links reaching outside the "
                 f"workspace: {aliases} (copy the file, or re-create it "

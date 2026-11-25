@@ -101,7 +101,7 @@ class MacOSSeatbeltEnvironment:
             self._share_read_only = ()
             self._cache_mounts = ()
             self._path_entries = ()
-            self._default_network = "loopback_only"
+            self._default_network = "none"
             configured_secrets = (
                 _DEFAULT_RUNTIME_SECRET_PATHS
                 if runtime_secret_paths is None

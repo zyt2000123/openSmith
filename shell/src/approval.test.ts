@@ -99,6 +99,22 @@ test("approval card annotates outbound network, taint warning, repeat guard, and
   assert.ok(details.some((d) => d.label === "Outbound network" && d.value === "true"));
 });
 
+test("degraded host_command with network=true labels NO OS SANDBOX instead of sandboxed", () => {
+  const hostApproval = {
+    ...shellApproval,
+    arguments: { command: "curl https://example.com", network: true },
+    scope: {
+      kind: "host_command",
+      target: "curl https://example.com",
+      access: ["filesystem", "network", "process"],
+      high_risk: true,
+    },
+  };
+
+  assert.match(approvalTitle(hostApproval), /NO OS SANDBOX/);
+  assert.match(approvalSummary(hostApproval), /NO OS SANDBOX/);
+});
+
 test("structured approval details stay single-line and bounded", () => {
   const details = approvalDetails({
     runId: "run-1",

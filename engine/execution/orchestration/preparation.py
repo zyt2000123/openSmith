@@ -355,6 +355,10 @@ async def prepare_runtime(
         services.tool_guard.set_sandbox_degraded(
             bool(getattr(sandbox_env, "is_degraded", False))
         )
+        services.tool_guard.set_sandbox_host_loopback(
+            getattr(sandbox_env, "backend_id", "") == "seatbelt"
+            and sandbox_profile.default_network == "loopback_only"
+        )
     bind_snapshot_tools(services, runtime.session_id)
     bind_memory_ops_tool(services, state_dir)
     bind_todo_tool(services, state_dir, runtime.session_id)

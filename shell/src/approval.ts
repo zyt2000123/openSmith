@@ -46,6 +46,9 @@ function detailLabel(key: string): string {
 export function approvalSummary(approval: PendingApproval): string {
   if (approval.presentation?.summary) return approval.presentation.summary;
   if (approval.tool === "shell") {
+    if (approval.scope?.kind === "host_command") {
+      return "Smith wants to run a host shell command [NO OS SANDBOX]:";
+    }
     return approval.arguments.command
       ? "Smith wants to run this shell command:"
       : "Smith wants to execute a shell command:";
@@ -56,7 +59,15 @@ export function approvalSummary(approval: PendingApproval): string {
 export function approvalTitle(approval: PendingApproval): string {
   if (approval.presentation?.title) return approval.presentation.title;
   if (approval.tool === "shell") {
-    if (approval.arguments.network === true || approval.scope?.kind === "sandbox_network") {
+    if (approval.scope?.kind === "host_command") {
+      return approval.arguments.network === true
+        ? "Run a host shell command with outbound network [NO OS SANDBOX]"
+        : "Run a host shell command [NO OS SANDBOX]";
+    }
+    if (
+      approval.scope?.kind === "sandbox_network" ||
+      (!approval.scope && approval.arguments.network === true)
+    ) {
       return "Run a shell command with outbound network";
     }
     return "Run a shell command";

@@ -114,6 +114,44 @@ def test_file_guard_accepts_extra_roots_without_cache_roots(tmp_path: Path) -> N
     assert cache_res.boundary_block
 
 
+def test_sandbox_profile_defaults_are_fail_closed_no_caches_no_network(tmp_path: Path) -> None:
+    """H2 & H3: default config disables auto_detect_caches and sets default_network='none'."""
+    fake_home = tmp_path / "home"
+    ws = fake_home / "ws"
+    uv_cache = fake_home / ".cache" / "uv"
+    cargo_reg = fake_home / ".cargo" / "registry"
+    for d in (ws, uv_cache, cargo_reg):
+        d.mkdir(parents=True)
+
+    cfg = SandboxProfileConfig.from_mapping({})
+    assert cfg.auto_detect_caches is False
+    assert cfg.default_network == "none"
+
+    profile = resolve_sandbox_profile(ws, cfg, home=fake_home, data_dir=fake_home / ".agent-smith")
+    assert profile.cache_mounts == ()
+    assert profile.default_network == "none"
+
+
+def test_hardlink_preflight_blocks_external_link_even_when_shared_with_cache(
+    tmp_path: Path,
+) -> None:
+    """H3: A workspace file linked into both a mounted cache AND an external file must fail closed."""
+    from engine.sandbox.preflight import check_hardlinks
+
+    ws = tmp_path / "ws"
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    for d in (ws, cache, outside):
+        d.mkdir()
+    secret_outside = outside / "host_secret.txt"
+    secret_outside.write_text("TOP_SECRET\n", encoding="utf-8")
+    os.link(secret_outside, cache / "cached_blob")
+    os.link(secret_outside, ws / "innocent.txt")
+
+    err = check_hardlinks((ws,), (), cache_roots=(cache,))
+    assert err is not None and "hard links" in err
+
+
 def test_runtime_credential_paths_include_vault_and_auth_token(tmp_path: Path) -> None:
     paths = runtime_credential_paths(tmp_path)
     names = {p.name for p in paths}

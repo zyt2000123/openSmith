@@ -985,6 +985,7 @@ class ToolGuard:
         self.whitelist = SessionWhitelist()
         self._tool_registry: dict[str, ToolDefinition] = tool_registry or {}
         self._sandbox_is_degraded: bool = False
+        self._sandbox_allows_host_loopback: bool = False
         self._safety_config: SafetyConfig = SafetyConfig()
         self._taint_store: SessionTaintStore | None = None
         self._vault_store: VaultStore | None = None
@@ -996,6 +997,10 @@ class ToolGuard:
     def set_sandbox_degraded(self, degraded: bool) -> None:
         """Mark whether the bound sandbox is running in degraded host fallback mode."""
         self._sandbox_is_degraded = bool(degraded)
+
+    def set_sandbox_host_loopback(self, enabled: bool) -> None:
+        """Mark whether the sandbox can reach host 127.0.0.1 (e.g. macOS loopback_only)."""
+        self._sandbox_allows_host_loopback = bool(enabled)
 
     def configure_safety(
         self,
@@ -1405,6 +1410,7 @@ class ToolGuard:
             definition,
             working_dir=self.file_guard._working_dir,
             sandbox_is_degraded=self._sandbox_is_degraded,
+            sandbox_allows_host_loopback=self._sandbox_allows_host_loopback,
         )
         vault_keys = extract_vault_placeholders(tool_call.arguments)
 
@@ -1744,48 +1750,64 @@ class ToolGuard:
         *,
         run_id: str = "",
     ) -> None:
-        """Update repeat sensitive counters and session taint immediately after execution."""
-        if result.is_error:
+        """Update repeat sensitive counters and session taint immediately after execution.
+
+        Taint and secret detection ALWAYS run on executed calls — even when
+        ``result.is_error`` is True (for example a non-zero exit code such as
+        ``cat prod.yaml; false`` or content starting with ``Error:``).  Only
+        unexecuted policy/registry rejections are skipped, and repeat-guard
+        counters still only increment on non-error executions.
+        """
+        if result.error_kind in {
+            "policy_blocked",
+            "approval_required",
+            "unknown_tool",
+            "tool_disabled",
+            "environment_unavailable",
+        }:
             return
         definition = self._tool_registry.get(tool_call.name)
 
-        # 1. Update repeat sensitive counter for semantic bucket
-        file_result = self._check_file_paths(tool_call)
-        dangerous_hit = self._check_dangerous_rules(tool_call) is not None
-        egress_target = resolve_egress_target(
-            tool_call,
-            definition,
-            working_dir=self.file_guard._working_dir,
-            sandbox_is_degraded=self._sandbox_is_degraded,
-        )
-        was_tainted = bool(
-            self._taint_store is not None and self._taint_store.is_tainted
-        )
-        eval_risk = RiskTier.ROUTINE
-        if file_result is not None:
-            eval_risk = self._risk_for_file_result(file_result)
-        elif dangerous_hit or (
-            definition is not None
-            and definition.opaque_command
-            and self._sandbox_is_degraded
-        ):
-            eval_risk = RiskTier.CRITICAL
-        elif call_requests_network_egress(tool_call, definition):
-            eval_risk = RiskTier.HIGH
+        # 1. Update repeat sensitive counter for semantic bucket (only on success)
+        if not result.is_error:
+            file_result = self._check_file_paths(tool_call)
+            dangerous_hit = self._check_dangerous_rules(tool_call) is not None
+            egress_target = resolve_egress_target(
+                tool_call,
+                definition,
+                working_dir=self.file_guard._working_dir,
+                sandbox_is_degraded=self._sandbox_is_degraded,
+                sandbox_allows_host_loopback=self._sandbox_allows_host_loopback,
+            )
+            was_tainted = bool(
+                self._taint_store is not None and self._taint_store.is_tainted
+            )
+            eval_risk = RiskTier.ROUTINE
+            if file_result is not None:
+                eval_risk = self._risk_for_file_result(file_result)
+            elif dangerous_hit or (
+                definition is not None
+                and definition.opaque_command
+                and self._sandbox_is_degraded
+            ):
+                eval_risk = RiskTier.CRITICAL
+            elif call_requests_network_egress(tool_call, definition):
+                eval_risk = RiskTier.HIGH
 
-        bucket_info = self._classify_call_bucket(
-            tool_call,
-            definition,
-            file_result=file_result,
-            dangerous_hit=dangerous_hit,
-            egress_target=egress_target,
-            tainted=was_tainted,
-            risk=eval_risk,
-        )
-        if bucket_info is not None:
-            self._repeat_guard.record(bucket_info[0])
+            bucket_info = self._classify_call_bucket(
+                tool_call,
+                definition,
+                file_result=file_result,
+                dangerous_hit=dangerous_hit,
+                egress_target=egress_target,
+                tainted=was_tainted,
+                risk=eval_risk,
+            )
+            if bucket_info is not None:
+                self._repeat_guard.record(bucket_info[0])
 
-        # 2. Update SessionTaintStore immediately (before next tool_call in same turn!)
+        # 2. Update SessionTaintStore immediately (before next tool_call in same turn!),
+        #    regardless of whether result.is_error is True.
         if self._taint_store is None or not self._safety_config.taint.enabled:
             return
 

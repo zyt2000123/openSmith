@@ -327,6 +327,19 @@ def test_tool_guard_network_egress_helper_and_approval_presentation(tmp_path: Pa
     assert "outbound network" in pres.title.lower()
     assert any(d.label == "Outbound network" for d in pres.details)
 
+    # H5: Degraded host_command + network=True MUST say NO OS SANDBOX, never "sandboxed"!
+    host_scope = ApprovalScope.host_command("curl https://example.com", high_risk=True)
+    pres_host_net = build_approval_presentation(
+        "shell",
+        "execute",
+        "",
+        {"command": "curl https://example.com", "network": True},
+        scope=host_scope,
+    )
+    assert "NO OS SANDBOX" in pres_host_net.title
+    assert "without OS sandbox" in pres_host_net.summary
+    assert "filesystem sandbox remains active" not in pres_host_net.reason.lower()
+
 
 @pytest.mark.skipif(
     sys.platform != "linux" or not detect_bwrap_availability().ready,

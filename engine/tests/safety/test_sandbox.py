@@ -657,8 +657,13 @@ def test_macos_seatbelt_blocks_outbound_network(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
-def test_macos_seatbelt_allows_loopback_while_blocking_outbound(tmp_path: Path) -> None:
-    """Default loopback-only sandbox permits 127.0.0.1 sockets for local tests."""
+def test_macos_seatbelt_default_denies_loopback_and_explicit_loopback_only_allows_it(
+    tmp_path: Path,
+) -> None:
+    """Default Seatbelt profile uses network=none (denying host 127.0.0.1);
+    loopback_only allows 127.0.0.1 only when explicitly configured."""
+    from engine.sandbox import SandboxProfileConfig, resolve_sandbox_profile
+
     code = (
         "import socket, threading\n"
         "srv = socket.socket()\n"
@@ -677,15 +682,33 @@ def test_macos_seatbelt_allows_loopback_while_blocking_outbound(tmp_path: Path) 
         "assert data == b'pong', data\n"
         "print('LOOPBACK_OK')\n"
     )
-    from engine.sandbox import SandboxProfileConfig, resolve_sandbox_profile
-
-    profile = resolve_sandbox_profile(
+    default_profile = resolve_sandbox_profile(
         tmp_path,
         SandboxProfileConfig(auto_detect_toolchains=True, auto_detect_caches=False),
     )
-    env = MacOSSeatbeltEnvironment(workspace=tmp_path, profile=profile)
+    assert default_profile.default_network == "none"
+    default_env = MacOSSeatbeltEnvironment(workspace=tmp_path, profile=default_profile)
+    denied = asyncio.run(
+        default_env.run_command(
+            argv=[sys.executable, "-c", code],
+            cwd=str(tmp_path),
+            timeout_seconds=5,
+        )
+    )
+    assert denied.exit_code not in (None, 0)
+    assert "LOOPBACK_OK" not in denied.stdout
+
+    loopback_profile = resolve_sandbox_profile(
+        tmp_path,
+        SandboxProfileConfig(
+            auto_detect_toolchains=True,
+            auto_detect_caches=False,
+            default_network="loopback_only",
+        ),
+    )
+    loopback_env = MacOSSeatbeltEnvironment(workspace=tmp_path, profile=loopback_profile)
     res = asyncio.run(
-        env.run_command(
+        loopback_env.run_command(
             argv=[sys.executable, "-c", code],
             cwd=str(tmp_path),
             timeout_seconds=5,

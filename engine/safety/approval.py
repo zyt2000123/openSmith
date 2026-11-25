@@ -610,8 +610,25 @@ def build_approval_presentation(
     target = _display_value(arguments.get("path") or arguments.get("file_path") or "")
 
     if tool_name == "shell":
-        if arguments.get("network") is True or (
-            scope is not None and scope.kind == "sandbox_network"
+        # Check scope.kind FIRST: a degraded host_command has NO OS sandbox
+        # isolation even when network=True, and must never be mislabeled as
+        # "sandboxed with outbound network".
+        if scope is not None and scope.kind == "host_command":
+            if arguments.get("network") is True:
+                title = "Run a host shell command with outbound network [NO OS SANDBOX]"
+                summary = (
+                    "Execute the requested command on the host without OS sandbox "
+                    "isolation (outbound network enabled)"
+                )
+            else:
+                title = "Run a host shell command [NO OS SANDBOX]"
+                summary = "Execute the requested command on the host without OS sandbox isolation"
+            fallback_reason = (
+                "This command runs on the host with NO OS SANDBOX isolation "
+                "(host filesystem and network accessible)."
+            )
+        elif (scope is not None and scope.kind == "sandbox_network") or (
+            scope is None and arguments.get("network") is True
         ):
             title = "Run a shell command with outbound network"
             summary = "Execute the requested sandboxed command with outbound network access"
@@ -619,10 +636,6 @@ def build_approval_presentation(
                 "This command requests outbound network access "
                 "(filesystem sandbox remains active)."
             )
-        elif scope is not None and scope.kind == "host_command":
-            title = "Run a host shell command [NO OS SANDBOX]"
-            summary = "Execute the requested command without full OS sandbox isolation"
-            fallback_reason = "This command runs outside workspace OS sandbox isolation."
         else:
             title = "Run a shell command"
             summary = "Execute the requested command inside the workspace sandbox"

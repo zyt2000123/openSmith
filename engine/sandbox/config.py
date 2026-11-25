@@ -56,10 +56,13 @@ class SandboxProfileConfig:
     extra_roots: tuple[str, ...] = ()
     auto_detect_toolchains: bool = True
     share_read_only: tuple[str, ...] = ()
-    auto_detect_caches: bool = True
+    # Opt-in only: mounting host package caches writable allows a sandboxed
+    # command to poison host-side cargo/go/npm/pnpm/uv caches.
+    auto_detect_caches: bool = False
     cache_roots: dict[str, str | list[str]] = field(default_factory=dict)
     extra_path_entries: tuple[str, ...] = ()
-    default_network: DefaultNetworkMode = "loopback_only"
+    # Fail-closed default: deny all network (including host 127.0.0.1 on macOS).
+    default_network: DefaultNetworkMode = "none"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object] | None) -> SandboxProfileConfig:
@@ -90,7 +93,7 @@ class SandboxProfileConfig:
                 f"{sorted(_VALID_FALLBACK_POLICIES)}, got {fallback_policy!r}"
             )
 
-        default_network = raw.get("default_network", "loopback_only")
+        default_network = raw.get("default_network", "none")
         if (
             not isinstance(default_network, str)
             or default_network not in _VALID_DEFAULT_NETWORKS
@@ -104,7 +107,7 @@ class SandboxProfileConfig:
         if not isinstance(auto_detect_toolchains, bool):
             raise ValueError("sandbox.auto_detect_toolchains must be a boolean")
 
-        auto_detect_caches = raw.get("auto_detect_caches", True)
+        auto_detect_caches = raw.get("auto_detect_caches", False)
         if not isinstance(auto_detect_caches, bool):
             raise ValueError("sandbox.auto_detect_caches must be a boolean")
 
@@ -191,7 +194,7 @@ class ResolvedSandboxProfile:
     path_entries: tuple[Path, ...] = ()
     runtime_secret_paths: tuple[Path, ...] = ()
     non_delegable_write_paths: tuple[Path, ...] = ()
-    default_network: DefaultNetworkMode = "loopback_only"
+    default_network: DefaultNetworkMode = "none"
     fallback_policy: SandboxFallbackPolicy = "deny"
     backend: SandboxBackendChoice = "auto"
     warnings: tuple[str, ...] = ()

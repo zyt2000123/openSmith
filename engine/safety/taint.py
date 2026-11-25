@@ -383,18 +383,29 @@ def resolve_egress_target(
     *,
     working_dir: Path | None = None,
     sandbox_is_degraded: bool = False,
+    sandbox_allows_host_loopback: bool = False,
 ) -> EgressTarget | None:
     """Resolve the standardized egress target for ``call``, or ``None`` if no egress."""
     if definition is None:
         return None
 
-    # 1. Opaque shell command: sandboxed network=False has NO outbound network!
+    # 1. Opaque shell command:
+    #    - network=True or degraded host -> host:shell egress
+    #    - macOS loopback_only shares the host's 127.0.0.1 (proxies, local DBs,
+    #      debugger ports), so treat it as unknown egress when evaluating taint.
+    #    - network=False with default_network="none" (or isolated Linux netns) has no egress.
     if definition.opaque_command:
         if sandbox_is_degraded or call.arguments.get("network") is True:
             return EgressTarget(
                 kind="host_shell",
                 target="host:shell",
                 raw_display="shell(network=true)" if not sandbox_is_degraded else "shell(host_degraded)",
+            )
+        if sandbox_allows_host_loopback:
+            return EgressTarget(
+                kind="unknown",
+                target="loopback:host",
+                raw_display="shell(host-loopback)",
             )
         return None
 

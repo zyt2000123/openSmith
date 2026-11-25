@@ -26,7 +26,8 @@ def test_sandbox_config_api_get_patch_and_validation(
         body = default_resp.json()
         assert body["backend"] == "auto"
         assert body["fallback_policy"] == "deny"
-        assert body["default_network"] == "loopback_only"
+        assert body["default_network"] == "none"
+        assert body["auto_detect_caches"] is False
 
         patch_resp = client.patch(
             "/api/config/sandbox",
