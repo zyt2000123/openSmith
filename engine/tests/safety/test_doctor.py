@@ -113,11 +113,14 @@ def test_doctor_live_eight_probes_pass_on_macos(tmp_path: Path) -> None:
         "probe.env_scrubbed",
         "probe.network_loopback_only",
         "probe.toolchain_ro",
+        "probe.toolchain_ca_bundle",
     }
     assert probe_ids == expected_probes
     for check in report.checks:
         if check.category == "probe":
-            assert check.status == "pass", f"{check.id} failed: {check.summary} {check.detail}"
+            assert check.status in ("pass", "skip"), f"{check.id} failed: {check.summary} {check.detail}"
+            if check.id != "probe.toolchain_ca_bundle":
+                assert check.status == "pass", f"{check.id} failed: {check.summary} {check.detail}"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="CLI probe test on macOS")

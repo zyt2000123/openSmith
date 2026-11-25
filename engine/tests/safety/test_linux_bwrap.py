@@ -253,6 +253,66 @@ def test_bwrap_handles_ubuntu_resolv_conf_symlink_and_smoke_test_uses_real_mount
     assert argv_off[-2:] == ["--", "/bin/true"]
 
 
+def test_bwrap_exempts_auto_detected_toolchain_shares_from_sensitive_blackhole(
+    tmp_path: Path,
+) -> None:
+    """B1 (Linux bwrap): Auto-detected toolchain shares are mounted RO without
+    walking/blackholing their *.pem CA bundles, while user share_read_only still is."""
+    fake_home = tmp_path / "home"
+    ws = fake_home / "ws"
+    user_ro = fake_home / "user-ro"
+    uv_toolchain = fake_home / ".local" / "share" / "uv"
+    for d in (ws, user_ro, uv_toolchain):
+        d.mkdir(parents=True)
+
+    user_pem = user_ro / "secret.pem"
+    user_pem.write_text("USER_SECRET_KEY\n", encoding="utf-8")
+    toolchain_pem = uv_toolchain / "cacert.pem"
+    toolchain_pem.write_text("PUBLIC_CA_CERT\n", encoding="utf-8")
+
+    cfg = SandboxProfileConfig(
+        auto_detect_toolchains=True,
+        auto_detect_caches=False,
+        share_read_only=(str(user_ro),),
+    )
+    profile = resolve_sandbox_profile(
+        ws, cfg, home=fake_home, data_dir=fake_home / ".agent-smith", platform="linux"
+    )
+    env = LinuxBwrapEnvironment(
+        workspace=ws,
+        profile=profile,
+        bwrap_binary="/usr/bin/bwrap",
+        host_home=fake_home,
+    )
+    sfile = tmp_path / "sfile"
+    sdir = tmp_path / "sdir"
+    sfile.write_bytes(b"")
+    sdir.mkdir()
+
+    argv = env._build_bwrap_argv(
+        bwrap_bin="/usr/bin/bwrap",
+        resolved_cwd=str(ws.resolve()),
+        inner_argv=["/bin/true"],
+        env=env._safe_environment(None),
+        network=True,
+        sentinel_file=sfile,
+        sentinel_dir=sdir,
+        resolv_is_symlink=False,
+    )
+
+    # Both shares are mounted read-only
+    assert str(user_ro.resolve()) in argv
+    assert str(uv_toolchain.resolve()) in argv
+    # User share_read_only secret.pem IS blackholed
+    assert str(user_pem.resolve()) in argv
+    # Auto-detected toolchain cacert.pem is NOT blackholed
+    assert str(toolchain_pem.resolve()) not in argv
+    # Cached sensitive scan excludes auto-detected toolchain roots as well
+    cached_paths = {p for p, _ in env._cached_sensitive_paths()}
+    assert user_pem.resolve() in cached_paths
+    assert toolchain_pem.resolve() not in cached_paths
+
+
 def test_bwrap_sensitive_scan_is_fingerprint_cached_and_skips_cache_mounts(
     monkeypatch,
     tmp_path: Path,

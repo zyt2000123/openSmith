@@ -568,6 +568,63 @@ def test_git_push_host_respects_pushurl_insteadof_and_fails_closed_on_ambiguity(
     assert _extract_git_remote_host(repo) == "unknown"
 
 
+def test_taint_git_env_matches_git_ops_and_ignores_workspace_dot_gitconfig(
+    tmp_path: Path,
+) -> None:
+    """M2: taint._safe_git_environment matches git_ops._safe_environment exactly
+    (GIT_CONFIG_GLOBAL/SYSTEM=/dev/null), so a workspace .gitconfig cannot spoof
+    the push host resolved by the guard vs the actual git_ops push."""
+    import os
+    import subprocess
+    from engine.safety.taint import _extract_git_remote_host, _safe_git_environment
+
+    git_ops_path = ROOT / "agents" / "tools" / "git_ops.py"
+    spec = importlib.util.spec_from_file_location("git_ops_env_parity_test", git_ops_path)
+    assert spec is not None and spec.loader is not None
+    git_ops = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(git_ops)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://evil.example.com/org/repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "decoy", "https://allowed.example.com/org/repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "branch.main.remote", "origin"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Plant a workspace .gitconfig that tries to spoof pushDefault and pushInsteadOf
+    # when HOME=repo_dir without GIT_CONFIG_GLOBAL=/dev/null.
+    (repo / ".gitconfig").write_text(
+        "[remote]\n"
+        "    pushDefault = decoy\n"
+        '[url "https://allowed.example.com/"]\n'
+        "    pushInsteadOf = https://evil.example.com/\n",
+        encoding="utf-8",
+    )
+
+    # 1. Exact environment parity with git_ops._safe_environment
+    assert _safe_git_environment(repo) == git_ops._safe_environment(str(repo))
+    assert _safe_git_environment(repo)["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert _safe_git_environment(repo)["GIT_CONFIG_SYSTEM"] == os.devnull
+
+    # 2. Workspace .gitconfig MUST be ignored; guard resolves the real origin host!
+    assert _extract_git_remote_host(repo) == "evil.example.com"
+
+
 def test_scoped_tool_registry_uses_subagent_child_guard_for_taint_allowlist_injection(
     tmp_path: Path,
 ) -> None:

@@ -245,3 +245,95 @@ def test_macos_seatbelt_supports_extra_roots_share_ro_and_cache_mounts(
     hl_res = asyncio.run(env.run_command(argv=["/bin/echo", "hi"], cwd=str(ws)))
     assert hl_res.exit_code is None
     assert hl_res.error and "hard links" in hl_res.error
+
+
+def test_seatbelt_profile_exempts_auto_detected_toolchain_shares_from_sensitive_denies(
+    tmp_path: Path,
+) -> None:
+    """B1: Sensitive-file deny clauses apply only to user-configured share_read_only,
+    never to auto-detected toolchain shares (which ship public CA bundles *.pem)."""
+    fake_home = tmp_path / "home"
+    ws = fake_home / "ws"
+    user_ro = fake_home / "user-ro"
+    uv_toolchain = fake_home / ".local" / "share" / "uv"
+    for d in (ws, user_ro, uv_toolchain):
+        d.mkdir(parents=True)
+
+    cfg = SandboxProfileConfig(
+        auto_detect_toolchains=True,
+        auto_detect_caches=False,
+        share_read_only=(str(user_ro),),
+    )
+    profile = resolve_sandbox_profile(
+        ws,
+        cfg,
+        home=fake_home,
+        data_dir=fake_home / ".agent-smith",
+        platform="darwin",
+    )
+    assert user_ro.resolve() in profile.user_share_read_only
+    assert uv_toolchain.resolve() in profile.toolchain_read_only
+    assert uv_toolchain.resolve() in profile.share_read_only
+
+    env = MacOSSeatbeltEnvironment(workspace=ws, profile=profile)
+    sbpl = env._profile(network=True)
+
+    user_idx = profile.share_read_only.index(user_ro.resolve())
+    uv_idx = profile.share_read_only.index(uv_toolchain.resolve())
+
+    # Both shares get read-only allow clauses
+    assert f'(allow file-read* (subpath (param "SHARE_RO_{user_idx}")))' in sbpl
+    assert f'(allow file-read* (subpath (param "SHARE_RO_{uv_idx}")))' in sbpl
+
+    # User-configured share_read_only STILL gets sensitive deny clauses
+    assert f'(regex-quote (param "SHARE_RO_{user_idx}"))' in sbpl
+
+    # Auto-detected toolchain share MUST NOT get sensitive deny clauses (would break *.pem CA bundles)
+    assert f'(regex-quote (param "SHARE_RO_{uv_idx}"))' not in sbpl
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_macos_seatbelt_allows_reading_ca_bundle_pem_in_auto_toolchain_share(
+    tmp_path: Path,
+) -> None:
+    """B1 live Seatbelt check: reading cacert.pem inside auto-detected uv toolchain succeeds
+    while .pem inside user-configured share_read_only remains denied."""
+    fake_home = tmp_path / "home"
+    ws = fake_home / "ws"
+    user_ro = fake_home / "user-ro"
+    uv_cert_dir = fake_home / ".local" / "share" / "uv" / "certifi"
+    for d in (ws, user_ro, uv_cert_dir):
+        d.mkdir(parents=True)
+
+    toolchain_pem = uv_cert_dir / "cacert.pem"
+    toolchain_pem.write_text("-----BEGIN CERTIFICATE-----\nPUBLIC_CA_BUNDLE\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    user_pem = user_ro / "private.pem"
+    user_pem.write_text("-----BEGIN PRIVATE KEY-----\nSECRET_USER_KEY\n-----END PRIVATE KEY-----\n", encoding="utf-8")
+
+    cfg = SandboxProfileConfig(
+        auto_detect_toolchains=True,
+        auto_detect_caches=False,
+        share_read_only=(str(user_ro),),
+    )
+    profile = resolve_sandbox_profile(
+        ws,
+        cfg,
+        home=fake_home,
+        data_dir=fake_home / ".agent-smith",
+        platform="darwin",
+    )
+    env = MacOSSeatbeltEnvironment(workspace=ws, profile=profile)
+
+    # Toolchain CA bundle (*.pem) MUST be readable
+    ca_res = asyncio.run(
+        env.run_command(argv=["/bin/cat", str(toolchain_pem)], cwd=str(ws))
+    )
+    assert ca_res.exit_code == 0, ca_res.stderr or ca_res.error
+    assert "PUBLIC_CA_BUNDLE" in ca_res.stdout
+
+    # User-configured share_read_only private.pem MUST still be denied
+    priv_res = asyncio.run(
+        env.run_command(argv=["/bin/cat", str(user_pem)], cwd=str(ws))
+    )
+    assert priv_res.exit_code not in (None, 0)
+    assert "SECRET_USER_KEY" not in priv_res.stdout

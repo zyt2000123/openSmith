@@ -190,6 +190,7 @@ class ResolvedSandboxProfile:
     workspace: Path
     extra_roots: tuple[Path, ...] = ()
     share_read_only: tuple[Path, ...] = ()
+    toolchain_read_only: tuple[Path, ...] = ()
     cache_mounts: tuple[CacheMount, ...] = ()
     path_entries: tuple[Path, ...] = ()
     runtime_secret_paths: tuple[Path, ...] = ()
@@ -199,6 +200,12 @@ class ResolvedSandboxProfile:
     backend: SandboxBackendChoice = "auto"
     warnings: tuple[str, ...] = ()
     rejected_paths: tuple[str, ...] = ()
+
+    @property
+    def user_share_read_only(self) -> tuple[Path, ...]:
+        """Explicit user-configured read-only shares (excluding auto-detected toolchains)."""
+        auto_set = frozenset(self.toolchain_read_only)
+        return tuple(p for p in self.share_read_only if p not in auto_set)
 
     @property
     def rw_workspace_roots(self) -> tuple[Path, ...]:
@@ -385,8 +392,12 @@ def resolve_sandbox_profile(
         if resolved != resolved_workspace:
             extra_roots.append(resolved)
 
-    # 2. Controlled read-only shares (explicit + auto-detected toolchains)
-    ro_roots: list[Path] = []
+    # 2. Controlled read-only shares (explicit user shares vs auto-detected toolchains).
+    #    Keeping auto-detected toolchains tracked separately lets sandbox backends
+    #    apply sensitive-file deny rules only to user-configured share_read_only
+    #    directories without blocking public CA bundles (*.pem) inside Homebrew,
+    #    uv, pyenv, or Python sys.prefix.
+    user_ro_roots: list[Path] = []
     for raw in cfg.share_read_only:
         resolved, err = validate_configured_root(
             raw,
@@ -400,8 +411,10 @@ def resolve_sandbox_profile(
             _record_issue(err, explicit=True)
             continue
         assert resolved is not None
-        ro_roots.append(resolved)
+        user_ro_roots.append(resolved)
 
+    user_ro_set = set(user_ro_roots)
+    auto_ro_roots: list[Path] = []
     if cfg.auto_detect_toolchains:
         for candidate in _auto_toolchain_candidates(
             platform=active_platform,
@@ -418,8 +431,8 @@ def resolve_sandbox_profile(
                 home=resolved_home,
                 data_dir=resolved_data,
             )
-            if resolved is not None:
-                ro_roots.append(resolved)
+            if resolved is not None and resolved not in user_ro_set:
+                auto_ro_roots.append(resolved)
 
     # 3. Controlled RW cache mounts (explicit + auto-detected caches)
     cache_mounts: list[CacheMount] = []
@@ -486,7 +499,9 @@ def resolve_sandbox_profile(
             )
 
     deduped_extra = _dedupe_paths(extra_roots)
-    deduped_ro = _dedupe_paths(ro_roots)
+    deduped_user_ro = _dedupe_paths(user_ro_roots)
+    deduped_auto_ro = _dedupe_paths(auto_ro_roots)
+    deduped_ro = _dedupe_paths((*deduped_user_ro, *deduped_auto_ro))
 
     # 4. Safe PATH entries (must lie inside system defaults, workspace,
     #    extra_roots, or share_read_only).
@@ -548,6 +563,7 @@ def resolve_sandbox_profile(
         workspace=resolved_workspace,
         extra_roots=deduped_extra,
         share_read_only=deduped_ro,
+        toolchain_read_only=deduped_auto_ro,
         cache_mounts=tuple(cache_mounts),
         path_entries=_dedupe_paths(path_candidates),
         runtime_secret_paths=configured_secrets,

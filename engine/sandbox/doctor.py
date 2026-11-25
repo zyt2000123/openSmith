@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import ssl
 import stat
 import sys
 import tempfile
@@ -407,6 +408,40 @@ def check_sandbox_health(
     )
 
 
+def _find_toolchain_ca_bundle(toolchain_roots: tuple[Path, ...]) -> Path | None:
+    """Locate an existing public CA bundle (*.pem) inside auto-detected toolchain shares."""
+    if not toolchain_roots:
+        return None
+    py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates: list[Path] = []
+    default_cafile = ssl.get_default_verify_paths().cafile
+    if default_cafile:
+        candidates.append(Path(default_cafile))
+    candidates.extend([
+        Path("/opt/homebrew/etc/ca-certificates/cert.pem"),
+        Path("/opt/homebrew/etc/openssl@3/cert.pem"),
+        Path("/usr/local/etc/ca-certificates/cert.pem"),
+        Path(sys.prefix) / "lib" / py_ver / "site-packages" / "pip" / "_vendor" / "certifi" / "cacert.pem",
+        Path(sys.prefix) / "lib" / py_ver / "site-packages" / "certifi" / "cacert.pem",
+        Path(sys.base_prefix) / "lib" / py_ver / "site-packages" / "pip" / "_vendor" / "certifi" / "cacert.pem",
+        Path(sys.base_prefix) / "lib" / py_ver / "site-packages" / "certifi" / "cacert.pem",
+    ])
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        for root in toolchain_roots:
+            try:
+                if resolved.is_relative_to(root):
+                    return resolved
+            except ValueError:
+                continue
+    return None
+
+
 async def _run_live_probes(
     *,
     platform: str,
@@ -769,6 +804,44 @@ async def _run_live_probes(
                     code="PROBE_TOOLCHAIN_RO_FAILED",
                 )
             )
+
+        # Probe 9: public CA bundle (*.pem) inside auto-detected toolchain share is readable
+        ca_bundle = _find_toolchain_ca_bundle(profile.toolchain_read_only)
+        if ca_bundle is None:
+            checks.append(
+                DoctorCheck(
+                    "probe.toolchain_ca_bundle",
+                    "probe",
+                    "skip",
+                    "No toolchain CA bundle (*.pem) found under auto-detected toolchain shares",
+                )
+            )
+        else:
+            r9 = await env.run_command(
+                argv=["/usr/bin/head", "-n", "5", str(ca_bundle)],
+                cwd=str(ws),
+                timeout_seconds=10,
+            )
+            if r9.exit_code == 0 and bool(r9.stdout.strip()):
+                checks.append(
+                    DoctorCheck(
+                        "probe.toolchain_ca_bundle",
+                        "probe",
+                        "pass",
+                        f"Toolchain CA bundle is readable inside sandbox ({ca_bundle})",
+                    )
+                )
+            else:
+                checks.append(
+                    DoctorCheck(
+                        "probe.toolchain_ca_bundle",
+                        "probe",
+                        "fail",
+                        f"Toolchain CA bundle was blocked inside sandbox ({ca_bundle})",
+                        detail=r9.error or r9.stderr or f"exit={r9.exit_code}",
+                        code="PROBE_TOOLCHAIN_CA_BUNDLE_BLOCKED",
+                    )
+                )
 
     return checks
 

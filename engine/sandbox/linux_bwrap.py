@@ -474,6 +474,7 @@ class LinuxBwrapEnvironment:
             self._workspace = profile.workspace
             self._extra_roots: tuple[Path, ...] = profile.extra_roots
             self._share_read_only: tuple[Path, ...] = profile.share_read_only
+            self._user_share_read_only: tuple[Path, ...] = profile.user_share_read_only
             self._cache_mounts: tuple[CacheMount, ...] = profile.cache_mounts
             self._path_entries: tuple[Path, ...] = profile.path_entries
             self._default_network = profile.default_network
@@ -491,6 +492,7 @@ class LinuxBwrapEnvironment:
             self._workspace = Path(workspace).expanduser().resolve()
             self._extra_roots = ()
             self._share_read_only = ()
+            self._user_share_read_only = ()
             self._cache_mounts = ()
             self._path_entries = ()
             self._default_network = "none"
@@ -669,12 +671,14 @@ class LinuxBwrapEnvironment:
             args.extend(["--bind", str(rw_root), str(rw_root)])
 
         # Stage 6: Blackhole existing sensitive files/dirs inside workspace,
-        # extra_roots, AND share_read_only trees (M4).
+        # extra_roots, and user-configured share_read_only trees (M4).
+        # Auto-detected toolchain shares are excluded so public CA bundles
+        # (*.pem) remain readable and huge toolchain trees are not walked per call.
         blackhole_targets = (
             sensitive_paths
             if sensitive_paths is not None
             else _find_sensitive_paths_under(
-                (*self._rw_workspace_roots, *self._share_read_only),
+                (*self._rw_workspace_roots, *self._user_share_read_only),
                 self._runtime_secret_paths,
             )
         )
@@ -697,7 +701,7 @@ class LinuxBwrapEnvironment:
 
     def _cached_sensitive_paths(self) -> list[tuple[Path, bool]]:
         """Compute sensitive paths to blackhole, cached by directory fingerprint (M6)."""
-        scan_roots = (*self._rw_workspace_roots, *self._share_read_only)
+        scan_roots = (*self._rw_workspace_roots, *self._user_share_read_only)
         fingerprint = compute_roots_fingerprint(scan_roots)
         cached = self._sensitive_scan_cache
         if (

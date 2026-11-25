@@ -82,6 +82,9 @@ class MacOSSeatbeltEnvironment:
             self._workspace = profile.workspace
             self._extra_roots: tuple[Path, ...] = profile.extra_roots
             self._share_read_only: tuple[Path, ...] = profile.share_read_only
+            self._toolchain_read_only: frozenset[Path] = frozenset(
+                profile.toolchain_read_only
+            )
             self._cache_mounts: tuple[CacheMount, ...] = profile.cache_mounts
             self._path_entries: tuple[Path, ...] = profile.path_entries
             self._default_network = profile.default_network
@@ -99,6 +102,7 @@ class MacOSSeatbeltEnvironment:
             self._workspace = Path(workspace).expanduser().resolve()
             self._extra_roots = ()
             self._share_read_only = ()
+            self._toolchain_read_only = frozenset()
             self._cache_mounts = ()
             self._path_entries = ()
             self._default_network = "none"
@@ -267,7 +271,12 @@ class MacOSSeatbeltEnvironment:
             parts.append(
                 build_sbpl_sensitive_deny_clauses(f"EXTRA_ROOT_{index}").rstrip("\n")
             )
-        for index, _ in enumerate(self._share_read_only):
+        for index, ro_path in enumerate(self._share_read_only):
+            # Apply sensitive-file deny rules only to user-configured share_read_only
+            # directories, NOT to auto-detected toolchain trees (/opt/homebrew, uv,
+            # pyenv, sys.prefix) which ship public CA bundles (*.pem) needed for TLS.
+            if ro_path in self._toolchain_read_only:
+                continue
             parts.append(
                 build_sbpl_sensitive_deny_clauses(f"SHARE_RO_{index}").rstrip("\n")
             )

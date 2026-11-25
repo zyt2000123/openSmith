@@ -328,6 +328,34 @@ def detect_secret_in_text(text: str) -> bool:
     return _EMBEDDED_SECRET_RE.search(text) is not None
 
 
+_SAFE_GIT_ENV_KEYS = ("LANG", "LC_ALL", "TERM", "TZ", "NO_COLOR")
+
+
+def _safe_git_environment(repo_dir: Path) -> dict[str, str]:
+    """Build the exact isolated git environment used by ``agents/tools/git_ops.py``.
+
+    Pinning ``GIT_CONFIG_GLOBAL=/dev/null`` and ``GIT_CONFIG_SYSTEM=/dev/null``
+    alongside ``HOME=repo_dir`` ensures a workspace ``.gitconfig`` (e.g.
+    ``remote.pushDefault`` or ``pushInsteadOf``) cannot make the taint guard
+    resolve a different push host than the real ``git_ops`` push executes.
+    """
+    environment = {
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "HOME": os.path.abspath(str(repo_dir)),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "Never",
+        "GIT_PAGER": "cat",
+        "GIT_EDITOR": "true",
+    }
+    for key in _SAFE_GIT_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
 def _run_git_readonly(repo_dir: Path, args: list[str]) -> str | None:
     """Run a read-only git query without executing repo hooks/fsmonitor."""
     try:
@@ -342,11 +370,7 @@ def _run_git_readonly(repo_dir: Path, args: list[str]) -> str | None:
             capture_output=True,
             text=True,
             timeout=3,
-            env={
-                "PATH": os.environ.get("PATH") or os.defpath,
-                "HOME": str(repo_dir),
-                "GIT_TERMINAL_PROMPT": "0",
-            },
+            env=_safe_git_environment(repo_dir),
         )
     except (OSError, subprocess.SubprocessError):
         return None
