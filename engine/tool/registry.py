@@ -654,6 +654,17 @@ class ToolRegistry:
                     else "none"
                 ),
             )
+            last_cmd_result = getattr(environment, "last_result", None)
+            if defn.opaque_command:
+                result.metadata["sandbox_backend"] = (
+                    getattr(last_cmd_result, "sandbox_backend", None)
+                    or getattr(environment, "backend_id", environment.name)
+                )
+                result.metadata["network_used"] = bool(
+                    getattr(last_cmd_result, "network_used", False)
+                    if last_cmd_result is not None
+                    else call.arguments.get("network") is True
+                )
         except asyncio.TimeoutError:
             result = ToolResult(
                 call_id=call.id,
@@ -799,20 +810,25 @@ class ToolRegistry:
         if (
             approval_granted
             and approval_scope is not None
-            and approval_scope.grants_host_execution
+            and (
+                approval_scope.grants_host_execution
+                or approval_scope.grants_network_execution
+                or approval_scope.grants_sandbox_execution
+            )
         ):
             scoped_environment = getattr(environment, "with_approval_scope", None)
-            if not callable(scoped_environment):
+            if callable(scoped_environment):
+                environment = scoped_environment(approval_scope)
+            elif approval_scope.grants_host_execution or approval_scope.grants_network_execution:
                 return ToolResult(
                     call_id=call.id,
                     content=(
-                        "Error: the bound sandbox cannot apply the approved host "
-                        "access scope"
+                        "Error: the bound sandbox cannot apply the approved "
+                        f"{approval_scope.kind} access scope"
                     ),
                     is_error=True,
                     error_kind="environment_unavailable",
                 )
-            environment = scoped_environment(approval_scope)
         if defn.concurrency == "serial":
             lock = self._serial_locks.setdefault(tool_name, asyncio.Lock())
             async with lock:

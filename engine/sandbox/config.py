@@ -240,11 +240,13 @@ def _auto_toolchain_candidates(
     else:
         candidates.append(Path("/usr/local"))
 
+    exe_root = Path(sys.executable).resolve().parent.parent
     candidates.extend([
         home / ".local" / "share" / "uv",
         home / ".local" / "bin",
         Path(sys.prefix),
         Path(sys.base_prefix),
+        exe_root,
         home / ".nvm" / "versions",
         home / ".pyenv" / "versions",
         home / ".rustup",

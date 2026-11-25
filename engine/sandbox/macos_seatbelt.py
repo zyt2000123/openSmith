@@ -10,7 +10,11 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .config import CacheMount, ResolvedSandboxProfile
-from .host import CommandResult, LocalExecutionEnvironment
+from .host import (
+    CommandResult,
+    LocalExecutionEnvironment,
+    detect_network_denied_hint,
+)
 from .policy import (
     CREDENTIAL_CONFIG_FILES,
     CREDENTIAL_DIRS,
@@ -117,8 +121,10 @@ class MacOSSeatbeltEnvironment:
             configured_non_delegable
         )
         self._approved_host_access = approved_host_access
+        self._approved_network = approved_host_access
         self._host = LocalExecutionEnvironment()
         self._preflight_cache = HardlinkPreflightCache()
+        self.last_result: CommandResult | None = None
 
     @property
     def _rw_workspace_roots(self) -> tuple[Path, ...]:
@@ -157,19 +163,28 @@ class MacOSSeatbeltEnvironment:
         return scoped
 
     def with_approval_scope(self, scope: object) -> MacOSSeatbeltEnvironment:
-        """Return a one-call environment matching an exact approved host scope.
+        """Return a one-call environment matching an exact approved scope.
 
-        ToolRegistry calls this only after binding *scope* to a normalized call
-        and a broker-issued approval id. This method turns that verified
-        capability into an OS profile without mutating the default sandbox.
+        - ``sandbox_command``: keeps full filesystem isolation and loopback-only network.
+        - ``sandbox_network``: enables outbound network while keeping full filesystem
+          isolation, credential denies, and non-delegable write protection intact.
+        - ``host_command``: temporary host access while still denying runtime secrets
+          and non-delegable write paths.
         """
-        if not bool(getattr(scope, "grants_host_execution", False)):
-            return self
         scoped = copy.copy(self)
-        scoped._approved_host_access = True
+        if bool(getattr(scope, "grants_host_execution", False)):
+            scoped._approved_host_access = True
+            scoped._approved_network = True
+        elif bool(getattr(scope, "grants_network_execution", False)):
+            scoped._approved_host_access = False
+            scoped._approved_network = True
+        else:
+            scoped._approved_host_access = False
+            scoped._approved_network = False
         return scoped
 
-    def _profile(self) -> str:
+    def _profile(self, *, network: bool = False) -> str:
+        allow_outbound = bool(network or self._approved_host_access)
         runtime_denies = "\n".join(
             "(deny file-read* file-write* "
             f'(literal (param "RUNTIME_SECRET_{index}")))'
@@ -190,12 +205,33 @@ class MacOSSeatbeltEnvironment:
 {runtime_denies}
 {protected_write_denies}
 """
+        network_clauses: list[str]
+        if allow_outbound:
+            network_clauses = [
+                "(allow network*)",
+                # Restrict unix-socket connections away from host sockets outside workspace
+                "(deny network-outbound (remote unix-socket))",
+                '(allow network-outbound (remote unix-socket (subpath (param "WORKSPACE"))))',
+                '(allow network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")))',
+            ]
+        elif self._default_network == "none":
+            network_clauses = ["(deny network*)"]
+        else:
+            network_clauses = [
+                "(deny network*)",
+                '(allow network-bind (local ip "localhost:*"))',
+                '(allow network-inbound (local ip "localhost:*"))',
+                '(allow network-outbound (remote ip "localhost:*"))',
+                '(allow network-bind (local unix-socket (subpath (param "WORKSPACE"))))',
+                '(allow network-outbound (remote unix-socket (subpath (param "WORKSPACE"))))',
+            ]
+
         parts: list[str] = [
-            '(version 1)',
-            '(deny default)',
+            "(version 1)",
+            "(deny default)",
             '(import "system.sb")',
-            '(deny network*)',
-            '(allow process*)',
+            *network_clauses,
+            "(allow process*)",
             '(allow file-read* (literal "/private/var/select/sh"))',
             '(allow file-read-metadata (subpath "/bin"))',
             '(allow file-read-metadata (subpath "/usr/bin"))',
@@ -206,6 +242,11 @@ class MacOSSeatbeltEnvironment:
             '(allow file-read* (subpath (param "WORKSPACE")))',
             '(allow file-write* (subpath (param "WORKSPACE")))',
         ]
+        if allow_outbound:
+            # Allow standard macOS TLS trust/resolver config reads when outbound
+            # network is explicitly approved, without exposing user $HOME.
+            parts.append('(allow file-read* (literal "/private/etc/resolv.conf"))')
+            parts.append('(allow file-read* (subpath "/private/etc/ssl"))')
         for index, _ in enumerate(self._extra_roots):
             param = f"EXTRA_ROOT_{index}"
             parts.append(f'(allow file-read-metadata (path-ancestors (param "{param}")))')
@@ -276,8 +317,10 @@ class MacOSSeatbeltEnvironment:
     def _sensitive_hardlink_error(self) -> str | None:
         """Inspect all writable roots for unsafe hardlink aliases."""
         return check_hardlinks(
-            self._all_writable_roots,
+            self._rw_workspace_roots,
             self._non_delegable_write_paths,
+            cache_roots=tuple(m.host_path for m in self._cache_mounts),
+            runtime_secret_paths=self._runtime_secret_paths,
         )
 
     async def run_command(
@@ -288,24 +331,47 @@ class MacOSSeatbeltEnvironment:
         cwd: str | None = None,
         timeout_seconds: float = 30.0,
         env: dict[str, str] | None = None,
+        network: bool = False,
     ) -> CommandResult:
         if sys.platform != "darwin":
             return CommandResult(
-                exit_code=None, error="macOS Seatbelt is unavailable on this platform"
+                exit_code=None,
+                error="macOS Seatbelt is unavailable on this platform",
+                sandbox_backend="seatbelt",
             )
         if not os.path.isfile(_SANDBOX_EXECUTABLE) or not os.access(
             _SANDBOX_EXECUTABLE, os.X_OK
         ):
             return CommandResult(
-                exit_code=None, error="macOS sandbox-exec is unavailable"
+                exit_code=None,
+                error="macOS sandbox-exec is unavailable",
+                sandbox_backend="seatbelt",
             )
         if (command is None) == (argv is None):
             return CommandResult(
-                exit_code=None, error="exactly one of command or argv is required"
+                exit_code=None,
+                error="exactly one of command or argv is required",
+                sandbox_backend="seatbelt",
+            )
+        if not isinstance(network, bool):
+            return CommandResult(
+                exit_code=None,
+                error="network parameter must be a boolean",
+                sandbox_backend="seatbelt",
+            )
+        if network and not self._approved_network:
+            return CommandResult(
+                exit_code=None,
+                error="outbound network access requires an approved sandbox_network scope",
+                sandbox_backend="seatbelt",
             )
         resolved_cwd, error = self._validate_cwd(cwd)
         if error:
-            return CommandResult(exit_code=None, error=error)
+            return CommandResult(
+                exit_code=None,
+                error=error,
+                sandbox_backend="seatbelt",
+            )
 
         hardlink_error = await asyncio.to_thread(
             self._preflight_cache.check,
@@ -314,7 +380,11 @@ class MacOSSeatbeltEnvironment:
             walk_fn=self._sensitive_hardlink_error,
         )
         if hardlink_error:
-            return CommandResult(exit_code=None, error=hardlink_error)
+            return CommandResult(
+                exit_code=None,
+                error=hardlink_error,
+                sandbox_backend="seatbelt",
+            )
 
         define_args: list[str] = ["-D", f"WORKSPACE={self._workspace}"]
         for index, extra_root in enumerate(self._extra_roots):
@@ -330,20 +400,29 @@ class MacOSSeatbeltEnvironment:
                 ["-D", f"NON_DELEGABLE_WRITE_{index}={protected_path}"]
             )
 
+        effective_network = bool(network or self._approved_host_access)
         wrapped_argv = [
             _SANDBOX_EXECUTABLE,
             *define_args,
             "-p",
-            self._profile(),
+            self._profile(network=effective_network),
         ]
         if command is not None:
             wrapped_argv.extend(["/bin/sh", "-c", command])
         else:
             assert argv is not None
             wrapped_argv.extend(argv)
-        return await self._host.run_command(
+        result = await self._host.run_command(
             argv=wrapped_argv,
             cwd=resolved_cwd,
             timeout_seconds=timeout_seconds,
             env=self._safe_environment(env),
         )
+        result.sandbox_backend = "seatbelt"
+        result.network_used = effective_network
+        if not effective_network and result.exit_code not in (None, 0):
+            result.network_denied_hint = detect_network_denied_hint(
+                result.stdout, result.stderr
+            )
+        self.last_result = result
+        return result

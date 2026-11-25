@@ -11,8 +11,40 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import re
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
+
+_OFFLINE_ERROR_RE = re.compile(
+    r"(?i)("
+    r"network is unreachable"
+    r"|enetunreach"
+    r"|eai_again"
+    r"|temporary failure in name resolution"
+    r"|name or service not known"
+    r"|nodename nor servname provided"
+    r"|could not resolve host"
+    r"|failed to establish a new connection"
+    r"|connecterror"
+    r"|failed to download"
+    r"|offline mode"
+    r")"
+)
+_EPERM_NETWORK_CONTEXT_RE = re.compile(
+    r"(?i)\b(connect|socket|http|https|curl|fetch|resolve|dns|tcp|udp|ssl|tls)\b"
+)
+
+
+def detect_network_denied_hint(stdout: str, stderr: str) -> bool:
+    """Heuristically detect failures likely caused by loopback-only sandboxing."""
+    combined = f"{stderr}\n{stdout}"
+    if _OFFLINE_ERROR_RE.search(combined):
+        return True
+    if "operation not permitted" in combined.lower() and _EPERM_NETWORK_CONTEXT_RE.search(
+        combined
+    ):
+        return True
+    return False
 
 MAX_OUTPUT = 10 * 1024
 # Retained output is split head/tail rather than head-only: a test runner puts
@@ -42,6 +74,11 @@ class CommandResult:
     # folded into ``error``: callers treat that as "the command failed" and
     # discard the exit code and output along with it.
     output_incomplete: bool = False
+    # Sandbox/network observability metadata (excluded from equality so
+    # callers comparing core execution results remain backwards-compatible).
+    network_used: bool = field(default=False, compare=False)
+    sandbox_backend: str = field(default="host", compare=False)
+    network_denied_hint: bool = field(default=False, compare=False)
 
 
 @runtime_checkable
@@ -58,6 +95,7 @@ class ExecutionEnvironment(Protocol):
         cwd: str | None = None,
         timeout_seconds: float = 30.0,
         env: dict[str, str] | None = None,
+        network: bool = False,
     ) -> CommandResult: ...
 
 
@@ -203,6 +241,7 @@ class LocalExecutionEnvironment:
     """Explicit host backend, with hardened process handling but no isolation."""
 
     name = "host"
+    backend_id = "host"
 
     async def run_command(
         self,
@@ -212,6 +251,7 @@ class LocalExecutionEnvironment:
         cwd: str | None = None,
         timeout_seconds: float = 30.0,
         env: dict[str, str] | None = None,
+        network: bool = False,
     ) -> CommandResult:
         if (command is None) == (argv is None):
             return CommandResult(exit_code=None, error="exactly one of command or argv is required")
@@ -279,4 +319,6 @@ class LocalExecutionEnvironment:
             stdout=_format_stream(stdout, stdout_total) if stdout else "",
             stderr=_format_stream(stderr, stderr_total) if stderr else "",
             output_incomplete=not drained,
+            network_used=True,
+            sandbox_backend="host",
         )

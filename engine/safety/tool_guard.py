@@ -926,6 +926,18 @@ def _rule_match_targets(arguments: dict) -> list[str]:
     return targets
 
 
+def call_requests_network_egress(
+    tool_call: ToolCall,
+    definition: ToolDefinition | None,
+) -> bool:
+    """True when a tool call opens external network connections."""
+    if definition is not None and getattr(definition, "network_access", False):
+        return True
+    if definition is not None and definition.opaque_command:
+        return tool_call.arguments.get("network") is True
+    return False
+
+
 # ── Main guard ──────────────────────────────────────────────
 
 class ToolGuard:
@@ -953,6 +965,11 @@ class ToolGuard:
         self.audit = AuditLog()
         self.whitelist = SessionWhitelist()
         self._tool_registry: dict[str, ToolDefinition] = tool_registry or {}
+        self._sandbox_is_degraded: bool = False
+
+    def set_sandbox_degraded(self, degraded: bool) -> None:
+        """Mark whether the bound sandbox is running in degraded host fallback mode."""
+        self._sandbox_is_degraded = bool(degraded)
 
     def bind_definitions(self, definitions: dict[str, ToolDefinition]) -> None:
         """Bind tool definitions after registry load so metadata-first checks apply."""
@@ -1163,10 +1180,12 @@ class ToolGuard:
             tool_call.name
         )
         if opaque_command:
-            return ApprovalScope.host_command(
-                str(tool_call.arguments.get("command") or ""),
-                high_risk=high_risk,
-            )
+            cmd = str(tool_call.arguments.get("command") or "")
+            if self._sandbox_is_degraded:
+                return ApprovalScope.host_command(cmd, high_risk=True)
+            if tool_call.arguments.get("network") is True:
+                return ApprovalScope.sandbox_network(cmd, high_risk=True)
+            return ApprovalScope.sandbox_command(cmd, high_risk=high_risk)
 
         definition = self._tool_registry.get(tool_call.name)
         if definition is not None and getattr(definition, "network_access", False):
@@ -1299,16 +1318,35 @@ class ToolGuard:
         approval_required = self._requires_approval(tool_call)
         approval_scope = self._approval_scope_for(tool_call) if approval_required else None
         definition = self._tool_registry.get(tool_call.name)
-        network_access = bool(
-            definition is not None and getattr(definition, "network_access", False)
-        )
-        result = GuardResult(
-            allowed=True,
-            level=level,
-            reason=f"Approval required for {tool_call.name}" if approval_required else "",
-            approval_required=approval_required,
-            approval_scope=approval_scope,
-            risk=(
+        is_opaque = bool(definition is not None and definition.opaque_command)
+        if is_opaque and "network" in tool_call.arguments and not isinstance(
+            tool_call.arguments["network"], bool
+        ):
+            bad_net = GuardResult(
+                allowed=False,
+                level=level,
+                reason="Argument 'network' must be a boolean",
+                risk=RiskTier.HIGH,
+            )
+            record(bad_net)
+            return bad_net
+
+        network_access = call_requests_network_egress(tool_call, definition)
+        if is_opaque and self._sandbox_is_degraded:
+            reason = (
+                f"[NO OS SANDBOX] Approval required for {tool_call.name} "
+                "(running in explicit host_with_approval fallback mode)"
+            )
+            risk = RiskTier.CRITICAL
+        elif is_opaque and network_access:
+            reason = (
+                f"Outbound network approval required for {tool_call.name} "
+                "(filesystem sandbox remains active)"
+            )
+            risk = RiskTier.HIGH
+        else:
+            reason = f"Approval required for {tool_call.name}" if approval_required else ""
+            risk = (
                 risk_for_approval(
                     level=level.value,
                     high_risk=bool(
@@ -1318,9 +1356,20 @@ class ToolGuard:
                 )
                 if approval_required
                 else RiskTier.ROUTINE
-            ),
+            )
+        result = GuardResult(
+            allowed=True,
+            level=level,
+            reason=reason,
+            approval_required=approval_required,
+            approval_scope=approval_scope,
+            risk=risk,
         )
-        record(result, whitelisted=tool_whitelisted)
+        record(
+            result,
+            whitelisted=tool_whitelisted,
+            sandbox_backend="host_degraded" if (is_opaque and self._sandbox_is_degraded) else None,
+        )
         return result
 
     @staticmethod

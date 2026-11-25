@@ -652,3 +652,103 @@ def test_macos_seatbelt_blocks_outbound_network(tmp_path: Path) -> None:
 
     assert result.exit_code not in (None, 0)
     assert "Operation not permitted" in result.stderr
+    assert result.network_denied_hint is True
+    assert result.network_used is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_macos_seatbelt_allows_loopback_while_blocking_outbound(tmp_path: Path) -> None:
+    """Default loopback-only sandbox permits 127.0.0.1 sockets for local tests."""
+    code = (
+        "import socket, threading\n"
+        "srv = socket.socket()\n"
+        "srv.bind(('127.0.0.1', 0))\n"
+        "port = srv.getsockname()[1]\n"
+        "srv.listen(1)\n"
+        "def accept():\n"
+        "    c, _ = srv.accept()\n"
+        "    c.sendall(b'pong')\n"
+        "    c.close()\n"
+        "t = threading.Thread(target=accept)\n"
+        "t.start()\n"
+        "cli = socket.create_connection(('127.0.0.1', port), timeout=2)\n"
+        "data = cli.recv(4)\n"
+        "cli.close(); t.join(); srv.close()\n"
+        "assert data == b'pong', data\n"
+        "print('LOOPBACK_OK')\n"
+    )
+    from engine.sandbox import SandboxProfileConfig, resolve_sandbox_profile
+
+    profile = resolve_sandbox_profile(
+        tmp_path,
+        SandboxProfileConfig(auto_detect_toolchains=True, auto_detect_caches=False),
+    )
+    env = MacOSSeatbeltEnvironment(workspace=tmp_path, profile=profile)
+    res = asyncio.run(
+        env.run_command(
+            argv=[sys.executable, "-c", code],
+            cwd=str(tmp_path),
+            timeout_seconds=5,
+        )
+    )
+    assert res.exit_code == 0, res.stderr or res.error
+    assert "LOOPBACK_OK" in res.stdout
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_macos_seatbelt_sandbox_network_keeps_filesystem_isolation(
+    tmp_path: Path,
+) -> None:
+    """Approving sandbox_network grants outbound network WITHOUT host filesystem access."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / ".env").write_text("SECRET=must-stay-blocked\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    provider = ws / "agents" / "tools"
+    provider.mkdir(parents=True)
+    (provider / "tool.py").write_text("original\n", encoding="utf-8")
+
+    env = MacOSSeatbeltEnvironment(
+        workspace=ws,
+        non_delegable_write_paths=[provider],
+    )
+    # Unapproved network=True is rejected fail-closed at the adapter layer
+    unapproved = asyncio.run(
+        env.run_command(argv=["/bin/echo", "nope"], cwd=str(ws), network=True)
+    )
+    assert unapproved.exit_code is None
+    assert unapproved.error and "sandbox_network" in unapproved.error
+
+    # Approved sandbox_command still keeps network=False and workspace FS isolation
+    cmd_env = env.with_approval_scope(ApprovalScope.sandbox_command("cat .env"))
+    cmd_secret = asyncio.run(cmd_env.run_command(argv=["/bin/cat", ".env"], cwd=str(ws)))
+    assert cmd_secret.exit_code not in (None, 0)
+    assert "SECRET" not in cmd_secret.stdout
+
+    # Approved sandbox_network enables outbound network in profile,
+    # while STILL blocking .env reads, outside writes, and non-delegable writes!
+    net_env = env.with_approval_scope(ApprovalScope.sandbox_network("curl x"))
+    assert "(allow network*)" in net_env._profile(network=True)
+    assert "(allow file-read* file-write*)" not in net_env._profile(network=True)
+
+    env_read = asyncio.run(
+        net_env.run_command(argv=["/bin/cat", ".env"], cwd=str(ws), network=True)
+    )
+    assert env_read.exit_code not in (None, 0)
+    assert "SECRET" not in env_read.stdout
+
+    outside_write = asyncio.run(
+        net_env.run_command(
+            command=f"printf escape > '{outside}'", cwd=str(ws), network=True
+        )
+    )
+    assert outside_write.exit_code not in (None, 0)
+    assert not outside.exists()
+
+    nd_write = asyncio.run(
+        net_env.run_command(
+            command="printf hacked > agents/tools/tool.py", cwd=str(ws), network=True
+        )
+    )
+    assert nd_write.exit_code not in (None, 0)
+    assert (provider / "tool.py").read_text(encoding="utf-8") == "original\n"

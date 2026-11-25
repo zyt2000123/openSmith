@@ -24,7 +24,11 @@ from engine.execution.routing.task_router import route_task
 from engine.execution.runtime_control import initial_runtime_control_prompt
 from engine.identity import IdentityCatalog, IdentitySpec, RouteDecision
 from engine.safety.eval_guard import EVAL_SENSITIVE_GUIDANCE, detect_eval_sensitive
-from engine.sandbox import MacOSSeatbeltEnvironment
+from engine.sandbox import (
+    SandboxProfileConfig,
+    create_sandbox_environment,
+    resolve_sandbox_profile,
+)
 from engine.tool.registry import ToolRegistry
 
 from .builtin_tools import (
@@ -228,6 +232,22 @@ def _route_grill_me_entry(
     return None
 
 
+async def _load_global_sandbox_config(runtime: RuntimeContext) -> SandboxProfileConfig:
+    """Load user-level ``sandbox:`` config exclusively from ``~/.agent-smith/config.yaml``.
+
+    Never loads sandbox mounts from the project working directory so an
+    untrusted repository cannot widen its own sandbox boundaries.
+    """
+    from common.yaml_utils import load_yaml
+
+    data_dir = runtime.profile_dir.parent
+    global_cfg = load_yaml(data_dir / "config.yaml")
+    if not isinstance(global_cfg, dict):
+        return SandboxProfileConfig()
+    raw_sandbox = global_cfg.get("sandbox")
+    return SandboxProfileConfig.from_mapping(raw_sandbox)
+
+
 async def _load_profile_config(runtime: RuntimeContext) -> dict:
     from common.yaml_utils import load_yaml
 
@@ -307,16 +327,30 @@ async def prepare_runtime(
     identity = route.identity
 
     provider_dir = runtime.agents_dir / "tools"
+    sandbox_config = await _load_global_sandbox_config(runtime)
+    sandbox_profile = resolve_sandbox_profile(
+        working_dir,
+        sandbox_config,
+        non_delegable_write_paths=[provider_dir],
+        data_dir=runtime.profile_dir.parent,
+    )
+    if sandbox_profile.warnings:
+        for warning in sandbox_profile.warnings:
+            logger.warning("sandbox profile warning: %s", warning)
+
     if services.tool_guard is not None:
-        services.tool_guard.set_working_directory(working_dir)
+        services.tool_guard.set_working_directory(
+            working_dir, extra_roots=sandbox_profile.extra_roots
+        )
         services.tool_guard.set_non_delegable_write_roots([provider_dir])
 
     services.tool_registry.load_builtin_providers(provider_dir)
     services.tool_registry.bind_working_directory(working_dir)
-    if sys.platform == "darwin":
-        environment = MacOSSeatbeltEnvironment(workspace=working_dir)
-        services.tool_registry.bind_execution_environment(
-            environment.with_non_delegable_write_paths([provider_dir])
+    sandbox_env = create_sandbox_environment(sandbox_profile)
+    services.tool_registry.bind_execution_environment(sandbox_env)
+    if services.tool_guard is not None:
+        services.tool_guard.set_sandbox_degraded(
+            bool(getattr(sandbox_env, "is_degraded", False))
         )
     bind_snapshot_tools(services, runtime.session_id)
     bind_memory_ops_tool(services, state_dir)

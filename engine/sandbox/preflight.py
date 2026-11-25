@@ -70,16 +70,47 @@ def compute_roots_fingerprint(roots: tuple[Path, ...]) -> str | None:
 def check_hardlinks(
     roots: tuple[Path, ...],
     non_delegable_write_paths: tuple[Path, ...] = (),
+    *,
+    cache_roots: tuple[Path, ...] = (),
+    runtime_secret_paths: tuple[Path, ...] = (),
 ) -> str | None:
-    """Inspect all writable ``roots`` for unsafe hardlink aliases."""
-    # Keyed by (st_dev, st_ino) -> (list of (root, relative_path), declared st_nlink)
-    seen: dict[tuple[int, int], tuple[list[tuple[Path, Path]], int]] = {}
-    unique_roots: list[Path] = []
-    for root in roots:
-        if root not in unique_roots:
-            unique_roots.append(root)
+    """Inspect all writable ``roots`` (and ``cache_roots``) for unsafe hardlink aliases.
 
-    for base in unique_roots:
+    Workspace roots (``roots``) enforce both protected-path aliasing and the
+    unaccounted external-link invariant (``st_nlink > seen_aliases``).  Package
+    ``cache_roots`` (e.g. ``~/.cache/uv``, pnpm store) legitimately share
+    content-addressed hardlinks with other projects' virtual environments, so
+    for cache-only inodes we check against protected paths, runtime secrets,
+    and non-delegable write roots without false-positiving on cross-repo cache
+    links.
+    """
+    # Keyed by (st_dev, st_ino) -> (list of (root, relative_path, is_cache), declared st_nlink)
+    seen: dict[tuple[int, int], tuple[list[tuple[Path, Path, bool]], int]] = {}
+    unique_workspace_roots: list[Path] = []
+    for root in roots:
+        if root not in unique_workspace_roots:
+            unique_workspace_roots.append(root)
+    unique_cache_roots: list[Path] = []
+    for root in cache_roots:
+        if root not in unique_workspace_roots and root not in unique_cache_roots:
+            unique_cache_roots.append(root)
+
+    protected_identities: set[tuple[int, int]] = set()
+    for secret_path in runtime_secret_paths:
+        try:
+            st = os.lstat(secret_path)
+            if stat.S_ISREG(st.st_mode):
+                protected_identities.add((st.st_dev, st.st_ino))
+        except OSError:
+            continue
+
+    scan_plan = [
+        *((root, False) for root in unique_workspace_roots),
+        *((root, True) for root in unique_cache_roots),
+    ]
+    total_roots = len(scan_plan)
+
+    for base, is_cache in scan_plan:
         pending = [base]
         while pending:
             current = pending.pop()
@@ -111,21 +142,26 @@ def check_hardlinks(
                         entries_for_inode, _ = seen.setdefault(
                             key, ([], metadata.st_nlink)
                         )
-                        entries_for_inode.append((base, relative))
+                        entries_for_inode.append((base, relative, is_cache))
             except OSError:
                 return "sandbox protected-path preflight could not inspect workspace"
 
-    for items, link_count in seen.values():
+    for key, (items, link_count) in seen.items():
         aliases = ", ".join(
             sorted(
-                str(rel) if len(unique_roots) == 1 else str(root / rel)
-                for root, rel in items
+                str(rel) if total_roots == 1 else str(root / rel)
+                for root, rel, _ in items
             )
         )
+        if key in protected_identities:
+            return (
+                "sandbox refuses files with hard links to a protected path "
+                f"(runtime secret): {aliases}"
+            )
         protected = next(
             (
                 rel
-                for root, rel in items
+                for root, rel, _ in items
                 if is_hardlink_protected_path(rel)
                 or _is_under_non_delegable(root / rel, non_delegable_write_paths)
             ),
@@ -136,7 +172,9 @@ def check_hardlinks(
                 "sandbox refuses files with hard links to a protected path "
                 f"({protected}): {aliases}"
             )
-        if link_count > len(items):
+        has_workspace_alias = any(not is_cache for _, _, is_cache in items)
+        has_cache_alias = any(is_cache for _, _, is_cache in items)
+        if has_workspace_alias and not has_cache_alias and link_count > len(items):
             return (
                 "sandbox refuses files with hard links reaching outside the "
                 f"workspace: {aliases} (copy the file, or re-create it "

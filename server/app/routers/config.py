@@ -86,6 +86,32 @@ class LLMConfig(BaseModel):
         return _validate_max_output_tokens(value)
 
 
+class SandboxCacheRootsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    uv: str | None = None
+    pip: str | None = None
+    npm: str | None = None
+    pnpm: str | None = None
+    cargo: str | None = None
+    go: str | None = None
+    extra: list[str] | None = None
+
+
+class SandboxConfigPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["auto", "seatbelt", "bwrap"] | None = None
+    fallback_policy: Literal["deny", "host_with_approval"] | None = None
+    extra_roots: list[str] | None = None
+    auto_detect_toolchains: bool | None = None
+    share_read_only: list[str] | None = None
+    auto_detect_caches: bool | None = None
+    cache_roots: SandboxCacheRootsPatch | None = None
+    extra_path_entries: list[str] | None = None
+    default_network: Literal["loopback_only", "none"] | None = None
+
+
 def get_config_service() -> ConfigService:
     return ConfigService()
 
@@ -103,3 +129,16 @@ async def list_relay_models(svc: ConfigService = Depends(get_config_service)):
 @router.post("/llm")
 async def set_llm_config(body: LLMConfig, svc: ConfigService = Depends(get_config_service)):
     return svc.set_llm_config(updates=body.model_dump(exclude_unset=True))
+
+
+@router.get("/sandbox")
+async def get_sandbox_config(svc: ConfigService = Depends(get_config_service)):
+    return svc.get_sandbox_config()
+
+
+@router.patch("/sandbox")
+async def patch_sandbox_config(
+    body: SandboxConfigPatch,
+    svc: ConfigService = Depends(get_config_service),
+):
+    return svc.set_sandbox_config(updates=body.model_dump(exclude_unset=True))

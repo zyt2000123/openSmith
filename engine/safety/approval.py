@@ -66,6 +66,28 @@ class ApprovalScope:
     high_risk: bool = False
 
     @classmethod
+    def sandbox_command(
+        cls, command: str, *, high_risk: bool = False
+    ) -> ApprovalScope:
+        return cls(
+            kind="sandbox_command",
+            target=command,
+            access=("workspace", "process"),
+            high_risk=high_risk,
+        )
+
+    @classmethod
+    def sandbox_network(
+        cls, command: str, *, high_risk: bool = True
+    ) -> ApprovalScope:
+        return cls(
+            kind="sandbox_network",
+            target=command,
+            access=("workspace", "process", "network"),
+            high_risk=high_risk,
+        )
+
+    @classmethod
     def host_command(cls, command: str, *, high_risk: bool = False) -> ApprovalScope:
         return cls(
             kind="host_command",
@@ -117,7 +139,19 @@ class ApprovalScope:
         return self.kind == "host_command"
 
     @property
+    def grants_network_execution(self) -> bool:
+        return self.kind in {"sandbox_network", "host_command", "network"}
+
+    @property
+    def grants_sandbox_execution(self) -> bool:
+        return self.kind in {"sandbox_command", "sandbox_network", "host_command"}
+
+    @property
     def description(self) -> str:
+        if self.kind == "sandbox_command":
+            return "Sandboxed workspace execution (loopback-only network)"
+        if self.kind == "sandbox_network":
+            return "Sandboxed workspace execution with outbound network access"
         if self.kind == "host_command":
             return "Host filesystem, network, and process access for this exact command"
         if self.kind == "network":
@@ -153,6 +187,7 @@ _DETAIL_LABELS = {
     "environment": "Environment",
     "index": "Task index",
     "message": "Commit message",
+    "network": "Outbound network",
     "new_string": "Replacement text",
     "old_string": "Text to replace",
     "path": "Path",
@@ -168,7 +203,7 @@ _DETAIL_LABELS = {
     "version_id": "Version",
 }
 _DETAIL_ORDER = {
-    "shell": ("command", "cwd", "timeout"),
+    "shell": ("command", "cwd", "network", "timeout"),
     "write_file": ("path", "append", "content"),
     "edit_file": ("path", "old_string", "new_string", "replace_all"),
     "git_ops": ("action", "cwd", "branch", "message", "files", "path", "staged"),
@@ -544,9 +579,23 @@ def build_approval_presentation(
     target = _display_value(arguments.get("path") or arguments.get("file_path") or "")
 
     if tool_name == "shell":
-        title = "Run a shell command"
-        summary = "Execute the requested command"
-        fallback_reason = "This command may change files or system state."
+        if arguments.get("network") is True or (
+            scope is not None and scope.kind == "sandbox_network"
+        ):
+            title = "Run a shell command with outbound network"
+            summary = "Execute the requested sandboxed command with outbound network access"
+            fallback_reason = (
+                "This command requests outbound network access "
+                "(filesystem sandbox remains active)."
+            )
+        elif scope is not None and scope.kind == "host_command":
+            title = "Run a host shell command [NO OS SANDBOX]"
+            summary = "Execute the requested command without full OS sandbox isolation"
+            fallback_reason = "This command runs outside workspace OS sandbox isolation."
+        else:
+            title = "Run a shell command"
+            summary = "Execute the requested command inside the workspace sandbox"
+            fallback_reason = "This command may change workspace files or process state."
     elif tool_name == "write_file":
         title = "Write a file"
         summary = f"{'Append to' if arguments.get('append') else 'Write to'} {target or 'the requested path'}"
