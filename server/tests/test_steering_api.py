@@ -17,8 +17,7 @@ from app.main import app
 from app.services.session_service import SessionService
 from common import config as common_config
 from common.database import close_db
-from engine.execution import EventType, ExecutionEvent, RunStateStore, RunStatus
-from engine.execution.steering import STEERING_BROKER
+from engine.execution import EventType, ExecutionEvent, RunStateStore, RunStatus, STEERING_BROKER
 from engine.safety.approval import APPROVAL_BROKER, ApprovalRequest
 
 

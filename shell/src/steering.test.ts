@@ -3,10 +3,10 @@ import test from "node:test";
 
 import { NodeBridge } from "./bridge.js";
 import { createAppStore } from "./store.js";
-import { appendQueuedSteering, applyStreamEvent, createTurnEntry } from "./transcript-state.js";
+import { appendQueuedSteering, applyStreamEvent, createTurnEntry, type TranscriptEntry } from "./transcript-state.js";
 
 test("steering_applied transitions queued steering block to applied and steering_deferred clears it", () => {
-  let entries = [createTurnEntry("refactor parser")];
+  let entries: TranscriptEntry[] = [createTurnEntry("refactor parser")];
   entries = appendQueuedSteering(entries, "st_1", "keep existing public API");
 
   const queuedTurn = entries[0];
