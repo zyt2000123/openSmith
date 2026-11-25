@@ -276,3 +276,19 @@ async def list_runs(
     svc: AgentService = Depends(get_agent_service),
 ):
     return await svc.list_runs(task_id)
+
+
+@router.get("/doctor")
+async def doctor_static(
+    cwd: str | None = Query(default=None),
+    svc: AgentService = Depends(get_agent_service),
+):
+    return await svc.run_doctor(cwd=cwd, run_probes=False)
+
+
+@router.post("/doctor/probe")
+async def doctor_probe(
+    cwd: str | None = Query(default=None),
+    svc: AgentService = Depends(get_agent_service),
+):
+    return await svc.run_doctor(cwd=cwd, run_probes=True)

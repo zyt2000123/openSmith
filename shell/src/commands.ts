@@ -39,6 +39,7 @@ const HELP_TEXT = [
   "- `/skill <name> [prompt]` — arm a skill, or run it straight away with a prompt",
   "- `/hooks` — inspect runtime lifecycle hooks",
   "- `/mcp` — inspect configured MCP servers and tools",
+  "- `/doctor` — run environment and live sandbox containment diagnostics",
   "- `/resume [session-id]` — recover the latest interrupted run, or open a session; use `/resume run <run-id>` for a specific run",
   "- `/compact` — switch to compact view; Ctrl+O toggles compact/transcript",
   "- `/reconnect` — retry the local server connection after a failed boot",
@@ -152,6 +153,13 @@ export function buildSlashItems(): SlashItem[] {
       title: "/hooks",
       command: "/hooks",
       description: "View runtime lifecycle hooks.",
+      category: "Commands",
+    },
+    {
+      id: "doctor",
+      title: "/doctor",
+      command: "/doctor",
+      description: "Run environment and live sandbox containment diagnostics.",
       category: "Commands",
     },
     {
@@ -337,6 +345,9 @@ const COMMAND_HANDLERS: Record<string, CommandHandler> = {
       hooksIndex: 0,
       statusLine: `${LIFECYCLE_HOOKS.length} built-in lifecycle hooks.`,
     });
+  },
+  "/doctor": async (_args, context) => {
+    await context.bridge.runDoctor(context.workingDir ?? process.cwd());
   },
   "/model": async (args, context) => {
     const state = context.getState();

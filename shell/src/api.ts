@@ -166,6 +166,33 @@ export type ApprovalPresentation = {
   reason: string;
 };
 
+export type DoctorCheck = {
+  id: string;
+  category: string;
+  status: "pass" | "warn" | "fail" | "skip";
+  summary: string;
+  detail?: string;
+  code?: string;
+  remediation?: string;
+};
+
+export type DoctorReport = {
+  ok: boolean;
+  platform: string;
+  cwd: string;
+  sandbox_backend: string;
+  fallback_policy: string;
+  checks: DoctorCheck[];
+  duration_ms: number;
+};
+
+export type ApprovalScope = {
+  kind: string;
+  target: string;
+  access: string[];
+  high_risk?: boolean;
+};
+
 export type PendingApproval = {
   runId: string;
   approvalId: string;
@@ -174,6 +201,11 @@ export type PendingApproval = {
   reason: string;
   arguments: Record<string, unknown>;
   presentation?: ApprovalPresentation;
+  risk?: string;
+  ruleId?: string;
+  taintSources?: string[];
+  repeatCount?: number;
+  scope?: ApprovalScope;
 };
 
 export type StreamEvent =
@@ -449,6 +481,14 @@ export type RunImprovementProposal = {
   suggested_change?: string | null;
   approval_required: boolean;
 };
+
+export async function runDoctorProbe(baseUrl: string, cwd?: string): Promise<DoctorReport> {
+  const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+  return request<DoctorReport>(baseUrl, `/api/agent/doctor/probe${query}`, {
+    method: "POST",
+    timeoutMs: 30_000,
+  });
+}
 
 export async function getObservabilityHealth(baseUrl: string): Promise<AgentHealth> {
   return request<AgentHealth>(baseUrl, "/api/agent/observability/health");
@@ -753,6 +793,33 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
   run_started: (payload) => ({ type: "run_started", runId: String(payload.run_id ?? "") }),
   approval_required: (payload) => {
     const presentation = approvalPresentation(payload);
+    const rawRisk = typeof payload.risk === "string" && payload.risk ? sanitizeTerminalText(payload.risk) : undefined;
+    const rawRuleId =
+      typeof payload.rule_id === "string" && payload.rule_id ? sanitizeTerminalText(payload.rule_id) : undefined;
+    const rawTaint = Array.isArray(payload.taint_sources)
+      ? payload.taint_sources
+          .filter((item): item is string => typeof item === "string" && item.length > 0)
+          .map((item) => sanitizeTerminalText(item))
+      : undefined;
+    const rawRepeat =
+      typeof payload.repeat_count === "number" && Number.isFinite(payload.repeat_count) && payload.repeat_count >= 2
+        ? payload.repeat_count
+        : undefined;
+    const rawScope =
+      payload.scope && typeof payload.scope === "object" && !Array.isArray(payload.scope)
+        ? (payload.scope as Record<string, unknown>)
+        : undefined;
+    const scope: ApprovalScope | undefined =
+      rawScope && typeof rawScope.kind === "string"
+        ? {
+            kind: sanitizeTerminalText(rawScope.kind),
+            target: sanitizeUnknownText(rawScope.target),
+            access: Array.isArray(rawScope.access)
+              ? rawScope.access.filter((a): a is string => typeof a === "string").map(sanitizeTerminalText)
+              : [],
+            ...(typeof rawScope.high_risk === "boolean" ? { high_risk: rawScope.high_risk } : {}),
+          }
+        : undefined;
     return {
       type: "approval_required",
       runId: String(payload.run_id ?? ""),
@@ -762,6 +829,11 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
       reason: sanitizeUnknownText(payload.reason).slice(0, 500) || "Approval required",
       arguments: objectPayload(payload.arguments),
       ...(presentation ? { presentation } : {}),
+      ...(rawRisk ? { risk: rawRisk } : {}),
+      ...(rawRuleId ? { ruleId: rawRuleId } : {}),
+      ...(rawTaint?.length ? { taintSources: rawTaint } : {}),
+      ...(rawRepeat !== undefined ? { repeatCount: rawRepeat } : {}),
+      ...(scope ? { scope } : {}),
     };
   },
   provisional_text_delta: (payload) => ({

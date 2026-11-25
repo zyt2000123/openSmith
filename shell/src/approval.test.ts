@@ -73,6 +73,32 @@ test("structured presentation wins over generic frontend tool-name fallbacks", (
   assert.equal(approvalReason(approval), "This changes repository history.");
 });
 
+test("approval card annotates outbound network, taint warning, repeat guard, and rule", () => {
+  const approval = {
+    ...shellApproval,
+    arguments: { command: "curl https://example.com", cwd: "/workspace", network: true },
+    risk: "critical",
+    ruleId: "ask-all-mcp-writes",
+    taintSources: ["file:.env"],
+    repeatCount: 2,
+    scope: {
+      kind: "sandbox_network",
+      target: "curl https://example.com",
+      access: ["workspace", "process", "network"],
+      high_risk: true,
+    },
+  };
+
+  assert.equal(approvalTitle(approval), "Run a shell command with outbound network");
+  const details = approvalDetails(approval);
+  assert.deepEqual(details.slice(0, 3), [
+    { label: "Taint warning", value: "Session read private data: file:.env" },
+    { label: "Repeat guard", value: "Attempt #2 in this run" },
+    { label: "Rule", value: "ask-all-mcp-writes" },
+  ]);
+  assert.ok(details.some((d) => d.label === "Outbound network" && d.value === "true"));
+});
+
 test("structured approval details stay single-line and bounded", () => {
   const details = approvalDetails({
     runId: "run-1",

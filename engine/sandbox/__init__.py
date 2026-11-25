@@ -32,12 +32,34 @@ from .linux_bwrap import (
 from .macos_seatbelt import MacOSSeatbeltEnvironment
 from .preflight import HardlinkPreflightCache
 
+_DOCTOR_EXPORTS = frozenset({
+    "CheckStatus",
+    "DoctorCheck",
+    "DoctorReport",
+    "SandboxHealthReport",
+    "check_sandbox_health",
+    "format_doctor_report",
+    "run_doctor",
+    "run_doctor_async",
+})
+
+
+def __getattr__(name: str):
+    if name in _DOCTOR_EXPORTS:
+        from . import doctor
+
+        return getattr(doctor, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 __all__ = (
     "BwrapAvailability",
     "CacheMount",
+    "CheckStatus",
     "CommandResult",
     "DefaultNetworkMode",
     "DegradedHostSandboxEnvironment",
+    "DoctorCheck",
+    "DoctorReport",
     "ExecutionEnvironment",
     "HardlinkPreflightCache",
     "LinuxBwrapEnvironment",
@@ -47,11 +69,16 @@ __all__ = (
     "ResolvedSandboxProfile",
     "SandboxBackendChoice",
     "SandboxFallbackPolicy",
+    "SandboxHealthReport",
     "SandboxProfileConfig",
     "UnavailableSandboxEnvironment",
+    "check_sandbox_health",
     "create_sandbox_environment",
     "detect_bwrap_availability",
     "detect_network_denied_hint",
+    "format_doctor_report",
     "probe_bwrap_availability",
     "resolve_sandbox_profile",
+    "run_doctor",
+    "run_doctor_async",
 )

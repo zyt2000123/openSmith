@@ -261,3 +261,19 @@ class AgentService:
         return await self.auto_task_service.list_runs(
             await self._profile_id(), task_id
         )
+
+    async def run_doctor(
+        self,
+        *,
+        cwd: str | None = None,
+        run_probes: bool = True,
+    ) -> dict:
+        from common import config as common_config
+        from engine.sandbox.doctor import run_doctor_async
+
+        report = await run_doctor_async(
+            cwd=cwd,
+            run_probes=run_probes,
+            data_dir=common_config.PATHS.data_dir,
+        )
+        return report.to_dict()

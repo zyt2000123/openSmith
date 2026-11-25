@@ -31,6 +31,7 @@ import {
   type RunImprovementProposal,
   type RunState,
   resolveRunApproval,
+  runDoctorProbe,
   type Session,
   type StreamEvent,
   type StreamTerminalStatus,
@@ -425,6 +426,32 @@ export class NodeBridge {
     const { baseUrl } = this.s;
     if (!baseUrl) throw new Error("Shell is not ready yet.");
     return initializeProjectInstructions(baseUrl, workingDir);
+  }
+
+  async runDoctor(workingDir?: string): Promise<void> {
+    const { baseUrl } = this.s;
+    if (!baseUrl) {
+      this.s.set({ panel: "chat", statusLine: NOT_READY_STATUS });
+      return;
+    }
+    if (this.s.inputLocked) return;
+    this.s.set({ inputLocked: true, statusLine: "Running sandbox diagnostics…" });
+    try {
+      const report = await runDoctorProbe(baseUrl, workingDir);
+      const { formatDoctorReport } = await import("./doctor.js");
+      this.s.pushSystemLine(formatDoctorReport(report), report.ok ? "info" : "error");
+      this.s.set({
+        panel: "chat",
+        statusLine: report.ok
+          ? `Doctor OK (${report.sandbox_backend}, ${report.duration_ms}ms).`
+          : `Doctor found issues (${report.sandbox_backend}).`,
+      });
+    } catch (error) {
+      this.s.pushSystemLine(`Doctor failed: ${errorMessage(error)}`, "error");
+      this.s.set({ panel: "chat", statusLine: "Doctor failed." });
+    } finally {
+      this.s.set({ inputLocked: false });
+    }
   }
 
   async openTokenStats(): Promise<void> {

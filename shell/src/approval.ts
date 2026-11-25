@@ -2,10 +2,11 @@ import type { ApprovalDetail, PendingApproval } from "./api.js";
 import { sanitizeTerminalText } from "./sanitize.js";
 import { truncateDisplay } from "./text-layout.js";
 
-const DETAIL_ORDER = ["command", "cwd", "path", "file_path", "timeout"];
+const DETAIL_ORDER = ["command", "cwd", "network", "path", "file_path", "timeout"];
 const DETAIL_LABELS: Record<string, string> = {
   command: "Command",
   cwd: "Working directory",
+  network: "Outbound network",
   path: "Path",
   file_path: "File",
   timeout: "Timeout",
@@ -54,7 +55,13 @@ export function approvalSummary(approval: PendingApproval): string {
 
 export function approvalTitle(approval: PendingApproval): string {
   if (approval.presentation?.title) return approval.presentation.title;
-  return approval.tool === "shell" ? "Run a shell command" : `Use ${oneLine(approval.tool) || "a tool"}`;
+  if (approval.tool === "shell") {
+    if (approval.arguments.network === true || approval.scope?.kind === "sandbox_network") {
+      return "Run a shell command with outbound network";
+    }
+    return "Run a shell command";
+  }
+  return `Use ${oneLine(approval.tool) || "a tool"}`;
 }
 
 export function approvalReason(approval: PendingApproval): string {
@@ -62,25 +69,50 @@ export function approvalReason(approval: PendingApproval): string {
 }
 
 export function approvalDetails(approval: PendingApproval): ApprovalDetail[] {
-  if (approval.presentation?.details.length) {
-    return approval.presentation.details.map((detail) => ({
-      label: oneLine(detail.label, 80),
-      value: oneLine(detail.value),
-    }));
+  const baseDetails: ApprovalDetail[] = approval.presentation?.details.length
+    ? approval.presentation.details.map((detail) => ({
+        label: oneLine(detail.label, 80),
+        value: oneLine(detail.value),
+      }))
+    : (() => {
+        const entries = Object.entries(approval.arguments).filter(
+          ([, value]) => value !== undefined && value !== "",
+        );
+        const ordered = [...entries].sort(([left], [right]) => {
+          const leftIndex = DETAIL_ORDER.indexOf(left);
+          const rightIndex = DETAIL_ORDER.indexOf(right);
+          if (leftIndex === -1 && rightIndex === -1) return 0;
+          if (leftIndex === -1) return 1;
+          if (rightIndex === -1) return -1;
+          return leftIndex - rightIndex;
+        });
+        return ordered.map(([key, value]) => ({
+          label: detailLabel(key),
+          value: oneLine(value),
+        }));
+      })();
+
+  const existingLabels = new Set(baseDetails.map((item) => item.label.toLowerCase()));
+  const annotations: ApprovalDetail[] = [];
+
+  if (approval.taintSources?.length && !existingLabels.has("taint warning")) {
+    annotations.push({
+      label: "Taint warning",
+      value: oneLine(`Session read private data: ${approval.taintSources.join(", ")}`),
+    });
+  }
+  if (approval.repeatCount !== undefined && approval.repeatCount >= 2 && !existingLabels.has("repeat guard")) {
+    annotations.push({
+      label: "Repeat guard",
+      value: `Attempt #${approval.repeatCount} in this run`,
+    });
+  }
+  if (approval.ruleId && !existingLabels.has("rule")) {
+    annotations.push({
+      label: "Rule",
+      value: oneLine(approval.ruleId),
+    });
   }
 
-  const entries = Object.entries(approval.arguments).filter(([, value]) => value !== undefined && value !== "");
-  const ordered = [...entries].sort(([left], [right]) => {
-    const leftIndex = DETAIL_ORDER.indexOf(left);
-    const rightIndex = DETAIL_ORDER.indexOf(right);
-    if (leftIndex === -1 && rightIndex === -1) return 0;
-    if (leftIndex === -1) return 1;
-    if (rightIndex === -1) return -1;
-    return leftIndex - rightIndex;
-  });
-
-  return ordered.map(([key, value]) => ({
-    label: detailLabel(key),
-    value: oneLine(value),
-  }));
+  return [...annotations, ...baseDetails];
 }
