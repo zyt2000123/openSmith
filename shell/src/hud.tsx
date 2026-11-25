@@ -288,7 +288,16 @@ function withUniqueKeys<T>(items: T[], getKey: (item: T) => string): Array<{ ite
 
 function runningToolParts(running: Record<string, string>): HudPart[] {
   const names = Object.values(running);
-  return names.slice(-2).map((name) => [{ text: "◐", color: WARNING }, { text: " " }, { text: name, color: SESSION }]);
+  if (names.length <= 1) {
+    return names.map((name) => [{ text: "◐", color: WARNING }, { text: " " }, { text: name, color: SESSION }]);
+  }
+  const shown = names.slice(0, 3).join(", ");
+  const suffix = names.length > 3 ? ` +${names.length - 3}` : "";
+  return [[
+    { text: "◐", color: WARNING },
+    { text: ` ${names.length} tools: `, color: MUTED },
+    { text: `${shown}${suffix}`, color: SESSION },
+  ]];
 }
 
 function countedToolParts(counts: Record<string, number>, marker: string, color: string, limit: number): HudPart[] {

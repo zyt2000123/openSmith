@@ -167,6 +167,7 @@ class RunState:
     last_event_type: str | None = None
     current_skill: str | None = None
     current_tool: str | None = None
+    active_tools: list[dict[str, str]] = field(default_factory=list)
     reason: str | None = None
     error: str | None = None
     error_details: dict[str, object] | None = None
@@ -204,6 +205,8 @@ class RunState:
         *,
         current_skill: str | None = None,
         current_tool: str | None = None,
+        tool_call_id: str | None = None,
+        remove_tool_id: str | None = None,
         clear_skill: bool = False,
         clear_tool: bool = False,
     ) -> None:
@@ -214,8 +217,30 @@ class RunState:
         elif clear_skill:
             self.current_skill = None
         if current_tool is not None:
-            self.current_tool = _bounded_text(current_tool)
+            bounded_name = _bounded_text(current_tool)
+            bounded_id = _bounded_text(tool_call_id) or ""
+            if bounded_name is not None:
+                if bounded_id:
+                    self.active_tools = [
+                        entry for entry in self.active_tools if entry.get("id") != bounded_id
+                    ]
+                if len(self.active_tools) < 16:
+                    self.active_tools.append({"id": bounded_id, "name": bounded_name})
+                self.current_tool = self.active_tools[0]["name"]
+        elif remove_tool_id is not None:
+            bounded_id = _bounded_text(remove_tool_id)
+            if bounded_id is not None:
+                remaining = [
+                    entry for entry in self.active_tools if entry.get("id") != bounded_id
+                ]
+                if len(remaining) != len(self.active_tools):
+                    self.active_tools = remaining
+                elif self.active_tools:
+                    # Legacy start without id followed by result with id
+                    self.active_tools.pop(0)
+            self.current_tool = self.active_tools[0]["name"] if self.active_tools else None
         elif clear_tool:
+            self.active_tools = []
             self.current_tool = None
         self.updated_at = _now()
 
@@ -235,6 +260,7 @@ class RunState:
             "last_event_type": self.last_event_type,
             "current_skill": self.current_skill,
             "current_tool": self.current_tool,
+            "active_tools": [dict(entry) for entry in self.active_tools],
             "reason": self.reason,
             "error": self.error,
             "error_details": self.error_details,
@@ -259,6 +285,21 @@ class RunState:
         except (TypeError, ValueError) as exc:
             raise RunStateError("Invalid persisted run event sequence") from exc
 
+        raw_active_tools = data.get("active_tools")
+        active_tools: list[dict[str, str]] = []
+        if isinstance(raw_active_tools, list):
+            for entry in raw_active_tools[:16]:
+                if isinstance(entry, dict):
+                    name = _bounded_text(entry.get("name"))
+                    if name is not None:
+                        active_tools.append({
+                            "id": _bounded_text(entry.get("id")) or "",
+                            "name": name,
+                        })
+        current_tool = _bounded_text(data.get("current_tool"))
+        if current_tool is None and active_tools:
+            current_tool = active_tools[0]["name"]
+
         return cls(
             run_id=run_id,
             agent_id=agent_id,
@@ -273,7 +314,8 @@ class RunState:
             event_seq=parsed_event_seq,
             last_event_type=_bounded_text(data.get("last_event_type")),
             current_skill=_bounded_text(data.get("current_skill")),
-            current_tool=_bounded_text(data.get("current_tool")),
+            current_tool=current_tool,
+            active_tools=active_tools,
             reason=_bounded_text(data.get("reason")),
             error=_bounded_text(data.get("error")),
             error_details=_bounded_error_details(data.get("error_details")),
@@ -764,6 +806,8 @@ class RunStateStore:
         *,
         current_skill: str | None = None,
         current_tool: str | None = None,
+        tool_call_id: str | None = None,
+        remove_tool_id: str | None = None,
         clear_skill: bool = False,
         clear_tool: bool = False,
     ) -> RunState:
@@ -773,6 +817,8 @@ class RunStateStore:
                 event_type,
                 current_skill=current_skill,
                 current_tool=current_tool,
+                tool_call_id=tool_call_id,
+                remove_tool_id=remove_tool_id,
                 clear_skill=clear_skill,
                 clear_tool=clear_tool,
             )
@@ -834,6 +880,8 @@ def project_execution_event(
             kwargs["clear_skill"] = True
         elif event.type is EventType.TOOL_CALL_START:
             kwargs["current_tool"] = event.data.get("name")
+            if event.data.get("id") is not None:
+                kwargs["tool_call_id"] = event.data.get("id")
         elif event.type is EventType.TOOL_CALL_RESULT:
             if event.data.get("approval_required"):
                 store.request_approval(
@@ -869,7 +917,10 @@ def project_execution_event(
                     reason=f"approval_{approval_outcome}",
                 )
                 return
-            kwargs["clear_tool"] = True
+            if event.data.get("id") is not None:
+                kwargs["remove_tool_id"] = event.data.get("id")
+            else:
+                kwargs["clear_tool"] = True
         store.record_event(run_id, event_type, **kwargs)
     except (RunStateError, ValueError, TypeError):
         # Run control state must not take down an otherwise valid execution.

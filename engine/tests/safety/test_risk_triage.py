@@ -61,6 +61,9 @@ def test_risk_tier_ordering() -> None:
     assert RiskTier.max(RiskTier.ELEVATED, RiskTier.HIGH) is RiskTier.HIGH
     assert RiskTier.max(RiskTier.CRITICAL, RiskTier.HIGH) is RiskTier.CRITICAL
     assert RiskTier.HIGH.weight > RiskTier.ELEVATED.weight
+    assert RiskTier.ROUTINE < RiskTier.ELEVATED < RiskTier.HIGH < RiskTier.CRITICAL
+    assert not (RiskTier.ROUTINE >= RiskTier.HIGH)
+    assert RiskTier.CRITICAL >= RiskTier.HIGH
 
 
 def test_routine_read_is_not_approval_gated(tmp_path: Path) -> None:

@@ -345,6 +345,9 @@ class RepeatSensitiveChecker:
         self.config = config if config is not None else RepeatGuardConfig()
         self._counts: dict[BucketKey, int] = {}
 
+    def current_count(self, bucket: BucketKey) -> int:
+        return self._counts.get(bucket, 0)
+
     def next_count(self, bucket: BucketKey) -> int:
         return self._counts.get(bucket, 0) + 1
 

@@ -1743,6 +1743,58 @@ class ToolGuard:
         )
         return candidate
 
+    def repeat_guard_headroom(self, tool_call: ToolCall) -> tuple[BucketKey, int] | None:
+        """Return ``(bucket_key, remaining_before_trigger)`` if RepeatGuard tracks this call.
+
+        Read-only parallel batching calls this before queueing another call in
+        the same bucket so a batch can never slip past ``repeat_guard.threshold``
+        before ``record_post_execution`` increments the real counter.
+        """
+        if not self._safety_config.repeat_guard.enabled:
+            return None
+        definition = self._tool_registry.get(tool_call.name)
+        file_result = self._check_file_paths(tool_call)
+        dangerous_hit = self._check_dangerous_rules(tool_call) is not None
+        egress_target = resolve_egress_target(
+            tool_call,
+            definition,
+            working_dir=self.file_guard._working_dir,
+            sandbox_is_degraded=self._sandbox_is_degraded,
+            sandbox_allows_host_loopback=self._sandbox_allows_host_loopback,
+        )
+        is_tainted = bool(
+            self._safety_config.taint.enabled
+            and self._taint_store is not None
+            and self._taint_store.is_tainted
+        )
+        eval_risk = RiskTier.ROUTINE
+        if file_result is not None:
+            eval_risk = self._risk_for_file_result(file_result)
+        elif dangerous_hit or (
+            definition is not None
+            and definition.opaque_command
+            and self._sandbox_is_degraded
+        ):
+            eval_risk = RiskTier.CRITICAL
+        elif call_requests_network_egress(tool_call, definition):
+            eval_risk = RiskTier.HIGH
+
+        bucket_info = self._classify_call_bucket(
+            tool_call,
+            definition,
+            file_result=file_result,
+            dangerous_hit=dangerous_hit,
+            egress_target=egress_target,
+            tainted=is_tainted,
+            risk=eval_risk,
+        )
+        if bucket_info is None:
+            return None
+        bucket_key = bucket_info[0]
+        current = self._repeat_guard.current_count(bucket_key)
+        headroom = max(0, self._safety_config.repeat_guard.threshold - 1 - current)
+        return bucket_key, headroom
+
     def record_post_execution(
         self,
         tool_call: ToolCall,
