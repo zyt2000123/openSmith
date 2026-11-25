@@ -321,6 +321,7 @@ class SessionService:
         deleted = await self.session_repo.delete_owned(session_id, agent_id)
         if not deleted:
             raise HTTPException(404, "Session not found")
+        from common import config as common_config
         from engine.safety.taint import delete_session_taint
 
         delete_session_taint(common_config.PATHS.agent_dir, session_id)
