@@ -203,12 +203,26 @@ def test_macos_seatbelt_supports_extra_roots_share_ro_and_cache_mounts(
     assert env_res.exit_code not in (None, 0)
     assert "EXTRA_SECRET" not in env_res.stdout
 
-    # share_read_only is readable but not writable
+    # share_read_only is readable for normal files, NOT writable, and secrets inside it are denied (M4)
+    (ro / ".env").write_text("RO_ENV_SECRET=must-not-leak\n", encoding="utf-8")
+    (ro / "id_rsa").write_text("RO_KEY_SECRET=must-not-leak\n", encoding="utf-8")
     ro_read = asyncio.run(
         env.run_command(argv=["/bin/cat", str(ro / "tool.txt")], cwd=str(ws))
     )
     assert ro_read.exit_code == 0
     assert ro_read.stdout == "readonly-tool\n"
+
+    ro_secret_env = asyncio.run(
+        env.run_command(argv=["/bin/cat", str(ro / ".env")], cwd=str(ws))
+    )
+    assert ro_secret_env.exit_code not in (None, 0)
+    assert "RO_ENV_SECRET" not in ro_secret_env.stdout
+
+    ro_secret_key = asyncio.run(
+        env.run_command(argv=["/bin/cat", str(ro / "id_rsa")], cwd=str(ws))
+    )
+    assert ro_secret_key.exit_code not in (None, 0)
+    assert "RO_KEY_SECRET" not in ro_secret_key.stdout
 
     ro_write = asyncio.run(
         env.run_command(command=f"printf bad > '{ro}/mutated.txt'", cwd=str(ws))

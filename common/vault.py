@@ -271,7 +271,18 @@ class VaultStore:
         *,
         tool_name: str | None,
         target_domain: str | None,
+        require_explicit_mcp_scope: bool = True,
     ) -> None:
+        if (
+            require_explicit_mcp_scope
+            and tool_name is not None
+            and tool_name.startswith("mcp_")
+            and not entry.allowed_tools
+        ):
+            raise VaultScopeError(
+                f"[vault-scope-001] Vault key '{entry.name}' must declare "
+                f"allowed_tools before it can be used by MCP tool '{tool_name}'"
+            )
         if entry.allowed_tools and tool_name is not None:
             if not any(fnmatch.fnmatchcase(tool_name, pat) for pat in entry.allowed_tools):
                 raise VaultScopeError(
@@ -322,6 +333,7 @@ class VaultStore:
         tool_name: str | None = None,
         target_domain: str | None = None,
         entries: Mapping[str, VaultEntry] | None = None,
+        require_explicit_mcp_scope: bool = True,
     ) -> tuple[str, list[tuple[str, str]]]:
         """Resolve ``{{vault:NAME}}`` placeholders in ``text`` at the execution boundary."""
         if "{{vault:" not in text:
@@ -335,7 +347,10 @@ class VaultStore:
             if entry is None:
                 raise VaultError(f"[vault-scope-001] Unknown vault key: {key}")
             self._check_entry_scope(
-                entry, tool_name=tool_name, target_domain=target_domain
+                entry,
+                tool_name=tool_name,
+                target_domain=target_domain,
+                require_explicit_mcp_scope=require_explicit_mcp_scope,
             )
             used[key] = entry.value
             return entry.value

@@ -103,8 +103,9 @@ def test_bwrap_argv_enforces_seven_stage_mount_order_and_flags(tmp_path: Path) -
         assert flag in argv_offline
 
     # Stage ordering check:
-    # Stage 1 (/etc) < Stage 2 (--tmpfs $HOME) < Stage 3 (ro) < Stage 4 (cache)
-    # < Stage 5 (workspace/extra) < Stage 6 (sensitive blackhole) < Stage 7 (non-delegable ro)
+    # Stage 1 (/etc, --tmpfs /run, resolv.conf) < Stage 2 (--tmpfs $HOME) < Stage 3 (ro)
+    # < Stage 4 (cache) < Stage 5 (workspace/extra) < Stage 6 (sensitive blackhole)
+    # < Stage 7 (non-delegable ro)
     def idx_pair(*tokens: str) -> int:
         for i in range(len(argv_offline) - len(tokens) + 1):
             if tuple(argv_offline[i : i + len(tokens)]) == tokens:
@@ -112,7 +113,7 @@ def test_bwrap_argv_enforces_seven_stage_mount_order_and_flags(tmp_path: Path) -
         raise AssertionError(f"Sequence not found: {tokens} in {argv_offline}")
 
     i_etc = idx_pair("--ro-bind", "/etc", "/etc")
-    i_resolv = idx_pair("--ro-bind", "/dev/null", "/etc/resolv.conf")
+    i_run = idx_pair("--tmpfs", "/run")
     i_home = idx_pair("--tmpfs", str(fake_home.resolve()))
     i_ro = idx_pair("--ro-bind", str(ro.resolve()), str(ro.resolve()))
     i_cache = idx_pair("--bind", str(cache.resolve()), str(cache.resolve()))
@@ -122,11 +123,11 @@ def test_bwrap_argv_enforces_seven_stage_mount_order_and_flags(tmp_path: Path) -
     i_git_blackhole = idx_pair("--ro-bind", str(sdir), str((ws / ".git").resolve()))
     i_non_delegable = idx_pair("--ro-bind", str(provider.resolve()), str(provider.resolve()))
 
-    assert i_etc < i_resolv < i_home < i_ro < i_cache < i_ws < i_extra
+    assert i_etc < i_run < i_home < i_ro < i_cache < i_ws < i_extra
     assert i_extra < i_env_blackhole < i_non_delegable
     assert i_extra < i_git_blackhole < i_non_delegable
 
-    # Online mode omits --unshare-net and /dev/null resolv.conf, but keeps ALL FS isolation!
+    # Online mode omits --unshare-net, keeps ALL FS isolation!
     argv_online = env._build_bwrap_argv(
         bwrap_bin="/usr/bin/bwrap",
         resolved_cwd=str(ws.resolve()),
@@ -135,6 +136,7 @@ def test_bwrap_argv_enforces_seven_stage_mount_order_and_flags(tmp_path: Path) -
         network=True,
         sentinel_file=sfile,
         sentinel_dir=sdir,
+        resolv_is_symlink=False,
     )
     assert "--unshare-net" not in argv_online
     assert "/etc/resolv.conf" not in argv_online
@@ -142,6 +144,108 @@ def test_bwrap_argv_enforces_seven_stage_mount_order_and_flags(tmp_path: Path) -
     assert str(fake_home.resolve()) in argv_online
     assert str((ws / ".env").resolve()) in argv_online
     assert str(provider.resolve()) in argv_online
+
+
+def test_bwrap_handles_ubuntu_resolv_conf_symlink_and_smoke_test_uses_real_mounts(
+    tmp_path: Path,
+) -> None:
+    """H4: Ubuntu /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf works in
+    both offline and online modes, and smoke test exercises the real Stage 1 mounts."""
+    fake_home = tmp_path / "home"
+    ws = fake_home / "ws"
+    ro = fake_home / "ro-share"
+    for d in (ws, ro):
+        d.mkdir(parents=True)
+    # M4: secret placed inside share_read_only must also be blackholed by bwrap
+    (ro / ".env").write_text("RO_SECRET=1\n", encoding="utf-8")
+
+    cfg = SandboxProfileConfig(
+        auto_detect_toolchains=False,
+        auto_detect_caches=False,
+        share_read_only=(str(ro),),
+    )
+    profile = resolve_sandbox_profile(
+        ws, cfg, home=fake_home, data_dir=fake_home / ".agent-smith", platform="linux"
+    )
+    env = LinuxBwrapEnvironment(
+        workspace=ws,
+        profile=profile,
+        bwrap_binary="/usr/bin/bwrap",
+        host_home=fake_home,
+    )
+    sfile = tmp_path / "sfile"
+    sdir = tmp_path / "sdir"
+    sfile.write_bytes(b"")
+    sdir.mkdir()
+
+    stub_target = Path("/run/systemd/resolve/stub-resolv.conf")
+    safe_env = env._safe_environment(None)
+
+    def find_seq(argv: list[str], *tokens: str) -> int:
+        for i in range(len(argv) - len(tokens) + 1):
+            if tuple(argv[i : i + len(tokens)]) == tokens:
+                return i
+        raise AssertionError(f"Sequence not found: {tokens} in {argv}")
+
+    # Offline Ubuntu: --tmpfs /run comes BEFORE --ro-bind /dev/null /run/systemd/resolve/stub-resolv.conf
+    argv_off = env._build_bwrap_argv(
+        bwrap_bin="/usr/bin/bwrap",
+        resolved_cwd=str(ws.resolve()),
+        inner_argv=["/bin/true"],
+        env=safe_env,
+        network=False,
+        sentinel_file=sfile,
+        sentinel_dir=sdir,
+        resolv_is_symlink=True,
+        resolv_real_target=stub_target,
+    )
+    i_run_off = find_seq(argv_off, "--tmpfs", "/run")
+    i_null_stub = find_seq(argv_off, "--ro-bind", "/dev/null", str(stub_target))
+    assert i_run_off < i_null_stub
+    # M4: ro-share/.env is blackholed with sentinel_file after ro-share is mounted
+    i_ro = find_seq(argv_off, "--ro-bind", str(ro.resolve()), str(ro.resolve()))
+    i_ro_env = find_seq(argv_off, "--ro-bind", str(sfile), str((ro / ".env").resolve()))
+    assert i_ro < i_ro_env
+
+    # Online Ubuntu: --tmpfs /run comes BEFORE --ro-bind <stub> <stub> so DNS resolves
+    argv_on = env._build_bwrap_argv(
+        bwrap_bin="/usr/bin/bwrap",
+        resolved_cwd=str(ws.resolve()),
+        inner_argv=["/bin/true"],
+        env=safe_env,
+        network=True,
+        sentinel_file=sfile,
+        sentinel_dir=sdir,
+        resolv_is_symlink=True,
+        resolv_real_target=stub_target,
+    )
+    i_run_on = find_seq(argv_on, "--tmpfs", "/run")
+    i_real_stub = find_seq(argv_on, "--ro-bind", str(stub_target), str(stub_target))
+    assert i_run_on < i_real_stub
+
+    # Smoke test in probe_bwrap_availability uses real Stage 1 mounts including resolv.conf
+    captured_smoke: list[list[str]] = []
+
+    def fake_smoke(argv: list[str]) -> tuple[int, str]:
+        captured_smoke.append(argv)
+        return 0, ""
+
+    avail = probe_bwrap_availability(
+        bwrap_path="/usr/bin/bwrap",
+        unprivileged_userns_clone="1",
+        apparmor_restrict_userns="0",
+        in_container=False,
+        run_smoke=fake_smoke,
+        resolv_is_symlink=True,
+        resolv_real_target=stub_target,
+    )
+    assert avail.ready
+    assert captured_smoke
+    smoke = captured_smoke[0]
+    assert "--unshare-net" in smoke
+    assert "--etc" not in smoke
+    assert find_seq(smoke, "--ro-bind", "/etc", "/etc") < find_seq(smoke, "--tmpfs", "/run")
+    assert find_seq(smoke, "--tmpfs", "/run") < find_seq(smoke, "--ro-bind", "/dev/null", str(stub_target))
 
 
 def test_bwrap_availability_detects_missing_apparmor_and_userns_disabled() -> None:

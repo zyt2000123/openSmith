@@ -497,3 +497,137 @@ def test_web_crawl_enforces_allowed_egress_hosts_on_redirects_and_renderer_route
     assert html == "<html>ok</html>"
     assert continued == ["https://allowed.example.com/app.js"]
     assert aborted == ["https://evil.example.net/beacon.gif:blockedbyclient"]
+
+
+def test_git_push_host_respects_pushurl_insteadof_and_fails_closed_on_ambiguity(
+    tmp_path: Path,
+) -> None:
+    """M2: git push egress target must resolve actual push URL (pushurl/insteadOf) and fail closed."""
+    import subprocess
+    from engine.safety.taint import _extract_git_remote_host
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/org/repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    assert _extract_git_remote_host(repo) == "github.com"
+
+    # pushurl override must win over fetch url
+    subprocess.run(
+        ["git", "remote", "set-url", "--push", "origin", "https://evil-push.example.com/org/repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    assert _extract_git_remote_host(repo) == "evil-push.example.com"
+
+    # pushInsteadOf rewrite must be reflected by git remote get-url --push
+    # (unset explicit pushurl first because git only applies pushInsteadOf when
+    # no explicit pushurl is set).
+    subprocess.run(
+        ["git", "config", "--unset-all", "remote.origin.pushurl"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "url.https://rewritten.example.org/.pushInsteadOf", "https://github.com/"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    assert _extract_git_remote_host(repo) == "rewritten.example.org"
+
+    # Multiple pushurls pointing to different hosts fail closed to "unknown"
+    subprocess.run(
+        ["git", "config", "--add", "remote.origin.pushurl", "https://github.com/org/repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "--add", "remote.origin.pushurl", "https://evil-mirror.example.com/org/repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    assert _extract_git_remote_host(repo) == "unknown"
+
+    # Ambiguous multi-remote repo with no upstream/pushDefault fails closed to "unknown"
+    subprocess.run(
+        ["git", "remote", "add", "upstream", "https://gitlab.com/org/repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    assert _extract_git_remote_host(repo) == "unknown"
+
+
+def test_scoped_tool_registry_uses_subagent_child_guard_for_taint_allowlist_injection(
+    tmp_path: Path,
+) -> None:
+    """M3: ScopedToolRegistry bound to child_guard injects _allowed_egress_hosts when child is tainted."""
+    from engine.tool.registry import ScopedToolRegistry
+
+    seen_hosts: list[object] = []
+
+    def fake_web_fetch(*, url: str, _allowed_egress_hosts=None) -> str:
+        seen_hosts.append(_allowed_egress_hosts)
+        return f"fetched:{url}"
+
+    reg = ToolRegistry()
+    reg.register(
+        "web_fetch",
+        "fetch",
+        {"type": "object", "properties": {"url": {"type": "string"}}},
+        fake_web_fetch,
+        network_access=True,
+        egress=True,
+        egress_target_arg="url",
+        permission_level="read",
+        approval_policy="never",
+    )
+    parent_store = SessionTaintStore(state_dir=tmp_path / "agent", session_id="m3-parent")
+    parent_guard = ToolGuard(tmp_path / "missing.json", tool_registry=reg.definitions())
+    parent_guard.configure_safety(
+        SafetyConfig.from_profile_config(
+            {
+                "safety": {
+                    "taint": {
+                        "enabled": True,
+                        "on_egress": "deny",
+                        "egress_allowlist": ["allowed.example.com"],
+                    }
+                }
+            }
+        ),
+        taint_store=parent_store,
+    )
+    reg.bind_tool_guard(parent_guard)
+
+    child_guard, child_taint = parent_guard.fork_for_subagent()
+    # Parent is still clean; ONLY child becomes tainted
+    child_taint.record("sensitive_file", "read_file", "file:.env")
+    assert not parent_store.is_tainted
+    assert child_taint.is_tainted
+
+    scoped = ScopedToolRegistry(reg, ["web_fetch"], tool_guard=child_guard)
+    # 1. Blocked host rejected by child_guard backstop inside scoped.execute
+    blocked = asyncio.run(
+        scoped.execute(ToolCall(id="c1", name="web_fetch", arguments={"url": "https://evil.com"}))
+    )
+    assert blocked.is_error
+    assert "[taint-egress-001]" in blocked.content
+
+    # 2. Allowlisted host gets _allowed_egress_hosts injected from child_guard!
+    call_ok = ToolCall(id="c2", name="web_fetch", arguments={"url": "https://allowed.example.com/a"})
+    d_ok = child_guard.check(call_ok, audit=False)
+    with scoped.authorize_execution(call_ok, approval_id="a1", approval_scope=d_ok.approval_scope):
+        ok = asyncio.run(scoped.execute(call_ok))
+    assert not ok.is_error, ok.content
+    assert seen_hosts == [("allowed.example.com",)]

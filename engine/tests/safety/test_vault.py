@@ -244,3 +244,67 @@ def test_vault_redactor_weak_secret_only_redacts_when_resolved() -> None:
     assert "[REDACTED:vault:PIN]" in out
     assert "12345" in out
     assert keys == ["PIN"]
+
+
+def test_mcp_vault_is_opt_in_and_rejects_unscoped_vault_entries(tmp_path: Path) -> None:
+    """M1: MCP tools default accepts_vault_placeholders=False, and even when opted in,
+    unscoped vault entries (allowed_tools=[]) are rejected for MCP tools."""
+    from engine.mcp.client import MCPTool, register_mcp_tools_with_prefix
+
+    class _DummyClient:
+        async def call_tool(self, name, kwargs):
+            return f"called:{name}:{kwargs}"
+
+    reg = ToolRegistry()
+    asyncio.run(
+        register_mcp_tools_with_prefix(
+            reg,
+            _DummyClient(),  # type: ignore[arg-type]
+            prefix="mcp_default",
+            tools=[MCPTool(name="send", description="send", input_schema={"type": "object"})],
+        )
+    )
+    asyncio.run(
+        register_mcp_tools_with_prefix(
+            reg,
+            _DummyClient(),  # type: ignore[arg-type]
+            prefix="mcp_optin",
+            tools=[MCPTool(name="send", description="send", input_schema={"type": "object"})],
+            accepts_vault_placeholders=True,
+        )
+    )
+    assert reg.get("mcp_default_send").accepts_vault_placeholders is False
+    assert reg.get("mcp_optin_send").accepts_vault_placeholders is True
+
+    store = VaultStore(tmp_path / "vault.json")
+    store.set_secret("UNSCOPED_KEY", "secret-unscoped-1234567890")
+    store.set_secret(
+        "SCOPED_KEY",
+        "secret-scoped-1234567890",
+        allowed_tools=["mcp_optin_*"],
+    )
+
+    guard = ToolGuard(tmp_path / "missing.json", tool_registry=reg.definitions())
+    guard.configure_safety(vault_store=store)
+
+    # Default MCP server refuses any vault placeholder
+    d_default = guard.check(
+        ToolCall(id="m1", name="mcp_default_send", arguments={"token": "{{vault:SCOPED_KEY}}"})
+    )
+    assert not d_default.allowed and not d_default.approval_required
+    assert "[vault-shell-001]" in d_default.reason
+
+    # Opt-in MCP server STILL refuses unscoped vault entry (allowed_tools=[])
+    d_unscoped = guard.check(
+        ToolCall(id="m2", name="mcp_optin_send", arguments={"token": "{{vault:UNSCOPED_KEY}}"})
+    )
+    assert not d_unscoped.allowed and not d_unscoped.approval_required
+    assert "[vault-scope-001]" in d_unscoped.reason
+    assert "allowed_tools" in d_unscoped.reason
+
+    # Opt-in MCP server accepts explicitly scoped vault entry (subject to normal approval)
+    d_scoped = guard.check(
+        ToolCall(id="m3", name="mcp_optin_send", arguments={"token": "{{vault:SCOPED_KEY}}"})
+    )
+    assert d_scoped.approval_required
+    assert "[vault-scope-001]" not in d_scoped.reason

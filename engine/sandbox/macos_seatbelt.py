@@ -267,6 +267,10 @@ class MacOSSeatbeltEnvironment:
             parts.append(
                 build_sbpl_sensitive_deny_clauses(f"EXTRA_ROOT_{index}").rstrip("\n")
             )
+        for index, _ in enumerate(self._share_read_only):
+            parts.append(
+                build_sbpl_sensitive_deny_clauses(f"SHARE_RO_{index}").rstrip("\n")
+            )
         for index, _ in enumerate(self._cache_mounts):
             parts.append(
                 build_sbpl_sensitive_deny_clauses(f"CACHE_ROOT_{index}").rstrip("\n")

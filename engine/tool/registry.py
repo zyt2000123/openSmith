@@ -124,6 +124,10 @@ class ToolRegistry:
         self._wants_environment: set[str] = set()
         self._serial_locks: dict[str, asyncio.Lock] = {}
         self._tool_guard: ToolGuard | None = None
+        self._active_tool_guard: ContextVar[ToolGuard | None] = ContextVar(
+            f"agent_smith_active_tool_guard_{id(self)}",
+            default=None,
+        )
         self._vault_store: Any | None = None
         self._authorized_call: ContextVar[
             tuple[str, str | None, ApprovalScope | None] | None
@@ -131,6 +135,22 @@ class ToolRegistry:
             f"agent_smith_authorized_tool_call_{id(self)}",
             default=None,
         )
+
+    def _effective_tool_guard(self) -> ToolGuard | None:
+        override = self._active_tool_guard.get()
+        return override if override is not None else self._tool_guard
+
+    @contextmanager
+    def use_tool_guard(self, guard: ToolGuard | None) -> Iterator[None]:
+        """Task-locally override the active ToolGuard (used by ScopedToolRegistry/subagents)."""
+        if guard is None:
+            yield
+            return
+        token = self._active_tool_guard.set(guard)
+        try:
+            yield
+        finally:
+            self._active_tool_guard.reset(token)
 
     def bind_vault_store(self, vault_store: Any | None) -> None:
         """Bind a VaultStore for boundary-only placeholder resolution & redaction."""
@@ -661,9 +681,10 @@ class ToolRegistry:
 
         arguments: dict[str, Any] = dict(call.arguments)
         resolved_secrets: list[tuple[str, str]] = []
+        active_guard = self._effective_tool_guard()
         vault_store = self._vault_store
-        if vault_store is None and self._tool_guard is not None:
-            vault_store = getattr(self._tool_guard, "vault_store", None)
+        if vault_store is None and active_guard is not None:
+            vault_store = getattr(active_guard, "vault_store", None)
 
         all_vault_entries = None
         if vault_store is not None:
@@ -698,14 +719,14 @@ class ToolRegistry:
         # allowlisted host, pass the allowed host patterns so 3xx redirects are
         # re-validated at every hop (blocking open-redirect exfiltration).
         if (
-            self._tool_guard is not None
+            active_guard is not None
             and tool_name in {"web_fetch", "web_crawl"}
-            and getattr(self._tool_guard, "taint_store", None) is not None
-            and self._tool_guard.taint_store.is_tainted
-            and self._tool_guard.safety_config.taint.enabled
+            and getattr(active_guard, "taint_store", None) is not None
+            and active_guard.taint_store.is_tainted
+            and active_guard.safety_config.taint.enabled
         ):
             allowed_hosts = (
-                self._tool_guard.safety_config.taint.allowlist.allowed_http_host_patterns()
+                active_guard.safety_config.taint.allowlist.allowed_http_host_patterns()
             )
             if allowed_hosts:
                 arguments["_allowed_egress_hosts"] = allowed_hosts
@@ -821,10 +842,11 @@ class ToolRegistry:
         defn, func = entry
         approval_granted = False
         approval_scope: ApprovalScope | None = None
-        if self._tool_guard is not None:
+        active_guard = self._effective_tool_guard()
+        if active_guard is not None:
             # The ReAct loop already evaluated and audited this call; this is a
             # backstop for internal callers, so it must not log a second time.
-            decision = self._tool_guard.check(call, audit=False)
+            decision = active_guard.check(call, audit=False)
             authorization = self._authorized_call.get()
             authorized = (
                 authorization is not None
@@ -837,18 +859,6 @@ class ToolRegistry:
             )
             approval_scope = decision.approval_scope
 
-            # Auto-whitelist: when a path approval is granted, remember the
-            # approved path so subsequent accesses to the same location don't
-            # require re-approval.  Inside the ordinary allowed directories
-            # every sibling is already accessible, so the parent directory may
-            # be whitelisted as a no-op.  For an EXTERNAL path, directory
-            # granularity would silently grant the model every sibling file in
-            # an arbitrary directory (/etc, ~/Library, ...) — including
-            # credential-bearing names the name-based sensitive checks do not
-            # cover (master.passwd, shadow).  External approvals therefore
-            # whitelist exactly one path.  HIGH/CRITICAL approvals are never
-            # cached: sensitive paths (.ssh, .aws, .env, .git/config) and
-            # destructive operations require approval each time regardless.
             if (
                 approval_granted
                 and approval_scope is not None
@@ -858,13 +868,12 @@ class ToolRegistry:
                 from pathlib import Path
                 try:
                     target_path = Path(approval_scope.target).expanduser().resolve()
-                    inside_allowed = self._tool_guard.file_guard.is_inside_allowed_dirs(target_path)
+                    inside_allowed = active_guard.file_guard.is_inside_allowed_dirs(target_path)
                     if inside_allowed and (target_path.is_file() or not target_path.exists()):
-                        self._tool_guard.whitelist.allow_path(str(target_path.parent))
+                        active_guard.whitelist.allow_path(str(target_path.parent))
                     else:
-                        self._tool_guard.whitelist.allow_file(str(target_path))
+                        active_guard.whitelist.allow_file(str(target_path))
                 except (ValueError, OSError):
-                    # Path resolution failed; skip whitelist addition
                     pass
             # A project-boundary result is intentionally ``allowed=False``
             # until the approval broker grants the exact normalized call.  Do
@@ -909,16 +918,15 @@ class ToolRegistry:
         if (
             approval_granted
             and approval_scope is not None
-            and (
-                approval_scope.grants_host_execution
-                or approval_scope.grants_network_execution
-                or approval_scope.grants_sandbox_execution
-            )
+            and approval_scope.grants_sandbox_execution
         ):
             scoped_environment = getattr(environment, "with_approval_scope", None)
             if callable(scoped_environment):
                 environment = scoped_environment(approval_scope)
-            elif approval_scope.grants_host_execution or approval_scope.grants_network_execution:
+            elif required_env == "sandbox" and (
+                approval_scope.grants_host_execution
+                or approval_scope.grants_network_execution
+            ):
                 return ToolResult(
                     call_id=call.id,
                     content=(
@@ -959,8 +967,15 @@ class ToolRegistry:
 class ScopedToolRegistry:
     """A non-mutating view that narrows one ``ToolRegistry`` for a skill node."""
 
-    def __init__(self, registry: ToolRegistry, names: Iterable[str]) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        names: Iterable[str],
+        *,
+        tool_guard: ToolGuard | None = None,
+    ) -> None:
         self._registry = registry
+        self._tool_guard_override = tool_guard
         self._allowed = frozenset(
             _canonical_tool_name(name)
             for name in names
@@ -1061,6 +1076,9 @@ class ScopedToolRegistry:
                 is_error=True,
                 error_kind="tool_disabled",
             )
+        if self._tool_guard_override is not None and hasattr(self._registry, "use_tool_guard"):
+            with self._registry.use_tool_guard(self._tool_guard_override):
+                return await self._registry.execute(call)
         return await self._registry.execute(call)
 
 

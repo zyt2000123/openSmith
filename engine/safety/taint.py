@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -327,45 +328,109 @@ def detect_secret_in_text(text: str) -> bool:
     return _EMBEDDED_SECRET_RE.search(text) is not None
 
 
-def _extract_git_remote_host(repo_dir: Path | None) -> str:
-    if repo_dir is None:
-        return "unknown"
-    git_path = repo_dir / ".git"
-    config_file: Path | None = None
-    if git_path.is_dir():
-        config_file = git_path / "config"
-    elif git_path.is_file():
-        try:
-            text = git_path.read_text(encoding="utf-8", errors="ignore").strip()
-            if text.startswith("gitdir:"):
-                gdir = Path(text[len("gitdir:"):].strip())
-                if not gdir.is_absolute():
-                    gdir = repo_dir / gdir
-                cand = gdir / "config"
-                if cand.is_file():
-                    config_file = cand
-                elif gdir.parent.name == "worktrees" and (gdir.parent.parent / "config").is_file():
-                    config_file = gdir.parent.parent / "config"
-        except OSError:
-            return "unknown"
-    if config_file is None or not config_file.is_file():
-        return "unknown"
+def _run_git_readonly(repo_dir: Path, args: list[str]) -> str | None:
+    """Run a read-only git query without executing repo hooks/fsmonitor."""
     try:
-        content = config_file.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
+        proc = subprocess.run(
+            [
+                "git",
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "core.fsmonitor=false",
+                *args,
+            ],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env={
+                "PATH": os.environ.get("PATH") or os.defpath,
+                "HOME": str(repo_dir),
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _parse_git_url_host(url: str) -> str:
+    """Extract normalized remote hostname from a git push URL, or ``'unknown'``."""
+    trimmed = url.strip()
+    if not trimmed:
         return "unknown"
-    match = _GIT_REMOTE_URL_RE.search(content)
-    if not match:
-        return "unknown"
-    url = match.group(1).strip()
-    if "://" in url:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.hostname:
-            return parsed.hostname.lower().rstrip(".")
-    scp = _SSH_SCP_HOST_RE.match(url)
+    if "://" in trimmed:
+        parsed = urllib.parse.urlparse(trimmed)
+        if parsed.scheme.lower() == "file" or not parsed.hostname:
+            return "unknown"
+        return parsed.hostname.lower().rstrip(".")
+    scp = _SSH_SCP_HOST_RE.match(trimmed)
     if scp:
         return scp.group(1).lower().rstrip(".")
     return "unknown"
+
+
+def _resolve_git_push_remote(repo_dir: Path, *, branch: str = "") -> str | None:
+    """Resolve which remote ``git push`` will target, or ``None`` if ambiguous."""
+    # `git_ops.py` always runs `git push --set-upstream origin <branch>` when
+    # `branch` is provided; otherwise bare `git push` follows git's own rules.
+    if branch:
+        return "origin"
+    current_branch = _run_git_readonly(repo_dir, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    if current_branch:
+        push_remote = _run_git_readonly(
+            repo_dir, ["config", "--get", f"branch.{current_branch}.pushRemote"]
+        )
+        if push_remote:
+            return push_remote
+        push_default = _run_git_readonly(repo_dir, ["config", "--get", "remote.pushDefault"])
+        if push_default:
+            return push_default
+        branch_remote = _run_git_readonly(
+            repo_dir, ["config", "--get", f"branch.{current_branch}.remote"]
+        )
+        if branch_remote:
+            return branch_remote
+    else:
+        push_default = _run_git_readonly(repo_dir, ["config", "--get", "remote.pushDefault"])
+        if push_default:
+            return push_default
+
+    remotes_raw = _run_git_readonly(repo_dir, ["remote"])
+    if not remotes_raw:
+        return None
+    remotes = [r.strip() for r in remotes_raw.splitlines() if r.strip()]
+    if len(remotes) == 1:
+        return remotes[0]
+    # Multiple remotes with no upstream / pushDefault configured -> ambiguous, fail closed.
+    return None
+
+
+def _extract_git_remote_host(repo_dir: Path | None, *, branch: str = "") -> str:
+    """Resolve the effective push remote host via ``git remote get-url --push --all``.
+
+    Honors branch upstream remote, ``pushRemote``, ``remote.pushDefault``,
+    ``pushurl``, and ``url.<base>.insteadOf`` / ``pushInsteadOf``.  Fails
+    closed to ``"unknown"`` whenever the target remote, host, or multi-pushurl
+    set is ambiguous.
+    """
+    if repo_dir is None or not repo_dir.is_dir():
+        return "unknown"
+    remote = _resolve_git_push_remote(repo_dir, branch=branch)
+    if not remote:
+        return "unknown"
+    push_urls_raw = _run_git_readonly(repo_dir, ["remote", "get-url", "--push", "--all", remote])
+    if not push_urls_raw:
+        return "unknown"
+    hosts = {
+        _parse_git_url_host(line)
+        for line in push_urls_raw.splitlines()
+        if line.strip()
+    }
+    if len(hosts) != 1:
+        return "unknown"
+    return next(iter(hosts))
 
 
 def _mcp_server_name_from_tool(tool_name: str, defn: ToolDefinition | None) -> str:
@@ -415,7 +480,8 @@ def resolve_egress_target(
             return None
         cwd_raw = call.arguments.get("cwd")
         repo_path = Path(cwd_raw).expanduser() if isinstance(cwd_raw, str) and cwd_raw else working_dir
-        host = _extract_git_remote_host(repo_path)
+        branch_arg = str(call.arguments.get("branch") or "").strip()
+        host = _extract_git_remote_host(repo_path, branch=branch_arg)
         return EgressTarget(
             kind="git_remote",
             target=f"git:{host}",

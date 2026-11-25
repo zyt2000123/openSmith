@@ -167,6 +167,70 @@ def detect_bwrap_availability() -> BwrapAvailability:
     return probe_bwrap_availability()
 
 
+def _resolv_conf_bwrap_args(
+    *,
+    network: bool,
+    resolv_conf_path: Path | None = None,
+    resolv_is_symlink: bool | None = None,
+    resolv_real_target: Path | None = None,
+) -> list[str]:
+    """Build bwrap mount args for ``/etc/resolv.conf`` after ``--tmpfs /run``.
+
+    On Ubuntu/systemd-resolved, ``/etc/resolv.conf`` is a symlink into
+    ``/run/systemd/resolve/stub-resolv.conf``.  Mounting ``/dev/null`` directly
+    onto ``/etc/resolv.conf`` before ``/run`` exists fails in bwrap, while
+    mounting ``--tmpfs /run`` without re-binding the symlink target breaks DNS
+    when ``network=True``.  Handling regular files and symlinks explicitly
+    keeps both modes working cleanly.
+    """
+    resolv_path = resolv_conf_path if resolv_conf_path is not None else Path("/etc/resolv.conf")
+    if resolv_is_symlink is None:
+        try:
+            is_symlink = resolv_path.is_symlink()
+        except OSError:
+            is_symlink = False
+    else:
+        is_symlink = resolv_is_symlink
+
+    real_target: Path | None = resolv_real_target
+    if real_target is None and is_symlink:
+        try:
+            resolved = resolv_path.resolve(strict=False)
+            real_target = resolved
+        except OSError:
+            real_target = None
+
+    if not network:
+        if not is_symlink:
+            # Regular file (Debian/Alpine/Docker): mask directly when present.
+            if resolv_conf_path is not None or resolv_path.exists():
+                return ["--ro-bind", "/dev/null", "/etc/resolv.conf"]
+            return []
+        # Symlink (e.g. Ubuntu -> /run/systemd/resolve/stub-resolv.conf):
+        # Because `--tmpfs /run` and `--tmpfs /tmp` are mounted before this,
+        # binding `/dev/null` to a target under `/run` or `/tmp` succeeds and
+        # makes `/etc/resolv.conf` resolve to an empty file.
+        if real_target is not None:
+            target_str = str(real_target)
+            if target_str.startswith(("/run/", "/tmp/")):
+                return ["--ro-bind", "/dev/null", target_str]
+            if target_str.startswith("/etc/") and (
+                resolv_real_target is not None or real_target.exists()
+            ):
+                return ["--ro-bind", "/dev/null", target_str]
+        return []
+
+    # network=True: if `/etc/resolv.conf` is a symlink into `/run/` or `/tmp/`,
+    # re-bind the real host target read-only onto the empty tmpfs so DNS works
+    # while the rest of host `/run` (docker.sock, dbus, etc.) stays hidden.
+    if is_symlink and real_target is not None:
+        target_str = str(real_target)
+        if target_str.startswith(("/run/", "/tmp/")):
+            if resolv_real_target is not None or real_target.is_file():
+                return ["--ro-bind", target_str, target_str]
+    return []
+
+
 def probe_bwrap_availability(
     *,
     bwrap_path: str | None = None,
@@ -174,6 +238,8 @@ def probe_bwrap_availability(
     apparmor_restrict_userns: str | None = None,
     in_container: bool | None = None,
     run_smoke=None,
+    resolv_is_symlink: bool | None = None,
+    resolv_real_target: Path | None = None,
 ) -> BwrapAvailability:
     """Uncached probe (with injectable seams for unit tests across platforms)."""
     binary = bwrap_path if bwrap_path is not None else shutil.which("bwrap")
@@ -219,14 +285,35 @@ def probe_bwrap_availability(
     userns_disabled = userns_val == "0"
     apparmor_restricted = apparmor_val == "1"
 
+    # Use the same Stage 1 namespace + mount arguments as real invocations
+    # (including /etc, /proc, /dev, /tmp, /run, and resolv.conf handling) so
+    # doctor catches mount/symlink/userns failures immediately.
     smoke_argv = [
         binary,
         "--unshare-user",
         "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-net",
+        "--die-with-parent",
+        "--new-session",
         "--ro-bind", "/usr", "/usr",
         "--ro-bind-try", "/bin", "/bin",
+        "--ro-bind-try", "/sbin", "/sbin",
         "--ro-bind-try", "/lib", "/lib",
         "--ro-bind-try", "/lib64", "/lib64",
+        "--ro-bind-try", "/lib32", "/lib32",
+        "--ro-bind", "/etc", "/etc",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--tmpfs", "/run",
+        *_resolv_conf_bwrap_args(
+            network=False,
+            resolv_is_symlink=resolv_is_symlink,
+            resolv_real_target=resolv_real_target,
+        ),
+        "--clearenv",
         "--",
         "/bin/true",
     ]
@@ -522,6 +609,9 @@ class LinuxBwrapEnvironment:
         network: bool,
         sentinel_file: Path,
         sentinel_dir: Path,
+        resolv_is_symlink: bool | None = None,
+        resolv_real_target: Path | None = None,
+        sensitive_paths: list[tuple[Path, bool]] | None = None,
     ) -> list[str]:
         """Construct the exact 7-stage bubblewrap invocation."""
         args: list[str] = [
@@ -541,7 +631,10 @@ class LinuxBwrapEnvironment:
         else:
             args.extend(["--cap-drop", "ALL"])
 
-        # Stage 1: Base read-only OS skeleton & isolated /proc, /dev, /tmp, /run
+        # Stage 1: Base read-only OS skeleton & isolated /proc, /dev, /tmp, /run.
+        # Mount --tmpfs /run BEFORE handling /etc/resolv.conf so Ubuntu's
+        # /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf symlink
+        # resolves cleanly in both offline and online modes.
         args.extend([
             "--ro-bind", "/usr", "/usr",
             "--ro-bind-try", "/bin", "/bin",
@@ -550,15 +643,18 @@ class LinuxBwrapEnvironment:
             "--ro-bind-try", "/lib64", "/lib64",
             "--ro-bind-try", "/lib32", "/lib32",
             "--ro-bind", "/etc", "/etc",
-        ])
-        if not network:
-            args.extend(["--ro-bind", "/dev/null", "/etc/resolv.conf"])
-        args.extend([
             "--proc", "/proc",
             "--dev", "/dev",
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
         ])
+        args.extend(
+            _resolv_conf_bwrap_args(
+                network=network,
+                resolv_is_symlink=resolv_is_symlink,
+                resolv_real_target=resolv_real_target,
+            )
+        )
 
         # Stage 2: Shield host $HOME completely with empty tmpfs
         args.extend(["--tmpfs", str(self._host_home)])
@@ -575,11 +671,17 @@ class LinuxBwrapEnvironment:
         for rw_root in self._rw_workspace_roots:
             args.extend(["--bind", str(rw_root), str(rw_root)])
 
-        # Stage 6: Blackhole existing sensitive files/dirs inside writable trees
-        for target_path, is_dir in _find_sensitive_paths_under(
-            self._all_writable_roots,
-            self._runtime_secret_paths,
-        ):
+        # Stage 6: Blackhole existing sensitive files/dirs inside workspace,
+        # extra_roots, AND share_read_only trees (M4).
+        blackhole_targets = (
+            sensitive_paths
+            if sensitive_paths is not None
+            else _find_sensitive_paths_under(
+                (*self._rw_workspace_roots, *self._share_read_only),
+                self._runtime_secret_paths,
+            )
+        )
+        for target_path, is_dir in blackhole_targets:
             sentinel = sentinel_dir if is_dir else sentinel_file
             args.extend(["--ro-bind", str(sentinel), str(target_path)])
 

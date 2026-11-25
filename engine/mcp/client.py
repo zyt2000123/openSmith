@@ -661,7 +661,7 @@ async def register_mcp_tools_with_prefix(
     on_connection_failure: Any | None = None,
     reads_private_data: bool = False,
     egress: bool = True,
-    accepts_vault_placeholders: bool = True,
+    accepts_vault_placeholders: bool = False,
 ) -> int:
     """Discover MCP tools and register them into a ToolRegistry.
 

@@ -170,11 +170,19 @@ async def _run_one(
     # should still be able to run a type that prefers one.
     llm = llm_for_role.get(spec.model) or llm_for_role[DEFAULT_MODEL_ROLE]
 
+    child_guard = tool_guard
+    child_taint = None
+    if tool_guard is not None and hasattr(tool_guard, "fork_for_subagent"):
+        child_guard, child_taint = tool_guard.fork_for_subagent()
+
     # Belt and braces: the catalog already strips the spawn tool, but a spec
     # built directly (tests, embeddings) must not be able to recurse either.
+    # Bind child_guard so ToolRegistry's backstop check and taint allowlist
+    # injection see this sub-agent's live guard and taint store (M3).
     scoped = ScopedToolRegistry(
         tool_registry,
         [name for name in spec.tools if name != SUB_AGENT_TOOL_NAME],
+        tool_guard=child_guard,
     )
     text_parts: list[str] = []
     usage: dict[str, int] = {}
@@ -223,11 +231,6 @@ async def _run_one(
 
     if batch.exhausted:
         return outcome(False, error="batch token budget exhausted before start")
-
-    child_guard = tool_guard
-    child_taint = None
-    if tool_guard is not None and hasattr(tool_guard, "fork_for_subagent"):
-        child_guard, child_taint = tool_guard.fork_for_subagent()
 
     try:
         # ``use_fact_gate`` also displaces the parent's gate for anything in

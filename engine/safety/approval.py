@@ -140,7 +140,7 @@ class ApprovalScope:
 
     @property
     def grants_network_execution(self) -> bool:
-        return self.kind in {"sandbox_network", "host_command", "network"}
+        return self.kind in {"sandbox_network", "host_command"}
 
     @property
     def grants_sandbox_execution(self) -> bool:

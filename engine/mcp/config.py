@@ -70,7 +70,7 @@ async def register_configured_mcp_tools(
                     reads_private_data=bool(srv_cfg.get("reads_private_data", False)),
                     egress=bool(srv_cfg.get("egress", True)),
                     accepts_vault_placeholders=bool(
-                        srv_cfg.get("accepts_vault_placeholders", True)
+                        srv_cfg.get("accepts_vault_placeholders", False)
                     ),
                 )
             return MCPRegistration(
@@ -106,7 +106,7 @@ async def register_configured_mcp_tools(
                 reads_private_data=bool(srv.get("reads_private_data", False)),
                 egress=bool(srv.get("egress", True)),
                 accepts_vault_placeholders=bool(
-                    srv.get("accepts_vault_placeholders", True)
+                    srv.get("accepts_vault_placeholders", False)
                 ),
             )
         except Exception:
@@ -132,7 +132,10 @@ def _resolve_mcp_vault_mapping(
     for k, v in values.items():
         if isinstance(v, str) and "{{vault:" in v:
             resolved_val, _ = vault_store.resolve_string(
-                v, tool_name=f"{tool_prefix}_*", target_domain=target_domain
+                v,
+                tool_name=f"{tool_prefix}_*",
+                target_domain=target_domain,
+                require_explicit_mcp_scope=False,
             )
             resolved[str(k)] = resolved_val
         else:
@@ -179,7 +182,12 @@ def mcp_transport_from_config(config: dict, *, vault_store: Any | None = None):
         parsed_raw = urlparse(url)
         domain = parsed_raw.hostname.lower().rstrip(".") if parsed_raw.hostname else None
         if store is not None and "{{vault:" in url:
-            url, _ = store.resolve_string(url, tool_name=f"{prefix}_*", target_domain=domain)
+            url, _ = store.resolve_string(
+                url,
+                tool_name=f"{prefix}_*",
+                target_domain=domain,
+                require_explicit_mcp_scope=False,
+            )
         headers = _resolve_mcp_vault_mapping(
             config.get("headers") if isinstance(config.get("headers"), dict) else None,
             store,
