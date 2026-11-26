@@ -8,6 +8,7 @@ import { applyToolActivity, cancelRunningToolActivity, createToolActivity, type 
 import type {
   AgentHealth,
   AgentProfile,
+  ContextElision,
   ContextUsage,
   LlmConfig,
   McpServer,
@@ -19,6 +20,7 @@ import type {
   StreamEvent,
   TokenStats,
   TokenUsage,
+  TurnBudget,
 } from "./api.js";
 import { CONTEXT_DISPLAY_WINDOW } from "./api.js";
 import { createEmptyConversation } from "./conversation.js";
@@ -64,6 +66,8 @@ export type ChatChannelState = {
   turnTokenUsage: TokenUsage;
   tokenUsage: TokenUsage;
   contextUsage: ContextUsage;
+  turnBudget: TurnBudget | null;
+  lastElision: ContextElision | null;
   busy: boolean;
   compressing: boolean;
   runStartedAt: number | null;
@@ -89,6 +93,8 @@ export function createEmptyChannelState(session: Session | null = null): ChatCha
       context_percent: 0,
       estimated: true,
     },
+    turnBudget: null,
+    lastElision: null,
     busy: false,
     compressing: false,
     runStartedAt: null,
@@ -140,6 +146,8 @@ export type AppState = {
   turnTokenUsage: TokenUsage;
   tokenUsage: TokenUsage;
   contextUsage: ContextUsage;
+  turnBudget: TurnBudget | null;
+  lastElision: ContextElision | null;
   tokenStats: TokenStats | null;
   tokenTab: TokenTab;
   observabilityRuns: ObservabilityRun[] | null;
@@ -303,6 +311,7 @@ function applyDoneStreamState(state: AppState, event: Extract<StreamEvent, { typ
   const transcript = bounded.transcript ?? state.transcript;
   return {
     ...bounded,
+    ...(event.budget ? { turnBudget: event.budget } : {}),
     pendingApproval: null,
     approvalResolving: false,
     lastToolCallId: null,
@@ -329,6 +338,21 @@ function applyStreamState(state: AppState, event: StreamEvent): Partial<AppState
         output_tokens: state.tokenUsage.output_tokens + event.output_tokens,
         total_tokens: state.tokenUsage.total_tokens + event.total_tokens,
       },
+    };
+  }
+
+  if (event.type === "budget_update") {
+    const { type: _ignored, ...budget } = event;
+    return {
+      turnBudget: budget,
+    };
+  }
+
+  if (event.type === "context_actions_elided") {
+    const { type: _ignored, ...elision } = event;
+    return {
+      lastElision: elision,
+      ...applyBoundedStreamEvent(state, event),
     };
   }
 
@@ -419,6 +443,8 @@ function snapshotActiveChannel(state: AppState): ChatChannelState {
     turnTokenUsage: state.turnTokenUsage,
     tokenUsage: state.tokenUsage,
     contextUsage: state.contextUsage,
+    turnBudget: state.turnBudget,
+    lastElision: state.lastElision,
     busy: state.busy,
     compressing: state.compressing,
     runStartedAt: state.runStartedAt,
@@ -440,6 +466,8 @@ function projectChannelToState(channel: ChatChannelState): Partial<AppState> {
     turnTokenUsage: channel.turnTokenUsage,
     tokenUsage: channel.tokenUsage,
     contextUsage: channel.contextUsage,
+    turnBudget: channel.turnBudget,
+    lastElision: channel.lastElision,
     busy: channel.busy,
     compressing: channel.compressing,
     runStartedAt: channel.runStartedAt,
@@ -472,6 +500,8 @@ function applyBackgroundStreamEvent(channel: ChatChannelState, event: StreamEven
     turnTokenUsage: nextPartial.turnTokenUsage ?? channel.turnTokenUsage,
     tokenUsage: nextPartial.tokenUsage ?? channel.tokenUsage,
     contextUsage: nextPartial.contextUsage ?? channel.contextUsage,
+    turnBudget: "turnBudget" in nextPartial ? (nextPartial.turnBudget ?? null) : channel.turnBudget,
+    lastElision: "lastElision" in nextPartial ? (nextPartial.lastElision ?? null) : channel.lastElision,
     compressing: nextPartial.compressing ?? channel.compressing,
     recoverableRunId:
       "recoverableRunId" in nextPartial ? (nextPartial.recoverableRunId ?? null) : channel.recoverableRunId,
@@ -510,6 +540,8 @@ export function createAppStore(initialHistory: string[] = []) {
       context_percent: 0,
       estimated: true,
     },
+    turnBudget: null,
+    lastElision: null,
     tokenStats: null,
     tokenTab: "stats",
     observabilityRuns: null,
@@ -584,6 +616,8 @@ export function createAppStore(initialHistory: string[] = []) {
         ...appendTranscript(s, createTurnEntry(userText)),
         turnCount: s.turnCount + 1,
         turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        turnBudget: null,
+        lastElision: null,
         toolActivity: { ...s.toolActivity, calls: {}, running: {} },
       })),
     applyEvent: (event) => set((state) => clearApprovalOnToolResult(state, event, applyStreamState(state, event))),
@@ -611,6 +645,8 @@ export function createAppStore(initialHistory: string[] = []) {
           if ("turnTokenUsage" in partial && partial.turnTokenUsage) mapped.turnTokenUsage = partial.turnTokenUsage;
           if ("tokenUsage" in partial && partial.tokenUsage) mapped.tokenUsage = partial.tokenUsage;
           if ("contextUsage" in partial && partial.contextUsage) mapped.contextUsage = partial.contextUsage;
+          if ("turnBudget" in partial) mapped.turnBudget = partial.turnBudget ?? null;
+          if ("lastElision" in partial) mapped.lastElision = partial.lastElision ?? null;
           if ("busy" in partial && partial.busy !== undefined) mapped.busy = partial.busy;
           if ("compressing" in partial && partial.compressing !== undefined) mapped.compressing = partial.compressing;
           if ("runStartedAt" in partial) mapped.runStartedAt = partial.runStartedAt ?? null;
@@ -633,6 +669,8 @@ export function createAppStore(initialHistory: string[] = []) {
             ...appendTranscript(s, createTurnEntry(userText)),
             turnCount: s.turnCount + 1,
             turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            turnBudget: null,
+            lastElision: null,
             toolActivity: { ...s.toolActivity, calls: {}, running: {} },
           };
         }
@@ -644,6 +682,8 @@ export function createAppStore(initialHistory: string[] = []) {
             transcript: limitTranscript([...bg.transcript, createTurnEntry(userText)], TRANSCRIPT_LIMIT),
             turnCount: bg.turnCount + 1,
             turnTokenUsage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            turnBudget: null,
+            lastElision: null,
             toolActivity: { ...bg.toolActivity, calls: {}, running: {} },
           },
         };

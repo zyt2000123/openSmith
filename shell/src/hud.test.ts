@@ -4,11 +4,12 @@ import test from "node:test";
 import {
   buildRunProgressParts,
   displayContextPercent,
+  elisionActivityPart,
   formatElapsed,
   MEMORY_FAILURE_STREAK_THRESHOLD,
   memoryMaintenanceLabel,
 } from "./hud.js";
-import { MUTED } from "./theme.js";
+import { ERROR, MUTED, WARNING } from "./theme.js";
 
 test("formats active run duration for the status HUD", () => {
   assert.equal(formatElapsed(1_000, 1_000), "0s");
@@ -96,4 +97,66 @@ test("failures below the streak threshold stay invisible", () => {
 
 test("servers without the failure fields keep their old labels", () => {
   assert.equal(memoryMaintenanceLabel({ compile: "pending", dream: "idle" }), "memory queued");
+});
+
+// ── Single-turn TaskBudget & Context Elision HUD ──
+
+test("buildRunProgressParts renders three-dimensional budget progress and warning/error colors", () => {
+  const parts = buildRunProgressParts(
+    1_000,
+    { input_tokens: 0, output_tokens: 0, total_tokens: 48_200 },
+    75_000,
+    {
+      tokens_used: 48_200,
+      tokens_limit: 400_000,
+      subagent_tokens: 12_400,
+      estimated_tokens: 0,
+      wall_seconds: 74,
+      wall_limit: 600,
+      cost_usd: 1.7,
+      cost_limit: 2.0,
+      cost_unpriced: false,
+      exhausted_dimension: null,
+    },
+  );
+  const rendered = parts.map((part) => part.text).join("");
+  assert.equal(rendered, "  working (1m 14s/10m · ↓ 48.2k/400.0k tok (sub 12.4k) · $1.70/$2.00)");
+  // Cost is 85% of $2.00 -> WARNING color.
+  const costSeg = parts.find((p) => p.text.includes("$1.70/$2.00"));
+  assert.equal(costSeg?.color, WARNING);
+
+  // Exhausted dimension renders in ERROR color; unpriced cost shows $?/... unpriced.
+  const unpricedParts = buildRunProgressParts(
+    1_000,
+    { input_tokens: 0, output_tokens: 0, total_tokens: 390_000 },
+    11_000,
+    {
+      tokens_used: 390_000,
+      tokens_limit: 400_000,
+      subagent_tokens: 0,
+      estimated_tokens: 0,
+      wall_seconds: 10,
+      wall_limit: null,
+      cost_usd: null,
+      cost_limit: 2.0,
+      cost_unpriced: true,
+      exhausted_dimension: "tokens",
+    },
+  );
+  assert.equal(unpricedParts.find((p) => p.text.includes("390.0k/400.0k"))?.color, ERROR);
+  assert.ok(unpricedParts.some((p) => p.text.includes("$?/$2.00 unpriced")));
+});
+
+test("elisionActivityPart renders compact summary and stays empty when absent", () => {
+  assert.deepEqual(elisionActivityPart(null), []);
+  const parts = elisionActivityPart({
+    trigger: "message_cap",
+    elided_messages: 12,
+    recorded_actions: 4,
+    total_ledger_actions: 7,
+    evicted_actions: 0,
+    highlights: ["edit_file: engine/context/fitting.py"],
+  });
+  assert.equal(parts.length, 1);
+  assert.equal(parts[0]?.[0]?.text, "✂ elided 12 msgs · 7 actions kept");
 });

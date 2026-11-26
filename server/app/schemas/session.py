@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -43,12 +45,22 @@ class ContextCompressionOut(BaseModel):
     context_summary_cutoff: int
 
 
+class BudgetOverride(BaseModel):
+    """Optional per-request budget tightening (cannot raise platform limits)."""
+
+    max_total_tokens: int | None = Field(default=None, gt=0)
+    max_wall_seconds: float | None = Field(default=None, gt=0)
+    max_cost_usd: float | None = Field(default=None, gt=0)
+    unpriced_cost_policy: Literal["warn_only", "fail_closed"] | None = None
+
+
 class MessageCreate(BaseModel):
     content: str = Field(max_length=100_000)
     context: str | None = Field(default=None, max_length=50_000)
     skill_name: str | None = None
     identity_id: str | None = None
     working_dir: str = Field(min_length=1)
+    budget: BudgetOverride | None = None
 
     @field_validator("working_dir")
     @classmethod

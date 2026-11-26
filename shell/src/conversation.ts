@@ -1,5 +1,13 @@
 import { createToolActivity, type ToolActivity } from "./activity.js";
-import { CONTEXT_DISPLAY_WINDOW, type ContextUsage, type Session, type SkillSummary, type TokenUsage } from "./api.js";
+import {
+  CONTEXT_DISPLAY_WINDOW,
+  type ContextElision,
+  type ContextUsage,
+  type Session,
+  type SkillSummary,
+  type TokenUsage,
+  type TurnBudget,
+} from "./api.js";
 import type { QueuedMessage } from "./queue.js";
 import type { TranscriptEntry } from "./transcript-state.js";
 
@@ -13,6 +21,8 @@ export type EmptyConversation = {
   turnTokenUsage: TokenUsage;
   tokenUsage: TokenUsage;
   contextUsage: ContextUsage;
+  turnBudget: TurnBudget | null;
+  lastElision: ContextElision | null;
   pendingSkill: SkillSummary | null;
   queuedMessages: QueuedMessage[];
   inputLocked: boolean;
@@ -45,6 +55,8 @@ export function createEmptyConversation(panel: ConversationPanel, statusLine: st
       context_percent: 0,
       estimated: true,
     },
+    turnBudget: null,
+    lastElision: null,
     pendingSkill: null,
     queuedMessages: [],
     inputLocked: false,

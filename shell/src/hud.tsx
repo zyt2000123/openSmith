@@ -3,7 +3,14 @@ import { Box, Text } from "ink";
 import { Fragment, memo, type ReactNode, useEffect, useState } from "react";
 
 import type { ToolActivity } from "./activity.js";
-import { type ContextUsage, fetchMemoryMaintenance, type MemoryMaintenance, type TokenUsage } from "./api.js";
+import {
+  type ContextElision,
+  type ContextUsage,
+  fetchMemoryMaintenance,
+  type MemoryMaintenance,
+  type TokenUsage,
+  type TurnBudget,
+} from "./api.js";
 import { BORDER, ERROR, GIT, MODEL, MUTED, PROJECT, SESSION, SUCCESS, WARNING } from "./theme.js";
 import type { TranscriptViewMode } from "./transcript-state.js";
 import { useWindowSize } from "./window-size.js";
@@ -336,13 +343,30 @@ function memoryParts(maintenance: MemoryMaintenance | null): HudPart[] {
   return [[{ text: `☾ ${label}`, color: MUTED }]];
 }
 
-function collectToolParts(activity: ToolActivity, maintenance: MemoryMaintenance | null): HudPart[] {
+export function elisionActivityPart(elision: ContextElision | null | undefined): HudPart[] {
+  if (!elision || (elision.elided_messages <= 0 && elision.total_ledger_actions <= 0)) return [];
+  return [
+    [
+      {
+        text: `✂ elided ${elision.elided_messages} msg${elision.elided_messages === 1 ? "" : "s"} · ${elision.total_ledger_actions} action${elision.total_ledger_actions === 1 ? "" : "s"} kept`,
+        color: MUTED,
+      },
+    ],
+  ];
+}
+
+function collectToolParts(
+  activity: ToolActivity,
+  maintenance: MemoryMaintenance | null,
+  lastElision?: ContextElision | null,
+): HudPart[] {
   return [
     ...runningToolParts(activity.running),
     ...countedToolParts(activity.successes, "✓", SUCCESS, 4),
     ...countedToolParts(activity.blocked, "⛔", WARNING, 2),
     ...countedToolParts(activity.preflight, "◆", WARNING, 2),
     ...countedToolParts(activity.errors, "!", ERROR, 2),
+    ...elisionActivityPart(lastElision),
     ...memoryParts(maintenance),
   ];
 }
@@ -409,13 +433,14 @@ export const StatusHud = memo(function StatusHud(options: {
   tokenUsage: TokenUsage;
   contextUsage: ContextUsage;
   toolActivity: ToolActivity;
+  lastElision?: ContextElision | null;
 }) {
   const { columns } = useWindowSize();
   const gitBranch = useGitBranch(options.cwd);
   const maintenance = useMemoryMaintenance(options.baseUrl);
   const maxWidth = Math.max(1, columns - 4);
   const headerLines = wrapParts(buildHeaderParts({ ...options, gitBranch }), maxWidth);
-  const activityLines = wrapParts(collectToolParts(options.toolActivity, maintenance), maxWidth);
+  const activityLines = wrapParts(collectToolParts(options.toolActivity, maintenance, options.lastElision), maxWidth);
 
   return (
     <Box flexDirection="column">
@@ -443,29 +468,125 @@ export function formatElapsed(startedAt: number | null, now = Date.now()): strin
   return minutes > 0 ? `${minutes}m ${remainingSeconds}s` : `${remainingSeconds}s`;
 }
 
+function formatLimitSeconds(seconds: number): string {
+  const rounded = Math.max(1, Math.round(seconds));
+  if (rounded >= 60 && rounded % 60 === 0) return `${rounded / 60}m`;
+  if (rounded >= 60) return `${Math.floor(rounded / 60)}m${rounded % 60}s`;
+  return `${rounded}s`;
+}
+
+function budgetToneColor(ratio: number, exhausted: boolean): string {
+  if (exhausted || ratio >= 0.95) return ERROR;
+  if (ratio >= 0.8) return WARNING;
+  return MUTED;
+}
+
 export function buildRunProgressParts(
   startedAt: number | null,
   tokenUsage: TokenUsage,
   now = Date.now(),
+  turnBudget: TurnBudget | null = null,
 ): HudSegment[] {
+  const hasHardLimit =
+    turnBudget !== null &&
+    (turnBudget.tokens_limit !== null || turnBudget.wall_limit !== null || turnBudget.cost_limit !== null);
+
+  if (!hasHardLimit || turnBudget === null) {
+    const parts: HudSegment[] = [
+      { text: "  ", color: MUTED },
+      { text: "working ", color: MUTED },
+      { text: `(${formatElapsed(startedAt, now)}`, color: MUTED },
+    ];
+
+    if (tokenUsage.total_tokens > 0) {
+      parts.push(
+        { text: " · ↓ ", color: MUTED },
+        { text: `${formatTokenCount(tokenUsage.total_tokens)} tokens`, color: MUTED },
+      );
+    }
+
+    parts.push({ text: ")", color: MUTED });
+    return parts;
+  }
+
+  const elapsedSeconds = startedAt !== null ? Math.max(0, (now - startedAt) / 1_000) : turnBudget.wall_seconds;
+  const elapsedDisplay = formatElapsed(startedAt, now);
+  const wallColor =
+    turnBudget.wall_limit !== null && turnBudget.wall_limit > 0
+      ? budgetToneColor(
+          elapsedSeconds / turnBudget.wall_limit,
+          turnBudget.exhausted_dimension === "wall_seconds",
+        )
+      : MUTED;
+
   const parts: HudSegment[] = [
     { text: "  ", color: MUTED },
     { text: "working ", color: MUTED },
-    { text: `(${formatElapsed(startedAt, now)}`, color: MUTED },
+    { text: "(", color: MUTED },
+    {
+      text:
+        turnBudget.wall_limit !== null
+          ? `${elapsedDisplay}/${formatLimitSeconds(turnBudget.wall_limit)}`
+          : elapsedDisplay,
+      color: wallColor,
+    },
   ];
 
-  if (tokenUsage.total_tokens > 0) {
+  const usedTokens = Math.max(turnBudget.tokens_used, tokenUsage.total_tokens);
+  if (turnBudget.tokens_limit !== null && turnBudget.tokens_limit > 0) {
+    const tokColor = budgetToneColor(
+      usedTokens / turnBudget.tokens_limit,
+      turnBudget.exhausted_dimension === "tokens",
+    );
+    const subNote =
+      turnBudget.subagent_tokens > 0 ? ` (sub ${formatTokenCount(turnBudget.subagent_tokens)})` : "";
     parts.push(
       { text: " · ↓ ", color: MUTED },
-      { text: `${formatTokenCount(tokenUsage.total_tokens)} tokens`, color: MUTED },
+      {
+        text: `${formatTokenCount(usedTokens)}/${formatTokenCount(turnBudget.tokens_limit)} tok${subNote}`,
+        color: tokColor,
+      },
     );
+  } else if (usedTokens > 0) {
+    const subNote =
+      turnBudget.subagent_tokens > 0 ? ` (sub ${formatTokenCount(turnBudget.subagent_tokens)})` : "";
+    parts.push(
+      { text: " · ↓ ", color: MUTED },
+      { text: `${formatTokenCount(usedTokens)} tok${subNote}`, color: MUTED },
+    );
+  }
+
+  if (turnBudget.cost_limit !== null && turnBudget.cost_limit > 0) {
+    if (turnBudget.cost_unpriced && turnBudget.cost_usd === null) {
+      parts.push(
+        { text: " · ", color: MUTED },
+        { text: `$?/$${turnBudget.cost_limit.toFixed(2)} unpriced`, color: WARNING },
+      );
+    } else if (turnBudget.cost_usd !== null) {
+      const costColor = budgetToneColor(
+        turnBudget.cost_usd / turnBudget.cost_limit,
+        turnBudget.exhausted_dimension === "cost_usd",
+      );
+      parts.push(
+        { text: " · ", color: MUTED },
+        { text: `$${turnBudget.cost_usd.toFixed(2)}/$${turnBudget.cost_limit.toFixed(2)}`, color: costColor },
+      );
+    }
   }
 
   parts.push({ text: ")", color: MUTED });
   return parts;
 }
 
-export function RunProgress({ startedAt, tokenUsage }: { startedAt: number | null; tokenUsage: TokenUsage }) {
+export function RunProgress({
+  startedAt,
+  tokenUsage,
+  turnBudget = null,
+}: {
+  startedAt: number | null;
+  tokenUsage: TokenUsage;
+  turnBudget?: TurnBudget | null;
+}) {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -475,11 +596,13 @@ export function RunProgress({ startedAt, tokenUsage }: { startedAt: number | nul
 
   return (
     <Box>
-      {buildRunProgressParts(startedAt, tokenUsage, now).map((part) => (
-        <Text key={segmentKey(part)} color={part.color}>
-          {part.text}
-        </Text>
-      ))}
+      {withUniqueKeys(buildRunProgressParts(startedAt, tokenUsage, now, turnBudget), segmentKey).map(
+        ({ item: part, key }) => (
+          <Text key={key} color={part.color}>
+            {part.text}
+          </Text>
+        ),
+      )}
     </Box>
   );
 }

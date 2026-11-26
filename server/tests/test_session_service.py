@@ -1652,3 +1652,106 @@ async def test_session_turn_lock_serializes_concurrent_turns() -> None:
 
     module._SESSION_STREAM_LOCKS.clear()
     module._SESSION_STREAM_LOCK_USERS.clear()
+
+
+@pytest.mark.asyncio
+async def test_sse_forwards_budget_update_and_redacted_elision_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_build_engine_runtime(agent_id: str, name: str, *, session_id: str | None = None):
+        return SimpleNamespace(agent_id=agent_id, agent_name=name, session_id=session_id), object()
+
+    async def fake_engine_reply_events(request, runtime, services):
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="context_actions_elided"),
+            data={
+                "trigger": "message_cap",
+                "elided_messages": 12,
+                "recorded_actions": 2,
+                "total_ledger_actions": 5,
+                "evicted_actions": 0,
+                "highlights": [
+                    "shell: curl -H 'Authorization: Bearer sk-1234567890abcdef1234567890' https://example.com",
+                    "write_file: engine/context/action_ledger.py",
+                ],
+            },
+        )
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="budget_update"),
+            data={
+                "tokens_used": 12000,
+                "tokens_limit": 400000,
+                "subagent_tokens": 2000,
+                "estimated_tokens": 0,
+                "wall_seconds": 14.2,
+                "wall_limit": 600.0,
+                "cost_usd": 0.12,
+                "cost_limit": 2.0,
+                "cost_unpriced": False,
+                "exhausted_dimension": None,
+            },
+        )
+        yield SimpleNamespace(type=SimpleNamespace(value="text_delta"), data={"text": "done"})
+        yield SimpleNamespace(
+            type=SimpleNamespace(value="run_finished"),
+            data={
+                "run_id": "run-budget-sse",
+                "status": "completed",
+                "budget": {
+                    "limits": {
+                        "max_total_tokens": 400000,
+                        "max_wall_seconds": 600.0,
+                        "max_cost_usd": 2.0,
+                        "unpriced_cost_policy": "warn_only",
+                    },
+                    "spent_tokens": 12000,
+                    "subagent_tokens": 2000,
+                    "estimated_tokens": 0,
+                    "wall_seconds": 14.2,
+                    "spent_cost_usd": 0.12,
+                    "cost_unpriced": False,
+                    "exhausted_dimension": None,
+                },
+            },
+        )
+
+    monkeypatch.setattr(session_service_module, "build_engine_runtime", fake_build_engine_runtime)
+    monkeypatch.setattr(
+        session_service_module,
+        "engine_run_stream_with_runtime",
+        _fake_run(fake_engine_reply_events),
+    )
+
+    repo = FakeSessionRepo()
+    events = [
+        event
+        async for event in stream_prepared_message(
+            SessionService(repo, FakeAgentProfileRepo()),
+            "smith-id",
+            "sess-1",
+            "hello",
+        )
+    ]
+
+    elision_events = [e for e in events if e["event"] == "context_actions_elided"]
+    assert len(elision_events) == 1
+    elision_payload = json.loads(elision_events[0]["data"])
+    assert elision_payload["elided_messages"] == 12
+    assert elision_payload["total_ledger_actions"] == 5
+    # Server secondary redaction must scrub any secret-shaped token in highlights.
+    assert "sk-1234567890abcdef" not in json.dumps(elision_payload["highlights"])
+    assert "[REDACTED]" in elision_payload["highlights"][0]
+
+    budget_events = [e for e in events if e["event"] == "budget_update"]
+    assert len(budget_events) == 1
+    assert json.loads(budget_events[0]["data"])["tokens_used"] == 12000
+
+    done_payload = json.loads(events[-1]["data"])
+    assert done_payload["budget"]["tokens_used"] == 12000
+    assert done_payload["budget"]["tokens_limit"] == 400000
+
+    # Elision summaries and budget payloads must never pollute persisted messages.
+    assert repo.saved_messages == [
+        ("sess-1", "user", "hello"),
+        ("sess-1", "assistant", "done"),
+    ]

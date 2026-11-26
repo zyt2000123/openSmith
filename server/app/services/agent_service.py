@@ -176,6 +176,7 @@ class AgentService:
         skill_name: str | None = None,
         identity_id: str | None = None,
         working_dir: str | None = None,
+        budget: dict | None = None,
     ) -> AsyncGenerator[dict, None]:
         return await self.session_service.prepare_stream_message(
             await self._profile_id(),
@@ -185,6 +186,7 @@ class AgentService:
             skill_name=skill_name,
             identity_id=identity_id,
             working_dir=working_dir,
+            budget=budget,
         )
 
     async def prepare_resume_run(self, run_id: str) -> AsyncGenerator[dict, None]:

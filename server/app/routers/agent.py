@@ -160,6 +160,7 @@ async def stream_message(
         skill_name=body.skill_name,
         identity_id=body.identity_id,
         working_dir=body.working_dir,
+        budget=body.budget.model_dump(exclude_none=True) if body.budget is not None else None,
     )
     # ping keeps idle SSE connections (long LLM thinking turns) alive through
     # proxies that would otherwise time out the connection.
