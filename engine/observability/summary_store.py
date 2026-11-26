@@ -71,6 +71,16 @@ class RunSummaryRecord:
                 "token_usage": dict(self.summary.token_usage),
                 "outcome": self.summary.outcome,
                 "reason": self.summary.reason,
+                **(
+                    {"budget_summary": dict(self.summary.budget_summary)}
+                    if self.summary.budget_summary is not None
+                    else {}
+                ),
+                **(
+                    {"elided_actions_count": self.summary.elided_actions_count}
+                    if self.summary.elided_actions_count > 0
+                    else {}
+                ),
             },
         }
 
@@ -111,6 +121,12 @@ class RunSummaryRecord:
                 token_usage={str(key): _non_negative_int(item) for key, item in token_usage.items()},
                 outcome=_optional_text(summary.get("outcome")),
                 reason=_optional_text(summary.get("reason")),
+                budget_summary=(
+                    dict(summary["budget_summary"])
+                    if isinstance(summary.get("budget_summary"), dict)
+                    else None
+                ),
+                elided_actions_count=_non_negative_int(summary.get("elided_actions_count")),
             ),
         )
 
@@ -355,6 +371,12 @@ def _merge_summaries(previous: RunSummary, current: RunSummary) -> RunSummary:
         token_usage=_sum_maps(previous.token_usage, current.token_usage),
         outcome=current.outcome,
         reason=current.reason,
+        budget_summary=(
+            dict(current.budget_summary)
+            if current.budget_summary is not None
+            else (dict(previous.budget_summary) if previous.budget_summary is not None else None)
+        ),
+        elided_actions_count=max(previous.elided_actions_count, current.elided_actions_count),
     )
 
 

@@ -400,6 +400,81 @@ def resolve_price_table() -> dict[str, dict[str, float]]:
     return table
 
 
+def resolve_budget_config(
+    session_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the optional single-turn ``budget`` configuration.
+
+    Supports ``max_total_tokens`` (int | None), ``max_wall_seconds``
+    (float | None), ``max_cost_usd`` (float | None), and
+    ``unpriced_cost_policy`` (``"warn_only"`` | ``"fail_closed"``).
+    Unset keys default to ``None`` (unlimited) and ``"warn_only"``.
+    """
+    merged = merge_configs(_merged_base_config(), session_override or {})
+    raw_budget = merged.get("budget")
+    if raw_budget is None:
+        return {
+            "max_total_tokens": None,
+            "max_wall_seconds": None,
+            "max_cost_usd": None,
+            "unpriced_cost_policy": "warn_only",
+        }
+    if not isinstance(raw_budget, dict):
+        raise YamlConfigError("budget configuration must be a mapping")
+
+    allowed_keys = {
+        "max_total_tokens",
+        "max_wall_seconds",
+        "max_cost_usd",
+        "unpriced_cost_policy",
+    }
+    unknown = set(raw_budget) - allowed_keys
+    if unknown:
+        raise YamlConfigError(
+            f"Unknown budget configuration fields: {', '.join(sorted(unknown))}"
+        )
+
+    max_tokens = raw_budget.get("max_total_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+            raise YamlConfigError("budget.max_total_tokens must be a positive integer")
+
+    max_wall = raw_budget.get("max_wall_seconds")
+    if max_wall is not None:
+        if (
+            isinstance(max_wall, bool)
+            or not isinstance(max_wall, (int, float))
+            or not math.isfinite(max_wall)
+            or max_wall <= 0
+        ):
+            raise YamlConfigError("budget.max_wall_seconds must be a positive number")
+        max_wall = float(max_wall)
+
+    max_cost = raw_budget.get("max_cost_usd")
+    if max_cost is not None:
+        if (
+            isinstance(max_cost, bool)
+            or not isinstance(max_cost, (int, float))
+            or not math.isfinite(max_cost)
+            or max_cost <= 0
+        ):
+            raise YamlConfigError("budget.max_cost_usd must be a positive number")
+        max_cost = float(max_cost)
+
+    policy = raw_budget.get("unpriced_cost_policy", "warn_only")
+    if policy not in {"warn_only", "fail_closed"}:
+        raise YamlConfigError(
+            "budget.unpriced_cost_policy must be 'warn_only' or 'fail_closed'"
+        )
+
+    return {
+        "max_total_tokens": max_tokens,
+        "max_wall_seconds": max_wall,
+        "max_cost_usd": max_cost,
+        "unpriced_cost_policy": policy,
+    }
+
+
 def resolve_llm_config(
     session_override: dict[str, Any] | None = None,
     usage: LLMUsage | str = LLMUsage.INTERACTIVE,

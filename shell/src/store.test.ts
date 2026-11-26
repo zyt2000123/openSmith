@@ -265,3 +265,70 @@ test("a new turn clears per-call activity but keeps cumulative counts", () => {
   store.getState().applyEvent({ type: "tool_call", id: "call_0", name: "shell", hint: "" });
   assert.equal(Object.keys(store.getState().toolActivity.running).length, 1);
 });
+
+test("store updates and resets turnBudget and lastElision across turns", () => {
+  const store = createAppStore();
+  store.getState().pushTurn("refactor");
+
+  store.getState().applyEvent({
+    type: "budget_update",
+    tokens_used: 15_000,
+    tokens_limit: 400_000,
+    subagent_tokens: 3_000,
+    estimated_tokens: 0,
+    wall_seconds: 12.5,
+    wall_limit: 600,
+    cost_usd: 0.12,
+    cost_limit: 2.0,
+    cost_unpriced: false,
+    exhausted_dimension: null,
+  });
+  assert.equal(store.getState().turnBudget?.tokens_used, 15_000);
+  assert.equal(store.getState().turnBudget?.subagent_tokens, 3_000);
+
+  store.getState().applyEvent({
+    type: "context_actions_elided",
+    trigger: "message_cap",
+    elided_messages: 10,
+    recorded_actions: 2,
+    total_ledger_actions: 2,
+    evicted_actions: 0,
+    highlights: ["write_file: a.py"],
+  });
+  assert.equal(store.getState().lastElision?.total_ledger_actions, 2);
+  const turn = store.getState().transcript.find((entry) => entry.kind === "turn");
+  assert.ok(turn && turn.kind === "turn");
+  assert.ok(turn.blocks.some((block) => block.type === "elision" && block.totalLedgerActions === 2));
+
+  // Budget exhaustion done event records budget snapshot and keeps recoverableRunId.
+  store.getState().applyEvent({
+    type: "done",
+    runId: "run-budget-stop",
+    status: "incomplete",
+    reason: "budget_tokens_exhausted",
+    budget: {
+      tokens_used: 400_000,
+      tokens_limit: 400_000,
+      subagent_tokens: 3_000,
+      estimated_tokens: 0,
+      wall_seconds: 30,
+      wall_limit: 600,
+      cost_usd: 0.9,
+      cost_limit: 2.0,
+      cost_unpriced: false,
+      exhausted_dimension: "tokens",
+    },
+  });
+  assert.equal(store.getState().recoverableRunId, "run-budget-stop");
+  assert.equal(store.getState().turnBudget?.exhausted_dimension, "tokens");
+  assert.ok(
+    store
+      .getState()
+      .transcript.some((entry) => entry.kind === "system" && entry.text.includes("Token budget reached")),
+  );
+
+  // Starting a new turn resets per-turn budget and elision state.
+  store.getState().pushTurn("next turn");
+  assert.equal(store.getState().turnBudget, null);
+  assert.equal(store.getState().lastElision, null);
+});

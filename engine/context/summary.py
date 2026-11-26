@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import asyncio
+import inspect
 import json
 import logging
 import re
 from typing import Any
 
 from engine.llm.observability import llm_purpose
+from engine.llm.usage import USAGE_REPORTED_KEY
 
+from .action_ledger import is_elision_note
 from .budget import (
     context_budget_for,
     estimate_messages_tokens,
+    estimate_tokens,
     model_limits_for,
 )
 
@@ -98,9 +103,22 @@ class SessionSummaryResult:
         return self.status is SessionSummaryStatus.COMPLETE
 
 
+def _supports_max_tokens_kwarg(fn: object) -> bool:
+    try:
+        sig = inspect.signature(fn)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "max_tokens":
+            return True
+    return False
+
+
 async def summarize_session(
     conversation: list[dict[str, Any]],
     llm: object,
+    *,
+    task_budget: Any | None = None,
 ) -> SessionSummaryResult:
     """Generate a bounded summary and report its validity explicitly."""
     request, source_was_trimmed = _summary_request(conversation)
@@ -121,9 +139,92 @@ async def summarize_session(
             input_was_trimmed=input_was_trimmed,
         )
 
-    with llm_purpose("compact"):
-        response = await llm.chat(request)
+    reservation = None
+    clamped_max_tokens: int | None = None
+    if task_budget is not None:
+        desired_out = model_limits_for(llm).max_output_tokens
+        model_name = str(getattr(llm, "model", "") or "")
+        thinking = bool(getattr(getattr(llm, "adapter", llm), "thinking", False))
+        check = task_budget.reserve_for_call(
+            estimated_input_tokens=request_tokens,
+            desired_max_output_tokens=desired_out,
+            model=model_name,
+            thinking=thinking,
+        )
+        if not check.allowed:
+            return SessionSummaryResult(
+                status=SessionSummaryStatus.UNFIT,
+                summary="",
+                source_message_count=len(conversation),
+                finish_reason=None,
+                request_tokens=request_tokens,
+                safe_input_budget=budget,
+                input_was_trimmed=input_was_trimmed,
+            )
+        reservation = check.reservation
+        if reservation is not None and reservation.reserved_output_tokens < desired_out:
+            clamped_max_tokens = reservation.reserved_output_tokens
+
+    response = None
+    try:
+        with llm_purpose("compact"):
+            chat_fn = llm.chat
+            call_coro = (
+                chat_fn(request, max_tokens=clamped_max_tokens)
+                if clamped_max_tokens is not None and _supports_max_tokens_kwarg(chat_fn)
+                else chat_fn(request)
+            )
+            if reservation is not None and reservation.timeout_seconds is not None:
+                async with asyncio.timeout(reservation.timeout_seconds):
+                    response = await call_coro
+            else:
+                response = await call_coro
+    except TimeoutError:
+        if task_budget is not None:
+            task_budget.release(reservation)
+            task_budget.trip("wall_seconds")
+        return SessionSummaryResult(
+            status=SessionSummaryStatus.UNFIT,
+            summary="",
+            source_message_count=len(conversation),
+            finish_reason=None,
+            request_tokens=request_tokens,
+            safe_input_budget=budget,
+            input_was_trimmed=input_was_trimmed,
+        )
+    except Exception:
+        if task_budget is not None:
+            task_budget.release(reservation)
+        raise
+
     summary = (getattr(response, "text", "") or "").strip()
+    if task_budget is not None:
+        raw_usage = getattr(response, "usage", None)
+        if isinstance(raw_usage, dict) and any(
+            isinstance(raw_usage.get(k), int) and raw_usage.get(k, 0) > 0
+            for k in ("input_tokens", "output_tokens", "total_tokens", "prompt_tokens", "completion_tokens")
+        ):
+            task_budget.reconcile(
+                reservation,
+                usage=raw_usage,
+                model=str(getattr(response, "model", "") or getattr(llm, "model", "") or ""),
+                estimated=False,
+            )
+        else:
+            out_est = estimate_tokens(summary + (getattr(response, "reasoning", "") or ""))
+            task_budget.reconcile(
+                reservation,
+                usage={
+                    "input_tokens": request_tokens,
+                    "output_tokens": out_est,
+                    "total_tokens": request_tokens + out_est,
+                    USAGE_REPORTED_KEY: 0,
+                    "estimated": True,
+                },
+                model=str(getattr(response, "model", "") or getattr(llm, "model", "") or ""),
+                estimated=True,
+            )
+
     finish_reason = getattr(response, "finish_reason", None)
     if not summary:
         status = SessionSummaryStatus.EMPTY
@@ -186,6 +287,11 @@ def _summary_request(
         role = message.get("role", "")
         content = message.get("content", "")
         if role == "system":
+            if is_elision_note(message) and isinstance(content, str) and content:
+                messages.append({
+                    "role": "user",
+                    "content": f"[Elided earlier actions]\n{content[:3000]}",
+                })
             continue
         if role == "tool":
             if isinstance(content, str) and content:

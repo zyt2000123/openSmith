@@ -113,9 +113,27 @@ async def run_pipeline(
     # a backtrack re-runs an earlier portion of the chain.
     fallback_reasons: dict[int, str] = {}
     from engine.execution.steering import SteeringMessage, format_steering_message
+    from engine.execution.task_budget import current_task_budget
     accumulated_steers: list[SteeringMessage] = []
 
     while node_idx < len(chain.nodes):
+        active_budget = current_task_budget()
+        if active_budget is not None and (
+            active_budget.exhausted or not active_budget.check_wall_clock()
+        ):
+            snap = active_budget.snapshot()
+            reason = active_budget.stop_reason or "budget_tokens_exhausted"
+            yield ExecutionEvent(EventType.BUDGET_UPDATE, snap.to_update_event_data())
+            yield ExecutionEvent(
+                EventType.TEXT_DELTA,
+                {"text": active_budget.format_exhausted_notice()},
+            )
+            yield ExecutionEvent(
+                EventType.INCOMPLETE,
+                {"reason": reason, "budget": snap.to_dict()},
+            )
+            yield ExecutionEvent(EventType.DONE, {})
+            return
         node = chain.nodes[node_idx]
 
         if node.condition is not None and not node.condition(context):

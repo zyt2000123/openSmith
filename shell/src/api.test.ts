@@ -399,6 +399,50 @@ test("SSE decoder preserves provisional lifecycle events", () => {
   });
 });
 
+test("SSE decoder parses budget_update, context_actions_elided, and done.budget", () => {
+  assert.deepEqual(
+    decodeSseEvent(
+      'event: budget_update\ndata: {"tokens_used":5000,"tokens_limit":100000,"subagent_tokens":1000,"estimated_tokens":0,"wall_seconds":12.5,"wall_limit":600,"cost_usd":0.05,"cost_limit":2.0,"cost_unpriced":false,"exhausted_dimension":null}',
+    ),
+    {
+      type: "budget_update",
+      tokens_used: 5000,
+      tokens_limit: 100000,
+      subagent_tokens: 1000,
+      estimated_tokens: 0,
+      wall_seconds: 12.5,
+      wall_limit: 600,
+      cost_usd: 0.05,
+      cost_limit: 2.0,
+      cost_unpriced: false,
+      exhausted_dimension: null,
+    },
+  );
+  assert.deepEqual(
+    decodeSseEvent(
+      'event: context_actions_elided\ndata: {"trigger":"message_cap","elided_messages":8,"recorded_actions":2,"total_ledger_actions":5,"evicted_actions":0,"highlights":["write_file: a.py"]}',
+    ),
+    {
+      type: "context_actions_elided",
+      trigger: "message_cap",
+      elided_messages: 8,
+      recorded_actions: 2,
+      total_ledger_actions: 5,
+      evicted_actions: 0,
+      highlights: ["write_file: a.py"],
+    },
+  );
+  const done = decodeSseEvent(
+    'event: done\ndata: {"id":"m1","run_id":"r1","status":"incomplete","reason":"budget_tokens_exhausted","budget":{"tokens_used":100000,"tokens_limit":100000,"subagent_tokens":0,"estimated_tokens":0,"wall_seconds":20,"wall_limit":600,"cost_usd":null,"cost_limit":null,"cost_unpriced":false,"exhausted_dimension":"tokens"}}',
+  );
+  assert.equal(done?.type, "done");
+  if (done?.type === "done") {
+    assert.equal(done.reason, "budget_tokens_exhausted");
+    assert.equal(done.budget?.tokens_used, 100000);
+    assert.equal(done.budget?.exhausted_dimension, "tokens");
+  }
+});
+
 test("streamMessage stops after done even when the SSE body stays open", async () => {
   const originalFetch = globalThis.fetch;
   let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;

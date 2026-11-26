@@ -77,12 +77,29 @@ export type SteeringBlock = {
   state: "queued" | "applied";
 };
 
+export type ElisionBlock = {
+  id: string;
+  type: "elision";
+  trigger: string;
+  elidedMessages: number;
+  recordedActions: number;
+  totalLedgerActions: number;
+  highlights: string[];
+};
+
 export type ProvisionalText = {
   provisionId: string;
   text: string;
 };
 
-export type TurnBlock = ThinkingBlock | ToolBlock | SkillBlock | SmithUiBlock | SmithUiFallbackBlock | SteeringBlock;
+export type TurnBlock =
+  | ThinkingBlock
+  | ToolBlock
+  | SkillBlock
+  | SmithUiBlock
+  | SmithUiFallbackBlock
+  | SteeringBlock
+  | ElisionBlock;
 
 export type TurnEntry = {
   id: string;
@@ -673,11 +690,31 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
     case "token_usage":
       return entries;
 
+    case "budget_update":
+      return entries;
+
+    case "context_actions_elided":
+      return updateLastTurn(entries, (turn) => ({
+        ...turn,
+        blocks: [
+          ...finishThinkingBlocks(turn.blocks),
+          {
+            id: createId(),
+            type: "elision",
+            trigger: event.trigger,
+            elidedMessages: event.elided_messages,
+            recordedActions: event.recorded_actions,
+            totalLedgerActions: event.total_ledger_actions,
+            highlights: event.highlights,
+          },
+        ],
+      }));
+
     case "context_usage":
     case "compression":
       return entries;
 
-    case "done":
+    case "done": {
       // Several legitimate server sequences end a turn without a terminal
       // event for every block: a pipeline node skipped after a backtrack gets
       // no SKILL_END, and an exception between TOOL_CALL_START and its result
@@ -685,7 +722,30 @@ export function applyStreamEvent(entries: TranscriptEntry[], event: StreamEvent)
       // those blocks leaves a permanent "running" card burned into <Static>.
       if (event.reason === "awaiting_user_input") return markLatestTurnWaitingForInput(entries);
       if (event.status === "failed") return interruptLatestTurn(entries, "error");
-      return interruptLatestTurn(entries, "cancelled", "Ended without a result.");
+      const closed = interruptLatestTurn(entries, "cancelled", "Ended without a result.");
+      if (
+        event.reason === "budget_tokens_exhausted" ||
+        event.reason === "budget_wall_time_exhausted" ||
+        event.reason === "budget_cost_exhausted"
+      ) {
+        const label =
+          event.reason === "budget_tokens_exhausted"
+            ? "Token budget reached"
+            : event.reason === "budget_wall_time_exhausted"
+              ? "Wall-clock budget reached"
+              : "Cost budget reached";
+        const summary = event.budget
+          ? ` (${event.budget.tokens_used} tok · ${event.budget.wall_seconds.toFixed(1)}s${
+              event.budget.cost_usd !== null ? ` · $${event.budget.cost_usd.toFixed(4)}` : ""
+            })`
+          : "";
+        return [
+          ...closed,
+          createSystemEntry(`${label}${summary}. Adjust turn budget limits or resume to continue.`, "info"),
+        ];
+      }
+      return closed;
+    }
   }
 }
 

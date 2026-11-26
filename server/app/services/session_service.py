@@ -17,6 +17,7 @@ from engine.execution import (
     RunStateStore,
     RunStatus,
     STEERING_BROKER,
+    TaskBudgetLimits,
     raw_text_delta,
     run_stream_with_runtime as engine_run_stream_with_runtime,
     resume_stream_with_runtime as engine_resume_stream_with_runtime,
@@ -767,6 +768,7 @@ class SessionService:
         identity_id: str | None = None,
         working_dir: str | None = None,
         *,
+        budget: dict | None = None,
         _history_override: list[dict] | None = None,
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
@@ -791,6 +793,7 @@ class SessionService:
             context=context,
             skill_name=skill_name,
             working_dir=working_dir,
+            budget=budget,
             _history_override=_history_override,
             _resume_run_id=_resume_run_id,
             _message_id=_message_id,
@@ -809,6 +812,7 @@ class SessionService:
         context: str | None = None,
         skill_name: str | None = None,
         working_dir: str | None = None,
+        budget: dict | None = None,
         _history_override: list[dict] | None = None,
         _resume_run_id: str | None = None,
         _message_id: str | None = None,
@@ -829,6 +833,7 @@ class SessionService:
         terminal_status = "completed"
         terminal_reason: str | None = None
         terminal_notice: str | None = None
+        terminal_budget: dict | None = None
         try:
             # Serialize history-read + user-message insert: two concurrent turns
             # both read before either inserts, so each run's context would omit
@@ -874,6 +879,14 @@ class SessionService:
                             ]
             runtime, services = await self._build_runtime(agent_id, profile_name, session_id)
             model_name = str(getattr(getattr(services, "llm", None), "model", "") or "")
+            budget_limits = None
+            if isinstance(budget, dict) and budget:
+                budget_limits = TaskBudgetLimits(
+                    max_total_tokens=budget.get("max_total_tokens"),
+                    max_wall_seconds=budget.get("max_wall_seconds"),
+                    max_cost_usd=budget.get("max_cost_usd"),
+                    unpriced_cost_policy=budget.get("unpriced_cost_policy", "warn_only"),
+                )
             request = EngineRequest(
                 message=content,
                 history=history,
@@ -886,6 +899,7 @@ class SessionService:
                 steering_history=steering_history,
                 ephemeral=is_side,
                 read_only_tools=is_side,
+                budget=budget_limits,
             )
             if _resume_run_id is None:
                 # RunStateStore.create() fsyncs; keep the blocking I/O off the
@@ -1100,6 +1114,33 @@ class SessionService:
                         ),
                         "fit_status": str(ev.data.get("fit_status", "unknown")),
                     })
+                elif t == "budget_update":
+                    yield sse("budget_update", {
+                        "tokens_used": ev.data.get("tokens_used", 0),
+                        "tokens_limit": ev.data.get("tokens_limit"),
+                        "subagent_tokens": ev.data.get("subagent_tokens", 0),
+                        "estimated_tokens": ev.data.get("estimated_tokens", 0),
+                        "wall_seconds": ev.data.get("wall_seconds", 0.0),
+                        "wall_limit": ev.data.get("wall_limit"),
+                        "cost_usd": ev.data.get("cost_usd"),
+                        "cost_limit": ev.data.get("cost_limit"),
+                        "cost_unpriced": bool(ev.data.get("cost_unpriced", False)),
+                        "exhausted_dimension": ev.data.get("exhausted_dimension"),
+                    })
+                elif t == "context_actions_elided":
+                    raw_highlights = ev.data.get("highlights")
+                    safe_highlights = [
+                        _redact_secrets_in_text(str(item))[:200]
+                        for item in (raw_highlights if isinstance(raw_highlights, list) else [])[:5]
+                    ]
+                    yield sse("context_actions_elided", {
+                        "trigger": str(ev.data.get("trigger", "message_cap")),
+                        "elided_messages": ev.data.get("elided_messages", 0),
+                        "recorded_actions": ev.data.get("recorded_actions", 0),
+                        "total_ledger_actions": ev.data.get("total_ledger_actions", 0),
+                        "evicted_actions": ev.data.get("evicted_actions", 0),
+                        "highlights": safe_highlights,
+                    })
                 elif t == "context_compression_start":
                     yield sse("compression", {"active": True})
                 elif t == "context_compression_end":
@@ -1116,6 +1157,21 @@ class SessionService:
                         terminal_status = status
                     reason = ev.data.get("reason")
                     terminal_reason = reason if isinstance(reason, str) and reason else None
+                    raw_budget = ev.data.get("budget")
+                    if isinstance(raw_budget, dict):
+                        limits = raw_budget.get("limits") if isinstance(raw_budget.get("limits"), dict) else {}
+                        terminal_budget = {
+                            "tokens_used": raw_budget.get("spent_tokens", 0),
+                            "tokens_limit": limits.get("max_total_tokens"),
+                            "subagent_tokens": raw_budget.get("subagent_tokens", 0),
+                            "estimated_tokens": raw_budget.get("estimated_tokens", 0),
+                            "wall_seconds": raw_budget.get("wall_seconds", 0.0),
+                            "wall_limit": limits.get("max_wall_seconds"),
+                            "cost_usd": raw_budget.get("spent_cost_usd"),
+                            "cost_limit": limits.get("max_cost_usd"),
+                            "cost_unpriced": bool(raw_budget.get("cost_unpriced", False)),
+                            "exhausted_dimension": raw_budget.get("exhausted_dimension"),
+                        }
                     if ev.data.get("memory_persist_failed"):
                         yield sse(
                             "message",
@@ -1195,4 +1251,6 @@ class SessionService:
             done_payload["run_id"] = run_id
         if terminal_reason:
             done_payload["reason"] = terminal_reason
+        if terminal_budget is not None:
+            done_payload["budget"] = terminal_budget
         yield sse("done", done_payload)

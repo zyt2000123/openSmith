@@ -18,6 +18,10 @@ from typing import Any
 from common.hash_chain import ChainVerification, HashChainLog
 from common.paths import PRIVATE_DIR_MODE
 from engine.execution.events import EventType, ExecutionEvent
+from engine.safety.redaction import (
+    TRACE_SECRET_RE as _SECRET_IN_VALUE,
+    redact_trace_secrets as _redact_secrets_in_text,
+)
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization)", re.I)
 # Numeric token-metric keys are not secrets and must persist as values, not
@@ -34,6 +38,15 @@ _SAFE_METRIC_KEYS = {
     "cache_read_tokens",
     "cache_write_tokens",
     "reasoning_tokens",
+    # Single-turn TaskBudget metrics.
+    "max_total_tokens",
+    "spent_tokens",
+    "subagent_tokens",
+    "estimated_tokens",
+    "in_flight_tokens",
+    "remaining_tokens",
+    "tokens_limit",
+    "tokens_used",
 }
 _MAX_VALUE_CHARS = 4096
 _MAX_DEPTH = 4
@@ -41,7 +54,7 @@ _DEFERRED_SYNC_EVENTS = {
     EventType.RAW_RESPONSE_EVENT,
     EventType.PROVISIONAL_TEXT_DELTA,
     # Per-iteration progress records.  An fsync per event ran inline on the SSE
-    # delivery path, so a tool-heavy turn paid hundreds of them; these three
+    # delivery path, so a tool-heavy turn paid hundreds of them; these
     # carry no resume or approval decision, and ``seal`` fsyncs the whole log
     # before it anchors the head, so a finished run is durable regardless.
     # TOOL_CALL_START/RESULT stay synchronous to match the run-state store,
@@ -49,34 +62,8 @@ _DEFERRED_SYNC_EVENTS = {
     EventType.THINKING,
     EventType.TOKEN_USAGE,
     EventType.CONTEXT_USAGE,
+    EventType.BUDGET_UPDATE,
 }
-# Name-based redaction cannot see a credential carried *inside* a value, and
-# TOOL_CALL_START writes the full tool arguments — so a shell command holding a
-# bearer token landed here verbatim, under the innocuous key "command".
-# The leading (?<![A-Za-z0-9]) is essential, not decoration: "sk-" occurs inside
-# ordinary kebab-case words — ta*sk-*scheduler, di*sk-*usage, ri*sk-*scoring —
-# and without a boundary the pattern ate whole filenames.  The auth-header branch
-# likewise needs a digit, or "Basic authentication" matched as a credential.
-_SECRET_IN_VALUE = re.compile(
-    r"""(?xi)
-    (?<![A-Za-z0-9])
-    (?: \b(?:bearer|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])
-          [A-Za-z0-9._~+/=-]{16,}                                     # auth headers
-      | sk-[A-Za-z0-9_-]{16,}                                         # OpenAI/Anthropic style
-      | gh[pousr]_[A-Za-z0-9]{20,}                                    # GitHub classic
-      | github_pat_[A-Za-z0-9_]{20,}                                  # GitHub fine-grained PAT
-      | glpat-[A-Za-z0-9_-]{16,}                                      # GitLab PAT
-      | AIza[0-9A-Za-z_-]{30,}                                        # Google API key
-      | AKIA[0-9A-Z]{12,}                                             # AWS key id
-      | xox[abprs]-[A-Za-z0-9-]{10,}                                  # Slack
-      | eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+     # JWT
-    )
-    """
-)
-
-
-def _redact_secrets_in_text(text: str) -> str:
-    return _SECRET_IN_VALUE.sub("[REDACTED]", text)
 
 
 def _bounded_trace_value(value: Any, depth: int = 0) -> Any:

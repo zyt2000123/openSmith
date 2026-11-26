@@ -573,6 +573,8 @@ type ShellFooterProps = {
   turnTokenUsage: AppStore["turnTokenUsage"];
   tokenUsage: AppStore["tokenUsage"];
   contextUsage: AppStore["contextUsage"];
+  turnBudget: AppStore["turnBudget"];
+  lastElision: AppStore["lastElision"];
   turnCount: number;
   toolActivity: AppStore["toolActivity"];
   onInputChange: (value: string) => void;
@@ -808,7 +810,11 @@ function ShellFooter(props: ShellFooterProps) {
       <SkillIndicator skill={props.pendingSkill} />
       <QueuePreview items={props.queuedMessages} />
       {props.busy && props.runStartedAt !== null ? (
-        <RunProgress startedAt={props.runStartedAt} tokenUsage={props.turnTokenUsage} />
+        <RunProgress
+          startedAt={props.runStartedAt}
+          tokenUsage={props.turnTokenUsage}
+          turnBudget={props.turnBudget}
+        />
       ) : null}
       <FooterInput {...props} />
       <StatusHud
@@ -822,6 +828,7 @@ function ShellFooter(props: ShellFooterProps) {
         toolActivity={props.toolActivity}
         turnCount={props.turnCount}
         viewMode={props.viewMode}
+        lastElision={props.lastElision}
       />
     </>
   );
@@ -1057,6 +1064,8 @@ function SmithApp() {
   const turnTokenUsage = useS((state) => state.turnTokenUsage);
   const tokenUsage = useS((state) => state.tokenUsage);
   const contextUsage = useS((state) => state.contextUsage);
+  const turnBudget = useS((state) => state.turnBudget);
+  const lastElision = useS((state) => state.lastElision);
   const tokenStats = useS((state) => state.tokenStats);
   const tokenTab = useS((state) => state.tokenTab);
   const observabilityRuns = useS((state) => state.observabilityRuns);
@@ -1273,6 +1282,8 @@ function SmithApp() {
             turnTokenUsage={turnTokenUsage}
             tokenUsage={tokenUsage}
             contextUsage={contextUsage}
+            turnBudget={turnBudget}
+            lastElision={lastElision}
             toolActivity={toolActivity}
             turnCount={turnCount}
             viewMode={viewMode}

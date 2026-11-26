@@ -29,6 +29,8 @@ class EventType(str, Enum):
     AWAITING_INPUT = "awaiting_input"
     TOKEN_USAGE = "token_usage"
     CONTEXT_USAGE = "context_usage"
+    BUDGET_UPDATE = "budget_update"
+    CONTEXT_ACTIONS_ELIDED = "context_actions_elided"
     CONTEXT_COMPRESSION_START = "context_compression_start"
     CONTEXT_COMPRESSION_END = "context_compression_end"
     PROVISIONAL_TEXT_DELTA = "provisional_text_delta"

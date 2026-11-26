@@ -126,6 +126,30 @@ export type ContextUsage = {
   fit_status?: string;
 };
 
+export type BudgetDimension = "tokens" | "wall_seconds" | "cost_usd";
+
+export type TurnBudget = {
+  tokens_used: number;
+  tokens_limit: number | null;
+  subagent_tokens: number;
+  estimated_tokens: number;
+  wall_seconds: number;
+  wall_limit: number | null;
+  cost_usd: number | null;
+  cost_limit: number | null;
+  cost_unpriced: boolean;
+  exhausted_dimension: BudgetDimension | null;
+};
+
+export type ContextElision = {
+  trigger: string;
+  elided_messages: number;
+  recorded_actions: number;
+  total_ledger_actions: number;
+  evicted_actions: number;
+  highlights: string[];
+};
+
 export type StreamTerminalStatus = "completed" | "failed" | "incomplete";
 
 export type MaintenanceState = "idle" | "pending" | "running";
@@ -253,8 +277,17 @@ export type StreamEvent =
   | { type: "awaiting_input"; skill: string; reason: string }
   | ({ type: "token_usage" } & TokenUsage)
   | ({ type: "context_usage" } & ContextUsage)
+  | ({ type: "budget_update" } & TurnBudget)
+  | ({ type: "context_actions_elided" } & ContextElision)
   | { type: "compression"; active: boolean }
-  | { type: "done"; id?: string; runId?: string; status: StreamTerminalStatus; reason?: string };
+  | {
+      type: "done";
+      id?: string;
+      runId?: string;
+      status: StreamTerminalStatus;
+      reason?: string;
+      budget?: TurnBudget;
+    };
 
 type RequestOptions = {
   method?: string;
@@ -1071,14 +1104,62 @@ const SSE_EVENT_DECODERS: Partial<Record<string, SseEventDecoder>> = {
     type: "compression",
     active: Boolean(payload.active),
   }),
-  done: (payload) => ({
-    type: "done",
-    id: payload.id ? String(payload.id) : undefined,
-    ...(payload.run_id ? { runId: String(payload.run_id) } : {}),
-    ...(typeof payload.reason === "string" && payload.reason ? { reason: payload.reason.slice(0, 500) } : {}),
-    status: terminalStatus(payload),
+  budget_update: (payload) => ({
+    type: "budget_update",
+    ...decodeTurnBudget(payload),
   }),
+  context_actions_elided: (payload) => ({
+    type: "context_actions_elided",
+    trigger: terminalText(payload.trigger).slice(0, 60) || "message_cap",
+    elided_messages: Math.max(0, Math.floor(finiteNumber(payload.elided_messages, 0))),
+    recorded_actions: Math.max(0, Math.floor(finiteNumber(payload.recorded_actions, 0))),
+    total_ledger_actions: Math.max(0, Math.floor(finiteNumber(payload.total_ledger_actions, 0))),
+    evicted_actions: Math.max(0, Math.floor(finiteNumber(payload.evicted_actions, 0))),
+    highlights: Array.isArray(payload.highlights)
+      ? payload.highlights
+          .slice(0, 5)
+          .map((item) => terminalText(item).slice(0, 200))
+          .filter(Boolean)
+      : [],
+  }),
+  done: (payload) => {
+    const rawBudget = payload.budget && typeof payload.budget === "object" ? objectPayload(payload.budget) : null;
+    return {
+      type: "done",
+      id: payload.id ? String(payload.id) : undefined,
+      ...(payload.run_id ? { runId: String(payload.run_id) } : {}),
+      ...(typeof payload.reason === "string" && payload.reason ? { reason: payload.reason.slice(0, 500) } : {}),
+      ...(rawBudget ? { budget: decodeTurnBudget(rawBudget) } : {}),
+      status: terminalStatus(payload),
+    };
+  },
 };
+
+function optionalFiniteNumber(value: unknown): number | null {
+  if (value === null || value === undefined || typeof value === "boolean") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function decodeBudgetDimension(value: unknown): BudgetDimension | null {
+  if (value === "tokens" || value === "wall_seconds" || value === "cost_usd") return value;
+  return null;
+}
+
+function decodeTurnBudget(payload: Record<string, unknown>): TurnBudget {
+  return {
+    tokens_used: Math.max(0, Math.floor(finiteNumber(payload.tokens_used, 0))),
+    tokens_limit: optionalFiniteNumber(payload.tokens_limit),
+    subagent_tokens: Math.max(0, Math.floor(finiteNumber(payload.subagent_tokens, 0))),
+    estimated_tokens: Math.max(0, Math.floor(finiteNumber(payload.estimated_tokens, 0))),
+    wall_seconds: Math.max(0, finiteNumber(payload.wall_seconds, 0)),
+    wall_limit: optionalFiniteNumber(payload.wall_limit),
+    cost_usd: optionalFiniteNumber(payload.cost_usd),
+    cost_limit: optionalFiniteNumber(payload.cost_limit),
+    cost_unpriced: Boolean(payload.cost_unpriced ?? false),
+    exhausted_dimension: decodeBudgetDimension(payload.exhausted_dimension),
+  };
+}
 
 export function decodeSseEvent(rawChunk: string): StreamEvent | null {
   const parsed = parseSseChunk(rawChunk);
@@ -1103,7 +1184,7 @@ function consumeSseChunks(chunks: string[], sawDone: boolean): { events: StreamE
       // may legally frame token_usage/context_usage after done (even in a later
       // TCP read), and dropping them would permanently undercount the session
       // totals.  Stale content events after done are dropped.
-      if (event.type === "token_usage" || event.type === "context_usage") {
+      if (event.type === "token_usage" || event.type === "context_usage" || event.type === "budget_update") {
         events.push(event);
       }
       continue;

@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
 from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, AsyncGenerator
+from typing import TYPE_CHECKING, Any, AsyncGenerator
 from uuid import uuid4
 
 from engine.context import (
+    ActionOutcome,
     ContextReceipt,
+    DroppedActionLedger,
+    build_action_outcome,
     estimate_tokens,
     fit_request,
     measure_request,
 )
+from engine.context.budget import model_limits_for
 from engine.context.compression import (
     RUNTIME_USER_NOTE_PREFIX,
     compaction_policy_for_llm,
@@ -28,6 +34,13 @@ from engine.execution.steering import (
     current_steering_inbox,
     format_steering_message,
 )
+from engine.execution.task_budget import (
+    BudgetReservation,
+    SubAgentScopedBudget,
+    TaskBudget,
+    current_task_budget,
+    reserve_for_call_waiting,
+)
 from engine.llm.contracts import (
     ChatResponse,
     LLMContextLengthError,
@@ -39,6 +52,7 @@ from engine.llm.usage import USAGE_REPORTED_KEY, normalize_usage
 from engine.safety.approval import (
     ApprovalRequest,
     ApprovalTimeoutError,
+    DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     build_approval_presentation,
     current_approval_context,
     summarize_arguments,
@@ -462,6 +476,10 @@ def _is_context_limit_error(error: BaseException) -> bool:
 def _recover_context_after_provider_rejection(
     conversation: list[dict],
     llm: object,
+    *,
+    ledger: DroppedActionLedger | None = None,
+    call_outcomes: dict[str, ActionOutcome] | None = None,
+    tool_definitions: dict | None = None,
 ) -> list[dict]:
     input_budget, _ = compaction_policy_for_llm(llm)
     # Keep a second cushion for request framing the local estimator cannot see
@@ -469,7 +487,46 @@ def _recover_context_after_provider_rejection(
     return trim_conversation_for_context_limit(
         conversation,
         token_budget=max(1, int(input_budget * 0.65)),
+        ledger=ledger,
+        call_outcomes=call_outcomes,
+        tool_definitions=tool_definitions,
     )
+
+
+def _tool_definitions_for(tool_registry: object) -> dict | None:
+    getter = getattr(tool_registry, "definitions", None)
+    if callable(getter):
+        result = getter()
+        if isinstance(result, dict):
+            return result
+    return None
+
+
+def _fn_accepts_kwarg(fn: object, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == name:
+            return True
+    return False
+
+
+def _invoke_llm_method(
+    fn: Any,
+    conversation: list[dict],
+    *,
+    tools: list[dict] | None,
+    prefix_cache_key: str | None,
+    max_tokens: int | None,
+) -> Any:
+    kwargs: dict[str, Any] = {"tools": tools}
+    if prefix_cache_key:
+        kwargs["prefix_cache_key"] = prefix_cache_key
+    if max_tokens is not None and _fn_accepts_kwarg(fn, "max_tokens"):
+        kwargs["max_tokens"] = max_tokens
+    return fn(conversation, **kwargs)
 
 
 def _should_repair_incomplete_final(
@@ -550,6 +607,7 @@ async def react_event_loop(
     provisional_lifecycle: bool = True,
     prefix_cache_key: str | None = None,
     hook_registry: "HookRegistry | None" = None,
+    task_budget: TaskBudget | SubAgentScopedBudget | None = None,
 ) -> AsyncGenerator[ExecutionEvent, None]:
     """ReAct loop: model response, tool calls, results, and next turn in one history."""
     lazy_tool_schemas = bool(getattr(tool_registry, "lazy_tool_schemas", False))
@@ -616,7 +674,90 @@ async def react_event_loop(
     model_compaction_enabled = True
     compaction_failures = 0
 
+    active_budget = task_budget if task_budget is not None else current_task_budget()
+    is_subagent_budget = isinstance(active_budget, SubAgentScopedBudget)
+    action_ledger = DroppedActionLedger()
+    call_outcomes: dict[str, ActionOutcome] = {}
+    last_elided_messages = 0
+    last_ledger_total = 0
+
+    def _maybe_elision_event(trigger: str) -> ExecutionEvent | None:
+        nonlocal last_elided_messages, last_ledger_total
+        current_elided = action_ledger.total_elided_messages
+        current_total = len(action_ledger) + action_ledger.evicted_entries
+        if current_elided <= last_elided_messages and current_total <= last_ledger_total:
+            return None
+        delta_elided = max(0, current_elided - last_elided_messages)
+        delta_actions = max(0, current_total - last_ledger_total)
+        last_elided_messages = current_elided
+        last_ledger_total = current_total
+        return ExecutionEvent(EventType.CONTEXT_ACTIONS_ELIDED, {
+            "trigger": trigger,
+            "elided_messages": delta_elided,
+            "recorded_actions": delta_actions,
+            "total_ledger_actions": current_total,
+            "evicted_actions": action_ledger.evicted_entries,
+            "highlights": action_ledger.highlights(limit=5),
+        })
+
+    def _budget_exhausted_events() -> list[ExecutionEvent]:
+        assert active_budget is not None
+        snap = active_budget.snapshot()
+        reason = active_budget.stop_reason or "budget_tokens_exhausted"
+        events: list[ExecutionEvent] = [
+            _provisional_retract_event(provision_id, reason)
+            for provision_id in active_provision_ids
+        ]
+        active_provision_ids.clear()
+        if not is_subagent_budget:
+            events.append(ExecutionEvent(EventType.BUDGET_UPDATE, snap.to_update_event_data()))
+            events.append(
+                ExecutionEvent(
+                    EventType.TEXT_DELTA,
+                    {"text": active_budget.format_exhausted_notice(completed_actions=len(action_ledger))},
+                )
+            )
+        events.append(
+            ExecutionEvent(
+                EventType.INCOMPLETE,
+                {
+                    "reason": reason,
+                    "budget": snap.to_dict(),
+                },
+            )
+        )
+        return events
+
+    def _record_outcome(
+        call_id: str,
+        tool_name: str,
+        arguments: dict,
+        *,
+        succeeded: bool,
+        side_effect_status: str = "none",
+    ) -> None:
+        status = (
+            side_effect_status
+            if side_effect_status in {"none", "completed", "unknown"}
+            else "none"
+        )
+        call_outcomes[call_id] = build_action_outcome(
+            call_id=call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            succeeded=succeeded,
+            side_effect_status=status,  # type: ignore[arg-type]
+            definition=(_tool_definitions_for(tool_registry) or {}).get(tool_name),
+        )
+
     while productive_iters < max_iters:
+        if active_budget is not None and (
+            active_budget.exhausted or not active_budget.check_wall_clock()
+        ):
+            for ev in _budget_exhausted_events():
+                yield ev
+            return
+
         # Drain point A: fold any mid-turn user steering BEFORE fit_request()
         # so the injected note counts toward the model's context budget.
         steering_inbox = current_steering_inbox()
@@ -637,7 +778,15 @@ async def react_event_loop(
                     "iteration": productive_iters,
                 })
 
-        conversation = trim_conversation_to_message_cap(conversation)
+        conversation = trim_conversation_to_message_cap(
+            conversation,
+            ledger=action_ledger,
+            call_outcomes=call_outcomes,
+            tool_definitions=_tool_definitions_for(tool_registry),
+        )
+        elision_event = _maybe_elision_event("message_cap")
+        if elision_event is not None:
+            yield elision_event
 
         pre_fit_receipt = measure_request(conversation, tools, llm)
         compression_started = (
@@ -652,7 +801,14 @@ async def react_event_loop(
             llm,
             prefix_cache_key=prefix_cache_key,
             allow_model_compaction=model_compaction_enabled,
+            ledger=action_ledger,
+            call_outcomes=call_outcomes,
+            tool_definitions=_tool_definitions_for(tool_registry),
+            task_budget=active_budget,
         )
+        elision_event = _maybe_elision_event("deterministic_trim")
+        if elision_event is not None:
+            yield elision_event
         if any(
             action in {"compaction_failed", "compaction_rejected"}
             for action in fit.actions
@@ -674,6 +830,10 @@ async def react_event_loop(
             fit_status=fit.status.value,
             actions=fit.actions,
         )
+        if active_budget is not None and active_budget.exhausted:
+            for ev in _budget_exhausted_events():
+                yield ev
+            return
         if not fit.fits:
             for provision_id in active_provision_ids:
                 yield _provisional_retract_event(
@@ -691,6 +851,31 @@ async def react_event_loop(
                 "actions": list(fit.actions),
             })
             return
+
+        reservation: BudgetReservation | None = None
+        clamped_max_tokens: int | None = None
+        call_timeout: float | None = None
+        if active_budget is not None:
+            desired_out = model_limits_for(llm).max_output_tokens
+            model_name = str(getattr(llm, "model", "") or "")
+            thinking = bool(getattr(getattr(llm, "adapter", llm), "thinking", False))
+            check = await reserve_for_call_waiting(
+                active_budget,
+                estimated_input_tokens=fit.receipt.estimated_input_tokens,
+                desired_max_output_tokens=desired_out,
+                model=model_name,
+                thinking=thinking,
+                is_subagent=is_subagent_budget,
+            )
+            if not check.allowed:
+                for ev in _budget_exhausted_events():
+                    yield ev
+                return
+            reservation = check.reservation
+            if reservation is not None:
+                if reservation.reserved_output_tokens < desired_out:
+                    clamped_max_tokens = reservation.reserved_output_tokens
+                call_timeout = reservation.timeout_seconds
 
         yield ExecutionEvent(EventType.THINKING, {})
         provider_prefix_cache_key = (
@@ -713,39 +898,65 @@ async def react_event_loop(
             if provisional_lifecycle:
                 response_provision_id = uuid4().hex
             try:
-                provider_stream = (
-                    stream_events(
-                        conversation,
-                        tools=tools,
-                        prefix_cache_key=provider_prefix_cache_key,
-                    )
-                    if provider_prefix_cache_key
-                    else stream_events(conversation, tools=tools)
+                provider_stream = _invoke_llm_method(
+                    stream_events,
+                    conversation,
+                    tools=tools,
+                    prefix_cache_key=provider_prefix_cache_key,
+                    max_tokens=clamped_max_tokens,
                 )
-                async for provider_event in provider_stream:
-                    accumulator.add(provider_event)
-                    is_text_delta = provider_event.type == ProviderEventType.OUTPUT_TEXT_DELTA
-                    raw_provision_id = response_provision_id if is_text_delta else None
-                    yield _raw_response_event(provider_event, provision_id=raw_provision_id)
-                    if raw_provision_id:
-                        delta = provider_event.data.get("delta")
-                        if isinstance(delta, str) and delta:
-                            if raw_provision_id not in active_provision_ids:
-                                active_provision_ids.append(raw_provision_id)
-                            yield _provisional_text_event(raw_provision_id, delta)
-                    # A streamed reasoning delta is not user-visible, but it
-                    # still proves the provider has begun a response.  A
-                    # fallback would replay that turn and can produce a
-                    # different tool plan, so only retry a stream that failed
-                    # before every semantic response delta.
-                    if not saw_content_event and provider_event.type in (
-                        ProviderEventType.OUTPUT_TEXT_DELTA,
-                        ProviderEventType.REASONING_DELTA,
-                        ProviderEventType.FUNCTION_CALL_ARGUMENTS_DELTA,
-                    ):
-                        saw_content_event = True
+                async with asyncio.timeout(call_timeout):
+                    async for provider_event in provider_stream:
+                        accumulator.add(provider_event)
+                        is_text_delta = provider_event.type == ProviderEventType.OUTPUT_TEXT_DELTA
+                        raw_provision_id = response_provision_id if is_text_delta else None
+                        yield _raw_response_event(provider_event, provision_id=raw_provision_id)
+                        if raw_provision_id:
+                            delta = provider_event.data.get("delta")
+                            if isinstance(delta, str) and delta:
+                                if raw_provision_id not in active_provision_ids:
+                                    active_provision_ids.append(raw_provision_id)
+                                yield _provisional_text_event(raw_provision_id, delta)
+                        # A streamed reasoning delta is not user-visible, but it
+                        # still proves the provider has begun a response.  A
+                        # fallback would replay that turn and can produce a
+                        # different tool plan, so only retry a stream that failed
+                        # before every semantic response delta.
+                        if not saw_content_event and provider_event.type in (
+                            ProviderEventType.OUTPUT_TEXT_DELTA,
+                            ProviderEventType.REASONING_DELTA,
+                            ProviderEventType.FUNCTION_CALL_ARGUMENTS_DELTA,
+                        ):
+                            saw_content_event = True
+            except TimeoutError:
+                if active_budget is not None:
+                    if saw_content_event:
+                        partial_out = estimate_tokens(
+                            "".join(accumulator.text_parts) + "".join(accumulator.reasoning_parts)
+                        )
+                        active_budget.reconcile(
+                            reservation,
+                            usage={
+                                "input_tokens": fit.receipt.estimated_input_tokens,
+                                "output_tokens": partial_out,
+                                "total_tokens": fit.receipt.estimated_input_tokens + partial_out,
+                                USAGE_REPORTED_KEY: 0,
+                                "estimated": True,
+                            },
+                            model=str(getattr(llm, "model", "") or ""),
+                            estimated=True,
+                        )
+                    else:
+                        active_budget.release(reservation)
+                    active_budget.trip("wall_seconds")
+                    for ev in _budget_exhausted_events():
+                        yield ev
+                    return
+                raise
             except Exception as stream_exc:
                 if _is_context_limit_error(stream_exc):
+                    if active_budget is not None:
+                        active_budget.release(reservation)
                     if context_recoveries >= 1:
                         for provision_id in active_provision_ids:
                             yield _provisional_retract_event(
@@ -774,7 +985,13 @@ async def react_event_loop(
                     conversation = _recover_context_after_provider_rejection(
                         conversation,
                         llm,
+                        ledger=action_ledger,
+                        call_outcomes=call_outcomes,
+                        tool_definitions=_tool_definitions_for(tool_registry),
                     )
+                    elision_event = _maybe_elision_event("provider_recovery")
+                    if elision_event is not None:
+                        yield elision_event
                     yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
                     continue
                 # Fallback to non-streaming only if this response emitted no
@@ -782,21 +999,54 @@ async def react_event_loop(
                 # as a provisional draft.  Otherwise the fallback could
                 # replay an unseen suffix or a different tool plan.
                 if saw_content_event or active_provision_ids:
+                    if active_budget is not None:
+                        if saw_content_event:
+                            partial_out = estimate_tokens(
+                                "".join(accumulator.text_parts) + "".join(accumulator.reasoning_parts)
+                            )
+                            active_budget.reconcile(
+                                reservation,
+                                usage={
+                                    "input_tokens": fit.receipt.estimated_input_tokens,
+                                    "output_tokens": partial_out,
+                                    "total_tokens": fit.receipt.estimated_input_tokens + partial_out,
+                                    USAGE_REPORTED_KEY: 0,
+                                    "estimated": True,
+                                },
+                                model=str(getattr(llm, "model", "") or ""),
+                                estimated=True,
+                            )
+                        else:
+                            active_budget.release(reservation)
                     for provision_id in active_provision_ids:
                         yield _provisional_retract_event(provision_id, "stream_error")
                     active_provision_ids.clear()
                     raise
                 try:
-                    response = await (
-                        llm.chat(
+                    remaining_fallback = (
+                        active_budget.remaining_wall_seconds()
+                        if active_budget is not None
+                        else None
+                    )
+                    async with asyncio.timeout(remaining_fallback):
+                        response = await _invoke_llm_method(
+                            llm.chat,
                             conversation,
                             tools=tools,
                             prefix_cache_key=provider_prefix_cache_key,
+                            max_tokens=clamped_max_tokens,
                         )
-                        if provider_prefix_cache_key
-                        else llm.chat(conversation, tools=tools)
-                    )
+                except TimeoutError:
+                    if active_budget is not None:
+                        active_budget.release(reservation)
+                        active_budget.trip("wall_seconds")
+                        for ev in _budget_exhausted_events():
+                            yield ev
+                        return
+                    raise
                 except Exception as exc:
+                    if active_budget is not None:
+                        active_budget.release(reservation)
                     if not _is_context_limit_error(exc):
                         raise
                     if context_recoveries >= 1:
@@ -807,13 +1057,24 @@ async def react_event_loop(
                         return
                     context_recoveries += 1
                     yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
-                    conversation = _recover_context_after_provider_rejection(conversation, llm)
+                    conversation = _recover_context_after_provider_rejection(
+                        conversation,
+                        llm,
+                        ledger=action_ledger,
+                        call_outcomes=call_outcomes,
+                        tool_definitions=_tool_definitions_for(tool_registry),
+                    )
+                    elision_event = _maybe_elision_event("provider_recovery")
+                    if elision_event is not None:
+                        yield elision_event
                     yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
                     continue
             else:
                 try:
                     response = accumulator.build()
                 except Exception:
+                    if active_budget is not None:
+                        active_budget.release(reservation)
                     for provision_id in active_provision_ids:
                         yield _provisional_retract_event(provision_id, "stream_error")
                     active_provision_ids.clear()
@@ -821,16 +1082,25 @@ async def react_event_loop(
                 response_text_was_streamed = accumulator.streamed_text
         else:
             try:
-                response = await (
-                    llm.chat(
+                async with asyncio.timeout(call_timeout):
+                    response = await _invoke_llm_method(
+                        llm.chat,
                         conversation,
                         tools=tools,
                         prefix_cache_key=provider_prefix_cache_key,
+                        max_tokens=clamped_max_tokens,
                     )
-                    if provider_prefix_cache_key
-                    else llm.chat(conversation, tools=tools)
-                )
+            except TimeoutError:
+                if active_budget is not None:
+                    active_budget.release(reservation)
+                    active_budget.trip("wall_seconds")
+                    for ev in _budget_exhausted_events():
+                        yield ev
+                    return
+                raise
             except Exception as exc:
+                if active_budget is not None:
+                    active_budget.release(reservation)
                 if not _is_context_limit_error(exc):
                     raise
                 if context_recoveries >= 1:
@@ -841,7 +1111,16 @@ async def react_event_loop(
                     return
                 context_recoveries += 1
                 yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_START)
-                conversation = _recover_context_after_provider_rejection(conversation, llm)
+                conversation = _recover_context_after_provider_rejection(
+                    conversation,
+                    llm,
+                    ledger=action_ledger,
+                    call_outcomes=call_outcomes,
+                    tool_definitions=_tool_definitions_for(tool_registry),
+                )
+                elision_event = _maybe_elision_event("provider_recovery")
+                if elision_event is not None:
+                    yield elision_event
                 yield ExecutionEvent(EventType.CONTEXT_COMPRESSION_END)
                 continue
         usage = _usage_event_data(response.usage) or _estimated_usage_event_data(
@@ -860,6 +1139,26 @@ async def react_event_loop(
             fit_status=fit.status.value,
             actions=fit.actions,
         )
+        if active_budget is not None:
+            reconciled_snapshot = active_budget.reconcile(
+                reservation,
+                usage=usage,
+                model=str(response.model or getattr(llm, "model", "") or ""),
+                estimated=not bool(usage.get(USAGE_REPORTED_KEY)),
+            )
+            if (
+                reconciled_snapshot is not None
+                and not is_subagent_budget
+                and (active_budget.has_limits or reconciled_snapshot.subagent_tokens > 0)
+            ):
+                yield ExecutionEvent(
+                    EventType.BUDGET_UPDATE,
+                    reconciled_snapshot.to_update_event_data(),
+                )
+            if active_budget.exhausted and (response.has_tool_calls or is_subagent_budget):
+                for ev in _budget_exhausted_events():
+                    yield ev
+                return
 
         thought = (response.reasoning or (response.text if response.has_tool_calls else "")).strip()
         if thought:
@@ -913,7 +1212,10 @@ async def react_event_loop(
             final_text, final_text_streamed = _final_text_delivery(final_text_parts)
 
             if response.finish_reason == "length":
-                if length_continuations < MAX_LENGTH_CONTINUATIONS:
+                if (
+                    length_continuations < MAX_LENGTH_CONTINUATIONS
+                    and not (active_budget is not None and active_budget.exhausted)
+                ):
                     length_continuations += 1
                     _append_length_continuation(
                         conversation, response.text, response.reasoning
@@ -927,6 +1229,10 @@ async def react_event_loop(
                     ):
                         yield event
                     active_provision_ids.clear()
+                if active_budget is not None and active_budget.exhausted:
+                    for ev in _budget_exhausted_events():
+                        yield ev
+                    return
                 yield ExecutionEvent(EventType.INCOMPLETE, {
                     "reason": "model_output_limit",
                     "continuations": length_continuations,
@@ -963,10 +1269,13 @@ async def react_event_loop(
                 })
                 return
 
-            if _should_repair_incomplete_final(
-                final_text,
-                had_successful_tool=had_successful_tool,
-                repair_count=incomplete_final_repairs,
+            if (
+                not (active_budget is not None and active_budget.exhausted)
+                and _should_repair_incomplete_final(
+                    final_text,
+                    had_successful_tool=had_successful_tool,
+                    repair_count=incomplete_final_repairs,
+                )
             ):
                 for provision_id in active_provision_ids:
                     yield _provisional_retract_event(provision_id, "incomplete_final_repair")
@@ -987,7 +1296,8 @@ async def react_event_loop(
             # instead of silently dropping it.
             steering_inbox = current_steering_inbox()
             if (
-                steering_inbox is not None
+                not (active_budget is not None and active_budget.exhausted)
+                and steering_inbox is not None
                 and steering_inbox.has_pending()
                 and steering_continuations < MAX_STEERING_CONTINUATIONS
             ):
@@ -1199,6 +1509,13 @@ async def react_event_loop(
                     # Update repeat-sensitive counters and SessionTaintStore in
                     # deterministic slot order (including is_error=True paths).
                     _record_post_exec_for_slot(slot, outcome)
+                    _record_outcome(
+                        item.raw_id,
+                        item.call.name,
+                        item.call.arguments,
+                        succeeded=not result.is_error,
+                        side_effect_status=result.side_effect_status,
+                    )
 
                     if outcome.warnings:
                         deferred_round_notes.append({
@@ -1562,6 +1879,7 @@ async def react_event_loop(
                         "arguments": call.arguments,
                     })
                     denial = pre_denial_reason or "Blocked by pre-tool hook"
+                    _record_outcome(tc.id, call.name, call.arguments, succeeded=False)
                     conversation.append({
                         "role": "tool",
                         "tool_call_id": call.id,
@@ -1675,11 +1993,40 @@ async def react_event_loop(
                         if decision.repeat_count >= 2:
                             approval_event_data["repeat_count"] = decision.repeat_count
                         yield ExecutionEvent(EventType.TOOL_CALL_RESULT, approval_event_data)
+                        wait_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS
+                        clamped_by_wall_budget = False
+                        if active_budget is not None:
+                            rem_wall = active_budget.remaining_wall_seconds()
+                            if rem_wall is not None:
+                                if rem_wall <= 0.0:
+                                    broker.resolve(run_id, approval_request.approval_id, False)
+                                    active_budget.trip("wall_seconds")
+                                    for ev in _budget_exhausted_events():
+                                        yield ev
+                                    return
+                                if rem_wall < wait_timeout:
+                                    wait_timeout = rem_wall
+                                    clamped_by_wall_budget = True
                         try:
-                            approved = await broker.wait(approval_request)
+                            approved = await broker.wait(
+                                approval_request,
+                                timeout_seconds=wait_timeout,
+                            )
                             denial = "User denied approval"
                             approval_outcome = "denied"
                         except ApprovalTimeoutError:
+                            if (
+                                clamped_by_wall_budget
+                                and active_budget is not None
+                                and (
+                                    active_budget.remaining_wall_seconds() is not None
+                                    and (active_budget.remaining_wall_seconds() or 0.0) <= 0.1
+                                )
+                            ):
+                                active_budget.trip("wall_seconds")
+                                for ev in _budget_exhausted_events():
+                                    yield ev
+                                return
                             approved = False
                             denial = "Approval timed out"
                             approval_outcome = "timed_out"
@@ -1689,6 +2036,7 @@ async def react_event_loop(
                             # to recreate it and risking a duplicate side effect.
                             granted_approval_id = approval_request.approval_id
                         else:
+                            _record_outcome(tc.id, call.name, call.arguments, succeeded=False)
                             conversation.append({
                                 "role": "tool",
                                 "tool_call_id": call.id,
@@ -1778,6 +2126,7 @@ async def react_event_loop(
                     # 是默认开启的 PreToolHook —— 编辑 pyproject.toml / tsconfig.json
                     # 就会走到这里。
                     denial = denial_reason or "Blocked by pre-tool hook"
+                    _record_outcome(tc.id, call.name, call.arguments, succeeded=False)
                     conversation.append({
                         "role": "tool",
                         "tool_call_id": call.id,
@@ -1825,6 +2174,14 @@ async def react_event_loop(
             ):
                 result = await tool_registry.execute(call)
 
+            _record_outcome(
+                tc.id,
+                call.name,
+                call.arguments,
+                succeeded=not result.is_error,
+                side_effect_status=result.side_effect_status,
+            )
+
             # Immediately update repeat-sensitive counters and SessionTaintStore
             # BEFORE evaluating the next tool call in this same assistant turn.
             if tool_guard is not None and hasattr(tool_guard, "record_post_execution"):
@@ -1858,6 +2215,17 @@ async def react_event_loop(
                     granted_approval_id=granted_approval_id,
                 ),
             )
+            if active_budget is not None and not is_subagent_budget and call.name == "sub_agent":
+                post_sub_snap = active_budget.snapshot()
+                if post_sub_snap.subagent_tokens > 0 or active_budget.has_limits:
+                    yield ExecutionEvent(
+                        EventType.BUDGET_UPDATE,
+                        post_sub_snap.to_update_event_data(),
+                    )
+                if active_budget.exhausted:
+                    for ev in _budget_exhausted_events():
+                        yield ev
+                    return
             if result.is_error:
                 round_had_failure = True
                 consecutive_errors += 1

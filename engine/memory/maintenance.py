@@ -98,16 +98,28 @@ class MemoryMaintenanceService:
             try:
                 from engine.memory.store import save_conversation_memory
 
-                compile_maintenance = (
-                    self._schedule_compilation
-                    if self.defer_maintenance
-                    else self._run_compilation_unlocked
-                )
-                dream_maintenance = (
-                    self._schedule_dream
-                    if self.defer_maintenance
-                    else self._run_dream_unlocked
-                )
+                budget_exhausted = turn_reason in {
+                    "budget_tokens_exhausted",
+                    "budget_wall_time_exhausted",
+                    "budget_cost_exhausted",
+                }
+                if budget_exhausted:
+                    async def _noop_maintenance(_memory_dir: Path) -> bool:
+                        return True
+
+                    compile_maintenance = _noop_maintenance
+                    dream_maintenance = _noop_maintenance
+                else:
+                    compile_maintenance = (
+                        self._schedule_compilation
+                        if self.defer_maintenance
+                        else self._run_compilation_unlocked
+                    )
+                    dream_maintenance = (
+                        self._schedule_dream
+                        if self.defer_maintenance
+                        else self._run_dream_unlocked
+                    )
                 await save_conversation_memory(
                     agent_dir,
                     user_message,

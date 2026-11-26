@@ -18,6 +18,7 @@ import { truncateDisplay } from "./text-layout.js";
 import { TOOL_PRESENTATION } from "./presentation.js";
 import { ACCENT, ASSISTANT, BORDER, ERROR, INFO, MUTED, SKILL, SUCCESS, WARNING } from "./theme.js";
 import type {
+  ElisionBlock,
   SkillBlock,
   SmithUiBlock,
   SmithUiFallbackBlock,
@@ -196,6 +197,7 @@ type RenderBlock =
   | SmithUiBlock
   | SmithUiFallbackBlock
   | SteeringBlock
+  | ElisionBlock
   | ToolGroupBlock
   | ToolSummaryBlock;
 
@@ -606,6 +608,21 @@ function TurnView({
                   {block.state === "applied" ? "↳ [Steered] " : "↳ [Steer queued] "}
                 </Text>
                 <Text color={INFO}>{truncate(block.content, 100)}</Text>
+              </Box>
+            );
+          case "elision":
+            return (
+              <Box key={block.id} flexDirection="column" marginTop={1} paddingLeft={2}>
+                <Text color={MUTED}>
+                  {`✂ elided ${block.elidedMessages} msg${block.elidedMessages === 1 ? "" : "s"} · ${block.totalLedgerActions} action${block.totalLedgerActions === 1 ? "" : "s"} kept`}
+                </Text>
+                {viewMode === "transcript" && block.highlights.length > 0
+                  ? block.highlights.map((item, idx) => (
+                      <Text key={`${block.id}-${idx}`} color={BORDER}>
+                        {`  - ${truncate(item, 96)}`}
+                      </Text>
+                    ))
+                  : null}
               </Box>
             );
           default:

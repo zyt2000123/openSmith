@@ -12,6 +12,13 @@ description: 面向个人工作流的常驻本地 Agent，负责理解目标、�
 llm:
   model: null
 
+# 可选的单 Turn 硬预算（tokens / 墙钟秒数 / 美元成本），主循环、压缩与子代理共享。
+# budget:
+#   max_total_tokens: 400000
+#   max_wall_seconds: 600
+#   max_cost_usd: 2.0
+#   unpriced_cost_policy: warn_only  # warn_only | fail_closed
+
 # 可选的领域知识语义检索。默认关闭；启用后仅在 durable 已命中领域时使用。
 # knowledge:
 #   embeddings:
