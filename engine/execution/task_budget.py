@@ -165,6 +165,10 @@ class BudgetCheckResult:
     exhausted_dimension: BudgetDimension | None = None
     stop_reason: str | None = None
     detail: str | None = None
+    # Refused only because concurrent in-flight reservations hold the headroom;
+    # actual spend still leaves room, so the budget is not tripped and the call
+    # may be retried once a sibling reservation settles.
+    contended: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +377,15 @@ class TaskBudget:
                 )
                 max_out_by_tokens = avail_tokens - est_input
                 if max_out_by_tokens < min_output:
+                    spent_only_out = (
+                        self.limits.max_total_tokens - self._spent_tokens - est_input
+                    )
+                    if self._in_flight_tokens > 0 and spent_only_out >= min_output:
+                        return BudgetCheckResult(
+                            allowed=False,
+                            exhausted_dimension="tokens",
+                            contended=True,
+                        )
                     self._trip_locked("tokens")
                     return BudgetCheckResult(
                         allowed=False,
@@ -404,6 +417,22 @@ class TaskBudget:
                         self._spent_cost_usd + self._in_flight_cost_usd
                     )
                     input_cost = (est_input / 1_000_000.0) * p_in
+
+                    def _cost_room(avail: float) -> bool:
+                        if avail <= input_cost:
+                            return False
+                        if p_out <= 0:
+                            return True
+                        return int(((avail - input_cost) * 1_000_000.0) / p_out) >= min_output
+
+                    if not _cost_room(avail_cost) and self._in_flight_cost_usd > 0 and _cost_room(
+                        self.limits.max_cost_usd - self._spent_cost_usd
+                    ):
+                        return BudgetCheckResult(
+                            allowed=False,
+                            exhausted_dimension="cost_usd",
+                            contended=True,
+                        )
                     if avail_cost <= input_cost:
                         self._trip_locked("cost_usd")
                         return BudgetCheckResult(
@@ -597,6 +626,8 @@ class TaskBudget:
 class BatchTokenLedger:
     """Shared in-flight + spent token counter for one sub-agent fan-out batch."""
 
+    BATCH_CONTENDED = 0
+
     def __init__(self, total_tokens: int) -> None:
         self.total_tokens = max(1, int(total_tokens))
         self._lock = threading.RLock()
@@ -620,14 +651,26 @@ class BatchTokenLedger:
         with self._lock:
             return self._exhausted or self._spent >= self.total_tokens
 
+    def available(self) -> int:
+        """Headroom left after spent and in-flight tokens (may be negative)."""
+        with self._lock:
+            return self.total_tokens - (self._spent + self._in_flight)
+
     def reserve(self, reservation_id: str, est_input: int, desired_out: int, min_out: int) -> int | None:
-        """Reserve tokens in the batch; return clamped output tokens or None if exhausted."""
+        """Reserve tokens in the batch.
+
+        Returns the clamped output tokens, ``None`` once the batch is exhausted
+        by actual spend, or ``BATCH_CONTENDED`` (0) when only sibling in-flight
+        reservations hold the headroom — that case does not exhaust the batch.
+        """
         with self._lock:
             if self._exhausted:
                 return None
             avail = self.total_tokens - (self._spent + self._in_flight)
             max_out = avail - est_input
             if max_out < min_out:
+                if self._in_flight > 0 and self.total_tokens - self._spent - est_input >= min_out:
+                    return self.BATCH_CONTENDED
                 self._exhausted = True
                 return None
             clamped_out = min(desired_out, max_out)
@@ -779,6 +822,18 @@ class SubAgentScopedBudget:
         est_input = max(0, int(estimated_input_tokens))
         desired_out = max(1, int(desired_max_output_tokens))
 
+        # Narrow the request by this agent's and the batch's own headroom first,
+        # so the parent reservation is not inflated by output the local caps
+        # would refuse anyway; inflated parent holds starve parallel siblings.
+        with self._lock:
+            local_out = self.agent_token_budget - (
+                self._agent_spent + self._agent_in_flight
+            ) - est_input
+        batch_out_peek = self.batch_ledger.available() - est_input
+        for cap in (local_out, batch_out_peek):
+            if cap >= min_output:
+                desired_out = min(desired_out, cap)
+
         # 1. Check parent turn budget first if present.
         parent_res: BudgetReservation | None = None
         if self.parent is not None:
@@ -790,7 +845,8 @@ class SubAgentScopedBudget:
                 is_subagent=True,
             )
             if not parent_check.allowed:
-                self.cancel_event.set()
+                if not parent_check.contended:
+                    self.cancel_event.set()
                 return parent_check
             parent_res = parent_check.reservation
             assert parent_res is not None
@@ -840,6 +896,14 @@ class SubAgentScopedBudget:
 
             # 4. Shared batch token cap (in-flight aware across concurrent siblings).
             batch_out = self.batch_ledger.reserve(res_id, est_input, clamped_out, min_output)
+            if batch_out == BatchTokenLedger.BATCH_CONTENDED:
+                if parent_res is not None and self.parent is not None:
+                    self.parent.release(parent_res)
+                return BudgetCheckResult(
+                    allowed=False,
+                    exhausted_dimension="tokens",
+                    contended=True,
+                )
             if batch_out is None:
                 if parent_res is not None and self.parent is not None:
                     self.parent.release(parent_res)
@@ -1002,11 +1066,47 @@ def without_task_budget() -> Iterator[None]:
         _CURRENT_TASK_BUDGET.reset(token)
 
 
+CONTENDED_POLL_SECONDS = 0.05
+CONTENDED_MAX_POLL_SECONDS = 0.5
+
+
+async def reserve_for_call_waiting(
+    budget: "TaskBudget | SubAgentScopedBudget",
+    **kwargs: Any,
+) -> BudgetCheckResult:
+    """Reserve budget, waiting while sibling in-flight reservations hold the headroom.
+
+    Contention is transient: concurrent sub-agent calls reconcile or release
+    their worst-case holds when they finish. Waiting is bounded by the budget's
+    wall clock (sub-agents always carry a task timeout) and by cancellation.
+    """
+    delay = CONTENDED_POLL_SECONDS
+    while True:
+        check = budget.reserve_for_call(**kwargs)
+        if check.allowed or not check.contended:
+            return check
+        if not budget.check_wall_clock() or budget.exhausted:
+            return BudgetCheckResult(
+                allowed=False,
+                exhausted_dimension=budget.exhausted_dimension,
+                stop_reason=budget.stop_reason,
+            )
+        remaining = budget.remaining_wall_seconds()
+        wait = delay if remaining is None else max(0.0, min(delay, remaining))
+        try:
+            await asyncio.wait_for(budget.cancel_event.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
+        delay = min(delay * 2, CONTENDED_MAX_POLL_SECONDS)
+
+
 __all__ = (
     "BatchTokenLedger",
     "BudgetCheckResult",
     "BudgetDimension",
     "BudgetReservation",
+    "CONTENDED_MAX_POLL_SECONDS",
+    "CONTENDED_POLL_SECONDS",
     "MIN_OUTPUT_TOKENS_DEFAULT",
     "MIN_OUTPUT_TOKENS_THINKING",
     "MIN_WALL_SECONDS_FOR_CALL",
@@ -1016,6 +1116,7 @@ __all__ = (
     "TaskBudgetSnapshot",
     "UnpricedCostPolicy",
     "current_task_budget",
+    "reserve_for_call_waiting",
     "stop_reason_for_dimension",
     "use_task_budget",
     "without_task_budget",

@@ -39,6 +39,7 @@ from engine.execution.task_budget import (
     SubAgentScopedBudget,
     TaskBudget,
     current_task_budget,
+    reserve_for_call_waiting,
 )
 from engine.llm.contracts import (
     ChatResponse,
@@ -858,7 +859,8 @@ async def react_event_loop(
             desired_out = model_limits_for(llm).max_output_tokens
             model_name = str(getattr(llm, "model", "") or "")
             thinking = bool(getattr(getattr(llm, "adapter", llm), "thinking", False))
-            check = active_budget.reserve_for_call(
+            check = await reserve_for_call_waiting(
+                active_budget,
                 estimated_input_tokens=fit.receipt.estimated_input_tokens,
                 desired_max_output_tokens=desired_out,
                 model=model_name,

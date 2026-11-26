@@ -1339,8 +1339,11 @@ async def test_concurrent_sub_agents_respect_in_flight_reservation_ceiling(
 
     assert in_flight_peak <= 10_000, f"in-flight + spent exceeded ceiling: {in_flight_peak}"
     assert parent_budget.snapshot().in_flight_tokens == 0
-    # Because 8 concurrent calls reserve ~4k output each, the ceiling stops the overflow cleanly.
-    assert any(not o.ok for o in outcomes)
+    # Worst-case holds contend, but actual spend (8 × 500) fits: siblings wait
+    # for each other to settle instead of tripping the turn budget.
+    assert all(o.ok for o in outcomes)
+    assert parent_budget.snapshot().spent_tokens == 4_000
+    assert not parent_budget.exhausted
 
 
 @pytest.mark.asyncio

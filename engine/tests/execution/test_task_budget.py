@@ -15,8 +15,11 @@ from engine.execution.orchestration.runtime import EngineRequest, RuntimeContext
 from engine.execution.react.react_loop import react_event_loop
 from engine.execution.task_budget import (
     MIN_OUTPUT_TOKENS_DEFAULT,
+    BatchTokenLedger,
+    SubAgentScopedBudget,
     TaskBudget,
     TaskBudgetLimits,
+    reserve_for_call_waiting,
     use_task_budget,
 )
 from engine.llm.adapters.anthropic import AnthropicAdapter
@@ -101,6 +104,93 @@ def test_reserve_clamps_max_tokens_and_reconciles_actual_usage() -> None:
     assert snap.in_flight_tokens == 0
     assert snap.spent_tokens == 1400
     assert not snap.exhausted
+
+
+def _reserve(budget: Any, est: int = 5000, out: int = 32_000) -> Any:
+    return budget.reserve_for_call(
+        estimated_input_tokens=est,
+        desired_max_output_tokens=out,
+        model="test-model",
+    )
+
+
+def test_sibling_in_flight_holds_contend_without_tripping_turn_budget() -> None:
+    budget = TaskBudget(TaskBudgetLimits(max_total_tokens=100_000))
+    held = [_reserve(budget) for _ in range(3)]
+    assert all(check.allowed for check in held)
+
+    fourth = _reserve(budget)
+    assert not fourth.allowed
+    assert fourth.contended
+    assert not budget.exhausted
+    assert not budget.cancel_event.is_set()
+
+    budget.reconcile(held[0].reservation, usage={"total_tokens": 6000}, model="test-model")
+    assert _reserve(budget).allowed
+
+    # A shortfall caused by actual spend still trips permanently.
+    spent = TaskBudget(TaskBudgetLimits(max_total_tokens=1000))
+    first = _reserve(spent, est=100, out=200)
+    spent.reconcile(first.reservation, usage={"total_tokens": 950}, model="test-model")
+    assert not _reserve(spent, est=100, out=200).contended
+    assert spent.exhausted
+
+
+def test_batch_ledger_contention_does_not_exhaust_batch() -> None:
+    ledger = BatchTokenLedger(10_000)
+    assert ledger.reserve("a", 1000, 9000, 128) == 9000
+    assert ledger.reserve("b", 1000, 9000, 128) == BatchTokenLedger.BATCH_CONTENDED
+    assert not ledger.exhausted
+    ledger.reconcile("a", 1500)
+    assert ledger.reserve("b", 1000, 9000, 128) == 7500
+
+
+def test_subagent_narrows_parent_hold_to_its_own_cap() -> None:
+    parent = TaskBudget(TaskBudgetLimits(max_total_tokens=100_000))
+    scoped = SubAgentScopedBudget(
+        agent_token_budget=8000,
+        batch_ledger=BatchTokenLedger(600_000),
+        task_timeout_seconds=600,
+        parent=parent,
+    )
+    check = _reserve(scoped)
+    assert check.allowed
+    assert check.reservation.reserved_output_tokens == 3000
+    assert parent.snapshot().in_flight_tokens == 8000
+
+
+@pytest.mark.asyncio
+async def test_parallel_subagents_wait_for_sibling_settlement() -> None:
+    parent = TaskBudget(TaskBudgetLimits(max_total_tokens=100_000))
+    batch = BatchTokenLedger(600_000)
+
+    def scoped() -> SubAgentScopedBudget:
+        return SubAgentScopedBudget(
+            agent_token_budget=400_000,
+            batch_ledger=batch,
+            task_timeout_seconds=30,
+            parent=parent,
+        )
+
+    holders = [scoped() for _ in range(3)]
+    held = [_reserve(h) for h in holders]
+    assert all(check.allowed for check in held)
+
+    waiter = asyncio.create_task(
+        reserve_for_call_waiting(
+            scoped(),
+            estimated_input_tokens=5000,
+            desired_max_output_tokens=32_000,
+            model="test-model",
+        )
+    )
+    await asyncio.sleep(0.12)
+    assert not waiter.done()
+    holders[0].reconcile(held[0].reservation, usage={"total_tokens": 6000}, model="test-model")
+
+    check = await asyncio.wait_for(waiter, timeout=2)
+    assert check.allowed
+    assert not parent.exhausted
 
 
 @pytest.mark.asyncio

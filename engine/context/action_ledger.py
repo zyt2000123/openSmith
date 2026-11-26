@@ -267,15 +267,17 @@ def classify_tool_action(
 
 
 def _action_label(tool_name: str, arguments: Mapping[str, Any]) -> str:
+    # The label lands in a system-role note, so model-supplied text must be
+    # collapsed and redacted like every target summary.
     action = arguments.get("action")
     if isinstance(action, str) and action.strip():
-        return f"{tool_name}({action.strip()})"
+        return f"{sanitize_single_line(tool_name, max_chars=60)}({sanitize_single_line(action, max_chars=60)})"
     if tool_name == "sub_agent":
         tasks = _extract_write_subagent_tasks(arguments)
         if tasks:
             types = sorted({agent_type for agent_type, _ in tasks})
-            return f"sub_agent({','.join(types)})"
-    return tool_name
+            return f"sub_agent({sanitize_single_line(','.join(types), max_chars=60)})"
+    return sanitize_single_line(tool_name, max_chars=60)
 
 
 def extract_target_summary(
