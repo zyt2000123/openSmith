@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping
 
 from engine.llm.contracts import DEFAULT_CONTEXT_WINDOW
+from .action_ledger import (
+    ActionOutcome,
+    DroppedActionLedger,
+    is_elision_note,
+)
 from .budget import (
     CONTEXT_COMPACTION_INPUT_RATIO,
     CONTEXT_COMPACTION_TRIGGER,
@@ -22,6 +27,7 @@ from .summary import PREVIOUS_SUMMARY_PREFIX, summarize_session
 
 if TYPE_CHECKING:
     from engine.llm.port import LLMPort
+    from engine.tool.interface import ToolDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +112,14 @@ def _split_active_context(
 
     The newest user turn is the request currently being executed. A context
     fitter may summarize or trim only the preceding history; the active turn
-    and its subsequent assistant/tool trail stay verbatim.
+    and its subsequent assistant/tool trail stay verbatim.  Any trailing
+    engine elision note at the end of the leading system span is moved into
+    ``history`` so compaction absorbs it instead of leaving a zombie system
+    message behind.
     """
     leading_system_count, active_start = active_turn_bounds(conversation)
+    while leading_system_count > 0 and is_elision_note(conversation[leading_system_count - 1]):
+        leading_system_count -= 1
 
     if active_start is None:
         return (
@@ -214,6 +225,9 @@ def trim_conversation_for_context_limit(
     conversation: list[dict],
     *,
     token_budget: int,
+    ledger: DroppedActionLedger | None = None,
+    call_outcomes: Mapping[str, ActionOutcome] | None = None,
+    tool_definitions: Mapping[str, "ToolDefinition"] | None = None,
 ) -> list[dict]:
     """Deterministically shrink an over-limit conversation without another LLM call.
 
@@ -231,8 +245,42 @@ def trim_conversation_for_context_limit(
     # tail slice can reverse a current safety constraint or task objective.
     protected, history, active = _split_active_context(copied)
 
+    effective_ledger = ledger if ledger is not None else DroppedActionLedger()
+    effective_ledger.ingest_dropped(
+        history,
+        call_outcomes=call_outcomes,
+        tool_definitions=tool_definitions,
+    )
+
+    recovery_prefix = (
+        "[Context deterministically shortened to fit the selected model]\n"
+    )
+    recovery_ack = {
+        "role": "assistant",
+        "content": "Understood. I have the relevant earlier context.",
+    }
+
+    # The protected contract, the synthesized recovery annotation, and the
+    # active work are constant across every binary-search step; only the
+    # synthesized history message varies. Measuring that fixed prefix once and
+    # serializing a single message per step avoids re-serializing the whole
+    # conversation O(log N) times.
+    fixed_cost = estimate_messages_tokens([*protected, recovery_ack, *active])
+    protected_active_cost = estimate_messages_tokens([*protected, *active])
+    available_history_tokens = max(0, token_budget - fixed_cost)
+    # Cap the structured completed-action section at <= 35% of available
+    # history space so raw recent context still has room during binary search,
+    # while preserving key write actions even when keep == 0.
+    action_byte_cap = min(2048, int(available_history_tokens * 0.35 * 3))
+    action_section = effective_ledger.render_recovery_section(
+        max_entries=20,
+        max_bytes=action_byte_cap,
+    )
+
     history_lines: list[str] = []
     for message in history:
+        if action_section and is_elision_note(message):
+            continue
         role = str(message.get("role", "unknown"))
         content = message.get("content")
         if not isinstance(content, str) or not content:
@@ -249,19 +297,13 @@ def trim_conversation_for_context_limit(
         if content:
             history_lines.append(f"[{role}] {content}")
 
-    recovery_prefix = (
-        "[Context deterministically shortened to fit the selected model]\n"
-    )
-    recovery_ack = {
-        "role": "assistant",
-        "content": "Understood. I have the relevant earlier context.",
-    }
     history_text = "\n".join(history_lines)
+    header_prefix = recovery_prefix + action_section
 
     def historical_candidate(keep: int) -> list[dict]:
         tail = history_text[-keep:] if keep else ""
         marker = "[... earlier context truncated ...]\n" if keep < len(history_text) else ""
-        recovered_history = recovery_prefix + marker + tail
+        recovered_history = header_prefix + marker + tail
         if not recovered_history.strip():
             return [*protected, *active]
         return [
@@ -271,23 +313,21 @@ def trim_conversation_for_context_limit(
             *active,
         ]
 
-    # The protected contract, the synthesized recovery annotation, and the
-    # active work are constant across every binary-search step; only the
-    # synthesized history message varies. Measuring that fixed prefix once and
-    # serializing a single message per step avoids re-serializing the whole
-    # conversation O(log N) times.
-    fixed_cost = estimate_messages_tokens([*protected, recovery_ack, *active])
-    protected_active_cost = estimate_messages_tokens([*protected, *active])
-
     def candidate_cost(keep: int) -> int:
         tail = history_text[-keep:] if keep else ""
         marker = "[... earlier context truncated ...]\n" if keep < len(history_text) else ""
-        recovered_history = recovery_prefix + marker + tail
+        recovered_history = header_prefix + marker + tail
         if not recovered_history.strip():
             return protected_active_cost
         return fixed_cost + estimate_messages_tokens(
             [{"role": "user", "content": recovered_history}]
         )
+
+    if action_section and candidate_cost(0) > token_budget:
+        # If the action section itself pushed keep==0 over budget, retry
+        # without it before giving up on the recovery pair.
+        action_section = ""
+        header_prefix = recovery_prefix
 
     minimum = historical_candidate(0)
     if candidate_cost(0) > token_budget:
@@ -325,7 +365,12 @@ async def compress(conversation: list[dict], llm: "LLMPort | None" = None) -> li
     return conversation
 
 
-async def compact_history(conversation: list[dict], llm: "LLMPort") -> list[dict]:
+async def compact_history(
+    conversation: list[dict],
+    llm: "LLMPort",
+    *,
+    task_budget: Any | None = None,
+) -> list[dict]:
     """Replace conversation with a compacted summary via LLM.
 
     Returns a new conversation with prior history summarized before the active
@@ -338,7 +383,7 @@ async def compact_history(conversation: list[dict], llm: "LLMPort") -> list[dict
         # summary would replace the very instruction the model must execute.
         return conversation
 
-    summary_result = await summarize_session(history, llm)
+    summary_result = await summarize_session(history, llm, task_budget=task_budget)
     if not summary_result.usable:
         # 摘要为空/被截断/被拒答时整体替换历史等于静默失忆——
         # 放弃本轮 compact，保留 prune 后的原始对话。

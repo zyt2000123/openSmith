@@ -27,6 +27,8 @@ class LLMPort(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         prefix_cache_key: str | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> ChatResponse: ...
 
     def chat_events(
@@ -34,6 +36,8 @@ class LLMPort(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         prefix_cache_key: str | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderEvent]: ...
 
     def chat_stream(

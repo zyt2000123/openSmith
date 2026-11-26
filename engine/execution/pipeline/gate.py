@@ -146,11 +146,78 @@ class LLMGate:
             template = self._prompt_template.replace(
                 "{output}", _bounded_gate_output(output)
             )
-            with llm_purpose("gate"):
-                resp = await self._llm.chat([
-                    {"role": "system", "content": "You are a quality gate. Evaluate the output and respond with ONLY 'PASS' or 'FAIL: <reason>'. Be strict."},
-                    {"role": "user", "content": template},
-                ])
+            gate_messages = [
+                {"role": "system", "content": "You are a quality gate. Evaluate the output and respond with ONLY 'PASS' or 'FAIL: <reason>'. Be strict."},
+                {"role": "user", "content": template},
+            ]
+            from engine.context.budget import estimate_messages_tokens, model_limits_for
+            from engine.execution.task_budget import current_task_budget
+
+            budget = current_task_budget()
+            reservation = None
+            if budget is not None:
+                check = budget.reserve_for_call(
+                    estimated_input_tokens=estimate_messages_tokens(gate_messages),
+                    desired_max_output_tokens=model_limits_for(self._llm).max_output_tokens,
+                    model=str(getattr(self._llm, "model", "") or ""),
+                )
+                if not check.allowed:
+                    return GateResult(
+                        "fail",
+                        f"Turn budget exhausted ({check.stop_reason or 'budget_exhausted'})",
+                        retry_hint="Budget limit reached.",
+                        infra_failure=True,
+                    )
+                reservation = check.reservation
+            try:
+                with llm_purpose("gate"):
+                    if reservation is not None and reservation.timeout_seconds is not None:
+                        import asyncio
+
+                        async with asyncio.timeout(reservation.timeout_seconds):
+                            resp = await self._llm.chat(gate_messages)
+                    else:
+                        resp = await self._llm.chat(gate_messages)
+            except TimeoutError:
+                if budget is not None:
+                    budget.release(reservation)
+                    budget.trip("wall_seconds")
+                return GateResult(
+                    "fail",
+                    "Turn wall-clock budget exhausted during gate check",
+                    retry_hint="Wall-clock budget limit reached.",
+                    infra_failure=True,
+                )
+            except Exception:
+                if budget is not None:
+                    budget.release(reservation)
+                raise
+            if budget is not None:
+                raw_usage = getattr(resp, "usage", None)
+                if isinstance(raw_usage, dict) and raw_usage:
+                    budget.reconcile(
+                        reservation,
+                        usage=raw_usage,
+                        model=str(getattr(resp, "model", "") or getattr(self._llm, "model", "") or ""),
+                    )
+                else:
+                    from engine.context.budget import estimate_tokens
+                    from engine.llm.usage import USAGE_REPORTED_KEY
+
+                    in_est = estimate_messages_tokens(gate_messages)
+                    out_est = estimate_tokens(getattr(resp, "text", "") or "")
+                    budget.reconcile(
+                        reservation,
+                        usage={
+                            "input_tokens": in_est,
+                            "output_tokens": out_est,
+                            "total_tokens": in_est + out_est,
+                            USAGE_REPORTED_KEY: 0,
+                            "estimated": True,
+                        },
+                        model=str(getattr(resp, "model", "") or getattr(self._llm, "model", "") or ""),
+                        estimated=True,
+                    )
             text = resp.text.strip()
             verdict = _normalized_llm_verdict(text)
             if _mentions_fail(verdict):

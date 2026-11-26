@@ -2168,3 +2168,157 @@ def test_long_arguments_sharing_a_prefix_are_not_treated_as_repeats():
         for call in llm.chat_calls
         for m in call["messages"]
     )
+
+
+def test_trim_preserves_active_turn_and_anthropic_user_alignment_with_action_ledger():
+    from engine.context.action_ledger import DroppedActionLedger, is_elision_note
+    from engine.tool.interface import ToolDefinition
+
+    defs = {
+        "write_file": ToolDefinition(
+            name="write_file", description="Write", is_write_tool=True, side_effect="write",
+        ),
+    }
+    ledger = DroppedActionLedger()
+    conversation: list[dict] = [{"role": "system", "content": "contract"}]
+    # Build 25 earlier user/assistant/tool rounds followed by an active request.
+    for i in range(25):
+        conversation.append({"role": "user", "content": f"old turn {i}"})
+        conversation.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": f"w-{i}",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": json.dumps({"file_path": f"f{i}.py"})},
+            }],
+        })
+        conversation.append({"role": "tool", "tool_call_id": f"w-{i}", "content": "OK"})
+    conversation.append({"role": "user", "content": "active current request"})
+
+    trimmed = trim_conversation_to_message_cap(
+        conversation, ledger=ledger, tool_definitions=defs,
+    )
+    assert any(m.get("content") == "active current request" for m in trimmed)
+    non_system = [m for m in trimmed if m.get("role") != "system"]
+    assert non_system[0]["role"] == "user", "first non-system message must be user for Anthropic"
+    notes = [m for m in trimmed if is_elision_note(m)]
+    assert len(notes) == 1
+    assert "f0.py" in notes[0]["content"]
+
+
+def test_fit_request_does_not_misclassify_elision_note_as_unfit_static_prompt():
+    from engine.context.action_ledger import DroppedActionLedger
+    from engine.context.fitting import ContextFitStatus, fit_request
+
+    class TightWindowLLM(FakeLLM):
+        limits = ModelLimits(
+            context_window=4_096,
+            context_window_declared=True,
+            max_output_tokens=1_024,
+            max_output_tokens_declared=True,
+        )
+
+    ledger = DroppedActionLedger(max_entries=50, max_render_bytes=4096)
+    for i in range(45):
+        ledger.ingest_dropped([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"c-{i}",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": json.dumps({"file_path": f"dir/module_{i:02d}_long_name.py"})},
+                }],
+            },
+            {"role": "tool", "tool_call_id": f"c-{i}", "content": "OK"},
+        ])
+    big_note = ledger.render_elision_note(dropped_count=90, dropped_tool_results=45)
+    messages = [
+        {"role": "system", "content": "small static prompt"},
+        big_note,
+        {"role": "user", "content": "do the next step"},
+    ]
+    fit = asyncio.run(fit_request(messages, None, TightWindowLLM([]), ledger=ledger))
+    assert fit.status is not ContextFitStatus.UNFIT_STATIC_PROMPT
+    assert fit.fits
+
+
+def test_compact_history_absorbs_prior_elision_note_into_summary_input():
+    from engine.context.action_ledger import DroppedActionLedger, is_elision_note
+    from engine.context.compression import compact_history
+
+    valid_summary = (
+        "<context_summary>"
+        "<conversation_overview>Refactored auth.</conversation_overview>"
+        "<key_knowledge>Uses SQLite.</key_knowledge>"
+        "<file_system_state>Modified auth.py.</file_system_state>"
+        "<recent_actions>Wrote auth.py.</recent_actions>"
+        "<current_plan>[IN PROGRESS] Tests.</current_plan>"
+        "</context_summary>"
+    )
+    ledger = DroppedActionLedger()
+    ledger.ingest_dropped([
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "w-auth",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": json.dumps({"file_path": "auth.py"})},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "w-auth", "content": "OK"},
+    ])
+    note = ledger.render_elision_note(dropped_count=10, dropped_tool_results=5)
+    llm = FakeLLM([ChatResponse(text=valid_summary, finish_reason="stop")])
+    conversation = [
+        {"role": "system", "content": "static system"},
+        note,
+        {"role": "user", "content": "earlier user message"},
+        {"role": "assistant", "content": "earlier reply"},
+        {"role": "user", "content": "current request"},
+    ]
+    compacted = asyncio.run(compact_history(conversation, llm))
+    summary_prompt_blob = json.dumps(llm.chat_calls[0]["messages"], ensure_ascii=False)
+    assert "auth.py" in summary_prompt_blob
+    assert not any(is_elision_note(m) for m in compacted)
+
+
+def test_wire_messages_never_contain_private_engine_keys():
+    async def run():
+        reg = ToolRegistry()
+
+        async def write_file(file_path: str) -> str:
+            return f"wrote {file_path}"
+
+        reg.register(
+            "write_file",
+            "Write a file",
+            {"type": "object", "properties": {"file_path": {"type": "string"}}},
+            write_file,
+            is_write_tool=True,
+            side_effect="write",
+        )
+        llm = FakeLLM([
+            ChatResponse(
+                tool_calls=[ToolCallData(id="w1", name="write_file", arguments={"file_path": "a.py"})],
+                finish_reason="tool_calls",
+            ),
+            ChatResponse(text="done", finish_reason="stop"),
+        ])
+        async for _ in _react_event_loop(
+            llm,
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "write a.py"}],
+            reg,
+            max_iters=3,
+        ):
+            pass
+        return llm
+
+    llm = asyncio.run(run())
+    for call in llm.chat_calls:
+        for msg in call["messages"]:
+            assert not any(str(k).startswith("_") for k in msg.keys()), (
+                f"private engine key leaked onto wire message: {list(msg.keys())}"
+            )

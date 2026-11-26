@@ -75,6 +75,8 @@ class ProviderClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         prefix_cache_key: str | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> ChatResponse:
         self._validate_requested_capabilities(tools, prefix_cache_key)
         started_at = time.monotonic()
@@ -85,6 +87,7 @@ class ProviderClient:
                     messages=messages,
                     tools=tools,
                     prefix_cache_key=prefix_cache_key,
+                    max_tokens=max_tokens,
                 )
             )
             return response
@@ -103,18 +106,23 @@ class ProviderClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         prefix_cache_key: str | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         self._validate_requested_capabilities(tools, prefix_cache_key)
         if not self.stream:
             # The non-streaming path funnels through ``chat()``, which already
             # emits the generation record; wrapping it again would double-count.
-            return self._complete_as_events(messages, tools, prefix_cache_key)
+            return self._complete_as_events(
+                messages, tools, prefix_cache_key, max_tokens=max_tokens,
+            )
         if not self.capabilities.streaming:
             raise LLMResponseError(f"Provider {self.provider} does not support streaming.")
         return self._observed_stream(LLMRequest(
             messages=messages,
             tools=tools,
             prefix_cache_key=prefix_cache_key,
+            max_tokens=max_tokens,
         ))
 
     async def _observed_stream(self, request: LLMRequest) -> AsyncIterator[ProviderEvent]:
@@ -198,6 +206,8 @@ class ProviderClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         prefix_cache_key: str | None,
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Normalize a non-streaming completion into the same event contract."""
         # Await the completion before announcing RESPONSE_CREATED so a failing
@@ -206,6 +216,7 @@ class ProviderClient:
             messages,
             tools,
             prefix_cache_key=prefix_cache_key,
+            max_tokens=max_tokens,
         )
         # Same data shape as the streaming adapters emit for this event, so
         # consumers can read ``model`` uniformly on both paths.

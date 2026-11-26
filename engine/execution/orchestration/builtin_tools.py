@@ -214,6 +214,10 @@ def bind_sub_agent_tool(services: RuntimeServices, agents_dir: Path) -> None:
         item_properties["agent_type"]["enum"] = agent_ids
 
     async def spawn(tasks: list[dict], max_parallel: int) -> list[dict]:
+        from engine.execution.task_budget import TaskBudget, current_task_budget
+
+        ambient_budget = current_task_budget()
+        parent_budget = ambient_budget if isinstance(ambient_budget, TaskBudget) else None
         outcomes = await run_sub_agents(
             [
                 SubAgentTask(
@@ -232,6 +236,7 @@ def bind_sub_agent_tool(services: RuntimeServices, agents_dir: Path) -> None:
             hook_registry=services.hook_registry,
             background_llm=services.background_llm,
             max_parallel=max_parallel,
+            parent_budget=parent_budget,
         )
         return [asdict(outcome) for outcome in outcomes]
 

@@ -38,6 +38,7 @@ from .orchestration.runtime import (
     RuntimeServices,
 )
 from .steering import STEERING_BROKER, SteerSubmitResult, SteeringMessage
+from .task_budget import TaskBudgetLimits
 
 
 __all__ = (
@@ -60,6 +61,7 @@ __all__ = (
     "STEERING_BROKER",
     "SteerSubmitResult",
     "SteeringMessage",
+    "TaskBudgetLimits",
     "raw_text_delta",
     "reply_with_runtime",
     "resume_stream_with_runtime",

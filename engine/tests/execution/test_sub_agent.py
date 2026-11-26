@@ -1252,3 +1252,118 @@ def test_every_shipped_type_declares_tools_that_actually_exist() -> None:
             assert registry.get(name) is not None, (
                 f"{spec.id} declares {name}, which no shipped provider registers"
             )
+
+
+# --------------------------------------------------------------------------
+# Shared parent TaskBudget
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sub_agents_share_and_debit_parent_task_budget_without_double_counting(
+    tmp_path: Path,
+) -> None:
+    from engine.execution.task_budget import TaskBudget, TaskBudgetLimits, use_task_budget
+
+    _write_type(tmp_path, "worker", tools=["echo_tool"], token_budget=50_000)
+    catalog = SubAgentCatalog.load(tmp_path)
+
+    class _BilledOnceLLM:
+        model = "test-model"
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None, *, max_tokens=None):
+            return ChatResponse(
+                text="report ok",
+                usage={"input_tokens": 400, "output_tokens": 100, "total_tokens": 500},
+                finish_reason="stop",
+            )
+
+    parent_budget = TaskBudget(TaskBudgetLimits(max_total_tokens=20_000))
+    with use_task_budget(parent_budget):
+        outcomes = await run_sub_agents(
+            [SubAgentTask("worker", "task 1"), SubAgentTask("worker", "task 2")],
+            catalog=catalog,
+            llm=_BilledOnceLLM(),
+            tool_registry=_registry(),
+            max_parallel=2,
+        )
+
+    assert all(o.ok for o in outcomes), [o.error for o in outcomes]
+    snap = parent_budget.snapshot()
+    # Two sub-agents x 500 tokens each = exactly 1000 tokens (never double-counted).
+    assert snap.spent_tokens == 1000
+    assert snap.subagent_tokens == 1000
+    assert snap.in_flight_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sub_agents_respect_in_flight_reservation_ceiling(
+    tmp_path: Path,
+) -> None:
+    from engine.execution.task_budget import TaskBudget, TaskBudgetLimits
+
+    _write_type(tmp_path, "worker", tools=["echo_tool"], token_budget=100_000)
+    catalog = SubAgentCatalog.load(tmp_path)
+
+    in_flight_peak = 0
+    parent_budget = TaskBudget(TaskBudgetLimits(max_total_tokens=10_000))
+
+    class _SlowConcurrentLLM:
+        model = "test-model"
+        max_output_tokens = 4_096
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, prefix_cache_key=None, *, max_tokens=None):
+            nonlocal in_flight_peak
+            self.calls += 1
+            snap = parent_budget.snapshot()
+            in_flight_peak = max(in_flight_peak, snap.spent_tokens + snap.in_flight_tokens)
+            await asyncio.sleep(0.05)
+            return ChatResponse(
+                text="done",
+                usage={"input_tokens": 400, "output_tokens": 100, "total_tokens": 500},
+                finish_reason="stop",
+            )
+
+    llm = _SlowConcurrentLLM()
+    outcomes = await run_sub_agents(
+        [SubAgentTask("worker", f"task {i}") for i in range(8)],
+        catalog=catalog,
+        llm=llm,
+        tool_registry=_registry(),
+        max_parallel=8,
+        parent_budget=parent_budget,
+    )
+
+    assert in_flight_peak <= 10_000, f"in-flight + spent exceeded ceiling: {in_flight_peak}"
+    assert parent_budget.snapshot().in_flight_tokens == 0
+    # Because 8 concurrent calls reserve ~4k output each, the ceiling stops the overflow cleanly.
+    assert any(not o.ok for o in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_parent_budget_exhaustion_cancels_pending_and_running_sub_agents(
+    tmp_path: Path,
+) -> None:
+    from engine.execution.task_budget import TaskBudget, TaskBudgetLimits
+
+    _write_type(tmp_path, "worker", tools=["echo_tool"], max_iters=20, token_budget=100_000)
+    catalog = SubAgentCatalog.load(tmp_path)
+    parent_budget = TaskBudget(TaskBudgetLimits(max_total_tokens=2_000))
+    llm = _BurningLLM(per_turn=1_000)
+
+    outcomes = await run_sub_agents(
+        [SubAgentTask("worker", f"spin {i}") for i in range(4)],
+        catalog=catalog,
+        llm=llm,
+        tool_registry=_registry(),
+        max_parallel=2,
+        parent_budget=parent_budget,
+    )
+
+    assert parent_budget.exhausted
+    assert all(not o.ok for o in outcomes)
+    assert llm.calls <= 4
+

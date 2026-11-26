@@ -34,7 +34,13 @@ from engine.execution.steering import (
     format_steering_message,
     use_steering_inbox,
 )
+from engine.execution.task_budget import (
+    TaskBudget,
+    TaskBudgetLimits,
+    use_task_budget,
+)
 from engine.llm.contracts import LLMResponseError
+from engine.llm.model_config import resolve_budget_config, resolve_price_table
 from engine.llm.observability import generation_context, llm_purpose
 from engine.safety.approval import APPROVAL_BROKER, use_approval_context
 from engine.safety.fact_gate import FactGate, FactGateContext, use_fact_gate
@@ -611,6 +617,28 @@ def resume_stream_with_runtime(
     )
 
 
+def _build_task_budget(request: EngineRequest) -> TaskBudget:
+    """Resolve platform/profile budget limits, tightened by any request override."""
+    try:
+        cfg = resolve_budget_config()
+    except Exception:
+        logger.warning("invalid budget configuration; falling back to unlimited", exc_info=True)
+        cfg = {}
+    base_limits = TaskBudgetLimits(
+        max_total_tokens=cfg.get("max_total_tokens"),
+        max_wall_seconds=cfg.get("max_wall_seconds"),
+        max_cost_usd=cfg.get("max_cost_usd"),
+        unpriced_cost_policy=cfg.get("unpriced_cost_policy", "warn_only"),
+    )
+    effective_limits = base_limits.tighten(request.budget)
+    try:
+        price_table = resolve_price_table()
+    except Exception:
+        logger.warning("failed to resolve price table for task budget", exc_info=True)
+        price_table = {}
+    return TaskBudget(effective_limits, price_table=price_table)
+
+
 async def _run_events_with_runtime(
     request: EngineRequest,
     runtime: RuntimeContext,
@@ -634,6 +662,7 @@ async def _run_events_with_runtime(
     memory_persist_failed = False
     execution_stage = "runtime_prepare"
     steering_inbox = STEERING_BROKER.open_run(run_id, runtime.session_id)
+    task_budget = _build_task_budget(request)
 
     def _terminal_event() -> ExecutionEvent:
         terminal_data: dict[str, object] = {"run_id": run_id, "status": terminal_status}
@@ -645,6 +674,9 @@ async def _run_events_with_runtime(
             # 记忆写入失败对用户默认不可见；在终态事件上打标，
             # 让前端有机会提示"本轮未写入长期记忆"。
             terminal_data["memory_persist_failed"] = True
+        budget_snap = task_budget.snapshot()
+        if task_budget.has_limits or budget_snap.subagent_tokens > 0:
+            terminal_data["budget"] = budget_snap.to_dict()
         return ExecutionEvent(EventType.RUN_FINISHED, terminal_data)
 
     if ledger is not None:
@@ -682,6 +714,7 @@ async def _run_events_with_runtime(
             use_fact_gate(_fact_gate_for_request(request, runtime, services)),
             use_approval_context(APPROVAL_BROKER, run_id),
             use_steering_inbox(steering_inbox),
+            use_task_budget(task_budget),
             generation_context(run_id=run_id, session_id=runtime.session_id),
             llm_purpose("main"),
         ):
@@ -856,13 +889,27 @@ async def _run_events_with_runtime(
         # 调用在资源清理之前，让写入型 StopHook 能拿到完整的会话上下文。
         if services.hook_registry is not None:
             try:
+                budget_snap = task_budget.snapshot()
+                stop_token_usage = dict(run_token_usage)
+                if budget_snap.spent_tokens > 0 and (
+                    budget_snap.input_tokens > stop_token_usage.get("input_tokens", 0)
+                    or budget_snap.output_tokens > stop_token_usage.get("output_tokens", 0)
+                ):
+                    stop_token_usage["input_tokens"] = max(
+                        stop_token_usage.get("input_tokens", 0),
+                        budget_snap.input_tokens,
+                    )
+                    stop_token_usage["output_tokens"] = max(
+                        stop_token_usage.get("output_tokens", 0),
+                        budget_snap.output_tokens,
+                    )
                 await services.hook_registry.run_stop_hooks(
                     runtime.session_id or "",
                     {
                         "session_id": runtime.session_id or "",
                         "run_id": run_id,
                         "session_stats": _stop_session_stats(
-                            run_token_usage,
+                            stop_token_usage,
                             services.llm,
                         ),
                     },

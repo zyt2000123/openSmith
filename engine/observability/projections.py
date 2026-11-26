@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Any, Mapping
 
 from engine.execution.events import EventType, ExecutionEvent
 
@@ -22,6 +22,8 @@ class RunSummary:
     token_usage: Mapping[str, int]
     outcome: str | None
     reason: str | None
+    budget_summary: Mapping[str, Any] | None = None
+    elided_actions_count: int = 0
 
 
 @dataclass
@@ -36,6 +38,8 @@ class RunSummaryProjection:
     _token_usage: Counter[str] = field(default_factory=Counter)
     _outcome: str | None = None
     _reason: str | None = None
+    _budget_summary: dict[str, Any] | None = None
+    _elided_actions_count: int = 0
 
     def record(self, event: ExecutionEvent) -> None:
         """Apply one event to the projection."""
@@ -46,6 +50,10 @@ class RunSummaryProjection:
             self._backtrack_count += 1
         elif event.type is EventType.TOOL_CALL_RESULT and event.data.get("approval_required"):
             self._approval_required_count += 1
+        elif event.type is EventType.CONTEXT_ACTIONS_ELIDED:
+            total = event.data.get("total_ledger_actions")
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                self._elided_actions_count = max(self._elided_actions_count, total)
         elif event.type is EventType.TOKEN_USAGE:
             for key in (
                 "input_tokens",
@@ -63,6 +71,9 @@ class RunSummaryProjection:
             self._outcome = str(status) if status is not None else None
             reason = event.data.get("reason")
             self._reason = str(reason) if reason is not None else None
+            budget = event.data.get("budget")
+            if isinstance(budget, dict):
+                self._budget_summary = dict(budget)
 
     def snapshot(self) -> RunSummary:
         """Return a detached summary suitable for a future query layer."""
@@ -76,4 +87,6 @@ class RunSummaryProjection:
             token_usage=dict(self._token_usage),
             outcome=self._outcome,
             reason=self._reason,
+            budget_summary=dict(self._budget_summary) if self._budget_summary is not None else None,
+            elided_actions_count=self._elided_actions_count,
         )

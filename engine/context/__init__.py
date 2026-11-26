@@ -1,5 +1,12 @@
 """Model-input context lifecycle: assembly, budgeting, and session compaction."""
 
+from .action_ledger import (
+    ActionOutcome,
+    DroppedActionLedger,
+    LedgerEntry,
+    build_action_outcome,
+    is_elision_note,
+)
 from .assembler import (
     AssembledPrompt,
     PromptAssembler,
@@ -31,8 +38,11 @@ from .summary import (
 )
 
 __all__ = (
+    "ActionOutcome",
     "AssembledPrompt",
     "CONTEXT_DISPLAY_WINDOW",
+    "DroppedActionLedger",
+    "LedgerEntry",
     "SESSION_SUMMARY_PREFIX",
     "ContextBudget",
     "ContextFitResult",
@@ -44,10 +54,12 @@ __all__ = (
     "PromptPlan",
     "SessionSummaryResult",
     "SessionSummaryStatus",
+    "build_action_outcome",
     "compact_history",
     "compress",
     "estimate_tokens",
     "fit_request",
+    "is_elision_note",
     "measure_request",
     "needs_compaction",
     "prompt_budget_for_llm",

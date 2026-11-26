@@ -233,3 +233,108 @@ def test_trace_store_only_chmods_when_creating_the_trace_file(
     # Appending to an already-private file must not re-chmod on every event.
     assert chmod_calls == []
     assert os.stat(tmp_path / "traces" / "run-chmod.jsonl").st_mode & 0o777 == 0o600
+
+
+def test_trace_store_preserves_budget_token_metric_keys_without_redacting(tmp_path):
+    store = TraceStore(tmp_path)
+    store.append(
+        "run-budget-keys",
+        ExecutionEvent(
+            EventType.BUDGET_UPDATE,
+            {
+                "tokens_used": 1200,
+                "tokens_limit": 400000,
+                "subagent_tokens": 300,
+                "estimated_tokens": 50,
+                "wall_seconds": 12.4,
+                "wall_limit": 600.0,
+                "cost_usd": 0.05,
+                "cost_limit": 2.0,
+                "cost_unpriced": False,
+                "exhausted_dimension": None,
+            },
+        ),
+    )
+    store.append(
+        "run-budget-keys",
+        ExecutionEvent(
+            EventType.RUN_FINISHED,
+            {
+                "run_id": "run-budget-keys",
+                "status": "incomplete",
+                "reason": "budget_tokens_exhausted",
+                "budget": {
+                    "limits": {"max_total_tokens": 400000, "max_wall_seconds": 600.0},
+                    "spent_tokens": 400000,
+                    "subagent_tokens": 300,
+                    "estimated_tokens": 50,
+                    "in_flight_tokens": 0,
+                    "exhausted": True,
+                },
+            },
+        ),
+    )
+    records = store.read("run-budget-keys")
+    update_data = records[0]["data"]
+    assert update_data["tokens_used"] == 1200
+    assert update_data["tokens_limit"] == 400000
+    assert update_data["subagent_tokens"] == 300
+    assert update_data["estimated_tokens"] == 50
+
+    finished_budget = records[1]["data"]["budget"]
+    assert finished_budget["spent_tokens"] == 400000
+    assert finished_budget["in_flight_tokens"] == 0
+    assert finished_budget["limits"]["max_total_tokens"] == 400000
+
+
+def test_budget_update_is_deferred_sync_and_run_finished_seals_budget_snapshot(tmp_path):
+    from engine.execution.orchestration.run_state import _DEFERRED_STATE_EVENTS
+    from engine.observability.projections import RunSummaryProjection
+    from engine.observability.recorder import RunEventRecorder
+    from engine.observability.summary_store import RunMetadata, RunSummaryStore
+    from engine.observability.trace_store import _DEFERRED_SYNC_EVENTS
+
+    assert EventType.BUDGET_UPDATE in _DEFERRED_SYNC_EVENTS
+    assert EventType.BUDGET_UPDATE in _DEFERRED_STATE_EVENTS
+
+    trace_store = TraceStore(tmp_path)
+    summary_store = RunSummaryStore(tmp_path)
+    meta = RunMetadata(
+        run_id="run-budget-summary",
+        agent_id="smith",
+        created_at="2026-11-26T00:00:00+00:00",
+    )
+    recorder = RunEventRecorder(
+        "run-budget-summary",
+        trace_store=trace_store,
+        summary_sinks=(lambda s: summary_store.save(meta, s),),
+    )
+    recorder.record(ExecutionEvent(EventType.RUN_STARTED, {"run_id": "run-budget-summary"}))
+    recorder.record(
+        ExecutionEvent(
+            EventType.CONTEXT_ACTIONS_ELIDED,
+            {"trigger": "message_cap", "elided_messages": 10, "recorded_actions": 3, "total_ledger_actions": 3},
+        )
+    )
+    recorder.record(
+        ExecutionEvent(
+            EventType.BUDGET_UPDATE,
+            {"tokens_used": 500, "tokens_limit": 1000, "subagent_tokens": 0},
+        )
+    )
+    recorder.record(
+        ExecutionEvent(
+            EventType.RUN_FINISHED,
+            {
+                "run_id": "run-budget-summary",
+                "status": "completed",
+                "budget": {"spent_tokens": 500, "exhausted": False},
+            },
+        )
+    )
+    loaded = summary_store.get("run-budget-summary")
+    assert loaded is not None
+    assert loaded.summary.elided_actions_count == 3
+    assert loaded.summary.budget_summary == {"spent_tokens": 500, "exhausted": False}
+    assert trace_store.verify("run-budget-summary").ok
+

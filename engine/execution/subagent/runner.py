@@ -14,6 +14,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from engine.execution.events import EventType, ExecutionEvent
+from engine.execution.task_budget import (
+    BatchTokenLedger,
+    SubAgentScopedBudget,
+    TaskBudget,
+    current_task_budget,
+    use_task_budget,
+)
 from engine.tool.registry import ScopedToolRegistry
 
 from .catalog import (
@@ -61,27 +68,6 @@ Do not ask the parent questions; it cannot reply. If the task is
 under-specified, state the assumption you made and continue. Never claim
 something you did not verify.
 """.strip()
-
-
-class _BatchBudget:
-    """Tokens the whole fan-out may still spend.
-
-    Single-threaded asyncio: ``spend`` runs to completion between awaits, so
-    the counter needs no lock. Exhaustion is sticky — once the batch is over
-    budget, every still-running agent stops at its next checkpoint rather than
-    racing to spend the remainder.
-    """
-
-    def __init__(self, total: int) -> None:
-        self.total = total
-        self.spent = 0
-
-    def spend(self, tokens: int) -> None:
-        self.spent += tokens
-
-    @property
-    def exhausted(self) -> bool:
-        return self.spent >= self.total
 
 
 @dataclass(frozen=True)
@@ -157,7 +143,8 @@ async def _run_one(
     tool_guard: "ToolGuard | None",
     hook_registry: "HookRegistry | None",
     timeout_seconds: float,
-    batch: _BatchBudget,
+    batch: BatchTokenLedger,
+    parent_budget: TaskBudget | None = None,
 ) -> SubAgentOutcome:
     label = task.display(index)
     try:
@@ -230,14 +217,42 @@ async def _run_one(
             model_role=spec.model,
         )
 
+    if parent_budget is not None and (
+        parent_budget.exhausted or not parent_budget.check_wall_clock()
+    ):
+        return outcome(
+            False,
+            error=f"parent {parent_budget.stop_reason or 'budget_exhausted'} before start",
+        )
     if batch.exhausted:
         return outcome(False, error="batch token budget exhausted before start")
+
+    effective_timeout = float(timeout_seconds)
+    if parent_budget is not None:
+        parent_rem = parent_budget.remaining_wall_seconds()
+        if parent_rem is not None:
+            effective_timeout = min(effective_timeout, parent_rem)
+            if effective_timeout <= 0.0:
+                parent_budget.trip("wall_seconds")
+                return outcome(False, error="parent budget_wall_time_exhausted before start")
+
+    scoped_budget = SubAgentScopedBudget(
+        agent_token_budget=spec.token_budget,
+        batch_ledger=batch,
+        task_timeout_seconds=effective_timeout,
+        parent=parent_budget,
+    )
 
     try:
         # ``use_fact_gate`` also displaces the parent's gate for anything in
         # this task that reads the ContextVar directly.
-        with without_approval_context(), without_steering_inbox(), use_fact_gate(sub_gate):
-            async with asyncio.timeout(timeout_seconds):
+        with (
+            without_approval_context(),
+            without_steering_inbox(),
+            use_fact_gate(sub_gate),
+            use_task_budget(scoped_budget),
+        ):
+            async with asyncio.timeout(effective_timeout):
                 # ``aclosing`` finalizes the loop deterministically when a
                 # budget break leaves it suspended, instead of waiting on the
                 # garbage collector to close it.
@@ -257,6 +272,7 @@ async def _run_one(
                         # work, so a sub-agent could edit files the parent is
                         # blocked from touching.
                         hook_registry=hook_registry,
+                        task_budget=scoped_budget,
                     )
                 ) as events:
                     async for event in events:
@@ -267,30 +283,20 @@ async def _run_one(
                         elif event.type is EventType.TOOL_CALL_START:
                             tool_calls += 1
                         elif event.type is EventType.TOKEN_USAGE:
-                            batch.spend(_accumulate_usage(usage, event))
-                            # Checked after the spend that caused it: the
-                            # tokens are already billed, so the only useful
-                            # response is to stop before the next turn
-                            # compounds them.
-                            if usage.get("total_tokens", 0) >= spec.token_budget:
-                                failure = (
-                                    f"token budget exhausted "
-                                    f"({usage['total_tokens']}/{spec.token_budget})"
-                                )
-                                break
-                            if batch.exhausted:
-                                failure = "batch token budget exhausted"
-                                break
+                            _accumulate_usage(usage, event)
                         elif event.type is EventType.FAILED:
                             failure = str(event.data.get("reason") or "failed")
                         elif event.type is EventType.INCOMPLETE:
-                            failure = str(event.data.get("reason") or "incomplete")
+                            failure = (
+                                scoped_budget.failure_message
+                                or str(event.data.get("reason") or "incomplete")
+                            )
     except asyncio.CancelledError:
         # Parent turn aborted — propagate so the whole fan-out unwinds instead
         # of reporting a fake per-task failure.
         raise
     except TimeoutError:
-        return outcome(False, error=f"timed out after {timeout_seconds:.0f}s")
+        return outcome(False, error=f"timed out after {effective_timeout:.0f}s")
     except Exception as exc:
         # One task must not sink the batch.
         logger.warning("sub-agent %s failed", label, exc_info=True)
@@ -306,6 +312,8 @@ async def _run_one(
         ):
             tool_guard.taint_store.merge_from(child_taint.sources, as_subagent=True)
 
+    if not failure and scoped_budget.exhausted:
+        failure = scoped_budget.failure_message or scoped_budget.stop_reason or "budget exhausted"
     if not "".join(text_parts).strip():
         # A sub-agent whose only product is a summary and that produced none
         # did not succeed, whatever the loop reported.
@@ -325,6 +333,7 @@ async def run_sub_agents(
     max_parallel: int = DEFAULT_MAX_PARALLEL,
     timeout_seconds: float = DEFAULT_TASK_TIMEOUT_SECONDS,
     batch_token_budget: int = DEFAULT_BATCH_TOKEN_BUDGET,
+    parent_budget: TaskBudget | None = None,
 ) -> list[SubAgentOutcome]:
     """Run *tasks* concurrently and return one outcome per task, in order."""
     if not tasks:
@@ -333,9 +342,13 @@ async def run_sub_agents(
         raise ValueError(
             f"at most {MAX_TASKS_PER_CALL} sub-agent tasks per call, got {len(tasks)}"
         )
+    if parent_budget is None:
+        ambient = current_task_budget()
+        if isinstance(ambient, TaskBudget):
+            parent_budget = ambient
     width = max(1, min(int(max_parallel), MAX_PARALLEL_CEILING, len(tasks)))
     limiter = asyncio.Semaphore(width)
-    batch = _BatchBudget(max(1, int(batch_token_budget)))
+    batch = BatchTokenLedger(max(1, int(batch_token_budget)))
     llm_for_role: dict[str, "LLMPort"] = {DEFAULT_MODEL_ROLE: llm}
     if background_llm is not None:
         llm_for_role["background"] = background_llm
@@ -352,6 +365,7 @@ async def run_sub_agents(
                 hook_registry=hook_registry,
                 timeout_seconds=timeout_seconds,
                 batch=batch,
+                parent_budget=parent_budget,
             )
 
     results = await asyncio.gather(

@@ -423,7 +423,14 @@ class OpenAIAdapter(HTTPAdapterMixin):
         }
         if request.tools:
             body["tools"] = request.tools
-        body["max_tokens"] = self.max_output_tokens
+        effective_max_tokens = (
+            min(self.max_output_tokens, request.max_tokens)
+            if isinstance(request.max_tokens, int)
+            and not isinstance(request.max_tokens, bool)
+            and request.max_tokens > 0
+            else self.max_output_tokens
+        )
+        body["max_tokens"] = effective_max_tokens
         if stream:
             # Without this flag the OpenAI Chat Completions API omits the
             # terminal usage chunk entirely, so every streaming call would

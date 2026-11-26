@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING, Any, Mapping
 
+from engine.context.action_ledger import (
+    ActionOutcome,
+    DroppedActionLedger,
+    ELISION_MARKER as _ELISION_MARKER,
+    is_elision_note as _is_elision_note,
+)
 from engine.context.compression import active_turn_bounds, is_request_turn
 from engine.execution.runtime_control import (
     continue_after_length_prompt,
     incomplete_final_repair_prompt,
     tool_failure_recovery_prompt,
 )
+
+if TYPE_CHECKING:
+    from engine.tool.interface import ToolDefinition
 
 DEFAULT_MAX_REACT_ITERS = 60
 MAX_FAILED_TOOL_RECOVERY_ITERS = 20
@@ -78,40 +88,38 @@ def looks_like_incomplete_final_after_tool(text: str) -> bool:
     return any(pattern.search(normalized) for pattern in _INCOMPLETE_FINAL_PATTERNS)
 
 
-def _elision_note(dropped: list[dict]) -> list[dict]:
-    """Leave a marker where trimmed messages used to be.
+def _elision_note(
+    dropped: list[dict],
+    *,
+    ledger: DroppedActionLedger | None = None,
+    call_outcomes: Mapping[str, ActionOutcome] | None = None,
+    tool_definitions: Mapping[str, "ToolDefinition"] | None = None,
+) -> list[dict]:
+    """Leave a structured action marker where trimmed messages used to be.
 
     Dropping the middle of the conversation outright removed every trace that
     those calls ever happened -- strictly worse than a pruned result, which at
     least keeps the call itself visible.  The model then re-ran work it had
     already completed, which is the same failure mode `[pruned: ...]` stubs
-    exist to prevent.  One system line is far cheaper than the re-run.
+    exist to prevent.  One system line with a compact completed-write ledger is
+    far cheaper than the re-run.
     """
     if not dropped:
         return []
-    tool_results = sum(1 for message in dropped if message.get("role") == "tool")
-    detail = f", including {tool_results} tool result(s)" if tool_results else ""
-    return [{
-        "role": "system",
-        "content": (
-            f"[{len(dropped)} {_ELISION_MARKER}{detail}. That work still "
-            "happened: rely on what you already established rather than "
-            "repeating it, and say so if you genuinely need a result again.]"
-        ),
-    }]
-
-
-_ELISION_MARKER = "earlier messages were elided to fit the context window"
-
-
-def _is_elision_note(message: dict) -> bool:
-    content = message.get("content")
-    return (
-        message.get("role") == "system"
-        and isinstance(content, str)
-        and content.startswith("[")
-        and _ELISION_MARKER in content
+    effective_ledger = ledger if ledger is not None else DroppedActionLedger()
+    effective_ledger.ingest_dropped(
+        dropped,
+        call_outcomes=call_outcomes,
+        tool_definitions=tool_definitions,
     )
+    dropped_non_notes = [msg for msg in dropped if not _is_elision_note(msg)]
+    tool_results = sum(1 for message in dropped_non_notes if message.get("role") == "tool")
+    return [
+        effective_ledger.render_elision_note(
+            dropped_count=len(dropped_non_notes) if dropped_non_notes else len(dropped),
+            dropped_tool_results=tool_results,
+        )
+    ]
 
 
 def _is_round_boundary(message: dict) -> bool:
@@ -126,7 +134,13 @@ def _is_round_boundary(message: dict) -> bool:
     return message.get("role") == "assistant" or is_request_turn(message)
 
 
-def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
+def trim_conversation_to_message_cap(
+    conversation: list[dict],
+    *,
+    ledger: DroppedActionLedger | None = None,
+    call_outcomes: Mapping[str, ActionOutcome] | None = None,
+    tool_definitions: Mapping[str, "ToolDefinition"] | None = None,
+) -> list[dict]:
     """Bound the conversation by message count without losing the request.
 
     Keeps the leading contract, the newest real user turn, and a recent tail.
@@ -172,7 +186,7 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
             cut += 1
         return cut
 
-    def kept(cut: int) -> list[dict]:
+    def split_for(cut: int) -> tuple[list[dict], list[dict], list[dict]]:
         head = conversation[:leading_system_count]
         dropped = conversation[leading_system_count:cut]
         if active_start is not None and active_start < cut:
@@ -184,9 +198,21 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
                 for index, message in enumerate(dropped, start=leading_system_count)
                 if index != active_start
             ]
-        # 留痕占一条消息：调用方用"结果是否真的变短"判断裁剪是否生效，
-        # dropped 只有一条时头+痕+尾与原长相等，正确地落入向后回退分支。
-        return head + _elision_note(dropped) + conversation[cut:]
+        return head, dropped, conversation[cut:]
+
+    def can_shrink(head: list[dict], dropped: list[dict], tail: list[dict]) -> bool:
+        note_len = 1 if dropped else 0
+        return len(head) + note_len + len(tail) < len(conversation)
+
+    def materialize(head: list[dict], dropped: list[dict], tail: list[dict]) -> list[dict]:
+        # Only mutate *ledger* once we have chosen a cut that actually shrinks
+        # the conversation, so rejected candidate cuts never double-count.
+        return head + _elision_note(
+            dropped,
+            ledger=ledger,
+            call_outcomes=call_outcomes,
+            tool_definitions=tool_definitions,
+        ) + tail
 
     # 切点落在 tool 结果串中会拆散 assistant(tool_calls)/tool 配对
     # （provider 400）。向前回退到 assistant 或**真实**请求轮的边界：同一轮的
@@ -200,9 +226,9 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
     cut = requested_cut
     while cut > leading_system_count and not _is_round_boundary(conversation[cut]):
         cut -= 1
-    trimmed = kept(aligned(cut))
-    if len(trimmed) < len(conversation):
-        return trimmed
+    head, dropped, tail = split_for(aligned(cut))
+    if can_shrink(head, dropped, tail):
+        return materialize(head, dropped, tail)
 
     # 回退吃光了可丢弃的中段，head+tail 就是整条对话，这道上限静默失效：
     # 一轮 8 个并行工具调用即可（实测 41 条裁剪后仍是 41 条，30 个调用时
@@ -213,9 +239,9 @@ def trim_conversation_to_message_cap(conversation: list[dict]) -> list[dict]:
     while forward < len(conversation) and not _is_round_boundary(conversation[forward]):
         forward += 1
     if forward < len(conversation):
-        forward_trimmed = kept(aligned(forward))
-        if len(forward_trimmed) < len(conversation):
-            return forward_trimmed
+        f_head, f_dropped, f_tail = split_for(aligned(forward))
+        if can_shrink(f_head, f_dropped, f_tail):
+            return materialize(f_head, f_dropped, f_tail)
     # 没有安全切点：尾巴里除了当前这一轮的 assistant 之外再无轮次边界（一轮
     # 40 个并行调用、中间还夹着 tool/system/[Current time] 时就是这样）。此时
     # 唯一能切的地方是那个 assistant 本身，而切掉它等于丢掉整个活动轮 ——

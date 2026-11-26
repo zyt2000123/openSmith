@@ -15,31 +15,19 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from engine.safety.redaction import (
+    EMBEDDED_FLAG_RE as _EMBEDDED_FLAG_RE,
+    EMBEDDED_SECRET_RE as _EMBEDDED_SECRET_RE,
+    SECRET_FLAG_RE as _SECRET_FLAG_RE,
+    SECRET_VALUE_RE as _SECRET_VALUE_RE,
+    SENSITIVE_ARGUMENT_KEY_PARTS as _SENSITIVE_ARGUMENT_KEY_PARTS,
+    URL_CREDENTIALS_RE as _URL_CREDENTIALS_RE,
+    is_secret_value as _is_secret_value,
+    is_sensitive_argument_name as _is_sensitive_argument_name,
+    redact_secret_text as _redact_secret_text,
+)
 from engine.safety.risk import RiskTier
 
-# Substring parts, matched against a key stripped of non-alphanumerics, so
-# ``db_password``/``clientSecret``/``auth_token`` redact just like ``password``.
-# Exact full-name matching used to let every such variant through into the
-# approval card and the SSE stream the user sees.
-#
-# Single source of truth: engine/safety/tool_guard.py imports the matching
-# helper from here instead of keeping a second, drift-prone copy.
-_SENSITIVE_ARGUMENT_KEY_PARTS = (
-    "apikey",
-    "authorization",
-    "cookie",
-    "credential",
-    "passwd",
-    "password",
-    "privatekey",
-    "secret",
-    "token",
-)
-
-
-def _is_sensitive_argument_name(key: object) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-    return any(part in normalized for part in _SENSITIVE_ARGUMENT_KEY_PARTS)
 _MAX_SUMMARY_ITEMS = 32
 _MAX_SUMMARY_DEPTH = 3
 _MAX_SUMMARY_TEXT = 240
@@ -386,88 +374,6 @@ class ApprovalBroker:
 def summarize_arguments(arguments: dict) -> dict[str, object]:
     """Return a bounded, redacted summary safe for SSE and run metadata."""
     return _summarize_mapping(arguments)
-
-
-_SECRET_FLAG_RE = re.compile(
-    r"^-{1,2}(?:password|passwd|token|secret|api[-_]?key|apikey|"
-    r"access[-_]?key|client[-_]?secret|private[-_]?key|auth(?:orization)?|"
-    r"bearer|session[-_]?key|cookie)(?:=|$)",
-    re.IGNORECASE,
-)
-
-_SECRET_VALUE_RE = re.compile(
-    r"(?:"
-    r"sk-[A-Za-z0-9_\-]{8,}"
-    r"|gh[pousr]_[A-Za-z0-9]{10,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[baprs]-[A-Za-z0-9\-]{8,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r"|eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
-    r"|Bearer [A-Za-z0-9._\-]+"
-    r")"
-)
-
-# Search-mode twin of ``_SECRET_VALUE_RE``: finds a credential embedded
-# *inside* a longer string (a shell command, a URL, a JSON blob).  Lengths are
-# tightened so ordinary content never matches — ``sk-development`` is a
-# directory name, not a key.
-_EMBEDDED_SECRET_RE = re.compile(
-    r"(?:"
-    r"sk-[A-Za-z0-9_\-]{20,}"
-    r"|gh[pousr]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{22,}"
-    r"|glpat-[A-Za-z0-9_\-]{20,}"
-    r"|xox[baprs]-[A-Za-z0-9\-]{16,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r"|AIza[0-9A-Za-z_\-]{30,}"
-    r"|eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{1,}\.[A-Za-z0-9_\-]{1,}"
-    # A bare Bearer token that is not itself a recognized key family: keep the
-    # word visible ("Bearer ***"), never the credential.  The negative
-    # lookahead lets sk-/gh_/… tokens fall through to their own branch above so
-    # the readable frame stays consistent with the other families.
-    r"|\bBearer\s+(?!sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|AIza|eyJ)"
-    r"[A-Za-z0-9._~+/=\-]{8,}"
-    r")"
-)
-
-# ``scheme://userinfo@`` in a URL — keep the scheme and host, drop the
-# userinfo (which may carry a password).
-_URL_CREDENTIALS_RE = re.compile(
-    r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s]+)@"
-)
-
-# ``--token value`` / ``--token=value`` embedded in a command string.
-_EMBEDDED_FLAG_RE = re.compile(
-    r"(?<=\s)(-{1,2}(?:password|passwd|token|secret|api[-_]?key|apikey|"
-    r"access[-_]?key|client[-_]?secret|private[-_]?key|auth(?:orization)?|"
-    r"bearer|session[-_]?key|cookie))(?:\s*=\s*|\s+)(?:(?:'[^']*')|(?:\"[^\"]*\")|[^\s;|&]+)",
-    re.IGNORECASE,
-)
-
-
-def _is_secret_value(value: str) -> bool:
-    """Whether a string is itself a credential rather than ordinary content."""
-    text = value.strip()
-    if not text:
-        return False
-    if re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", text):
-        return True
-    return bool(_SECRET_VALUE_RE.fullmatch(text))
-
-
-def _redact_secret_text(text: str) -> str:
-    """Redact secret-shaped material embedded in a string summary.
-
-    A whole-string credential is hidden entirely; otherwise each embedded
-    high-confidence token, ``--flag value`` pair, and URL userinfo is replaced
-    in place so the surrounding context stays readable.
-    """
-    if _is_secret_value(text):
-        return "***"
-    redacted = _EMBEDDED_SECRET_RE.sub("***", text)
-    redacted = _EMBEDDED_FLAG_RE.sub(r"\1 ***", redacted)
-    redacted = _URL_CREDENTIALS_RE.sub(r"\1***@", redacted)
-    return redacted
 
 
 def _summarize_list(values: list | tuple, *, depth: int) -> list[object]:

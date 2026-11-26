@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from engine.execution.events import RunObservationFactory
+from engine.execution.task_budget import TaskBudgetLimits
 from engine.identity import IdentityCatalog
 from engine.llm.port import LLMPort
 from engine.safety.tool_guard import ToolGuard
@@ -44,6 +45,7 @@ class EngineRequest:
     steering_history: tuple[str, ...] = ()
     ephemeral: bool = False
     read_only_tools: bool = False
+    budget: TaskBudgetLimits | None = None
 
 
 @dataclass(frozen=True)

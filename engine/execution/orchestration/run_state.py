@@ -117,6 +117,7 @@ _DEFERRED_STATE_EVENTS = frozenset({
     EventType.THINKING,
     EventType.TOKEN_USAGE,
     EventType.CONTEXT_USAGE,
+    EventType.BUDGET_UPDATE,
 })
 
 

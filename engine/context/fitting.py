@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any, Mapping
 
+from .action_ledger import (
+    ActionOutcome,
+    DroppedActionLedger,
+    is_elision_note,
+)
 from .budget import (
     ContextBudget,
     context_budget_for,
@@ -19,6 +24,9 @@ from .compression import (
     prune_tool_outputs,
     trim_conversation_for_context_limit,
 )
+
+if TYPE_CHECKING:
+    from engine.tool.interface import ToolDefinition
 
 
 class ContextFitStatus(str, Enum):
@@ -65,6 +73,44 @@ class ContextFitResult:
         }
 
 
+def _shrink_or_drop_elision_notes(
+    messages: list[dict[str, Any]],
+    *,
+    ledger: DroppedActionLedger | None,
+    drop: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    changed = False
+    updated: list[dict[str, Any]] = []
+    for msg in messages:
+        if not is_elision_note(msg):
+            updated.append(msg)
+            continue
+        changed = True
+        if drop:
+            continue
+        if ledger is not None:
+            compact = ledger.render_elision_note(
+                dropped_count=ledger.total_elided_messages,
+                dropped_tool_results=ledger.total_elided_tool_results,
+                max_entries=10,
+                max_bytes=1024,
+            )
+            if compact["content"] != msg.get("content"):
+                updated.append(compact)
+            else:
+                # Already compact; drop to reclaim space.
+                continue
+        else:
+            # Without a ledger instance, keep only the first line + closing bracket.
+            content = str(msg.get("content", ""))
+            first_line = content.splitlines()[0] if content else ""
+            if first_line and not first_line.endswith("]"):
+                first_line = first_line + "]"
+            if first_line and first_line != content:
+                updated.append({"role": "system", "content": first_line})
+    return updated, changed
+
+
 async def fit_request(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
@@ -72,6 +118,10 @@ async def fit_request(
     *,
     prefix_cache_key: str | None = None,
     allow_model_compaction: bool = True,
+    ledger: DroppedActionLedger | None = None,
+    call_outcomes: Mapping[str, ActionOutcome] | None = None,
+    tool_definitions: Mapping[str, "ToolDefinition"] | None = None,
+    task_budget: Any | None = None,
 ) -> ContextFitResult:
     """Fit and remeasure one complete request before any provider call."""
     budget = context_budget_for(model_limits_for(llm))
@@ -110,6 +160,10 @@ async def fit_request(
     for message in original:
         if message.get("role") != "system":
             break
+        # Dynamic elision annotations are transient and compressible; do not
+        # misclassify them as an irreducible static prompt contract.
+        if is_elision_note(message):
+            continue
         protected_systems.append(message)
     if protected_systems:
         static_receipt = assess(protected_systems)
@@ -136,6 +190,22 @@ async def fit_request(
 
     active_receipt = assess(_preserved_active_context(candidate))
     if active_receipt.estimated_input_tokens > budget.safe_input_budget:
+        # Try shrinking or dropping transient elision notes before declaring
+        # the active request unfit.
+        shrunk, changed = _shrink_or_drop_elision_notes(candidate, ledger=ledger, drop=False)
+        if changed:
+            candidate = shrunk
+            actions.append("elision_note_compacted")
+            active_receipt = assess(_preserved_active_context(candidate))
+        if active_receipt.estimated_input_tokens > budget.safe_input_budget:
+            dropped_notes, dropped_changed = _shrink_or_drop_elision_notes(
+                candidate, ledger=ledger, drop=True
+            )
+            if dropped_changed:
+                candidate = dropped_notes
+                actions.append("elision_note_dropped")
+                active_receipt = assess(_preserved_active_context(candidate))
+    if active_receipt.estimated_input_tokens > budget.safe_input_budget:
         return result(
             ContextFitStatus.UNFIT_REQUEST,
             candidate,
@@ -153,9 +223,11 @@ async def fit_request(
             actions,
         )
 
-    if allow_model_compaction:
+    if allow_model_compaction and not (
+        task_budget is not None and getattr(task_budget, "exhausted", False)
+    ):
         try:
-            compacted = await compact_history(candidate, llm)
+            compacted = await compact_history(candidate, llm, task_budget=task_budget)
         except Exception:
             actions.append("compaction_failed")
         else:
@@ -173,7 +245,11 @@ async def fit_request(
             else:
                 actions.append("compaction_rejected")
     else:
-        actions.append("model_compaction_disabled")
+        actions.append(
+            "compaction_skipped_budget"
+            if task_budget is not None and getattr(task_budget, "exhausted", False)
+            else "model_compaction_disabled"
+        )
 
     receipt = assess(candidate)
     if receipt.estimated_input_tokens <= budget.safe_input_budget:
@@ -201,6 +277,9 @@ async def fit_request(
     recovered = trim_conversation_for_context_limit(
         candidate,
         token_budget=message_budget,
+        ledger=ledger,
+        call_outcomes=call_outcomes,
+        tool_definitions=tool_definitions,
     )
     recovered_receipt = assess(recovered)
     actions.append("deterministic_trim")

@@ -81,6 +81,7 @@ class LLMRequest:
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] | None = None
     prefix_cache_key: str | None = None
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
